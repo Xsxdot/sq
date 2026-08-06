@@ -72,6 +72,11 @@ func (s *Server) routes(reg *prometheus.Registry) {
 	s.mux.HandleFunc("GET /admin/groups/{name}", s.protected(s.handleGroupGet))
 	s.mux.HandleFunc("POST /admin/groups/{name}/reset-cursor", s.protected(s.handleGroupResetCursor))
 	s.mux.HandleFunc("DELETE /admin/groups/{name}", s.protected(s.handleGroupDelete))
+	s.mux.HandleFunc("GET /admin/messages", s.protected(s.handleMessagesQuery))
+	s.mux.HandleFunc("POST /admin/messages/send", s.protected(s.handleMessageSend))
+	s.mux.HandleFunc("POST /admin/dlq/{group}/resend", s.protected(s.handleDLQResend))
+	s.mux.HandleFunc("GET /admin/delay", s.protected(s.handleDelayList))
+	s.mux.HandleFunc("GET /admin/overview", s.protected(s.handleOverview))
 }
 
 // Handler 返回根 handler（测试注入用）。
