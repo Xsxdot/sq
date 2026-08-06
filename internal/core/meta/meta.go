@@ -106,7 +106,11 @@ func (m *Meta) GetTopic(name string) (TopicConfig, bool) {
 }
 
 // EnsureTopic 获取 topic；不存在且开启自动创建时按默认队列数创建。
+// 名字合法性校验优先于其他逻辑，确保无效名字返回 ErrBadName 而非 ErrTopicNotFound。
 func (m *Meta) EnsureTopic(name string) (TopicConfig, error) {
+	if err := ValidateName(name); err != nil {
+		return TopicConfig{}, err
+	}
 	if tc, ok := m.GetTopic(name); ok {
 		return tc, nil
 	}

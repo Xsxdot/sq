@@ -56,6 +56,29 @@ func TestEnsureTopicNotFoundWhenAutoCreateOff(t *testing.T) {
 	}
 }
 
+func TestEnsureTopicBadNameIndependentOfAutoCreate(t *testing.T) {
+	// 无效名字应返回 ErrBadName，与 autoCreate 标志无关
+	invalidName := "has/slash"
+
+	// 情形1: autoCreate=false，无效名字返回 ErrBadName（不是 ErrTopicNotFound）
+	m1, st1 := newTestMeta(t, t.TempDir(), false)
+	defer st1.Close()
+	if _, err := m1.EnsureTopic(invalidName); !errors.Is(err, ErrBadName) {
+		t.Fatalf("autoCreate=false: 期望 ErrBadName，得到 %v", err)
+	}
+
+	// 情形2: autoCreate=true，无效名字返回 ErrBadName（不创建 topic）
+	m2, st2 := newTestMeta(t, t.TempDir(), true)
+	defer st2.Close()
+	if _, err := m2.EnsureTopic(invalidName); !errors.Is(err, ErrBadName) {
+		t.Fatalf("autoCreate=true: 期望 ErrBadName，得到 %v", err)
+	}
+	// 确保没有创建
+	if _, ok := m2.GetTopic(invalidName); ok {
+		t.Fatalf("无效名字不应被创建")
+	}
+}
+
 func TestValidateName(t *testing.T) {
 	if err := ValidateName("ok_Topic-1%"); err != nil {
 		t.Fatalf("合法名被拒: %v", err)
