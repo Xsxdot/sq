@@ -60,7 +60,7 @@ func TestPassPurgesExpired(t *testing.T) {
 	writeMsgAt(t, st, "t", 0, old, "k-old")
 	writeMsgAt(t, st, "t", 1, fresh, "k-new")
 
-	m := New(st, mt, time.Minute, slog.Default())
+	m := New(st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default())
 	n, err := m.Pass()
 	if err != nil || n != 1 {
 		t.Fatalf("Pass: %d %v", n, err)
@@ -91,7 +91,7 @@ func TestPassIdempotentAndNoExpired(t *testing.T) {
 	st, mt := newFixture(t)
 	mt.CreateTopic("t", 1)
 	writeMsgAt(t, st, "t", 0, time.Now().UnixMilli())
-	m := New(st, mt, time.Minute, slog.Default())
+	m := New(st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default())
 	for i := 0; i < 2; i++ {
 		if n, err := m.Pass(); err != nil || n != 0 {
 			t.Fatalf("第 %d 次 Pass: %d %v", i+1, n, err)
@@ -106,7 +106,7 @@ func TestConsumeAfterPurge(t *testing.T) {
 	old := time.Now().Add(-4 * 24 * time.Hour).UnixMilli()
 	writeMsgAt(t, st, "t", 0, old)
 	writeMsgAt(t, st, "t", 1, time.Now().UnixMilli())
-	if _, err := New(st, mt, time.Minute, slog.Default()).Pass(); err != nil {
+	if _, err := New(st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default()).Pass(); err != nil {
 		t.Fatal(err)
 	}
 	pr := produce.New(st, mt, slog.Default())
@@ -120,7 +120,7 @@ func TestConsumeAfterPurge(t *testing.T) {
 // TestRunStopsOnCancel Run 循环响应 ctx 取消退出（停机路径）。
 func TestRunStopsOnCancel(t *testing.T) {
 	st, mt := newFixture(t)
-	m := New(st, mt, time.Hour, slog.Default())
+	m := New(st, mt, time.Hour, t.TempDir(), 0, nil, slog.Default())
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { m.Run(ctx); close(done) }()

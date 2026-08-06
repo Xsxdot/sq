@@ -221,6 +221,9 @@ func writeBrokerConfig(t *testing.T) (cfgPath, endpoint string) {
 		// 会拒绝空 retention_check_interval，序列化出去反而起不来（与
 		// DefaultMaxAttempts 同款陷阱）。
 		RetentionCheckInterval: "5m",
+		// e2e 机器磁盘状况不可控，显式关闭水位以免误拒写；0 在校验范围
+		// [0,99] 内表示关闭（缺省是 85，e2e 里磁盘打满会莫名其妙拒写）。
+		DiskWatermarkPercent: 0,
 		// debug 级别：broker 侧的投递/确认日志是排查「消息没到」的唯一线索，
 		// 失败时由 dumpBrokerLog 打进测试输出。
 		LogLevel: "debug",

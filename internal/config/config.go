@@ -39,7 +39,8 @@ type Config struct {
 	DefaultQueueNums   uint32 `yaml:"default_queue_nums"`   // 自动建 topic 的队列数
 	DefaultMaxAttempts int32  `yaml:"default_max_attempts"` // 新订阅组默认最大投递次数
 	RetentionCheckInterval string `yaml:"retention_check_interval"` // 过期清理扫描间隔（Go duration 格式）
-	LogLevel           string `yaml:"log_level"`            // debug|info|warn|error
+	DiskWatermarkPercent   int    `yaml:"disk_watermark_percent"`   // 超过即拒写，0=关闭
+	LogLevel               string `yaml:"log_level"`                // debug|info|warn|error
 }
 
 // Load 加载配置。path 为空时返回纯默认值；文件存在则按字段覆盖。
@@ -49,6 +50,7 @@ func Load(path string) (*Config, error) {
 		DataDir: "./data", Fsync: "sync",
 		AutoCreateTopic: true, DefaultQueueNums: 4, DefaultMaxAttempts: 16, LogLevel: "info",
 		RetentionCheckInterval: "5m",
+		DiskWatermarkPercent:   85,
 	}
 	if path == "" {
 		return cfg, nil
@@ -83,6 +85,12 @@ func Load(path string) (*Config, error) {
 	// 都不能让 retention 任务以 0 间隔空转或整趟跳过，启动时挡住。
 	if d, err := time.ParseDuration(cfg.RetentionCheckInterval); err != nil || d <= 0 {
 		return nil, fmt.Errorf("配置 retention_check_interval 须为正 duration（如 5m），得到 %q", cfg.RetentionCheckInterval)
+	}
+	// disk_watermark_percent 必须在 [0,99]：100 意味着"永不触发拒写"却保留着
+	// 拒写逻辑的错觉，99 才是"留 1% 余量"的真实语义；负数/超限是配置笔误，
+	// 启动时挡住比运行期静默不拒写更容易被发现。
+	if cfg.DiskWatermarkPercent < 0 || cfg.DiskWatermarkPercent > 99 {
+		return nil, fmt.Errorf("配置 disk_watermark_percent 须在 [0,99]（0=关闭），得到 %d", cfg.DiskWatermarkPercent)
 	}
 	// log_level 与 SetupSlog 的 switch 分支必须同步：这里不挡住，SetupSlog 的
 	// default 分支会把拼错的级别静默降级成 info，错误从此不可见。

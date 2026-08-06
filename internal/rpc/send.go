@@ -27,6 +27,12 @@ import (
 // "整批任一条失败即整体失败"这句话在字面上和效果上一致：失败就是真的什么
 // 都没写。
 func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*pb.SendMessageResponse, error) {
+	// 磁盘水位拒写保读（spec §7）：只拦生产者写入，消费链路（Receive/Ack）不受影响
+	if s.writeBlocked != nil && s.writeBlocked.Load() {
+		s.logger.Warn("磁盘水位超限，拒绝写入", "messages", len(req.GetMessages()))
+		return &pb.SendMessageResponse{Status: errStatus(pb.Code_FORBIDDEN,
+			"磁盘使用率超过水位线，暂时拒写（保读）")}, nil
+	}
 	// 第一遍：只翻译 + 校验，不做任何持久化。
 	msgs := make([]*core.Message, 0, len(req.GetMessages()))
 	for _, pm := range req.GetMessages() {

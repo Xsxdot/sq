@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/signal"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -69,9 +70,11 @@ func run() error {
 	// retention 后台清理。停机顺序关键：先取消并等待清理 goroutine 退出，
 	// 再让 defer 关闭 store——否则可能在 store 关闭后提交清理批次（panic）。
 	// defer 为 LIFO：本 defer 注册在 st.Close 的 defer 之后，故先执行。
+	// writeBlocked 由 retention 每趟探测磁盘后更新，rpc.SendMessage 据此拒写。
+	writeBlocked := &atomic.Bool{}
 	retCtx, retCancel := context.WithCancel(context.Background())
 	var retWG sync.WaitGroup
-	rm := retention.New(st, mt, cfg.RetentionInterval(), logger)
+	rm := retention.New(st, mt, cfg.RetentionInterval(), cfg.DataDir, cfg.DiskWatermarkPercent, writeBlocked, logger)
 	retWG.Add(1)
 	go func() { defer retWG.Done(); rm.Run(retCtx) }()
 	defer func() { retCancel(); retWG.Wait() }()
@@ -90,7 +93,7 @@ func run() error {
 		grpc.MaxRecvMsgSize(rpc.MaxGRPCMessageSize),
 		grpc.MaxSendMsgSize(rpc.MaxGRPCMessageSize),
 	)
-	srv := rpc.New(cfg, mt, pr, dl, logger)
+	srv := rpc.New(cfg, mt, pr, dl, writeBlocked, logger)
 	srv.Register(gs)
 
 	// signal.Notify 必须先于 gs.Serve 的 goroutine 注册：如果反过来，

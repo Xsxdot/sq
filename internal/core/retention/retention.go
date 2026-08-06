@@ -17,6 +17,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/xushixin/sq/internal/core"
@@ -33,11 +34,25 @@ type Manager struct {
 	mt       *meta.Meta
 	interval time.Duration
 	logger   *slog.Logger
+
+	// 磁盘水位保护三件套（spec §7 拒写保读）：
+	// dataDir 为探测目标（磁盘使用率按它所在的文件系统计算）；
+	// watermarkPct<=0 或 writeBlocked 为 nil 时水位检查整体禁用。
+	dataDir       string
+	watermarkPct  int
+	writeBlocked  *atomic.Bool
 }
 
-// New 构造清理任务。interval 为扫描间隔（config.RetentionInterval()）。
-func New(st *store.Store, mt *meta.Meta, interval time.Duration, logger *slog.Logger) *Manager {
-	return &Manager{st: st, mt: mt, interval: interval, logger: logger.With("mod", "retention")}
+// New 构造清理任务。
+//
+// 参数：
+//   - interval: 扫描间隔（config.RetentionInterval()）
+//   - dataDir/watermarkPct/writeBlocked: 磁盘水位保护三件套；
+//     watermarkPct<=0 或 writeBlocked 为 nil 时水位检查禁用
+func New(st *store.Store, mt *meta.Meta, interval time.Duration, dataDir string,
+	watermarkPct int, writeBlocked *atomic.Bool, logger *slog.Logger) *Manager {
+	return &Manager{st: st, mt: mt, interval: interval, dataDir: dataDir,
+		watermarkPct: watermarkPct, writeBlocked: writeBlocked, logger: logger.With("mod", "retention")}
 }
 
 // Run 阻塞运行清理循环：启动即跑一趟，此后每 interval 一趟；ctx 取消即返回。
@@ -47,6 +62,7 @@ func (m *Manager) Run(ctx context.Context) {
 	t := time.NewTicker(m.interval)
 	defer t.Stop()
 	for {
+		m.checkDisk()
 		if n, err := m.Pass(); err != nil {
 			m.logger.Error("retention 清理失败", "err", err)
 		} else if n > 0 {
@@ -58,6 +74,27 @@ func (m *Manager) Run(ctx context.Context) {
 			return
 		case <-t.C:
 		}
+	}
+}
+
+// checkDisk 探测磁盘用量并更新拒写开关。只在状态翻转时打日志（避免每趟刷屏）。
+func (m *Manager) checkDisk() {
+	if m.watermarkPct <= 0 || m.writeBlocked == nil {
+		return
+	}
+	used, err := diskUsedPercent(m.dataDir)
+	if err != nil {
+		m.logger.Warn("磁盘水位检查失败，本趟跳过", "dir", m.dataDir, "err", err)
+		return
+	}
+	blocked := used >= float64(m.watermarkPct)
+	if blocked != m.writeBlocked.Load() {
+		if blocked {
+			m.logger.Error("磁盘使用率超过水位线，进入拒写保读", "used_pct", used, "watermark", m.watermarkPct)
+		} else {
+			m.logger.Info("磁盘使用率回落，恢复写入", "used_pct", used, "watermark", m.watermarkPct)
+		}
+		m.writeBlocked.Store(blocked)
 	}
 }
 

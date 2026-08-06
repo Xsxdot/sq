@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 
 	"google.golang.org/grpc"
 
@@ -34,11 +35,12 @@ const brokerName = "sq0" // 单机版固定 broker 名；v2 集群时改为节�
 // 同时满足 gRPC "must embed Unimplemented...Server" 的前向兼容惯例。
 type Server struct {
 	pb.UnimplementedMessagingServiceServer
-	cfg    *config.Config
-	mt     *meta.Meta
-	pr     *produce.Producer
-	dl     *deliver.Deliverer
-	logger *slog.Logger
+	cfg          *config.Config
+	mt           *meta.Meta
+	pr           *produce.Producer
+	dl           *deliver.Deliverer
+	writeBlocked *atomic.Bool
+	logger       *slog.Logger
 
 	// done 由 Shutdown 关闭，用于让没有自然终点的长流（Telemetry）主动收尾。
 	// 见 Shutdown 的注释：不给它们一个「该结束了」的信号，grpc.Server 的
@@ -50,10 +52,11 @@ type Server struct {
 // New 构造协议适配层。四个依赖各自服务于一组 RPC：cfg 提供对外通告地址与
 // 协商参数，mt 管 topic/group 注册表（QueryRoute/Heartbeat/QueryAssignment），
 // pr 是写路径（SendMessage），dl 是 POP 消费路径
-// （ReceiveMessage/AckMessage/ChangeInvisibleDuration）。
-func New(cfg *config.Config, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, logger *slog.Logger) *Server {
+// （ReceiveMessage/AckMessage/ChangeInvisibleDuration）；writeBlocked 是
+// 磁盘水位拒写开关（spec §7，由 retention 循环每趟更新），为 nil 时不拒写。
+func New(cfg *config.Config, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, writeBlocked *atomic.Bool, logger *slog.Logger) *Server {
 	return &Server{
-		cfg: cfg, mt: mt, pr: pr, dl: dl, logger: logger.With("mod", "rpc"),
+		cfg: cfg, mt: mt, pr: pr, dl: dl, writeBlocked: writeBlocked, logger: logger.With("mod", "rpc"),
 		done: make(chan struct{}),
 	}
 }

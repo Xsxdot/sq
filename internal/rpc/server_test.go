@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -41,9 +42,10 @@ import (
 //   - srv：停机行为（Shutdown 让 Telemetry 长流收尾）只能从服务端这一侧触发
 //   - dl：需要绕开协议层、直接查"盘上到底有没有这条消息"时用
 type testEnv struct {
-	srv    *Server
-	client pb.MessagingServiceClient
-	dl     *deliver.Deliverer
+	srv     *Server
+	client  pb.MessagingServiceClient
+	dl      *deliver.Deliverer
+	blocked *atomic.Bool
 }
 
 // newTestEnv 起一套测试环境。autoCreate 决定未知 topic 是否自动创建；opts 追加
@@ -74,7 +76,8 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
 	}
-	srv := New(cfg, mt, pr, dl, slog.Default())
+	blocked := &atomic.Bool{}
+	srv := New(cfg, mt, pr, dl, blocked, slog.Default())
 
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer(opts...)
@@ -93,7 +96,7 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	return testEnv{srv: srv, client: pb.NewMessagingServiceClient(conn), dl: dl}
+	return testEnv{srv: srv, client: pb.NewMessagingServiceClient(conn), dl: dl, blocked: blocked}
 }
 
 // newTestClient 是 newTestEnv 最常用形态的简写：autoCreate=true、无额外

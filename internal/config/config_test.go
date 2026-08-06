@@ -119,6 +119,18 @@ func TestDefaultMaxAttempts(t *testing.T) {
 	}
 }
 
+func TestDiskWatermark(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil || cfg.DiskWatermarkPercent != 85 {
+		t.Fatalf("默认水位: %d %v", cfg.DiskWatermarkPercent, err)
+	}
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	os.WriteFile(p, []byte("disk_watermark_percent: 120\n"), 0o644)
+	if _, err := Load(p); err == nil {
+		t.Fatal("应拒绝 >99 的水位")
+	}
+}
+
 func TestRetentionInterval(t *testing.T) {
 	cfg, err := Load("")
 	if err != nil || cfg.RetentionInterval() != 5*time.Minute {

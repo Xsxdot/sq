@@ -264,4 +264,23 @@ func TestSendMessageMalformedTopicReturnsIllegalTopic(t *testing.T) {
 	}
 }
 
+// TestSendMessageRejectedWhenDiskBlocked 超水位拒写返回 FORBIDDEN（保读不保写）。
+func TestSendMessageRejectedWhenDiskBlocked(t *testing.T) {
+	env := newTestEnv(t, true) // server_test.go 既有 fixture，本 task 为其增 blocked 字段
+	c, blocked := env.client, env.blocked
+	blocked.Store(true)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic:            &pb.Resource{Name: "dw"},
+			SystemProperties: &pb.SystemProperties{MessageType: pb.MessageType_NORMAL},
+			Body:             []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_FORBIDDEN {
+		t.Fatalf("期望 FORBIDDEN，得到 %v %v", resp.GetStatus(), err)
+	}
+	blocked.Store(false)
+	sendOne(t, c, "dw", "x") // 恢复后可写
+}
+
 func strPtr(s string) *string { return &s }
