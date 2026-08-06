@@ -20,12 +20,13 @@ import (
 )
 
 // PurgeTopicData 清理 topic 的全部消息数据：各队列 msg/ 区间、alloc 计数器、
-// keyidx/ 索引，单批原子提交。
+// keyidx/ 索引，单批原子提交。logger 为注入式应用日志器（本包内部 With("mod", "adminops")）。
 //
 // 调用顺序契约：先 Purge 再 meta.DeleteTopic。崩溃在两步之间的中间态是
 // 「注册表还在、数据已空」——等价于一个空 topic，无害且可重试；反过来会留下
 // 永远没人清理的孤儿数据（注册表没了，retention 不再扫它）。
-func PurgeTopicData(st *store.Store, tc meta.TopicConfig) error {
+func PurgeTopicData(st *store.Store, tc meta.TopicConfig, logger *slog.Logger) error {
+	logger = logger.With("mod", "adminops")
 	b := st.NewBatch()
 	for q := uint32(0); q < tc.Queues; q++ {
 		mp := store.MsgQueuePrefix(tc.Name, q)
@@ -37,13 +38,15 @@ func PurgeTopicData(st *store.Store, tc meta.TopicConfig) error {
 	if err := st.Apply(b); err != nil {
 		return fmt.Errorf("清理 topic %s 数据: %w", tc.Name, err)
 	}
-	slog.Default().Info("topic 数据已清理", "mod", "adminops", "topic", tc.Name, "queues", tc.Queues)
+	logger.Info("topic 数据已清理", "topic", tc.Name, "queues", tc.Queues)
 	return nil
 }
 
 // PurgeGroupData 清理订阅组的 cursor/ 与 inflight/ 全部记录，单批原子提交。
+// logger 为注入式应用日志器（同 PurgeTopicData）。
 // 调用顺序契约与 PurgeTopicData 同理：先 Purge 再 meta.DeleteGroup。
-func PurgeGroupData(st *store.Store, group string) error {
+func PurgeGroupData(st *store.Store, group string, logger *slog.Logger) error {
+	logger = logger.With("mod", "adminops")
 	b := st.NewBatch()
 	cp := store.CursorGroupPrefix(group)
 	b.DeleteRange(cp, store.PrefixUpperBound(cp), nil)
@@ -52,6 +55,6 @@ func PurgeGroupData(st *store.Store, group string) error {
 	if err := st.Apply(b); err != nil {
 		return fmt.Errorf("清理 group %s 数据: %w", group, err)
 	}
-	slog.Default().Info("消费组数据已清理", "mod", "adminops", "group", group)
+	logger.Info("消费组数据已清理", "group", group)
 	return nil
 }

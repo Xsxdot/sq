@@ -52,7 +52,7 @@ func TestPurgeTopicData(t *testing.T) {
 		t.Fatal(err)
 	}
 	tc, _ := mt.GetTopic("del-me")
-	if err := PurgeTopicData(st, tc); err != nil {
+	if err := PurgeTopicData(st, tc, slog.Default()); err != nil {
 		t.Fatal(err)
 	}
 	if n := countPrefix(t, st, store.MsgQueuePrefix("del-me", 0)); n != 0 {
@@ -82,7 +82,7 @@ func TestPurgeGroupData(t *testing.T) {
 	if _, err := dl.Receive(context.Background(), "g-keep", "t1", 0, 1, time.Minute, 0, nil); err != nil {
 		t.Fatal(err)
 	}
-	if err := PurgeGroupData(st, "g-del"); err != nil {
+	if err := PurgeGroupData(st, "g-del", slog.Default()); err != nil {
 		t.Fatal(err)
 	}
 	if n := countPrefix(t, st, store.CursorGroupPrefix("g-del")); n != 0 {
