@@ -35,9 +35,11 @@ func main() {
 //
 // 生命周期收尾：defer st.Close() 在函数声明处即挂好——store.Open 成功后
 // 任何后续失败路径（包括 net.Listen 失败）都会经由 defer 正常关闭 store，
-// 不会泄漏底层 Pebble 句柄；正常路径下 defer 在 gs.GracefulStop() 返回之后
-// 才执行，确保「先等在途 RPC 结束、再关 store」这个顺序（RPC handler 仍可能
-// 在关闭过程中访问 store，store 必须比 gRPC server 活得更久）。
+// 不会泄漏底层 Pebble 句柄。两条退出路径在 defer 执行前都先让 gRPC server
+// 停止接收/处理请求，保证 store 关闭时不会再有 handler goroutine 在读写它：
+// 正常路径（收到信号）在 defer 之前调用 gs.GracefulStop()，等在途 RPC
+// 自然结束；异常路径（gs.Serve 提前返回）调用 gs.Stop() 立即中断在途 RPC
+// （理由见下方 errCh 分支注释），两者殊途同归，只是收尾姿态不同。
 func run() error {
 	cfgPath := flag.String("config", "", "配置文件路径（可选）")
 	flag.Parse()
@@ -76,13 +78,19 @@ func run() error {
 	)
 	rpc.New(cfg, mt, pr, dl, logger).Register(gs)
 
+	// signal.Notify 必须先于 gs.Serve 的 goroutine 注册：如果反过来，
+	// Serve 启动后、Notify 生效前这段窗口期内到达的 SIGTERM 会命中 Go 的
+	// 默认处置（直接杀进程），defer st.Close() 不会执行，「先排空 RPC、
+	// 再关 store」的停机契约在这条路径上根本不会被触发——这不是"极少数情况
+	// 才会踩中"的边缘分支，而是每次进程刚启动就存在的真实竞态窗口。
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+
 	errCh := make(chan error, 1)
 	go func() { errCh <- gs.Serve(lis) }()
 	logger.Info("sq 已启动", "grpc_listen", cfg.GRPCListen,
 		"advertise", cfg.AdvertiseHost, "data_dir", cfg.DataDir, "fsync", cfg.Fsync)
 
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 	select {
 	case sig := <-sigCh:
 		logger.Info("收到退出信号，优雅停机", "signal", sig.String())
@@ -93,6 +101,17 @@ func run() error {
 		// gs.Serve 提前返回（如监听 socket 被意外关闭），属于运行期故障，
 		// 而不是「用户主动要求退出」——沿用 run() 统一的错误返回路径，
 		// 让 main() 按非 0 退出码上报，不能被外部监控当成正常停机。
+		//
+		// 这里用 Stop() 而不是 GracefulStop()：Serve 本身已经失败（监听
+		// 层出了问题），继续接受/处理新请求已不再可能，此时"礼貌地等待
+		// 在途 RPC 自然结束"既没有对应的新流量场景去验证，也可能因为某个
+		// 长轮询 RPC（如 ReceiveMessage，默认可挂到 20s）迟迟不返回而拖长
+		// 一个本该立刻上报的启动/运行期故障的退出时间。Stop() 立即中断
+		// 所有在途 RPC 再返回，牺牲这些 RPC 的优雅收尾换取故障退出的及时性，
+		// 这里的取舍方向与用户主动触发的正常停机（SIGTERM 分支用
+		// GracefulStop）刻意不同。此后 defer st.Close() 才会执行，Stop()
+		// 已经保证不会再有 handler goroutine 在读写 store。
+		gs.Stop()
 		return err
 	}
 }

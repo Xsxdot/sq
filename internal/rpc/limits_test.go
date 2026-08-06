@@ -49,10 +49,16 @@ func newProdConfiguredClient(t *testing.T) pb.MessagingServiceClient {
 		t.Fatalf("store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, _ := meta.New(st, true, 4, slog.Default())
+	mt, err := meta.New(st, true, 4, slog.Default())
+	if err != nil {
+		t.Fatalf("meta.New: %v", err)
+	}
 	pr := produce.New(st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
-	cfg, _ := config.Load("")
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
 	srv := New(cfg, mt, pr, dl, slog.Default())
 
 	lis := bufconn.Listen(1 << 20)
