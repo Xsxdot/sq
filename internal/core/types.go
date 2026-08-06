@@ -118,6 +118,11 @@ func NewMessageID() string {
 type InflightState struct {
 	ExpireAtMs int64 `json:"expire_at_ms"` // 不可见截止时间；早于 now 即可重投
 	Attempts   int32 `json:"attempts"`     // 已投递次数（首投=1）
+	// Ordered 顺序消息标记（M4）：true 表示这条 inflight 对应 MessageGroup 非空
+	// 的顺序消息，它的存在即该队列顺序锁被占用——deliver 不变式：每
+	// (group,topic,queue) 至多 1 条 Ordered inflight。omitempty：M3 及以前
+	// 落盘的旧记录无此键，解码得 false（非顺序），无需迁移。
+	Ordered bool `json:"ordered,omitempty"`
 }
 
 // EncodeInflight 序列化 inflight 状态。

@@ -113,3 +113,21 @@ func TestInflightRoundTrip(t *testing.T) {
 		t.Fatalf("round trip: %+v %v", got, err)
 	}
 }
+
+func TestInflightOrderedRoundTripAndCompat(t *testing.T) {
+	// 新字段往返
+	raw := EncodeInflight(&InflightState{ExpireAtMs: 100, Attempts: 2, Ordered: true})
+	got, err := DecodeInflight(raw)
+	if err != nil || !got.Ordered || got.ExpireAtMs != 100 || got.Attempts != 2 {
+		t.Fatalf("Ordered 往返失败: %+v %v", got, err)
+	}
+	// 旧数据兼容：M3 及以前落盘的 inflight JSON 没有 ordered 键，解码得 false
+	old, err := DecodeInflight([]byte(`{"expire_at_ms":100,"attempts":1}`))
+	if err != nil || old.Ordered {
+		t.Fatalf("旧数据兼容失败: %+v %v", old, err)
+	}
+	// 零值不产生新键：非顺序 inflight 编码结果与升级前逐字节一致
+	if bytes.Contains(EncodeInflight(&InflightState{ExpireAtMs: 1, Attempts: 1}), []byte("ordered")) {
+		t.Fatal("零值 Ordered 不应出现在 JSON 中")
+	}
+}
