@@ -17,6 +17,9 @@ package rpc
 import (
 	"context"
 	"errors"
+	"hash/crc32"
+	"strconv"
+	"strings"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -167,6 +170,14 @@ func (s *Server) longPollWait(ctx context.Context) time.Duration {
 	return wait
 }
 
+// crc32Checksum 按官方 SDK 的校验式计算消息体 CRC32 校验和：无前导零的大写
+// 十六进制。格式必须与 SDK v5.1.4 message.go 的
+// `strings.ToUpper(strconv.FormatInt(int64(crc32.ChecksumIEEE(body)), 16))`
+// 逐字符一致——差一个前导零或大小写，消费端就会把消息标记为 corrupted。
+func crc32Checksum(body []byte) string {
+	return strings.ToUpper(strconv.FormatInt(int64(crc32.ChecksumIEEE(body)), 16))
+}
+
 // toPBMessage core.Message → proto（读方向翻译，receipt handle 在此注入）。
 // handle 编入 m.DeliveryAttempt——deliver.Receive 已经把首投/重投的正确
 // attempt 值填好在这个字段上，这里原样取用即可，无需额外传参。
@@ -174,6 +185,9 @@ func (s *Server) longPollWait(ctx context.Context) time.Duration {
 // 本函数必须回填 toCoreMessage 收下的每一个透传字段：写方向存了、读方向不发，
 // 效果与压根没存一样，只是更难发现（盘上数据看着是对的）。改动其中一侧时
 // 请同时改另一侧，两者的类型映射集中在 sysprops.go。
+//
+// 透传之上有两条"缺失兜底"（只在生产者什么都没声明时生效，不覆盖已有值）：
+// digest 缺失补算 CRC32、encoding 未声明归一化 IDENTITY，理由见各自的行内注释。
 func (s *Server) toPBMessage(m *core.Message, group string) *pb.Message {
 	handle := receiptEncode(group, m.Topic, m.QueueID, m.Offset, m.DeliveryAttempt)
 	attempt := m.DeliveryAttempt
@@ -186,12 +200,30 @@ func (s *Server) toPBMessage(m *core.Message, group string) *pb.Message {
 			"topic", m.Topic, "queue", m.QueueID, "offset", m.Offset,
 			"msg_id", m.ID, "body_encoding", string(m.BodyEncoding))
 	}
+	// 生产者未声明编码时归一化为 IDENTITY 下发：sq 存的就是原始字节，IDENTITY
+	// 是这个事实的如实陈述；而下发 UNSPECIFIED 会让官方 SDK 消费端每条消息打一条
+	// "unsupported message encoding algorithm" ERROR（message.go 的 default 分支）。
+	// 判据必须是 m.BodyEncoding（盘上真的没声明），不能是 enc==UNSPECIFIED：
+	// 后者会把上面 !known 分支（盘上存着不认识的 token，Body 可能是某种未知
+	// 压缩格式）也一并伪装成 IDENTITY，从"如实说不知道"变成"主动说谎"。
+	if m.BodyEncoding == core.BodyEncodingUnspecified {
+		enc = pb.Encoding_IDENTITY
+	}
+	// 生产者没带 digest 时（官方 Go SDK v5.1.4 的生产者就从不设置它）补算 CRC32：
+	// 消费端对 digest 类型 UNSPECIFIED 的每条消息都会刷一条 WARN，补算之后消费端
+	// 校验通过、日志干净。这不与"digest 是端到端的事、sq 不重算"（sysprops.go）
+	// 矛盾：生产者声明过的 digest 依旧原样透传、绝不覆盖——兜底只在端到端链路
+	// 本来就是空白的时候补一段服务端到消费端的完整性校验，聊胜于无。
+	digest := digestToPB(m.BodyDigest)
+	if digest == nil {
+		digest = &pb.Digest{Type: pb.DigestType_CRC32, Checksum: crc32Checksum(m.Body)}
+	}
 	sp := &pb.SystemProperties{
 		MessageId:       m.ID,
 		MessageType:     pb.MessageType_NORMAL,
 		Keys:            m.Keys,
 		BodyEncoding:    enc,
-		BodyDigest:      digestToPB(m.BodyDigest),
+		BodyDigest:      digest,
 		BornTimestamp:   timestamppb.New(time.UnixMilli(m.BornAtMs)),
 		BornHost:        m.BornHost,
 		StoreTimestamp:  timestamppb.New(time.UnixMilli(m.StoreAtMs)),

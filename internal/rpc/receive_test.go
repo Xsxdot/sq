@@ -27,7 +27,10 @@ package rpc
 
 import (
 	"context"
+	"hash/crc32"
 	"io"
+	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,6 +181,54 @@ func TestSendReceivePreservesPassthroughSystemProperties(t *testing.T) {
 	}
 	if sp.GetTraceContext() != traceContext {
 		t.Fatalf("trace_context 应原样带回 %q，实际 %q", traceContext, sp.GetTraceContext())
+	}
+}
+
+// TestReceiveBackfillsDigestAndNormalizesEncodingWhenProducerOmitsThem 锁定
+// 投递路径对"生产者什么都没声明"的兜底：digest 缺失时按 SDK 校验式补算 CRC32，
+// encoding 未声明时归一化为 IDENTITY。
+//
+// 为什么需要兜底（而不是继续纯透传）：官方 Go SDK v5.1.4 的生产者
+// （publishing_message.go）只设置 Encoding_IDENTITY，**从不设置 BodyDigest**；
+// 而它的消费端（message.go fromProtobuf_MessageView2）对 digest 类型为
+// UNSPECIFIED 的每条消息都会打一条
+// "unsupported message body digest algorithm" WARN。纯透传意味着官方 SDK
+// 自产自销的每一条消息都在消费端刷一条 WARN——功能可用（消息不会被标
+// corrupted），但生产环境的客户端日志会被刷爆。
+//
+// 兜底只在"缺失"时生效：已有 digest/encoding 的照旧透传（那是端到端校验的
+// 语义所在，由 TestSendReceivePreservesPassthroughSystemProperties 锁定，
+// 该测试同时保证 GZIP 不会被这里的归一化改写）。
+func TestReceiveBackfillsDigestAndNormalizesEncodingWhenProducerOmitsThem(t *testing.T) {
+	c := newTestClient(t)
+	const topic = "digest-backfill"
+	const body = "no-digest-payload"
+	// sendOne 只带 MessageType，不带 digest/encoding——正是官方 Go SDK 生产者
+	// 发出的 SystemProperties 形态（encoding 它会设 IDENTITY，这里连 encoding
+	// 也不带，顺带覆盖"未声明 encoding 归一化"分支）。
+	sendOne(t, c, topic, body)
+
+	var got *pb.Message
+	for q := int32(0); q < 4 && got == nil; q++ {
+		got = receiveOne(t, c, "g-digest-backfill", topic, q, time.Minute)
+	}
+	if got == nil {
+		t.Fatal("未收到消息")
+	}
+	sp := got.GetSystemProperties()
+	// 期望校验和必须按 SDK message.go 的原式计算（无前导零、大写十六进制），
+	// 逐字符一致才不会被消费端标记 corrupted。
+	wantChecksum := strings.ToUpper(strconv.FormatInt(int64(crc32.ChecksumIEEE([]byte(body))), 16))
+	if sp.GetBodyDigest().GetType() != pb.DigestType_CRC32 {
+		t.Fatalf("digest 缺失时应补算 CRC32，实际类型 %v（SDK 消费端会对 UNSPECIFIED 每条消息刷 WARN）",
+			sp.GetBodyDigest().GetType())
+	}
+	if sp.GetBodyDigest().GetChecksum() != wantChecksum {
+		t.Fatalf("补算的 CRC32 校验和应为 %q，实际 %q（不一致会被 SDK 标记 corrupted）",
+			wantChecksum, sp.GetBodyDigest().GetChecksum())
+	}
+	if sp.GetBodyEncoding() != pb.Encoding_IDENTITY {
+		t.Fatalf("未声明 encoding 应归一化为 IDENTITY，实际 %v", sp.GetBodyEncoding())
 	}
 }
 
