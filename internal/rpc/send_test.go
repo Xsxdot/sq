@@ -136,7 +136,7 @@ func TestSendMessageRejectsBatchAtomically(t *testing.T) {
 	}
 
 	// 直接从消费引擎取该 topic，证明"first-valid"没有被真正写入。
-	msgs, err := dl.Receive(context.Background(), "g-batch-check", topic, 0, 10, time.Second, 0)
+	msgs, err := dl.Receive(context.Background(), "g-batch-check", topic, 0, 10, time.Second, 0, nil)
 	if err != nil {
 		t.Fatalf("Receive: %v", err)
 	}
@@ -209,7 +209,7 @@ func TestSendMessageRejectsBatchWithOversizedBodyAtomically(t *testing.T) {
 		t.Fatalf("整批失败时不应返回任何 entry: %v", resp.GetEntries())
 	}
 
-	msgs, err := dl.Receive(context.Background(), "g-batch-oversized-check", topic, 0, 10, time.Second, 0)
+	msgs, err := dl.Receive(context.Background(), "g-batch-oversized-check", topic, 0, 10, time.Second, 0, nil)
 	if err != nil {
 		t.Fatalf("Receive: %v", err)
 	}

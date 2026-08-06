@@ -15,6 +15,10 @@
 //     "不限"，把算出来的 0 传进去会吐出整条剩余队列
 //   - 验证阶段 1 的孤儿 inflight 清理会真正提交（提交判据是"有无暂存写入"而非
 //     "有无可投递消息"），且不误报为投递成功
+//   - 验证 Tag 过滤：只投匹配 tag 的消息；不匹配的跳过、推进位点、不占 inflight
+//     （对该消费组永久跳过，换全量过滤器也收不到）
+//   - 验证全部消息不匹配时位点仍须持久化推进（否则每次 Receive 反复扫描同一批
+//     不匹配消息，性能退化且永不前进）
 //
 // 边界：
 //   - 仅测试 deliver.Deliverer 及其导出方法的行为
@@ -61,11 +65,18 @@ func (f *fixture) send(t *testing.T, topic, body string) {
 	}
 }
 
+func (f *fixture) sendTagged(t *testing.T, topic, body, tag string) {
+	t.Helper()
+	if _, err := f.pr.Append(&core.Message{Topic: topic, Body: []byte(body), Tag: tag}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+}
+
 func TestReceiveAckFlow(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t", "a")
 	f.send(t, "t", "b")
-	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0)
+	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
 	if err != nil || len(msgs) != 2 {
 		t.Fatalf("Receive: %d %v", len(msgs), err)
 	}
@@ -78,7 +89,7 @@ func TestReceiveAckFlow(t *testing.T) {
 			t.Fatalf("Ack: %v %v", ok, err)
 		}
 	}
-	msgs, err = f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0)
+	msgs, err = f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
 	if err != nil || len(msgs) != 0 {
 		t.Fatalf("ack 后仍收到: %d %v", len(msgs), err)
 	}
@@ -95,18 +106,18 @@ func TestUnackedRedeliveryAfterExpire(t *testing.T) {
 	// 30ms，消息于是合法过期重投，断言假失败。这不是被测代码的 bug，是测试自己
 	// 的时间预算太紧。300ms/400ms 留出足够裕量。其余计时类用例不用一并调整：
 	// 它们的容错方向本来就是安全的（宁可多等，不会误判"过早重投"）。
-	msgs, _ := f.dl.Receive(context.Background(), "g", "t", 0, 10, 300*time.Millisecond, 0)
+	msgs, _ := f.dl.Receive(context.Background(), "g", "t", 0, 10, 300*time.Millisecond, 0, nil)
 	if len(msgs) != 1 {
 		t.Fatalf("首取: %d", len(msgs))
 	}
 	// 未过期期间不可见
-	msgs, _ = f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0)
+	msgs, _ = f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
 	if len(msgs) != 0 {
 		t.Fatalf("不可见期内重复投递: %d", len(msgs))
 	}
 	time.Sleep(400 * time.Millisecond)
 	// 过期后重投，attempt +1
-	msgs, _ = f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0)
+	msgs, _ = f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
 	if len(msgs) != 1 || msgs[0].DeliveryAttempt != 2 {
 		t.Fatalf("过期重投: %d attempt=%v", len(msgs), msgs)
 	}
@@ -115,7 +126,7 @@ func TestUnackedRedeliveryAfterExpire(t *testing.T) {
 func TestAckIdempotent(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t", "a")
-	msgs, _ := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0)
+	msgs, _ := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
 	ok, err := f.dl.Ack("g", "t", msgs[0].QueueID, msgs[0].Offset, msgs[0].DeliveryAttempt)
 	if !ok || err != nil {
 		t.Fatalf("首次 Ack: %v %v", ok, err)
@@ -130,7 +141,7 @@ func TestLongPollingWakesOnNewMessage(t *testing.T) {
 	f := newFixture(t)
 	done := make(chan []*core.Message, 1)
 	go func() {
-		msgs, _ := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 3*time.Second)
+		msgs, _ := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 3*time.Second, nil)
 		done <- msgs
 	}()
 	time.Sleep(100 * time.Millisecond) // 让 Receive 先进入等待
@@ -148,8 +159,8 @@ func TestLongPollingWakesOnNewMessage(t *testing.T) {
 func TestTwoGroupsIndependentCursors(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t", "a")
-	m1, _ := f.dl.Receive(context.Background(), "g1", "t", 0, 10, time.Minute, 0)
-	m2, _ := f.dl.Receive(context.Background(), "g2", "t", 0, 10, time.Minute, 0)
+	m1, _ := f.dl.Receive(context.Background(), "g1", "t", 0, 10, time.Minute, 0, nil)
+	m2, _ := f.dl.Receive(context.Background(), "g2", "t", 0, 10, time.Minute, 0, nil)
 	if len(m1) != 1 || len(m2) != 1 {
 		t.Fatalf("两组各自应收到 1 条: %d %d", len(m1), len(m2))
 	}
@@ -169,14 +180,14 @@ func TestRedeliveryFillDoesNotUnboundNewMessageScan(t *testing.T) {
 		f.send(t, "t", body)
 	}
 	// 第一次取件：maxMsgs=2，极短不可见时间，取到 offset 0,1，不 ack
-	first, err := f.dl.Receive(context.Background(), "g", "t", 0, 2, 30*time.Millisecond, 0)
+	first, err := f.dl.Receive(context.Background(), "g", "t", 0, 2, 30*time.Millisecond, 0, nil)
 	if err != nil || len(first) != 2 {
 		t.Fatalf("首取: %d %v", len(first), err)
 	}
 	time.Sleep(50 * time.Millisecond) // 等待 inflight 过期
 	// 第二次取件：maxMsgs 仍为 2。阶段 1 应能凑满 2 条重投（offset 0,1），
 	// 阶段 2 必须被跳过——返回值长度必须恰好是 maxMsgs，不能把剩余 3 条新消息也带出来。
-	second, err := f.dl.Receive(context.Background(), "g", "t", 0, 2, time.Minute, 0)
+	second, err := f.dl.Receive(context.Background(), "g", "t", 0, 2, time.Minute, 0, nil)
 	if err != nil {
 		t.Fatalf("次取: %v", err)
 	}
@@ -209,7 +220,7 @@ func TestRedeliveryFillDoesNotUnboundNewMessageScan(t *testing.T) {
 func TestOrphanInflightCleanupPersistsAndDoesNotReportDelivery(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t", "a")
-	first, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 30*time.Millisecond, 0)
+	first, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 30*time.Millisecond, 0, nil)
 	if err != nil || len(first) != 1 {
 		t.Fatalf("首取: %d %v", len(first), err)
 	}
@@ -223,7 +234,7 @@ func TestOrphanInflightCleanupPersistsAndDoesNotReportDelivery(t *testing.T) {
 	}
 	time.Sleep(50 * time.Millisecond) // 等待 inflight 过期，变成孤儿重投候选
 
-	out, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0)
+	out, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
 	if err != nil {
 		t.Fatalf("孤儿清理取件: %v", err)
 	}
@@ -249,14 +260,14 @@ func TestOrphanInflightCleanupPersistsAndDoesNotReportDelivery(t *testing.T) {
 func TestAckStaleAttemptRejected(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t", "a")
-	first, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 200*time.Millisecond, 0)
+	first, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 200*time.Millisecond, 0, nil)
 	if err != nil || len(first) != 1 {
 		t.Fatalf("首取: %d %v", len(first), err)
 	}
 	offset, staleAttempt := first[0].Offset, first[0].DeliveryAttempt // attempt=1
 	time.Sleep(300 * time.Millisecond)                                // 等待首轮过期
 
-	second, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 200*time.Millisecond, 0)
+	second, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 200*time.Millisecond, 0, nil)
 	if err != nil || len(second) != 1 || second[0].DeliveryAttempt != 2 {
 		t.Fatalf("过期重投应得 attempt=2: %d %v", len(second), second)
 	}
@@ -270,7 +281,7 @@ func TestAckStaleAttemptRejected(t *testing.T) {
 	// 证明 attempt=2 的记录仍在：等它也过期，应该还能重投出 attempt=3；
 	// 若陈旧 ack 误删了记录，这里会因为找不到可重投的 inflight 而拿到 0 条。
 	time.Sleep(300 * time.Millisecond)
-	third, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0)
+	third, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
 	if err != nil || len(third) != 1 || third[0].DeliveryAttempt != 3 {
 		t.Fatalf("陈旧 ack 不应删除记录，记录应仍可重投: %d %v", len(third), third)
 	}
@@ -281,12 +292,12 @@ func TestAckStaleAttemptRejected(t *testing.T) {
 func TestAckCorrectAttemptSucceeds(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t", "a")
-	first, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 200*time.Millisecond, 0)
+	first, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 200*time.Millisecond, 0, nil)
 	if err != nil || len(first) != 1 {
 		t.Fatalf("首取: %d %v", len(first), err)
 	}
 	time.Sleep(300 * time.Millisecond)
-	second, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0)
+	second, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
 	if err != nil || len(second) != 1 || second[0].DeliveryAttempt != 2 {
 		t.Fatalf("过期重投应得 attempt=2: %d %v", len(second), second)
 	}
@@ -307,7 +318,7 @@ func TestAckCorrectAttemptSucceeds(t *testing.T) {
 func TestChangeInvisibleExtendsWindow(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t", "a")
-	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 50*time.Millisecond, 0)
+	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 50*time.Millisecond, 0, nil)
 	if err != nil || len(msgs) != 1 {
 		t.Fatalf("首取: %d %v", len(msgs), err)
 	}
@@ -316,7 +327,7 @@ func TestChangeInvisibleExtendsWindow(t *testing.T) {
 		t.Fatalf("ChangeInvisible: %v %v", ok, err)
 	}
 	time.Sleep(80 * time.Millisecond) // 超过原 50ms 不可见时间，但远小于新设的 1 分钟
-	again, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0)
+	again, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
 	if err != nil || len(again) != 0 {
 		t.Fatalf("延长不可见时间后不应重投: %d %v", len(again), err)
 	}
@@ -328,12 +339,12 @@ func TestChangeInvisibleExtendsWindow(t *testing.T) {
 func TestChangeInvisiblePreservesAttempts(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t", "a")
-	first, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 200*time.Millisecond, 0)
+	first, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 200*time.Millisecond, 0, nil)
 	if err != nil || len(first) != 1 {
 		t.Fatalf("首取: %d %v", len(first), err)
 	}
 	time.Sleep(300 * time.Millisecond)
-	second, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0)
+	second, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
 	if err != nil || len(second) != 1 || second[0].DeliveryAttempt != 2 {
 		t.Fatalf("过期重投应得 attempt=2: %d %v", len(second), second)
 	}
@@ -342,7 +353,7 @@ func TestChangeInvisiblePreservesAttempts(t *testing.T) {
 		t.Fatalf("ChangeInvisible: %v %v", ok, err)
 	}
 	time.Sleep(120 * time.Millisecond)
-	third, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0)
+	third, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
 	if err != nil || len(third) != 1 || third[0].DeliveryAttempt != 3 {
 		t.Fatalf("ChangeInvisible 后 attempts 应在原值上继续递增，不应被改写/重置: %d %v", len(third), third)
 	}
@@ -357,5 +368,52 @@ func TestChangeInvisibleUnknownOffsetReturnsFalse(t *testing.T) {
 	ok, err := f.dl.ChangeInvisible("g", "t", 0, 999, 1, time.Minute)
 	if ok || err != nil {
 		t.Fatalf("未知 offset 应为 (false,nil): %v %v", ok, err)
+	}
+}
+
+// TestTagFilterDelivery 只投匹配 tag；不匹配的跳过、推进位点、不占 inflight。
+func TestTagFilterDelivery(t *testing.T) {
+	f := newFixture(t)
+	f.sendTagged(t, "t", "a", "tagA") // offset 0
+	f.sendTagged(t, "t", "b", "tagB") // offset 1
+	f.sendTagged(t, "t", "c", "tagA") // offset 2
+
+	flt, err := ParseTagFilter("tagA")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, flt)
+	if err != nil || len(msgs) != 2 || string(msgs[0].Body) != "a" || string(msgs[1].Body) != "c" {
+		t.Fatalf("过滤投递: %d %v", len(msgs), err)
+	}
+	// b 已被位点跳过：即便换成全量过滤器也收不到（本组永久跳过）
+	msgs, err = f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(msgs) != 0 {
+		t.Fatalf("被过滤消息不应再投: %d %v", len(msgs), err)
+	}
+	// b 不占 inflight
+	if _, ok, _ := f.st.Get(store.InflightKey("g", "t", 0, 1)); ok {
+		t.Fatal("被过滤消息不应写 inflight")
+	}
+	// 另一消费组不受影响，能收到全部 3 条
+	msgs, err = f.dl.Receive(context.Background(), "g2", "t", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(msgs) != 3 {
+		t.Fatalf("其他组应不受过滤影响: %d %v", len(msgs), err)
+	}
+}
+
+// TestTagFilterAllFilteredAdvancesCursor 全部不匹配时位点仍须持久化推进，
+// 否则每次 Receive 重复扫描同一批不匹配消息（性能退化 + 永不前进）。
+func TestTagFilterAllFilteredAdvancesCursor(t *testing.T) {
+	f := newFixture(t)
+	f.sendTagged(t, "t", "x", "tagB")
+	flt, _ := ParseTagFilter("tagA")
+	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, flt)
+	if err != nil || len(msgs) != 0 {
+		t.Fatalf("Receive: %d %v", len(msgs), err)
+	}
+	v, ok, err := f.st.Get(store.CursorKey("g", "t", 0))
+	if err != nil || !ok || store.GetU64(v) != 1 {
+		t.Fatalf("位点应推进到 1: ok=%v %v", ok, err)
 	}
 }

@@ -74,7 +74,7 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 	}
 	wait := s.longPollWait(stream.Context())
 
-	msgs, err := s.dl.Receive(stream.Context(), group, topic, queueID, batch, invisible, wait)
+	msgs, err := s.dl.Receive(stream.Context(), group, topic, queueID, batch, invisible, wait, nil)
 	if err != nil {
 		// deliver.Receive 的错误不是铁板一块，必须按性质分类（同 QueryAssignment
 		// 对 EnsureTopic 错误的分类原则）：

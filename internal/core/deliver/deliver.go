@@ -11,7 +11,8 @@
 // 边界：
 //   - 重投是惰性的（Receive 时检查），M1 无后台扫描 goroutine——
 //     没有消费者在收时也就没有人需要重投，语义等价而实现最简
-//   - 不管投递次数上限/DLQ（M2）；不管 Tag 过滤（M2，M1 只接受 "*"）
+//   - 不管投递次数上限/DLQ（M2）；Tag 过滤已落地（"*"/"tagA"/"tagA || tagB"），
+//     SQL92 属性过滤属 v1.1
 //
 // 位点语义说明（对应 spec §5.2"推进到最小未 ack"的实现形态）：
 //
@@ -32,6 +33,12 @@ import (
 	"github.com/xushixin/sq/internal/core/produce"
 	"github.com/xushixin/sq/internal/store"
 )
+
+// scanBudget 单次取件最多检视的新消息条数。Tag 过滤可能连续跳过大量不匹配
+// 消息，必须限制单趟工作量；位点照常推进，下一趟从新位点继续，保证前进性。
+// M1 时 Scan 的 limit 用 maxMsgs-len(out)（检视数=投递数）；过滤下两者分离：
+// 检视上限用本常量，投递上限由回调内 len(out) < maxMsgs 控制。
+const scanBudget = 1024
 
 // Deliverer POP 消费引擎。并发安全：同一队列的取件/确认/改不可见时间全部在
 // 该队列的 qmu 临界区内执行（Receive 经 receiveOnce、Ack、ChangeInvisible
@@ -76,7 +83,9 @@ func (d *Deliverer) lockQueue(group, topic string, q uint32) *sync.Mutex {
 // 先重投本队列已过期的 inflight，再从 fetch 位点取新消息，合计不超过 maxMsgs。
 // 空结果时最长等待 wait（长轮询），期间新消息写入会立即唤醒重试；
 // wait<=0 时不等待，取一次就返回。
-func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible, wait time.Duration) ([]*core.Message, error) {
+// filter 非 nil 时只投 tag 命中的新消息：不匹配的跳过并推进本组位点，
+// 不投递、不占 inflight（对该组永久跳过）。阶段 1 的过期重投不重新过滤。
+func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible, wait time.Duration, filter *TagFilter) ([]*core.Message, error) {
 	if _, err := d.mt.EnsureGroup(group); err != nil {
 		return nil, err
 	}
@@ -86,7 +95,7 @@ func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID ui
 		// 这个窗口期内的写入会错过 close 广播，导致长轮询白等到超时——
 		// 订阅在前，即便取件与写入之间发生竞态，wakeCh 也一定能收到这次唤醒。
 		wakeCh := d.pr.Subscribe(topic)
-		msgs, err := d.receiveOnce(group, topic, queueID, maxMsgs, invisible)
+		msgs, err := d.receiveOnce(group, topic, queueID, maxMsgs, invisible, filter)
 		if err != nil || len(msgs) > 0 {
 			return msgs, err
 		}
@@ -110,8 +119,9 @@ func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID ui
 	}
 }
 
-// receiveOnce 单次取件：过期 inflight 重投 + 新消息，合计不超过 maxMsgs。
-func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int, invisible time.Duration) ([]*core.Message, error) {
+// receiveOnce 单次取件：过期 inflight 重投 + 新消息（可带 Tag 过滤），
+// 合计不超过 maxMsgs。
+func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, filter *TagFilter) ([]*core.Message, error) {
 	qlock := d.lockQueue(group, topic, queueID)
 	qlock.Lock()
 	defer qlock.Unlock()
@@ -197,17 +207,26 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 	if len(out) < maxMsgs {
 		lower := store.MsgKey(topic, queueID, cursor)
 		upper := store.PrefixUpperBound(store.MsgQueuePrefix(topic, queueID))
-		err = d.st.Scan(lower, upper, maxMsgs-len(out), func(k, v []byte) (bool, error) {
+		skipped := 0
+		err = d.st.Scan(lower, upper, scanBudget, func(k, v []byte) (bool, error) {
 			m, err := core.DecodeMessage(v)
 			if err != nil {
 				return false, err
+			}
+			// 位点始终越过已检视消息：Tag 不匹配即对本消费组永久跳过
+			//（spec §5 流程 2：不投递、不占 inflight、推进本组视角位点）。
+			// 全部被过滤（out 为空）时位点也必须持久化——newCursor 前进即触发
+			// 下方既有的 staged 判定进 Apply——否则下趟重复扫描同一批不匹配消息。
+			newCursor = m.Offset + 1
+			if !filter.Match(m.Tag) {
+				skipped++
+				return true, nil
 			}
 			m.DeliveryAttempt = 1
 			b.Set(store.InflightKey(group, topic, queueID, m.Offset),
 				core.EncodeInflight(&core.InflightState{ExpireAtMs: expireAt, Attempts: 1}), nil)
 			out = append(out, m)
-			newCursor = m.Offset + 1
-			return true, nil
+			return len(out) < maxMsgs, nil
 		})
 		if err != nil {
 			b.Close()
@@ -215,6 +234,9 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 		}
 		if newCursor > cursor {
 			staged = true
+		}
+		if skipped > 0 {
+			d.logger.Debug("Tag 过滤跳过消息", "group", group, "topic", topic, "queue", queueID, "skipped", skipped)
 		}
 	}
 
@@ -239,10 +261,12 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 		return nil, fmt.Errorf("提交取件批次 (group=%s topic=%s q=%d): %w", group, topic, queueID, err)
 	}
 	if len(out) == 0 {
-		// 本轮唯一做的事是清理孤儿 inflight（上面那条 Warn 已说明是哪几条）。
-		// 单独一句话，不与投递共用消息：这恰恰是运维最需要读懂的一轮——
-		// 打成"投递消息 count=0"会让人以为队列空转，从而忽略掉刚刚发生的数据修复。
-		d.logger.Debug("本轮无可投递消息，仅清理了孤儿 inflight 记录",
+		// 本轮做了"无投递但有写入"的工作：清理孤儿 inflight（上面那条 Warn
+		// 已说明是哪几条），或全部新消息被 Tag 过滤跳过、只推进了本组位点
+		// （上方 Debug 日志说明跳过了几条）。单独一句话，不与投递共用消息：
+		// 这恰恰是运维最需要读懂的一轮——打成"投递消息 count=0"会让人以为
+		// 队列空转，从而忽略掉刚刚发生的数据修复或过滤推进。
+		d.logger.Debug("本轮无可投递消息，仅清理了孤儿 inflight 或推进了过滤位点",
 			"group", group, "topic", topic, "queue", queueID, "cursor", newCursor)
 		return out, nil
 	}
