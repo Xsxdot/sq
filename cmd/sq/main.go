@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"google.golang.org/grpc"
 
@@ -37,9 +38,9 @@ func main() {
 // 任何后续失败路径（包括 net.Listen 失败）都会经由 defer 正常关闭 store，
 // 不会泄漏底层 Pebble 句柄。两条退出路径在 defer 执行前都先让 gRPC server
 // 停止接收/处理请求，保证 store 关闭时不会再有 handler goroutine 在读写它：
-// 正常路径（收到信号）在 defer 之前调用 gs.GracefulStop()，等在途 RPC
-// 自然结束；异常路径（gs.Serve 提前返回）调用 gs.Stop() 立即中断在途 RPC
-// （理由见下方 errCh 分支注释），两者殊途同归，只是收尾姿态不同。
+// 正常路径（收到信号）在 defer 之前调用 gracefulStop()，在有上限的前提下等
+// 在途 RPC 自然结束；异常路径（gs.Serve 提前返回）调用 gs.Stop() 立即中断
+// 在途 RPC（理由见下方 errCh 分支注释），两者殊途同归，只是收尾姿态不同。
 func run() error {
 	cfgPath := flag.String("config", "", "配置文件路径（可选）")
 	flag.Parse()
@@ -76,7 +77,8 @@ func run() error {
 		grpc.MaxRecvMsgSize(rpc.MaxGRPCMessageSize),
 		grpc.MaxSendMsgSize(rpc.MaxGRPCMessageSize),
 	)
-	rpc.New(cfg, mt, pr, dl, logger).Register(gs)
+	srv := rpc.New(cfg, mt, pr, dl, logger)
+	srv.Register(gs)
 
 	// signal.Notify 必须先于 gs.Serve 的 goroutine 注册：如果反过来，
 	// Serve 启动后、Notify 生效前这段窗口期内到达的 SIGTERM 会命中 Go 的
@@ -94,7 +96,11 @@ func run() error {
 	select {
 	case sig := <-sigCh:
 		logger.Info("收到退出信号，优雅停机", "signal", sig.String())
-		gs.GracefulStop() // 等待在途 RPC 结束；store 由 defer 关闭
+		// 顺序不能反：先让协议适配层收尾没有自然终点的长流（Telemetry），
+		// 再等在途 RPC 排空。反过来的话 GracefulStop 会先把自己挂在那条
+		// 永不结束的流上，Shutdown 根本没有机会被调用（见 rpc.Server.Shutdown）。
+		srv.Shutdown()
+		gracefulStop(gs, logger) // 等待在途 RPC 结束（有上限）；store 由 defer 关闭
 		logger.Info("sq 已停止")
 		return nil
 	case err := <-errCh:
@@ -113,5 +119,47 @@ func run() error {
 		// 已经保证不会再有 handler goroutine 在读写 store。
 		gs.Stop()
 		return err
+	}
+}
+
+// gracefulStopTimeout 优雅停机的等待上限。
+//
+// 取值依据：在途 RPC 里最长的是 ReceiveMessage 的长轮询，服务端侧上限是
+// internal/rpc 的 defaultLongPolling（20s），再留出写回响应的余量，30s 足以
+// 让所有「有正常终点」的请求自己走完。超过它还没结束的，只可能是没有正常
+// 终点的流（见下方 gracefulStop 的说明）。
+const gracefulStopTimeout = 30 * time.Second
+
+// gracefulStop 带上限地优雅停机：先让在途 RPC 自然结束，超时则强制中断。
+//
+// 为什么不能直接裸调 gs.GracefulStop()：它会一直等到最后一个在途 RPC 结束为止，
+// 没有任何超时。正常情况下 rpc.Server.Shutdown() 已经把唯一一条没有自然终点的
+// 长流（Telemetry）收掉了，剩下的都是有终点的请求，这里等一等就能排空；但
+// 「服务端能不能停下来」这件事不该建立在「所有 handler 都行为良好」这个假设上——
+// 只要有一个 RPC 因为 bug 或对端异常挂住，裸 GracefulStop 就是一次无限期阻塞，
+// 对外表现为 systemctl stop 卡死、容器被超时 SIGKILL。这个上限就是那道兜底。
+//
+// Task 13 的实测数据（未接 Shutdown 之前）说明了这类阻塞有多真实：无客户端时
+// 停机 0.03s；接一个官方 SDK producer 时 9.5s（靠客户端自己的 GOAWAY 恢复逻辑
+// 碰巧断开）；再加一个 SimpleConsumer 之后就再也没有停下来过，只能靠这里的
+// 强制中断兜底。
+//
+// 超时后调用 Stop() 是有意为之：Stop 会立即中断所有在途 RPC，并让阻塞中的
+// GracefulStop 返回。被中断的 ReceiveMessage 不会造成消息丢失——那些消息的
+// inflight 记录已经落盘，消费者没收到就不会 ack，不可见窗口一过即重投，
+// 正是 at-least-once 语义覆盖的情形。
+func gracefulStop(gs *grpc.Server, logger *slog.Logger) {
+	done := make(chan struct{})
+	go func() {
+		gs.GracefulStop()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(gracefulStopTimeout):
+		logger.Warn("优雅停机超时，强制中断在途 RPC",
+			"timeout", gracefulStopTimeout, "reason", "存在没有自然终点的长流（如 Telemetry）或长轮询未结束")
+		gs.Stop()
+		<-done // Stop 会让上面阻塞中的 GracefulStop 返回，这里等它真正收尾
 	}
 }

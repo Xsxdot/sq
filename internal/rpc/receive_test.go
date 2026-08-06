@@ -368,3 +368,33 @@ func TestAckMessageMalformedHandleEntryIncludesReceiptHandle(t *testing.T) {
 		t.Fatalf("ReceiptHandle 应回显原始值，实际 %q", e.GetReceiptHandle())
 	}
 }
+
+// TestReceiveMessageEmptyPollReportsMessageNotFound 锁定长轮询空结果的协议表述：
+// 必须是一帧 MESSAGE_NOT_FOUND status，且不带任何消息帧。
+//
+// 不能回 OK + 零条消息：官方 SDK 的 push 消费者只对 MESSAGE_NOT_FOUND 这一个码
+// 有「没有新消息」的识别分支（命中后按流控退避重发取件请求），回 OK 会让它把
+// 空结果当成一次成功取件、立刻无退避地再发一次。详见 receive.go 该分支的注释，
+// 以及 test/e2e 里用真实 SDK 断言同一行为的用例。
+func TestReceiveMessageEmptyPollReportsMessageNotFound(t *testing.T) {
+	c := newTestClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stream, err := c.ReceiveMessage(ctx, &pb.ReceiveMessageRequest{
+		Group:             &pb.Resource{Name: "g-empty"},
+		MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: "empty-topic"}, Id: 0},
+		FilterExpression:  &pb.FilterExpression{Type: pb.FilterType_TAG, Expression: "*"},
+		BatchSize:         10,
+		InvisibleDuration: durationpb.New(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ReceiveMessage: %v", err)
+	}
+	msgs, st := recvAll(t, stream)
+	if len(msgs) != 0 {
+		t.Fatalf("空队列不应返回消息，实际 %d 条", len(msgs))
+	}
+	if st.GetCode() != pb.Code_MESSAGE_NOT_FOUND {
+		t.Fatalf("空轮询状态码应为 MESSAGE_NOT_FOUND，实际 %v", st)
+	}
+}

@@ -34,8 +34,17 @@ const defaultLongPolling = 20 * time.Second
 // 否则响应会在 deadline 之后才发出，被客户端判定为超时。
 const longPollWaitMargin = time.Second
 
-// ReceiveMessage POP 取件（服务端流）。流格式：先逐条消息，最后一条 status，
-// SDK 依赖这个"消息在前、status 收尾"的顺序识别流结束。
+// ReceiveMessage POP 取件（服务端流）。流格式：先逐条消息，最后一帧 status。
+//
+// 关于帧顺序（Task 13 已用官方 SDK 实测，不再是悬案）：官方 Go SDK 并不依赖
+// 任何顺序——它把整条流读到 io.EOF 收集成一个切片后才统一处理，Status 帧无论
+// 出现在头部还是尾部都会被同样地取用。上游 Apache proxy 是 status 在前，sq
+// 选择 status 收尾：它同时也是"服务端已经把本批全部发完"的天然信号，而且
+// 消息推送中途失败时不会留下一个"已经宣称 OK 却没发全"的流。两种顺序都在
+// test/e2e 里实跑验证过（见 task-13 报告），此处的选择不影响 SDK 兼容性。
+//
+// 空结果不走这条格式：长轮询到期无消息时只发一帧 MESSAGE_NOT_FOUND status，
+// 理由见下方该分支的注释。
 func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.MessagingService_ReceiveMessageServer) error {
 	group := req.GetGroup().GetName()
 	mq := req.GetMessageQueue()
@@ -91,6 +100,25 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 				Status: errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error()),
 			}})
 		}
+	}
+	if len(msgs) == 0 {
+		// 长轮询到期仍无消息：必须回 MESSAGE_NOT_FOUND（协议里 40401，doc 写
+		// "Message not found from server"），不能回 OK + 零条消息。
+		//
+		// 依据是官方 SDK 的实际代码而非猜测：process_queue.go 的接收回调里有一条
+		// 专门以该错误码为条件的分支
+		// （isNoNewMessage := isRpcErr && rpcErr.GetCode() == MESSAGE_NOT_FOUND），
+		// 命中时只打一条 Debug 并按流控退避重新发起下一次取件；不命中时走的是
+		// Errorf("Exception raised during message reception") 这条真·故障路径。
+		// 如果服务端用 OK + 零条来表示"没消息"，push 消费者根本不会进入这条分支，
+		// 而是把空结果当成一次成功取件、立刻无退避地再发一次——空队列场景下
+		// 客户端侧的流控就此失效。SimpleConsumer 两种码都能工作（它把非 OK 状态
+		// 翻译成 error 交给调用方循环处理），所以这条不是"能不能跑通"的问题，
+		// 而是与协议参考实现保持一致的问题。
+		s.logger.Debug("ReceiveMessage 长轮询到期无消息", "group", group, "topic", topic, "queue", queueID, "wait", wait)
+		return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
+			Status: errStatus(pb.Code_MESSAGE_NOT_FOUND, "本次长轮询无可投递消息"),
+		}})
 	}
 	for i, m := range msgs {
 		if err := stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Message{

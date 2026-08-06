@@ -15,6 +15,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync"
 
 	"google.golang.org/grpc"
 
@@ -38,13 +39,44 @@ type Server struct {
 	pr     *produce.Producer
 	dl     *deliver.Deliverer
 	logger *slog.Logger
+
+	// done 由 Shutdown 关闭，用于让没有自然终点的长流（Telemetry）主动收尾。
+	// 见 Shutdown 的注释：不给它们一个「该结束了」的信号，grpc.Server 的
+	// GracefulStop 会永远等下去。
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 // New 构造协议适配层。pr/dl 由 Task 10（SendMessage/AckMessage 等）、
 // Task 11（ReceiveMessage/QueryAssignment）使用；本任务的 4 个 RPC
 // 只用到 mt 与 cfg，但构造签名一次定死，后续任务不再改。
 func New(cfg *config.Config, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, logger *slog.Logger) *Server {
-	return &Server{cfg: cfg, mt: mt, pr: pr, dl: dl, logger: logger.With("mod", "rpc")}
+	return &Server{
+		cfg: cfg, mt: mt, pr: pr, dl: dl, logger: logger.With("mod", "rpc"),
+		done: make(chan struct{}),
+	}
+}
+
+// Shutdown 通知协议适配层「服务端要停机了」，让没有自然终点的长流主动收尾。
+// 幂等，可重复调用；不阻塞，也不负责停 gRPC server（那是调用方的事）。
+//
+// 为什么必须有这么一个信号：Telemetry 是一条双向长流，服务端 handler 阻塞在
+// stream.Recv() 上，只有客户端主动断开才会返回；而 grpc.Server.GracefulStop()
+// 的语义是「等所有在途 RPC 结束」——只要还有一个客户端进程活着且没有关掉这条
+// 流，GracefulStop 就永远不返回。官方 Go SDK 恰好就是这样：它的
+// Client.GracefulStop() 只停自己的后台 goroutine，既不 CloseSend 也不关闭
+// ClientConn。Task 13 的实测结果是：只连一个 producer 时 sq 停机耗时约 9.5s
+// （靠客户端自己的 GOAWAY 恢复逻辑碰巧断开），再加一个 SimpleConsumer 之后
+// 就再也停不下来了，只能靠强制中断兜底。
+//
+// 正确的做法不是把这个"等不到"的时间调长，而是让服务端自己决定长流何时结束：
+// 调用方在 GracefulStop 之前先调用本方法，Telemetry handler 会立即返回、
+// 流随之关闭，GracefulStop 就只需要等那些真正有终点的在途 RPC 了。
+func (s *Server) Shutdown() {
+	s.doneOnce.Do(func() {
+		close(s.done)
+		s.logger.Info("协议适配层进入停机：通知 telemetry 长流收尾")
+	})
 }
 
 // Register 把 Server 挂载到 gRPC server 上。
@@ -135,29 +167,70 @@ func (s *Server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.H
 	return &pb.HeartbeatResponse{Status: okStatus()}, nil
 }
 
-// Telemetry 双向流。M1 职责：收到 Settings 即原样回发（SDK 启动阶段的握手依赖
-// 这个回包才能继续），其余命令（线程栈、消息校验结果等）记日志后忽略。
-// M6 会在此下发事务回查命令。
+// Telemetry 双向流。M1 职责：收到客户端上报的 Settings 后下发服务端协商结果
+// （SDK 启动阶段的握手依赖这个回包才能继续），其余命令（线程栈、消息校验结果等）
+// 记日志后忽略。M6 会在此下发事务回查命令。
+//
+// 回包不是把客户端的 Settings 原样回显，而是经 negotiateSettings 填入服务端
+// 权威字段——原样回显会把客户端的消息体上限改写成 0，导致它此后每一次发送都在
+// 本地被拒（详见 settings.go 的包内说明与该函数注释）。
+//
+// 读循环不能直接阻塞在 stream.Recv() 上：Recv 只有收到数据、流出错或底层
+// 连接断开才返回，服务端没有任何办法主动打断它。这条流又恰恰是没有自然终点的
+// ——客户端可以一直挂着不发也不关——于是停机时 GracefulStop 会永远等它。
+// 因此把 Recv 挪到一个独立 goroutine 里，主循环 select 读取结果与 s.done：
+// 收到停机信号就直接返回，由 gRPC 关闭流，读 goroutine 的 Recv 随之出错退出。
 func (s *Server) Telemetry(stream pb.MessagingService_TelemetryServer) error {
-	for {
-		cmd, err := stream.Recv()
-		if err != nil {
-			// 客户端断流是正常生命周期的一部分，Debug 即可，不算错误。
-			s.logger.Debug("telemetry 流结束", "err", err)
-			return nil
-		}
-		switch c := cmd.GetCommand().(type) {
-		case *pb.TelemetryCommand_Settings:
-			st := c.Settings
-			if err := stream.Send(&pb.TelemetryCommand{
-				Status:  okStatus(),
-				Command: &pb.TelemetryCommand_Settings{Settings: st},
-			}); err != nil {
-				return fmt.Errorf("telemetry 回发 settings: %w", err)
+	// 缓冲 1 + readerDone：handler 先返回时，读 goroutine 手上可能正好有一条
+	// 没人接收的结果，靠缓冲位或 readerDone 分支退出，不会永久阻塞在发送上。
+	type recvResult struct {
+		cmd *pb.TelemetryCommand
+		err error
+	}
+	recvCh := make(chan recvResult, 1)
+	readerDone := make(chan struct{})
+	defer close(readerDone)
+	go func() {
+		for {
+			cmd, err := stream.Recv()
+			select {
+			case recvCh <- recvResult{cmd: cmd, err: err}:
+			case <-readerDone:
+				return
 			}
-			s.logger.Debug("telemetry settings 已协商")
-		default:
-			s.logger.Debug("telemetry 忽略未处理命令", "type", fmt.Sprintf("%T", c))
+			if err != nil {
+				return
+			}
+		}
+	}()
+
+	for {
+		select {
+		case <-s.done:
+			// 服务端停机：主动结束这条长流，让 GracefulStop 能够收敛。
+			s.logger.Debug("telemetry 流随服务端停机收尾")
+			return nil
+		case r := <-recvCh:
+			if r.err != nil {
+				// 客户端断流是正常生命周期的一部分，Debug 即可，不算错误。
+				s.logger.Debug("telemetry 流结束", "err", r.err)
+				return nil
+			}
+			switch c := r.cmd.GetCommand().(type) {
+			case *pb.TelemetryCommand_Settings:
+				settings := s.negotiateSettings(c.Settings)
+				if err := stream.Send(&pb.TelemetryCommand{
+					Status:  okStatus(),
+					Command: &pb.TelemetryCommand_Settings{Settings: settings},
+				}); err != nil {
+					return fmt.Errorf("telemetry 下发 settings: %w", err)
+				}
+				s.logger.Debug("telemetry settings 已协商",
+					"client_type", c.Settings.GetClientType(),
+					"pub_sub", fmt.Sprintf("%T", settings.GetPubSub()))
+			default:
+				s.logger.Debug("telemetry 忽略未处理命令", "type", fmt.Sprintf("%T", c))
+			}
 		}
 	}
 }
