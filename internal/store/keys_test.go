@@ -11,6 +11,7 @@ package store
 
 import (
 	"bytes"
+	"math"
 	"testing"
 )
 
@@ -93,6 +94,45 @@ func TestParseKeyIdxKeyRejectsGarbage(t *testing.T) {
 	for _, bad := range [][]byte{[]byte("keyidx/"), []byte("keyidx/t"), []byte("keyidx/t/short"), []byte("msg/t/x")} {
 		if _, _, _, _, _, err := ParseKeyIdxKey(bad); err == nil {
 			t.Fatalf("应拒绝非法 key %q", bad)
+		}
+	}
+}
+
+func TestDelayKeyRoundTrip(t *testing.T) {
+	k := DelayKey(1700000000123, 42)
+	due, seq, err := ParseDelayKey(k)
+	if err != nil || due != 1700000000123 || seq != 42 {
+		t.Fatalf("round trip: %d %d %v", due, seq, err)
+	}
+}
+
+func TestDelayKeyOrdering(t *testing.T) {
+	// 字节序 = (dueMs, seq) 字典序：先按到期时间，同一毫秒按 seq
+	a := DelayKey(1000, 999)
+	b := DelayKey(1001, 0)
+	c := DelayKey(1001, 1)
+	if !(bytes.Compare(a, b) < 0 && bytes.Compare(b, c) < 0) {
+		t.Fatal("delay key 排序错误")
+	}
+}
+
+func TestDelayScanUpperBoundIsInclusiveOfNow(t *testing.T) {
+	// 上界必须恰好包含 dueMs==now 的全部 seq，且不包含 now+1 的任何条目
+	up := DelayScanUpperBound(1000)
+	atNowMaxSeq := DelayKey(1000, math.MaxUint64)
+	atNextMs := DelayKey(1001, 0)
+	if !(bytes.Compare(atNowMaxSeq, up) < 0) {
+		t.Fatal("dueMs==now 的条目被上界排除")
+	}
+	if bytes.Compare(atNextMs, up) < 0 {
+		t.Fatal("dueMs==now+1 的条目被上界纳入")
+	}
+}
+
+func TestParseDelayKeyRejectsGarbage(t *testing.T) {
+	for _, k := range [][]byte{[]byte("delay/short"), []byte("msg/x"), DelayKey(1, 1)[:10]} {
+		if _, _, err := ParseDelayKey(k); err == nil {
+			t.Fatalf("应拒绝非法 key: %q", k)
 		}
 	}
 }

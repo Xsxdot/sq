@@ -25,6 +25,12 @@ const (
 	cursorPrefix    = "cursor/"
 	inflightPrefix  = "inflight/"
 	keyIdxPrefix    = "keyidx/"
+	delayPrefix     = "delay/"
+	// DelayPrefix 延时暂存区扫描下界（导出供 delay 包使用）。
+	DelayPrefix = delayPrefix
+	// delayAllocKey 全局单 key，与 alloc/{topic} 的按队列计数器不同：
+	// 延时条目移入前不属于任何队列，无法按队列维护计数器。
+	delayAllocKey = "delayalloc"
 )
 
 // PutU64 大端编码。
@@ -162,6 +168,36 @@ func PrefixUpperBound(prefix []byte) []byte {
 	}
 	return nil
 }
+
+// DelayKey 延时暂存条目：delay/{dueMs:8B}{seq:8B}，值为完整编码消息（spec §4）。
+// dueMs 是墙钟 UnixMilli 恒为正，按 uint64 大端编码后字节序即数值序；
+// seq 是全局分配的写入序号，仅用于同一毫秒内多条消息的 key 去重与稳定排序。
+func DelayKey(dueMs int64, seq uint64) []byte {
+	k := make([]byte, 0, len(delayPrefix)+16)
+	k = append(k, delayPrefix...)
+	k = append(k, PutU64(uint64(dueMs))...)
+	k = append(k, PutU64(seq)...)
+	return k
+}
+
+// DelayScanUpperBound 到期扫描 [DelayPrefix, 本上界) 的开区间上界：
+// 用 dueMs+1 的最小 key，恰好把 dueMs<=nowMs 的全部条目（含 nowMs 毫秒内
+// 任意 seq）纳入区间，且不含 nowMs+1 的任何条目。
+func DelayScanUpperBound(nowMs int64) []byte {
+	return DelayKey(nowMs+1, 0)
+}
+
+// ParseDelayKey 解析延时条目 key。前缀后必须恰好 16 字节定长二进制。
+func ParseDelayKey(k []byte) (int64, uint64, error) {
+	rest, ok := bytes.CutPrefix(k, []byte(delayPrefix))
+	if !ok || len(rest) != 16 {
+		return 0, 0, fmt.Errorf("非法 delay key: %q", k)
+	}
+	return int64(binary.BigEndian.Uint64(rest[:8])), binary.BigEndian.Uint64(rest[8:]), nil
+}
+
+// DelayAllocKey 延时 seq 全局计数器（值为下一可用 seq 的 8B 大端编码）。
+func DelayAllocKey() []byte { return []byte(delayAllocKey) }
 
 // KeyIdxKey Keys 业务索引：keyidx/{topic}/{key}/{storeMs:8B}{queueID:4B}{offset:8B}，值为空。
 //
