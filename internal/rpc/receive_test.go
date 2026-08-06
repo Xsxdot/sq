@@ -38,6 +38,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/xushixin/sq/internal/core"
+	"github.com/xushixin/sq/internal/core/deliver"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
@@ -692,5 +693,72 @@ func TestReceiveMessageEmptyPollReportsMessageNotFound(t *testing.T) {
 	}
 	if st.GetCode() != pb.Code_MESSAGE_NOT_FOUND {
 		t.Fatalf("空轮询状态码应为 MESSAGE_NOT_FOUND，实际 %v", st)
+	}
+}
+
+// 投递方向 FIFO 回填：盘上带 MessageGroup 的消息类型必须回填 FIFO；
+// DeliverAtMs 优先（写方向已拒绝两者组合，读方向仍需确定性优先级）
+func TestToPBMessageEchoesFifoType(t *testing.T) {
+	env := newTestEnv(t, true)
+	m := &core.Message{ID: "f1", Topic: "t", Body: []byte("x"), MessageGroup: "grp", DeliveryAttempt: 1}
+	pm := env.srv.toPBMessage(m, "g", time.Minute)
+	sp := pm.GetSystemProperties()
+	if sp.GetMessageType() != pb.MessageType_FIFO || sp.GetMessageGroup() != "grp" {
+		t.Fatalf("FIFO 回填不符: type=%v group=%q", sp.GetMessageType(), sp.GetMessageGroup())
+	}
+	// 组合数据（理论上写方向已拒绝）按 DELAY 优先，保证确定性
+	both := &core.Message{ID: "f2", Topic: "t", Body: []byte("x"), MessageGroup: "grp",
+		DeliverAtMs: time.Now().UnixMilli(), DeliveryAttempt: 1}
+	if env.srv.toPBMessage(both, "g", time.Minute).GetSystemProperties().GetMessageType() != pb.MessageType_DELAY {
+		t.Fatal("DeliverAtMs 与 MessageGroup 并存时应按 DELAY 回填")
+	}
+}
+
+// 顺序消息重投的 InvisibleDuration 回填不套退避下限：deliver 侧对顺序消息
+// 不退避（Task 2），协议层若仍按退避公式回填，SDK 换算出的可见时间点会
+// 晚于服务端实际，消费端白等
+func TestToPBMessageOrderedRedeliveryNoBackoffEcho(t *testing.T) {
+	env := newTestEnv(t, true)
+	ord := &core.Message{ID: "o1", Topic: "t", Body: []byte("x"), MessageGroup: "grp", DeliveryAttempt: 3}
+	pm := env.srv.toPBMessage(ord, "g", time.Second)
+	if d := pm.GetSystemProperties().GetInvisibleDuration().AsDuration(); d != time.Second {
+		t.Fatalf("顺序重投回填应用客户端值 1s，得到 %v", d)
+	}
+	// 对照：非顺序重投仍套退避下限（既有行为不回归）
+	norm := &core.Message{ID: "n1", Topic: "t", Body: []byte("x"), DeliveryAttempt: 3}
+	pm2 := env.srv.toPBMessage(norm, "g", time.Second)
+	if d := pm2.GetSystemProperties().GetInvisibleDuration().AsDuration(); d != deliver.RetryBackoff(3) {
+		t.Fatalf("非顺序重投应回填退避下限 %v，得到 %v", deliver.RetryBackoff(3), d)
+	}
+}
+
+// 全链路：FIFO 发送 → 投递 → 消费端读回类型与组名
+func TestSendFifoDeliveredWithTypeEcho(t *testing.T) {
+	env := newTestEnv(t, true)
+	resp, err := env.client.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "fifo2"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:  pb.MessageType_FIFO,
+				MessageGroup: strPtr("grp-2"),
+			},
+			Body: []byte("hello"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("发送: %v %v", resp.GetStatus(), err)
+	}
+	// MessageGroup 经 hash 定队（produce.go），组名 "grp-2" 落哪条队列不固定，
+	// 逐队列收取（凑够即停），与包内其它全链路用例的取法一致。
+	var pm *pb.Message
+	for q := int32(0); q < 4 && pm == nil; q++ {
+		pm = receiveOne(t, env.client, "g", "fifo2", q, time.Minute)
+	}
+	if pm == nil {
+		t.Fatal("未收到 FIFO 消息")
+	}
+	sp := pm.GetSystemProperties()
+	if sp.GetMessageType() != pb.MessageType_FIFO || sp.GetMessageGroup() != "grp-2" {
+		t.Fatalf("投递回读不符: type=%v group=%q", sp.GetMessageType(), sp.GetMessageGroup())
 	}
 }

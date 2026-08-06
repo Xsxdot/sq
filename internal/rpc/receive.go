@@ -196,7 +196,7 @@ func crc32Checksum(body []byte) string {
 // 本函数必须回填 toCoreMessage 收下的每一个透传字段：写方向存了、读方向不发，
 // 效果与压根没存一样，只是更难发现（盘上数据看着是对的）。改动其中一侧时
 // 请同时改另一侧，两者的类型映射集中在 sysprops.go。
-// DeliverAtMs 也在此回填（类型 + DeliveryTimestamp 两个字段）。
+// DeliverAtMs 也在此回填（类型 + DeliveryTimestamp 两个字段）；MessageGroup 非空时类型回填 FIFO（M4）。
 //
 // 透传之上有两条"缺失兜底"（只在生产者什么都没声明时生效，不覆盖已有值）：
 // digest 缺失补算 CRC32、encoding 未声明归一化 IDENTITY，理由见各自的行内注释。
@@ -209,7 +209,11 @@ func (s *Server) toPBMessage(m *core.Message, group string, invisible time.Durat
 	// 这里用同一公式（deliver.RetryBackoff）回填，否则 SDK 依 InvisibleDuration
 	// 换算出的可见时间点会早于服务端实际。首投无退避概念，保持客户端值。
 	eff := invisible
-	if m.DeliveryAttempt >= 2 {
+	// 顺序消息除外（M4）：deliver 对顺序重投不设退避下限（卡队头要的是快速
+	// 原地重投，spec §5 流程 6 的退避仅限非顺序），这里的回填判据必须与
+	// deliver 侧（receiveOnce 的 !r.ordered）保持一致，否则 SDK 依
+	// InvisibleDuration 换算的可见时间点晚于服务端实际。
+	if m.DeliveryAttempt >= 2 && m.MessageGroup == "" {
 		if bo := deliver.RetryBackoff(m.DeliveryAttempt); bo > eff {
 			eff = bo
 		}
@@ -240,12 +244,16 @@ func (s *Server) toPBMessage(m *core.Message, group string, invisible time.Durat
 	if digest == nil {
 		digest = &pb.Digest{Type: pb.DigestType_CRC32, Checksum: crc32Checksum(m.Body)}
 	}
-	// 延时消息投递时如实回填类型与到期时间：SDK 的 MessageView 会把
-	// DeliveryTimestamp 暴露给应用（message.go fromProtobuf），少了它，
-	// 消费端就读不回自己发送时设置的延时时间
+	// 投递时如实回填消息类型：延时看 DeliverAtMs、顺序看 MessageGroup。
+	// 写方向已拒绝两者组合，这里的优先级只为对脏数据保持确定性；
+	// DLQ 消息的 MessageGroup 在 moveToDLQ 时已清空，回 NORMAL，符合
+	// "死信不再参与顺序"的语义。
 	mtype := pb.MessageType_NORMAL
-	if m.DeliverAtMs > 0 {
+	switch {
+	case m.DeliverAtMs > 0:
 		mtype = pb.MessageType_DELAY
+	case m.MessageGroup != "":
+		mtype = pb.MessageType_FIFO
 	}
 	sp := &pb.SystemProperties{
 		MessageId:         m.ID,
