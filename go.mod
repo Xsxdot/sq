@@ -2,7 +2,10 @@ module github.com/xushixin/sq
 
 go 1.26.1
 
-require gopkg.in/yaml.v3 v3.0.1
+require (
+	github.com/cockroachdb/pebble/v2 v2.1.6
+	gopkg.in/yaml.v3 v3.0.1
+)
 
 require (
 	github.com/DataDog/zstd v1.5.7 // indirect
@@ -13,7 +16,6 @@ require (
 	github.com/cockroachdb/crlib v0.0.0-20241112164430-1264a2edc35b // indirect
 	github.com/cockroachdb/errors v1.11.3 // indirect
 	github.com/cockroachdb/logtags v0.0.0-20230118201751-21c54148d20b // indirect
-	github.com/cockroachdb/pebble/v2 v2.1.6 // indirect
 	github.com/cockroachdb/redact v1.1.5 // indirect
 	github.com/cockroachdb/swiss v0.0.0-20251224182025-b0f6560f979b // indirect
 	github.com/cockroachdb/tokenbucket v0.0.0-20230807174530-cc333fc44b06 // indirect

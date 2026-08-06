@@ -65,6 +65,8 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 func (s *Store) NewBatch() *pebble.Batch { return s.db.NewBatch() }
 
 // Apply 原子提交批次并按配置刷盘。这是唯一写入口（见类型注释）。
+// 成功后批次被关闭并回收到 Pebble 的内存池；失败时批次由调用方处理。
+// 调用方不应在 Apply 后重用或关闭批次（除非 Apply 失败）。
 func (s *Store) Apply(b *pebble.Batch) error {
 	opt := pebble.NoSync
 	if s.sync {
@@ -73,7 +75,9 @@ func (s *Store) Apply(b *pebble.Batch) error {
 	if err := b.Commit(opt); err != nil {
 		return fmt.Errorf("store Apply: %w", err)
 	}
-	return nil
+	// 提交成功，关闭批次以回收到 Pebble 的 sync.Pool（见 Pebble DB.Set 源码）。
+	// 这确保热路径不会持续分配新的批次结构。
+	return b.Close()
 }
 
 // Scan 按 [lower, upper) 升序遍历，最多 limit 条（limit<=0 不限）。
