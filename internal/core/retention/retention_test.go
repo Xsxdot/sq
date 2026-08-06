@@ -1,5 +1,5 @@
 // retention 清理任务测试：直接向 store 注入带旧 StoreAtMs 的消息制造过期数据
-//（produce.Append 总用当前时间，无法造旧数据）。
+// （produce.Append 总用当前时间，无法造旧数据）。
 package retention
 
 import (

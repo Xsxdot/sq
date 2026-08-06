@@ -38,9 +38,9 @@ type Manager struct {
 	// 磁盘水位保护三件套（spec §7 拒写保读）：
 	// dataDir 为探测目标（磁盘使用率按它所在的文件系统计算）；
 	// watermarkPct<=0 或 writeBlocked 为 nil 时水位检查整体禁用。
-	dataDir       string
-	watermarkPct  int
-	writeBlocked  *atomic.Bool
+	dataDir      string
+	watermarkPct int
+	writeBlocked *atomic.Bool
 }
 
 // New 构造清理任务。

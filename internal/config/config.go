@@ -30,14 +30,14 @@ const MaxDefaultQueueNums = 1024
 
 // Config 为 sq 全部运行配置。零值无意义，必须经 Load 构造。
 type Config struct {
-	GRPCListen         string `yaml:"grpc_listen"`          // gRPC 监听地址，默认 :8081
-	AdvertiseHost      string `yaml:"advertise_host"`       // 路由响应中的对外地址，默认 127.0.0.1
-	AdvertisePort      int    `yaml:"advertise_port"`       // 默认 8081
-	DataDir            string `yaml:"data_dir"`             // Pebble 数据目录
-	Fsync              string `yaml:"fsync"`                // sync|async
-	AutoCreateTopic    bool   `yaml:"auto_create_topic"`    // QueryRoute/Send 未知 topic 时自动建
-	DefaultQueueNums   uint32 `yaml:"default_queue_nums"`   // 自动建 topic 的队列数
-	DefaultMaxAttempts int32  `yaml:"default_max_attempts"` // 新订阅组默认最大投递次数
+	GRPCListen             string `yaml:"grpc_listen"`              // gRPC 监听地址，默认 :8081
+	AdvertiseHost          string `yaml:"advertise_host"`           // 路由响应中的对外地址，默认 127.0.0.1
+	AdvertisePort          int    `yaml:"advertise_port"`           // 默认 8081
+	DataDir                string `yaml:"data_dir"`                 // Pebble 数据目录
+	Fsync                  string `yaml:"fsync"`                    // sync|async
+	AutoCreateTopic        bool   `yaml:"auto_create_topic"`        // QueryRoute/Send 未知 topic 时自动建
+	DefaultQueueNums       uint32 `yaml:"default_queue_nums"`       // 自动建 topic 的队列数
+	DefaultMaxAttempts     int32  `yaml:"default_max_attempts"`     // 新订阅组默认最大投递次数
 	RetentionCheckInterval string `yaml:"retention_check_interval"` // 过期清理扫描间隔（Go duration 格式）
 	DiskWatermarkPercent   int    `yaml:"disk_watermark_percent"`   // 超过即拒写，0=关闭
 	LogLevel               string `yaml:"log_level"`                // debug|info|warn|error
