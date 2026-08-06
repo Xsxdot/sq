@@ -17,6 +17,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/xushixin/sq/internal/config"
+	"github.com/xushixin/sq/internal/core/delay"
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
@@ -78,6 +79,16 @@ func run() error {
 	retWG.Add(1)
 	go func() { defer retWG.Done(); rm.Run(retCtx) }()
 	defer func() { retCancel(); retWG.Wait() }()
+
+	// delay 调度器：到期延时消息移入正常队列。停机顺序与 retention 同理——
+	// defer LIFO 保证先取消并等待调度 goroutine 退出，再轮到 st.Close 的 defer，
+	// 不会在 store 关闭后提交搬运批次。
+	dlyCtx, dlyCancel := context.WithCancel(context.Background())
+	var dlyWG sync.WaitGroup
+	ds := delay.New(st, pr, logger)
+	dlyWG.Add(1)
+	go func() { defer dlyWG.Done(); ds.Run(dlyCtx) }()
+	defer func() { dlyCancel(); dlyWG.Wait() }()
 
 	lis, err := net.Listen("tcp", cfg.GRPCListen)
 	if err != nil {
