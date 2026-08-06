@@ -1,0 +1,99 @@
+// SendMessage 相关：proto Message ↔ core.Message 的写方向翻译。
+// 边界：仅 NORMAL 类型（M3 延时 / M4 FIFO 属性 / M6 事务在各自里程碑打开）。
+package rpc
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/xushixin/sq/internal/core"
+	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
+)
+
+// SendMessage 批量写入。
+//
+// 两遍处理，不能边校验边写：先把整批消息逐条翻译并校验（toCoreMessage），
+// 任一条不合法就直接返回该失败状态、不写入任何一条；只有整批全部通过校验，
+// 才进入第二遍逐条 Append。
+//
+// 为什么不能像"翻译一条、校验一条、立刻 Append 一条"那样做：假设批内第 1 条
+// 合法、第 2 条不合法，若边验边写，第 1 条会在第 2 条校验失败之前就已经真正
+// 落盘，但响应仍然告诉客户端"整批失败"。客户端据此判断整批未生效，而这类
+// 校验失败（消息类型/内容非法）本身不可重试——重发同一请求只会在同一位置
+// 再次失败——于是第 1 条就永久卡在"服务端已持久化但客户端认为未发送成功"
+// 的不一致状态，且没有任何机制能让客户端发现并处理它。两遍处理保证了
+// "整批任一条失败即整体失败"这句话在字面上和效果上一致：失败就是真的什么
+// 都没写。
+func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*pb.SendMessageResponse, error) {
+	// 第一遍：只翻译 + 校验，不做任何持久化。
+	msgs := make([]*core.Message, 0, len(req.GetMessages()))
+	for _, pm := range req.GetMessages() {
+		m, st := s.toCoreMessage(pm)
+		if st != nil {
+			s.logger.Warn("SendMessage 拒绝", "topic", pm.GetTopic().GetName(), "reason", st.GetMessage())
+			return &pb.SendMessageResponse{Status: st}, nil
+		}
+		msgs = append(msgs, m)
+	}
+
+	// 第二遍：整批校验通过后才真正写入。
+	//
+	// 注意：这里仍可能在写到第 N 条时 Append 失败（store 内部故障），此时前面
+	// N-1 条已经真正落盘且无法撤回——没有跨消息的原子写入机制。但这与上面
+	// 两遍处理要解决的问题不同：这是运行时 I/O 故障，不是"客户端输入非法"，
+	// 属于 MQ 客户端本就要容忍的 at-least-once 场景（收到失败状态后重试，
+	// 服务端凭 msgId 或消费端幂等处理去重），保留 brief 原有的"整批返回该错误"
+	// 行为即可，不额外引入多消息原子写入的复杂度。
+	entries := make([]*pb.SendResultEntry, 0, len(msgs))
+	for _, m := range msgs {
+		stored, err := s.pr.Append(m)
+		if err != nil {
+			s.logger.Error("SendMessage 写入失败", "topic", m.Topic, "msg_id", m.ID, "err", err)
+			return &pb.SendMessageResponse{Status: errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error())}, nil
+		}
+		entries = append(entries, &pb.SendResultEntry{
+			Status:    okStatus(),
+			MessageId: stored.ID,
+			Offset:    int64(stored.Offset),
+		})
+	}
+	return &pb.SendMessageResponse{Status: okStatus(), Entries: entries}, nil
+}
+
+// toCoreMessage 翻译并校验一条 proto 消息。返回非 nil status 表示拒绝，
+// 此时不产生任何副作用（不触碰 store/meta）。
+func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
+	sp := pm.GetSystemProperties()
+	switch sp.GetMessageType() {
+	case pb.MessageType_NORMAL:
+	case pb.MessageType_FIFO:
+		// FIFO 消息的写入路径与 NORMAL 相同（MessageGroup 定队列已在 produce 实现），
+		// 但消费端顺序锁是 M4——为避免"能发不能保序"的假象，M1 一并拒绝。
+		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "顺序消息将在 M4 支持")
+	case pb.MessageType_DELAY:
+		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "延时消息将在 M3 支持")
+	case pb.MessageType_TRANSACTION:
+		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "事务消息将在 M6 支持")
+	default:
+		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,
+			fmt.Sprintf("未知消息类型 %v", sp.GetMessageType()))
+	}
+	if len(pm.GetBody()) == 0 {
+		return nil, errStatus(pb.Code_MESSAGE_BODY_EMPTY, "消息体为空")
+	}
+	born := time.Now().UnixMilli()
+	if ts := sp.GetBornTimestamp(); ts != nil {
+		born = ts.AsTime().UnixMilli()
+	}
+	return &core.Message{
+		ID:           sp.GetMessageId(), // 客户端生成的 msgId，保留以便端到端对账
+		Topic:        pm.GetTopic().GetName(),
+		Tag:          sp.GetTag(),
+		Keys:         sp.GetKeys(),
+		MessageGroup: sp.GetMessageGroup(),
+		Properties:   pm.GetUserProperties(),
+		Body:         pm.GetBody(),
+		BornAtMs:     born,
+	}, nil
+}
