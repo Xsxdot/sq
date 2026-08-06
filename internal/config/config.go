@@ -70,6 +70,13 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("配置 default_queue_nums 必须在 1..%d 之间，得到 %d",
 			MaxDefaultQueueNums, cfg.DefaultQueueNums)
 	}
+	// log_level 与 SetupSlog 的 switch 分支必须同步：这里不挡住，SetupSlog 的
+	// default 分支会把拼错的级别静默降级成 info，错误从此不可见。
+	switch cfg.LogLevel {
+	case "debug", "info", "warn", "error":
+	default:
+		return nil, fmt.Errorf("配置 log_level 只接受 debug|info|warn|error，得到 %q", cfg.LogLevel)
+	}
 	return cfg, nil
 }
 

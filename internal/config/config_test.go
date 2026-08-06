@@ -75,6 +75,19 @@ func TestLoadRejectsOutOfRangeQueueNums(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsBadLogLevel 非法 log_level 必须在启动时报错：现状 SetupSlog
+// 静默降级为 info，一个拼写错误（如 verbose）会让 debug 日志无声消失，
+// 与同文件 fsync/default_queue_nums 的严格校验风格也不一致。
+func TestLoadRejectsBadLogLevel(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	if err := os.WriteFile(p, []byte("log_level: verbose\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil {
+		t.Fatal("期望拒绝非法 log_level")
+	}
+}
+
 // TestLoadAcceptsBoundaryQueueNums 与上一条互补：边界值本身必须放行，
 // 免得校验写成了排他区间。
 func TestLoadAcceptsBoundaryQueueNums(t *testing.T) {

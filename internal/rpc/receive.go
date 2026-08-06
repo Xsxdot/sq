@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/xushixin/sq/internal/core"
@@ -125,7 +126,7 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 	}
 	for i, m := range msgs {
 		if err := stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Message{
-			Message: s.toPBMessage(m, group),
+			Message: s.toPBMessage(m, group, invisible),
 		}}); err != nil {
 			// 推送到一半流断了（客户端提前关闭/网络问题），前面已经发出的消息
 			// 已经生效（inflight 已写），只是本次响应没能完整送达。这条日志必须
@@ -188,7 +189,7 @@ func crc32Checksum(body []byte) string {
 //
 // 透传之上有两条"缺失兜底"（只在生产者什么都没声明时生效，不覆盖已有值）：
 // digest 缺失补算 CRC32、encoding 未声明归一化 IDENTITY，理由见各自的行内注释。
-func (s *Server) toPBMessage(m *core.Message, group string) *pb.Message {
+func (s *Server) toPBMessage(m *core.Message, group string, invisible time.Duration) *pb.Message {
 	handle := receiptEncode(group, m.Topic, m.QueueID, m.Offset, m.DeliveryAttempt)
 	attempt := m.DeliveryAttempt
 	offset := int64(m.Offset)
@@ -219,17 +220,18 @@ func (s *Server) toPBMessage(m *core.Message, group string) *pb.Message {
 		digest = &pb.Digest{Type: pb.DigestType_CRC32, Checksum: crc32Checksum(m.Body)}
 	}
 	sp := &pb.SystemProperties{
-		MessageId:       m.ID,
-		MessageType:     pb.MessageType_NORMAL,
-		Keys:            m.Keys,
-		BodyEncoding:    enc,
-		BodyDigest:      digest,
-		BornTimestamp:   timestamppb.New(time.UnixMilli(m.BornAtMs)),
-		BornHost:        m.BornHost,
-		StoreTimestamp:  timestamppb.New(time.UnixMilli(m.StoreAtMs)),
-		DeliveryAttempt: &attempt,
-		ReceiptHandle:   &handle,
-		QueueId:         int32(m.QueueID),
+		MessageId:         m.ID,
+		MessageType:       pb.MessageType_NORMAL,
+		Keys:              m.Keys,
+		BodyEncoding:      enc,
+		BodyDigest:        digest,
+		BornTimestamp:     timestamppb.New(time.UnixMilli(m.BornAtMs)),
+		BornHost:          m.BornHost,
+		StoreTimestamp:    timestamppb.New(time.UnixMilli(m.StoreAtMs)),
+		DeliveryAttempt:   &attempt,
+		ReceiptHandle:     &handle,
+		QueueId:           int32(m.QueueID),
+		InvisibleDuration: durationpb.New(invisible),
 		// QueueOffset 在生成代码里是 *int64（不是 *int32，也不是值类型），
 		// 上面的 offset 局部变量就是为了取地址而存在的。
 		QueueOffset: &offset,

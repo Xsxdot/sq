@@ -36,6 +36,7 @@ import (
 
 	"google.golang.org/protobuf/types/known/durationpb"
 
+	"github.com/xushixin/sq/internal/core"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
@@ -374,6 +375,16 @@ func TestAckWithStaleAttemptTokenFailsAndMessageStaysRedeliverable(t *testing.T)
 	}
 	if len(freshAck.GetEntries()) != 1 || freshAck.GetEntries()[0].GetStatus().GetCode() != pb.Code_OK {
 		t.Fatalf("当前 handle 确认应成功，实际 %v", freshAck.GetEntries())
+	}
+}
+
+// TestToPBMessageSetsInvisibleDuration 下发消息须回填本次的不可见时长，
+// SDK 依此换算消息可见时间点展示/重试。
+func TestToPBMessageSetsInvisibleDuration(t *testing.T) {
+	s := &Server{}
+	msg := s.toPBMessage(&core.Message{ID: "A", Topic: "t", Body: []byte("x"), DeliveryAttempt: 1}, "g", 45*time.Second)
+	if got := msg.GetSystemProperties().GetInvisibleDuration().AsDuration(); got != 45*time.Second {
+		t.Fatalf("InvisibleDuration: 期望 45s，得到 %v", got)
 	}
 }
 
