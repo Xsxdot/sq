@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/store"
@@ -113,5 +114,45 @@ func TestSubscribeWakesOnAppend(t *testing.T) {
 	case <-ch: // 期望已被 close
 	default:
 		t.Fatal("Append 未唤醒订阅者")
+	}
+}
+
+// TestAppendWritesKeyIndex Keys 索引必须与消息同批落盘。
+func TestAppendWritesKeyIndex(t *testing.T) {
+	pr, st := newTestProducer(t, t.TempDir()) // 本文件既有 fixture（Task 3 已改 4 参 meta.New）
+	defer st.Close()
+	m, err := pr.Append(&core.Message{Topic: "t", Body: []byte("x"), Keys: []string{"k1", "k2"}})
+	if err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+	for _, key := range []string{"k1", "k2"} {
+		pfx := store.KeyIdxKeyPrefix("t", key)
+		found := 0
+		err := st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) {
+			_, pk, _, q, off, err := store.ParseKeyIdxKey(k)
+			if err != nil || pk != key || q != m.QueueID || off != m.Offset {
+				t.Fatalf("索引内容不符: %v %v %v %v", pk, q, off, err)
+			}
+			found++
+			return true, nil
+		})
+		if err != nil || found != 1 {
+			t.Fatalf("key %s 索引条数: %d %v", key, found, err)
+		}
+	}
+}
+
+// TestAppendWithExtraAtomic extra 写操作与消息同批提交。
+func TestAppendWithExtraAtomic(t *testing.T) {
+	pr, st := newTestProducer(t, t.TempDir())
+	defer st.Close()
+	marker := []byte("test/marker")
+	_, err := pr.AppendWith(&core.Message{Topic: "t", Body: []byte("x")},
+		func(b *pebble.Batch) { b.Set(marker, []byte("1"), nil) })
+	if err != nil {
+		t.Fatalf("AppendWith: %v", err)
+	}
+	if _, ok, _ := st.Get(marker); !ok {
+		t.Fatal("extra 写操作未随消息落盘")
 	}
 }

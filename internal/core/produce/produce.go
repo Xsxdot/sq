@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/cockroachdb/pebble/v2"
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/store"
@@ -47,9 +48,14 @@ func New(st *store.Store, mt *meta.Meta, logger *slog.Logger) *Producer {
 
 func qkey(topic string, q uint32) string { return fmt.Sprintf("%s/%d", topic, q) }
 
-// Append 写入一条普通消息：选队列 → 分配 offset → 原子落盘 → 唤醒长轮询。
-// 入参 m 的 QueueID/Offset/StoreAtMs 由本方法填充；ID 为空时生成。
-func (p *Producer) Append(m *core.Message) (*core.Message, error) {
+// AppendWith 在 Append 基础上，把 extra 组装的额外写操作并入同一原子批次。
+//
+// 用途：DLQ 转入（写死信消息 + 删源 inflight）、M3 延时转正（写消息 + 删 delay
+// 条目）等「消息写入必须与另一处状态变更同生共死」的场景。extra 可为 nil。
+//
+// 注意：extra 只应操作与本消息无键冲突的 key；extra 内不得再调用本 Producer
+// 的任何方法（p.mu 不可重入）。
+func (p *Producer) AppendWith(m *core.Message, extra func(b *pebble.Batch)) (*core.Message, error) {
 	if len(m.Body) == 0 || len(m.Body) > MaxBodySize {
 		return nil, fmt.Errorf("消息体大小非法: %d（上限 %d）", len(m.Body), MaxBodySize)
 	}
@@ -107,6 +113,16 @@ func (p *Producer) Append(m *core.Message) (*core.Message, error) {
 	b := p.st.NewBatch()
 	b.Set(store.MsgKey(m.Topic, m.QueueID, m.Offset), raw, nil)
 	b.Set(store.AllocKey(m.Topic, m.QueueID), store.PutU64(off+1), nil)
+	// Keys 业务索引与消息同批写入（spec §5 流程 1）：崩溃时索引与消息要么都在要么都不在
+	for _, key := range m.Keys {
+		if key == "" {
+			continue // 空 key 无检索意义（SDK 不会生成，防御脏输入）
+		}
+		b.Set(store.KeyIdxKey(m.Topic, key, m.StoreAtMs, m.QueueID, m.Offset), nil, nil)
+	}
+	if extra != nil {
+		extra(b)
+	}
 	if err := p.st.Apply(b); err != nil {
 		return nil, fmt.Errorf("写入消息 %s (topic=%s q=%d off=%d): %w", m.ID, m.Topic, m.QueueID, m.Offset, err)
 	}
@@ -114,9 +130,12 @@ func (p *Producer) Append(m *core.Message) (*core.Message, error) {
 	// 否则下次 Append 会因为缓存命中而跳过盘上校验，白白烧掉一个从未真正写出的 offset。
 	p.next[qkey(m.Topic, m.QueueID)] = off + 1
 	p.wakeLocked(m.Topic)
-	p.logger.Debug("消息已写入", "topic", m.Topic, "queue", m.QueueID, "offset", m.Offset, "msg_id", m.ID)
+	p.logger.Debug("消息已写入", "topic", m.Topic, "queue", m.QueueID, "offset", m.Offset, "msg_id", m.ID, "keys", len(m.Keys))
 	return m, nil
 }
+
+// Append 写入一条普通消息（M1 签名保持不变）。
+func (p *Producer) Append(m *core.Message) (*core.Message, error) { return p.AppendWith(m, nil) }
 
 // nextOffsetLocked 取该队列下一 offset。缓存未命中时读盘上 alloc/ 计数器——
 // 崩溃后靠它 O(1) 恢复，且因与消息同 Batch 提交，绝不会分配已用过的 offset。
