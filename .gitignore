@@ -1,0 +1,4 @@
+/sq
+/data/
+*.log
+node_modules/
