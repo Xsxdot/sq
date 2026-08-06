@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/xushixin/sq/internal/core"
+	"github.com/xushixin/sq/internal/core/produce"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
@@ -81,6 +82,19 @@ func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 	}
 	if len(pm.GetBody()) == 0 {
 		return nil, errStatus(pb.Code_MESSAGE_BODY_EMPTY, "消息体为空")
+	}
+	// 上限校验必须放在这里（第一遍），不能只依赖 produce.Append 的同款检查：
+	// body 超限是客户端输入错误，与空 body 同性质，理应在第一遍就被拦下，
+	// 否则批内一条超限消息会重新打开"前面消息已落盘、批量状态却报整体失败"
+	// 的口子（两遍处理本来就是为了堵住这个口子）。同时超限要映射成
+	// MESSAGE_BODY_TOO_LARGE 而不是走到 Append 报错后被折叠成
+	// INTERNAL_SERVER_ERROR——后者语义是"服务端故障，可重试"，会让客户端
+	// 对着一条永远不可能成功的超限消息反复重试。
+	// 复用 produce.MaxBodySize 而不是重复写 4*1024*1024：上下限只能有一个
+	// 出处，否则两处未来可能改出不一致的上限。
+	if len(pm.GetBody()) > produce.MaxBodySize {
+		return nil, errStatus(pb.Code_MESSAGE_BODY_TOO_LARGE,
+			fmt.Sprintf("消息体过大: %d（上限 %d）", len(pm.GetBody()), produce.MaxBodySize))
 	}
 	born := time.Now().UnixMilli()
 	if ts := sp.GetBornTimestamp(); ts != nil {
