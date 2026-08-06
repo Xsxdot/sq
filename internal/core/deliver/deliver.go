@@ -3,7 +3,9 @@
 // 职责：
 //   - Receive：先重投本队列已过期的 inflight，再从 fetch 位点取新消息；
 //     新取消息写 inflight 并推进位点（同一 Batch 原子提交）
-//   - Ack/ChangeInvisible：按 (group,topic,queue,offset) 定位 inflight
+//   - Ack/ChangeInvisible：按 (group,topic,queue,offset,attempt) 定位 inflight——
+//     attempt 是消费者持有句柄的一部分，防止陈旧句柄误伤被重投覆盖的新记录
+//     （见类型注释与方法注释的详细说明）
 //   - 长轮询：produce.Subscribe 的 close-broadcast + 截止时间
 //
 // 边界：
@@ -31,7 +33,13 @@ import (
 	"github.com/xushixin/sq/internal/store"
 )
 
-// Deliverer POP 消费引擎。并发安全：同一队列的取件互斥（qmu），不同队列并行。
+// Deliverer POP 消费引擎。并发安全：同一队列的取件/确认/改不可见时间全部在
+// 该队列的 qmu 临界区内执行（Receive 经 receiveOnce、Ack、ChangeInvisible
+// 三者都在方法开头取同一把队列锁），不同队列并行。
+// 三者共同读写同一片 inflight 键空间，若只有 Receive 持锁而 Ack/
+// ChangeInvisible 不持锁，会出现"重投覆盖后的记录被陈旧 Ack 误删"
+// "ChangeInvisible 的读-改-写覆盖掉并发重投写入的新 attempts"等竞态——
+// 这正是本类型曾经的注释里"并发安全"这句话不成立的地方，现在三者统一持锁后才真正成立。
 type Deliverer struct {
 	st     *store.Store
 	mt     *meta.Meta
@@ -233,10 +241,28 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 	return out, nil
 }
 
-// Ack 确认消息。inflight 不存在（重复 ack / 已过期重投）返回 (false, nil)，幂等，不算错误。
-func (d *Deliverer) Ack(group, topic string, queueID uint32, offset uint64) (bool, error) {
+// Ack 确认消息。attempt 必须与该 offset 当前持久化的 InflightState.Attempts 一致——
+// 消费者持有的 attempt 来自它收到的那次 Receive（core.Message.DeliveryAttempt）。
+//
+// 为什么要校验 attempt，而不是只按 (group,topic,queue,offset) 删记录：
+// 若消费者 A 收到 X（attempt=1）后处理超时，X 会被过期重投给消费者 B（attempt=2，
+// 全新的过期时间）。此时 A 迟到的 Ack(X) 若不带 attempt 校验，会直接删掉 B 那条
+// 记录——X 从此既无 inflight 兜底、cursor 也已跳过它，一旦 B 处理失败或崩溃，
+// X 就永久丢失，直接违反本包头注释声明的"已 ack 前消息不丢"。attempt 不匹配
+// 说明这是一个陈旧句柄，语义上等价于"记录已不存在"：幂等返回 (false, nil)，不报错。
+//
+// inflight 不存在或 attempt 不匹配都返回 (false, nil)，幂等，不算错误。
+func (d *Deliverer) Ack(group, topic string, queueID uint32, offset uint64, attempt int32) (bool, error) {
+	// 与 receiveOnce 共享队列锁：Ack 要执行的 Get→校验→Delete 若不与重投互斥，
+	// receiveOnce 的过期重投（Get 旧记录→写入新 attempts）可能与本方法的
+	// Get→Delete 交错，产生"删掉了重投后新记录"或"看到重投前的旧 attempts"
+	// 之类的竞态。持有同一把 qmu 是类型注释里"并发安全"这句话成立的前提。
+	qlock := d.lockQueue(group, topic, queueID)
+	qlock.Lock()
+	defer qlock.Unlock()
+
 	k := store.InflightKey(group, topic, queueID, offset)
-	_, ok, err := d.st.Get(k)
+	v, ok, err := d.st.Get(k)
 	if err != nil {
 		return false, fmt.Errorf("ack 查询 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 	}
@@ -244,17 +270,40 @@ func (d *Deliverer) Ack(group, topic string, queueID uint32, offset uint64) (boo
 		d.logger.Debug("ack 目标不存在（重复 ack 或已重投）", "group", group, "topic", topic, "queue", queueID, "offset", offset)
 		return false, nil
 	}
+	ist, err := core.DecodeInflight(v)
+	if err != nil {
+		return false, fmt.Errorf("解码 inflight (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+	}
+	if ist.Attempts != attempt {
+		d.logger.Debug("ack attempt 不匹配（陈旧句柄，已被重投覆盖）",
+			"group", group, "topic", topic, "queue", queueID, "offset", offset,
+			"want_attempt", ist.Attempts, "got_attempt", attempt)
+		return false, nil
+	}
 	b := d.st.NewBatch()
 	b.Delete(k, nil)
 	if err := d.st.Apply(b); err != nil {
 		return false, fmt.Errorf("ack (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 	}
-	d.logger.Debug("消息已确认", "group", group, "topic", topic, "queue", queueID, "offset", offset)
+	d.logger.Debug("消息已确认", "group", group, "topic", topic, "queue", queueID, "offset", offset, "attempt", attempt)
 	return true, nil
 }
 
-// ChangeInvisible 重设不可见截止时间（消费端主动延长/缩短处理时间）。目标不存在返回 (false, nil)，幂等。
-func (d *Deliverer) ChangeInvisible(group, topic string, queueID uint32, offset uint64, invisible time.Duration) (bool, error) {
+// ChangeInvisible 重设不可见截止时间（消费端主动延长/缩短处理时间）。
+// attempt 校验规则与 Ack 相同：必须与当前持久化的 Attempts 一致，否则视为
+// 陈旧句柄，返回 (false, nil)——理由同 Ack 的注释：本方法也是一次 Get→改→Set
+// 的读-改-写，若操作的是已被重投覆盖的旧记录，写回去的 ExpireAtMs 会作用在
+// "别人正在处理的新一轮投递"上，等于让消费者延长了一个不属于自己的窗口。
+//
+// inflight 不存在或 attempt 不匹配都返回 (false, nil)，幂等，不算错误。
+func (d *Deliverer) ChangeInvisible(group, topic string, queueID uint32, offset uint64, attempt int32, invisible time.Duration) (bool, error) {
+	// 与 Ack 同理：必须持队列锁再做 Get→改→Set，否则这次读-改-写可能与
+	// receiveOnce 的过期重投交错，覆盖掉重投写入的新 Attempts（丢更新），
+	// 或在 Ack 的 Delete 与本方法的 Set 之间发生"删除后又被写回"的复活。
+	qlock := d.lockQueue(group, topic, queueID)
+	qlock.Lock()
+	defer qlock.Unlock()
+
 	k := store.InflightKey(group, topic, queueID, offset)
 	v, ok, err := d.st.Get(k)
 	if err != nil {
@@ -268,12 +317,18 @@ func (d *Deliverer) ChangeInvisible(group, topic string, queueID uint32, offset 
 	if err != nil {
 		return false, fmt.Errorf("解码 inflight (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 	}
+	if ist.Attempts != attempt {
+		d.logger.Debug("改不可见时间 attempt 不匹配（陈旧句柄，已被重投覆盖）",
+			"group", group, "topic", topic, "queue", queueID, "offset", offset,
+			"want_attempt", ist.Attempts, "got_attempt", attempt)
+		return false, nil
+	}
 	ist.ExpireAtMs = time.Now().Add(invisible).UnixMilli()
 	b := d.st.NewBatch()
 	b.Set(k, core.EncodeInflight(ist), nil)
 	if err := d.st.Apply(b); err != nil {
 		return false, fmt.Errorf("改不可见时间 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 	}
-	d.logger.Debug("已更新不可见时间", "group", group, "topic", topic, "queue", queueID, "offset", offset, "invisible_ms", invisible.Milliseconds())
+	d.logger.Debug("已更新不可见时间", "group", group, "topic", topic, "queue", queueID, "offset", offset, "attempt", attempt, "invisible_ms", invisible.Milliseconds())
 	return true, nil
 }
