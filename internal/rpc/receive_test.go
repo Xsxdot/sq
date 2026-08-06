@@ -35,6 +35,7 @@ import (
 	"time"
 
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/xushixin/sq/internal/core"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
@@ -402,6 +403,57 @@ func TestToPBMessageBackfillsRetryBackoffFloorOnRedelivery(t *testing.T) {
 	fresh := s.toPBMessage(&core.Message{ID: "C", Topic: "t", Body: []byte("x"), DeliveryAttempt: 1}, "g", 5*time.Second)
 	if got := fresh.GetSystemProperties().GetInvisibleDuration().AsDuration(); got != 5*time.Second {
 		t.Fatalf("首投消息 InvisibleDuration 应保持客户端值 5s，实际 %v", got)
+	}
+}
+
+// TestToPBMessageEchoesDelayTypeAndTimestamp 锁定投递方向的 DELAY 回填：
+// 盘上带 DeliverAtMs 的消息投递时，MessageType 必须如实回填为 DELAY、
+// DeliveryTimestamp 必须回填为到期时间；普通消息保持 NORMAL 且不带
+// DeliveryTimestamp。
+func TestToPBMessageEchoesDelayTypeAndTimestamp(t *testing.T) {
+	env := newTestEnv(t, true)
+	due := time.Now().Add(-time.Second).UnixMilli() // 已过期：发送即直通立即投递
+	m := &core.Message{ID: "d1", Topic: "t", Body: []byte("x"), DeliverAtMs: due, DeliveryAttempt: 1}
+	pm := env.srv.toPBMessage(m, "g", time.Minute)
+	if pm.GetSystemProperties().GetMessageType() != pb.MessageType_DELAY {
+		t.Fatalf("延时消息投递类型应为 DELAY，得到 %v", pm.GetSystemProperties().GetMessageType())
+	}
+	got := pm.GetSystemProperties().GetDeliveryTimestamp()
+	if got == nil || got.AsTime().UnixMilli() != due {
+		t.Fatalf("DeliveryTimestamp 未回填: %v", got)
+	}
+	// 普通消息不受影响
+	n := &core.Message{ID: "n1", Topic: "t", Body: []byte("y"), DeliveryAttempt: 1}
+	pn := env.srv.toPBMessage(n, "g", time.Minute)
+	if pn.GetSystemProperties().GetMessageType() != pb.MessageType_NORMAL ||
+		pn.GetSystemProperties().GetDeliveryTimestamp() != nil {
+		t.Fatal("普通消息不应带 DELAY 类型或 DeliveryTimestamp")
+	}
+}
+
+// 全链路：过期时间戳的 DELAY 消息发送后直通立即投递，消费端读回自己设置的时间
+func TestSendPastDueDelayDeliveredImmediatelyWithTimestampEcho(t *testing.T) {
+	env := newTestEnv(t, true)
+	due := time.Now().Add(-time.Second)
+	resp, err := env.client.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "dly2"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:       pb.MessageType_DELAY,
+				DeliveryTimestamp: timestamppb.New(due),
+			},
+			Body: []byte("imm"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("发送: %v %v", resp.GetStatus(), err)
+	}
+	pm := receiveOne(t, env.client, "g", "dly2", 0, time.Minute)
+	if pm.GetSystemProperties().GetMessageType() != pb.MessageType_DELAY {
+		t.Fatal("投递类型应为 DELAY")
+	}
+	if ts := pm.GetSystemProperties().GetDeliveryTimestamp(); ts == nil || ts.AsTime().UnixMilli() != due.UnixMilli() {
+		t.Fatalf("DeliveryTimestamp 回读不符: %v", ts)
 	}
 }
 

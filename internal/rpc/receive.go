@@ -196,6 +196,7 @@ func crc32Checksum(body []byte) string {
 // 本函数必须回填 toCoreMessage 收下的每一个透传字段：写方向存了、读方向不发，
 // 效果与压根没存一样，只是更难发现（盘上数据看着是对的）。改动其中一侧时
 // 请同时改另一侧，两者的类型映射集中在 sysprops.go。
+// DeliverAtMs 也在此回填（类型 + DeliveryTimestamp 两个字段）。
 //
 // 透传之上有两条"缺失兜底"（只在生产者什么都没声明时生效，不覆盖已有值）：
 // digest 缺失补算 CRC32、encoding 未声明归一化 IDENTITY，理由见各自的行内注释。
@@ -239,9 +240,16 @@ func (s *Server) toPBMessage(m *core.Message, group string, invisible time.Durat
 	if digest == nil {
 		digest = &pb.Digest{Type: pb.DigestType_CRC32, Checksum: crc32Checksum(m.Body)}
 	}
+	// 延时消息投递时如实回填类型与到期时间：SDK 的 MessageView 会把
+	// DeliveryTimestamp 暴露给应用（message.go fromProtobuf），少了它，
+	// 消费端就读不回自己发送时设置的延时时间
+	mtype := pb.MessageType_NORMAL
+	if m.DeliverAtMs > 0 {
+		mtype = pb.MessageType_DELAY
+	}
 	sp := &pb.SystemProperties{
 		MessageId:         m.ID,
-		MessageType:       pb.MessageType_NORMAL,
+		MessageType:       mtype,
 		Keys:              m.Keys,
 		BodyEncoding:      enc,
 		BodyDigest:        digest,
@@ -259,6 +267,9 @@ func (s *Server) toPBMessage(m *core.Message, group string, invisible time.Durat
 	if m.Tag != "" {
 		tag := m.Tag
 		sp.Tag = &tag
+	}
+	if m.DeliverAtMs > 0 {
+		sp.DeliveryTimestamp = timestamppb.New(time.UnixMilli(m.DeliverAtMs))
 	}
 	if m.MessageGroup != "" {
 		mg := m.MessageGroup
