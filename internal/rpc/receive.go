@@ -203,6 +203,16 @@ func (s *Server) toPBMessage(m *core.Message, group string, invisible time.Durat
 	handle := receiptEncode(group, m.Topic, m.QueueID, m.Offset, m.DeliveryAttempt)
 	attempt := m.DeliveryAttempt
 	offset := int64(m.Offset)
+	// 重投消息（attempt>=2）的实际不可见时长是 max(客户端要求, 退避下限)：
+	// receiveOnce 的过期语义是 exp=now+max(invisible,backoff)（deliver.go），
+	// 这里用同一公式（deliver.RetryBackoff）回填，否则 SDK 依 InvisibleDuration
+	// 换算出的可见时间点会早于服务端实际。首投无退避概念，保持客户端值。
+	eff := invisible
+	if m.DeliveryAttempt >= 2 {
+		if bo := deliver.RetryBackoff(m.DeliveryAttempt); bo > eff {
+			eff = bo
+		}
+	}
 	// 盘上的 token 只可能来自 bodyEncodingToCore，正常不会认不出来；真认不出来
 	// 说明数据被外部改写或两个方向被改得不再对称，宁可发一个"未声明"也要留日志。
 	enc, known := bodyEncodingToPB(m.BodyEncoding)
@@ -241,7 +251,7 @@ func (s *Server) toPBMessage(m *core.Message, group string, invisible time.Durat
 		DeliveryAttempt:   &attempt,
 		ReceiptHandle:     &handle,
 		QueueId:           int32(m.QueueID),
-		InvisibleDuration: durationpb.New(invisible),
+		InvisibleDuration: durationpb.New(eff),
 		// QueueOffset 在生成代码里是 *int64（不是 *int32，也不是值类型），
 		// 上面的 offset 局部变量就是为了取地址而存在的。
 		QueueOffset: &offset,

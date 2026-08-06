@@ -120,6 +120,8 @@ func (m *Manager) Pass() (int, error) {
 
 // purgeQueue 找到 [队首, 首条未过期) 边界并 DeleteRange 整段删除。
 // 队列内消息按 offset 追加写入、StoreAtMs 单调不减，扫到首条未过期即可停。
+// 注：单调性假设可能被时钟回跳（NTP 校时）短暂打破——被回跳越过停止边界的
+// 过期消息会在后续趟次被清掉，只有延迟、不丢消息。
 func (m *Manager) purgeQueue(topic string, q uint32, cutoff int64) (int, error) {
 	pfx := store.MsgQueuePrefix(topic, q)
 	var boundary uint64
@@ -181,6 +183,10 @@ func (m *Manager) purgeKeyIdx(topic string, cutoff int64) error {
 	}
 	if err := m.st.Apply(b); err != nil {
 		return fmt.Errorf("索引删除提交: %w", err)
+	}
+	if n == maxPurgePerQueue {
+		// 与 purgeQueue 同样的上限语义：n 触顶说明还有未扫描条目，剩余留待下趟
+		m.logger.Info("retention 索引达单趟上限，剩余留待下趟", "topic", topic)
 	}
 	m.logger.Debug("retention 清理索引", "topic", topic, "purged_idx", n)
 	return nil

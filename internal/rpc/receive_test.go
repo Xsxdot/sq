@@ -388,6 +388,23 @@ func TestToPBMessageSetsInvisibleDuration(t *testing.T) {
 	}
 }
 
+// TestToPBMessageBackfillsRetryBackoffFloorOnRedelivery 重投消息（attempt>=2）下发
+// InvisibleDuration 必须反映实际过期语义 max(客户端要求, 退避下限)：
+// receiveOnce 里重投的过期时间是 exp=now+max(invisible,backoff)（deliver.go），
+// 若这里仍回填客户端原值，SDK 换算出的可见时间点会早于服务端实际，消费端
+// 展示/重试节奏与服务端不一致。首投（attempt=1）无退避概念，保持客户端值。
+func TestToPBMessageBackfillsRetryBackoffFloorOnRedelivery(t *testing.T) {
+	s := &Server{}
+	redelivered := s.toPBMessage(&core.Message{ID: "B", Topic: "t", Body: []byte("x"), DeliveryAttempt: 2}, "g", time.Second)
+	if got := redelivered.GetSystemProperties().GetInvisibleDuration().AsDuration(); got != 10*time.Second {
+		t.Fatalf("重投消息 InvisibleDuration 应回填退避下限 10s，实际 %v", got)
+	}
+	fresh := s.toPBMessage(&core.Message{ID: "C", Topic: "t", Body: []byte("x"), DeliveryAttempt: 1}, "g", 5*time.Second)
+	if got := fresh.GetSystemProperties().GetInvisibleDuration().AsDuration(); got != 5*time.Second {
+		t.Fatalf("首投消息 InvisibleDuration 应保持客户端值 5s，实际 %v", got)
+	}
+}
+
 // TestReceiveMessageRejectsIllegalConsumerGroup 验证消费组名字非法
 // （deliver.Receive 内部 EnsureGroup 报 meta.ErrBadName）时返回
 // Code_ILLEGAL_CONSUMER_GROUP——这是客户端可自行处理（改名字重试没用，

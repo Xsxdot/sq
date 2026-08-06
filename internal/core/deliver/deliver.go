@@ -68,6 +68,12 @@ func retryBackoff(attempts int32) time.Duration {
 	return d
 }
 
+// RetryBackoff 导出包装，rpc 层回填 InvisibleDuration 用同一公式。
+// attempts<2 的语义由调用方保证（首投无退避，调用方只在 attempt>=2 时调用）。
+func RetryBackoff(attempts int32) time.Duration {
+	return retryBackoff(attempts)
+}
+
 // Deliverer POP 消费引擎。并发安全：同一队列的取件/确认/改不可见时间全部在
 // 该队列的 qmu 临界区内执行（Receive 经 receiveOnce、Ack、ChangeInvisible
 // 三者都在方法开头取同一把队列锁），不同队列并行。
