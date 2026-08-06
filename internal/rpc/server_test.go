@@ -64,7 +64,7 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, autoCreate, 4, slog.Default())
+	mt, err := meta.New(st, autoCreate, 4, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("meta.New: %v", err)
 	}

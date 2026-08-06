@@ -14,6 +14,7 @@ import (
 	"errors"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/xushixin/sq/internal/store"
 )
@@ -24,7 +25,7 @@ func newTestMeta(t *testing.T, dir string, autoCreate bool) (*Meta, *store.Store
 	if err != nil {
 		t.Fatalf("Open store: %v", err)
 	}
-	m, err := New(st, autoCreate, 4, slog.Default())
+	m, err := New(st, autoCreate, 4, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("New meta: %v", err)
 	}
@@ -96,5 +97,60 @@ func TestEnsureGroup(t *testing.T) {
 	g, err := m.EnsureGroup("g1")
 	if err != nil || g.Name != "g1" {
 		t.Fatalf("EnsureGroup: %+v %v", g, err)
+	}
+}
+
+// TestGroupMaxAttempts 新组按 broker 默认注册；旧数据（0 值）回退包默认。
+func TestGroupMaxAttempts(t *testing.T) {
+	st, err := store.Open(t.TempDir(), true, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	m, err := New(st, true, 4, 2, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	gc, err := m.EnsureGroup("g1")
+	if err != nil || gc.EffectiveMaxAttempts() != 2 {
+		t.Fatalf("新组 maxAttempts: %d %v", gc.EffectiveMaxAttempts(), err)
+	}
+	// M1 落盘的旧组无 max_attempts 字段（解码为 0）→ 回退 DefaultMaxAttempts
+	if got := (GroupConfig{}).EffectiveMaxAttempts(); got != DefaultMaxAttempts {
+		t.Fatalf("零值回退: %d", got)
+	}
+}
+
+func TestTopicRetentionDefault(t *testing.T) {
+	st, _ := store.Open(t.TempDir(), true, slog.Default())
+	t.Cleanup(func() { st.Close() })
+	m, _ := New(st, true, 4, 16, slog.Default())
+	tc, err := m.CreateTopic("t", 4)
+	if err != nil || tc.EffectiveRetention() != 72*time.Hour {
+		t.Fatalf("默认 retention: %v %v", tc.EffectiveRetention(), err)
+	}
+	if got := (TopicConfig{}).EffectiveRetention(); got != 72*time.Hour {
+		t.Fatalf("零值回退: %v", got)
+	}
+}
+
+func TestDLQTopicName(t *testing.T) {
+	name := DLQTopicName("orders-g")
+	if name != "%DLQ%orders-g" {
+		t.Fatalf("DLQ 名: %s", name)
+	}
+	if err := ValidateName(name); err != nil {
+		t.Fatalf("DLQ 名必须通过名字校验（'%%' 在合法字符集内）: %v", err)
+	}
+}
+
+func TestTopicsSnapshot(t *testing.T) {
+	st, _ := store.Open(t.TempDir(), true, slog.Default())
+	t.Cleanup(func() { st.Close() })
+	m, _ := New(st, true, 4, 16, slog.Default())
+	m.CreateTopic("a", 1)
+	m.CreateTopic("b", 2)
+	if got := len(m.Topics()); got != 2 {
+		t.Fatalf("Topics 快照: %d", got)
 	}
 }

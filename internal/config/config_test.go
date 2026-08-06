@@ -105,3 +105,15 @@ func TestLoadAcceptsBoundaryQueueNums(t *testing.T) {
 		}
 	}
 }
+
+func TestDefaultMaxAttempts(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil || cfg.DefaultMaxAttempts != 16 {
+		t.Fatalf("默认 max attempts: %d %v", cfg.DefaultMaxAttempts, err)
+	}
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	os.WriteFile(p, []byte("default_max_attempts: 0\n"), 0o644)
+	if _, err := Load(p); err == nil {
+		t.Fatal("应拒绝 default_max_attempts=0")
+	}
+}

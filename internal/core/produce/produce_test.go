@@ -26,7 +26,7 @@ func newTestProducer(t *testing.T, dir string) (*Producer, *store.Store) {
 	if err != nil {
 		t.Fatalf("store: %v", err)
 	}
-	mt, err := meta.New(st, true, 4, slog.Default())
+	mt, err := meta.New(st, true, 4, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}

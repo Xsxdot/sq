@@ -29,14 +29,15 @@ const MaxDefaultQueueNums = 1024
 
 // Config 为 sq 全部运行配置。零值无意义，必须经 Load 构造。
 type Config struct {
-	GRPCListen       string `yaml:"grpc_listen"`        // gRPC 监听地址，默认 :8081
-	AdvertiseHost    string `yaml:"advertise_host"`     // 路由响应中的对外地址，默认 127.0.0.1
-	AdvertisePort    int    `yaml:"advertise_port"`     // 默认 8081
-	DataDir          string `yaml:"data_dir"`           // Pebble 数据目录
-	Fsync            string `yaml:"fsync"`              // sync|async
-	AutoCreateTopic  bool   `yaml:"auto_create_topic"`  // QueryRoute/Send 未知 topic 时自动建
-	DefaultQueueNums uint32 `yaml:"default_queue_nums"` // 自动建 topic 的队列数
-	LogLevel         string `yaml:"log_level"`          // debug|info|warn|error
+	GRPCListen         string `yaml:"grpc_listen"`          // gRPC 监听地址，默认 :8081
+	AdvertiseHost      string `yaml:"advertise_host"`       // 路由响应中的对外地址，默认 127.0.0.1
+	AdvertisePort      int    `yaml:"advertise_port"`       // 默认 8081
+	DataDir            string `yaml:"data_dir"`             // Pebble 数据目录
+	Fsync              string `yaml:"fsync"`                // sync|async
+	AutoCreateTopic    bool   `yaml:"auto_create_topic"`    // QueryRoute/Send 未知 topic 时自动建
+	DefaultQueueNums   uint32 `yaml:"default_queue_nums"`   // 自动建 topic 的队列数
+	DefaultMaxAttempts int32  `yaml:"default_max_attempts"` // 新订阅组默认最大投递次数
+	LogLevel           string `yaml:"log_level"`            // debug|info|warn|error
 }
 
 // Load 加载配置。path 为空时返回纯默认值；文件存在则按字段覆盖。
@@ -44,7 +45,7 @@ func Load(path string) (*Config, error) {
 	cfg := &Config{
 		GRPCListen: ":8081", AdvertiseHost: "127.0.0.1", AdvertisePort: 8081,
 		DataDir: "./data", Fsync: "sync",
-		AutoCreateTopic: true, DefaultQueueNums: 4, LogLevel: "info",
+		AutoCreateTopic: true, DefaultQueueNums: 4, DefaultMaxAttempts: 16, LogLevel: "info",
 	}
 	if path == "" {
 		return cfg, nil
@@ -69,6 +70,11 @@ func Load(path string) (*Config, error) {
 	if cfg.DefaultQueueNums < 1 || cfg.DefaultQueueNums > MaxDefaultQueueNums {
 		return nil, fmt.Errorf("配置 default_queue_nums 必须在 1..%d 之间，得到 %d",
 			MaxDefaultQueueNums, cfg.DefaultQueueNums)
+	}
+	// max_attempts=0 会让新订阅组全部回退包默认，使配置项的语义与
+	// meta.New 的防御性回退重叠，配置层面的笔误不该静默吞掉，启动即报错。
+	if cfg.DefaultMaxAttempts <= 0 {
+		return nil, fmt.Errorf("配置 default_max_attempts 必须 >0，得到 %d", cfg.DefaultMaxAttempts)
 	}
 	// log_level 与 SetupSlog 的 switch 分支必须同步：这里不挡住，SetupSlog 的
 	// default 分支会把拼错的级别静默降级成 info，错误从此不可见。

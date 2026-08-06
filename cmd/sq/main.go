@@ -56,7 +56,7 @@ func run() error {
 		return err
 	}
 	defer st.Close()
-	mt, err := meta.New(st, cfg.AutoCreateTopic, cfg.DefaultQueueNums, logger)
+	mt, err := meta.New(st, cfg.AutoCreateTopic, cfg.DefaultQueueNums, cfg.DefaultMaxAttempts, logger)
 	if err != nil {
 		return err
 	}

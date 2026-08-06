@@ -209,13 +209,14 @@ func writeBrokerConfig(t *testing.T) (cfgPath, endpoint string) {
 	// QueryRoute 返回的 endpoints 就是 SDK 后续做 telemetry/send/receive 的目标，
 	// 对不上时表现为握手超时而不是「路由错」，很难定位。
 	cfg := &config.Config{
-		GRPCListen:       fmt.Sprintf("127.0.0.1:%d", port),
-		AdvertiseHost:    "127.0.0.1",
-		AdvertisePort:    port,
-		DataDir:          filepath.Join(dir, "data"),
-		Fsync:            "sync",
-		AutoCreateTopic:  true,
-		DefaultQueueNums: 4,
+		GRPCListen:         fmt.Sprintf("127.0.0.1:%d", port),
+		AdvertiseHost:      "127.0.0.1",
+		AdvertisePort:      port,
+		DataDir:            filepath.Join(dir, "data"),
+		Fsync:              "sync",
+		AutoCreateTopic:    true,
+		DefaultQueueNums:   4,
+		DefaultMaxAttempts: 16,
 		// debug 级别：broker 侧的投递/确认日志是排查「消息没到」的唯一线索，
 		// 失败时由 dumpBrokerLog 打进测试输出。
 		LogLevel: "debug",

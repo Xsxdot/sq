@@ -46,7 +46,7 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatalf("store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, slog.Default()) // 单队列，测试确定性
+	mt, err := meta.New(st, true, 1, 16, slog.Default()) // 单队列，测试确定性
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
