@@ -179,19 +179,35 @@ func pickPort(t *testing.T) int {
 	return l.Addr().(*net.TCPAddr).Port
 }
 
-// startBroker 起一个独立的 sq broker 进程，返回 SDK 用的接入点地址。
+// brokerHandle 一个已启动的 broker 进程及其现场。
 //
-// advertise_host/advertise_port 必须与进程实际监听的地址完全一致：
-// QueryRoute 返回的 endpoints 就是 SDK 后续做 telemetry/send/receive 的目标，
-// 对不上时表现为握手超时而不是「路由错」，很难定位。
+// cfgPath 保留在句柄上是刻意的：同一份配置文件（同一数据目录、同一端口）
+// 可以喂给 launchBroker 多次——重启恢复类用例正是靠"停掉第一代、用同一份
+// 配置拉起第二代"来验证 cursor/inflight 跨进程持久化的。
+type brokerHandle struct {
+	endpoint string
+	cfgPath  string
+	logPath  string
+	logFile  *os.File
+	cmd      *exec.Cmd
+	waitDone chan error
+}
+
+// writeBrokerConfig 选端口、在独立临时目录写好 broker 配置。
 //
 // 返回：
-//   - endpoint: "host:port" 形式的接入点，直接喂给 rmq.Config.Endpoint
-func startBroker(t *testing.T) string {
+//   - cfgPath: 配置文件路径（数据目录与日志都放在它的同级目录下）
+//   - endpoint: "host:port" 接入点，直接喂给 rmq.Config.Endpoint
+//
+// 与 launchBroker 拆开是为了重启类用例：写一次配置、启动两次进程。
+// 常规用例不需要感知这层拆分，直接用 startBroker 即可。
+func writeBrokerConfig(t *testing.T) (cfgPath, endpoint string) {
 	t.Helper()
-
 	port := pickPort(t)
 	dir := t.TempDir()
+	// advertise_host/advertise_port 必须与进程实际监听的地址完全一致：
+	// QueryRoute 返回的 endpoints 就是 SDK 后续做 telemetry/send/receive 的目标，
+	// 对不上时表现为握手超时而不是「路由错」，很难定位。
 	cfg := &config.Config{
 		GRPCListen:       fmt.Sprintf("127.0.0.1:%d", port),
 		AdvertiseHost:    "127.0.0.1",
@@ -210,17 +226,24 @@ func startBroker(t *testing.T) string {
 	if err != nil {
 		t.Fatalf("序列化 broker 配置失败: %v", err)
 	}
-	cfgPath := filepath.Join(dir, "sq.yaml")
+	cfgPath = filepath.Join(dir, "sq.yaml")
 	if err := os.WriteFile(cfgPath, raw, 0o600); err != nil {
 		t.Fatalf("写 broker 配置失败: %v", err)
 	}
+	return cfgPath, fmt.Sprintf("%s:%d", cfg.AdvertiseHost, cfg.AdvertisePort)
+}
 
-	logPath := filepath.Join(dir, "broker.log")
+// launchBroker 按给定配置启动一个 broker 进程并等待其开始接受连接。
+//
+// 不注册任何 Cleanup：进程生命周期由调用方负责——常规用例经 startBroker
+// 托管，重启用例需要亲手停起两次。logPath 由调用方指定：重启用例给两代
+// 进程各自独立的日志文件，失败时能分清是哪一代进程干的。
+func launchBroker(t *testing.T, cfgPath, endpoint, logPath string) *brokerHandle {
+	t.Helper()
 	logFile, err := os.Create(logPath)
 	if err != nil {
 		t.Fatalf("创建 broker 日志文件失败: %v", err)
 	}
-
 	cmd := exec.Command(brokerBinary, "-config", cfgPath)
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
@@ -228,26 +251,42 @@ func startBroker(t *testing.T) string {
 		logFile.Close()
 		t.Fatalf("启动 broker 进程失败: %v", err)
 	}
-
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- cmd.Wait() }()
+	waitBrokerReady(t, endpoint, waitDone, logPath)
+	t.Logf("broker 已就绪，endpoint=%s pid=%d", endpoint, cmd.Process.Pid)
+	return &brokerHandle{
+		endpoint: endpoint, cfgPath: cfgPath, logPath: logPath,
+		logFile: logFile, cmd: cmd, waitDone: waitDone,
+	}
+}
 
+// stop 优雅停止进程（SIGTERM + stopBroker 的退出码/停机预算断言）并关闭日志文件。
+func (h *brokerHandle) stop(t *testing.T) {
+	t.Helper()
+	stopBroker(t, h.cmd, h.waitDone)
+	h.logFile.Close()
+}
+
+// startBroker 起一个独立的 sq broker 进程并托管其生命周期（Cleanup 时优雅停止、
+// 失败时展开日志），返回 SDK 用的接入点地址。适用于"一个用例一个 broker"的
+// 常规场景；需要亲手控制停起时机的用例（如重启恢复）改用
+// writeBrokerConfig + launchBroker 组合。
+func startBroker(t *testing.T) string {
+	t.Helper()
+	cfgPath, endpoint := writeBrokerConfig(t)
+	h := launchBroker(t, cfgPath, endpoint, filepath.Join(filepath.Dir(cfgPath), "broker.log"))
 	t.Cleanup(func() {
-		stopBroker(t, cmd, waitDone)
-		logFile.Close()
+		h.stop(t)
 		// 只在失败时把 broker 日志灌进测试输出：成功时它是几百行 debug 噪音，
 		// 失败时它是唯一能说明服务端到底做了什么的证据。
 		if t.Failed() {
-			dumpBrokerLog(t, logPath)
+			dumpBrokerLog(t, h.logPath)
 		} else {
-			t.Logf("broker 日志: %s（用例通过，未展开）", logPath)
+			t.Logf("broker 日志: %s（用例通过，未展开）", h.logPath)
 		}
 	})
-
-	endpoint := fmt.Sprintf("%s:%d", cfg.AdvertiseHost, cfg.AdvertisePort)
-	waitBrokerReady(t, endpoint, waitDone, logPath)
-	t.Logf("broker 已就绪，endpoint=%s pid=%d", endpoint, cmd.Process.Pid)
-	return endpoint
+	return h.endpoint
 }
 
 // waitBrokerReady 轮询直到 broker 开始接受 TCP 连接。
