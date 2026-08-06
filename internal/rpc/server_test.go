@@ -243,7 +243,7 @@ func TestTelemetrySubscriptionSettingsMatchClientType(t *testing.T) {
 		t.Fatal("fifo 必须显式下发（当前为 nil，客户端只能靠默认值猜）")
 	}
 	if *sub.Subscription.Fifo {
-		t.Fatal("M1 不支持顺序消费，fifo 必须显式下发 false")
+		t.Fatal("M4 起顺序由 broker 端强制（顺序锁），fifo 协商标志待 push 消费流程验证后（M5+）再翻转，当前保持 false")
 	}
 	if sub.Subscription.ReceiveBatchSize == nil {
 		t.Fatal("receive_batch_size 必须显式下发：漏填时 push 消费者拿到的批量大小是 0")

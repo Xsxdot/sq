@@ -100,8 +100,9 @@ func (s *Server) negotiateSettings(client *pb.Settings) *pb.Settings {
 		out.PubSub = &pb.Settings_Subscription{Subscription: &pb.Subscription{
 			Group:         ps.Subscription.GetGroup(),
 			Subscriptions: ps.Subscription.GetSubscriptions(),
-			// M1 不支持顺序消费（属 M4），必须显式下发 false，
-			// 不能留空让客户端去猜。
+			// M4 起顺序由 broker 端强制（队列级顺序锁），消费端无需协商关闭；
+			// fifo 协商标志待 push 消费流程验证后（M5+）再翻转，
+			// 当前保持显式下发 false（不能留空让客户端去猜）。
 			Fifo:             &fifo,
 			ReceiveBatchSize: &batch,
 			// 下发服务端真实的长轮询上限，而不是回显客户端自报的值：

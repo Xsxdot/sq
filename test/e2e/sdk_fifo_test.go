@@ -43,7 +43,7 @@ func newFifoConsumer(t *testing.T, endpoint, group, topic string) rmq.SimpleCons
 	return c
 }
 
-// newFifoProducer 构造 producer 并发送 n 条同组顺序消息（body: {prefix}-{i}）
+// sendFifoBatch 构造 producer 并发送 n 条同组顺序消息（body: {prefix}-{i}）
 func sendFifoBatch(t *testing.T, endpoint, topic, group, prefix string, n int) {
 	t.Helper()
 	producer, err := rmq.NewProducer(&rmq.Config{
@@ -110,7 +110,7 @@ func TestOfficialGoSDKFIFOOrderedDelivery(t *testing.T) {
 }
 
 // TestOfficialGoSDKFIFOBlockedUntilAck 卡住语义：first 未 ack 的 20s 窗口内
-// 只会收到 first（不可见 5s，期间重投数次、attempt 递增），绝不能见到
+// 只会收到 first（不可见 5s，期间重投数次），绝不能见到
 // second；ack 最新一次收到的 first 后 second 到达
 func TestOfficialGoSDKFIFOBlockedUntilAck(t *testing.T) {
 	endpoint := startBroker(t)

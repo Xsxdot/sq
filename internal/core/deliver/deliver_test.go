@@ -560,9 +560,37 @@ func TestOrderedStuckOnExpiredRedelivery(t *testing.T) {
 	if _, err := f.dl.Ack("g", "t", 0, red[0].Offset, red[0].DeliveryAttempt); err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
-	next, _ := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	next, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	if err != nil {
+		t.Fatalf("ack 后取件: %v", err)
+	}
 	if len(next) != 1 || string(next[0].Body) != "b" {
 		t.Fatalf("ack 后应投 b: %d", len(next))
+	}
+}
+
+// 孤儿清理释放顺序锁：持有锁的顺序消息被 retention 清掉后（消息记录删除、
+// inflight 残留），下一条顺序消息可投——五个解锁路径中唯一没直测的一条
+func TestOrderedOrphanCleanupReleasesLock(t *testing.T) {
+	f := newFixture(t)
+	f.sendGrouped(t, "t", "a", "g1")
+	f.sendGrouped(t, "t", "b", "g1")
+	m, err := f.dl.Receive(context.Background(), "g", "t", 0, 1, 30*time.Millisecond, 0, nil)
+	if err != nil || len(m) != 1 || string(m[0].Body) != "a" {
+		t.Fatalf("首投: %+v %v", m, err)
+	}
+	time.Sleep(50 * time.Millisecond) // 让 a 的 inflight 过期，进入重投候选
+	// 模拟 retention：消息记录已删，仅 inflight 残留（store 无单条 Delete，
+	// 与 TestOrphanInflightCleanupPersistsAndDoesNotReportDelivery 同用批次写法）
+	b := f.st.NewBatch()
+	b.Delete(store.MsgKey("t", 0, m[0].Offset), nil)
+	if err := f.st.Apply(b); err != nil {
+		t.Fatalf("Delete msg: %v", err)
+	}
+	// 本轮 receiveOnce 应清理孤儿记录（Warn）并释放顺序锁，b 放行
+	next, err := f.dl.Receive(context.Background(), "g", "t", 0, 1, time.Minute, 0, nil)
+	if err != nil || len(next) != 1 || string(next[0].Body) != "b" {
+		t.Fatalf("孤儿清理后应投 b: %+v %v", next, err)
 	}
 }
 
