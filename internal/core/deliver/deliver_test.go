@@ -19,6 +19,7 @@
 //     （对该消费组永久跳过，换全量过滤器也收不到）
 //   - 验证全部消息不匹配时位点仍须持久化推进（否则每次 Receive 反复扫描同一批
 //     不匹配消息，性能退化且永不前进）
+//   - 验证重投指数退避（不可见时长下限）与投递次数超限后原子转入 %DLQ%{group}
 //
 // 边界：
 //   - 仅测试 deliver.Deliverer 及其导出方法的行为
@@ -44,13 +45,18 @@ type fixture struct {
 }
 
 func newFixture(t *testing.T) *fixture {
+	return newFixtureMaxAttempts(t, 16)
+}
+
+// newFixtureMaxAttempts 指定组默认 maxAttempts 的 fixture（DLQ 用例用小值控制时长）。
+func newFixtureMaxAttempts(t *testing.T, maxAttempts int32) *fixture {
 	t.Helper()
 	st, err := store.Open(t.TempDir(), true, slog.Default())
 	if err != nil {
 		t.Fatalf("store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, 16, slog.Default()) // 单队列，测试确定性
+	mt, err := meta.New(st, true, 1, maxAttempts, slog.Default())
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
@@ -258,6 +264,13 @@ func TestOrphanInflightCleanupPersistsAndDoesNotReportDelivery(t *testing.T) {
 // 在下一次过期后继续被重投出来（attempt 变成 3）"来证明记录确实还在，而不是
 // 只看 Ack 的返回值（返回值层面 (false,nil) 和"记录已被删"看起来是一样的）。
 func TestAckStaleAttemptRejected(t *testing.T) {
+	// attempt=2 的重投会受退避下限约束（默认 10s），而本用例的结尾依赖它
+	// 在 300ms 内再次过期、重投出 attempt=3 来证明记录未被陈旧 ack 误删。
+	// 注入小退避基数绕过该下限（var 供测试注入，见实现注释）。
+	oldBase := retryBackoffBase
+	retryBackoffBase = 10 * time.Millisecond
+	defer func() { retryBackoffBase = oldBase }()
+
 	f := newFixture(t)
 	f.send(t, "t", "a")
 	first, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 200*time.Millisecond, 0, nil)
@@ -415,5 +428,77 @@ func TestTagFilterAllFilteredAdvancesCursor(t *testing.T) {
 	v, ok, err := f.st.Get(store.CursorKey("g", "t", 0))
 	if err != nil || !ok || store.GetU64(v) != 1 {
 		t.Fatalf("位点应推进到 1: ok=%v %v", ok, err)
+	}
+}
+
+func TestRetryBackoffTable(t *testing.T) {
+	cases := map[int32]time.Duration{2: 10 * time.Second, 3: 20 * time.Second, 4: 40 * time.Second, 30: 5 * time.Minute}
+	for attempts, want := range cases {
+		if got := retryBackoff(attempts); got != want {
+			t.Fatalf("retryBackoff(%d) = %v，期望 %v", attempts, got, want)
+		}
+	}
+}
+
+// TestRedeliveryUsesBackoffFloor 重投时不可见时长取 max(客户端要求, 退避下限)。
+func TestRedeliveryUsesBackoffFloor(t *testing.T) {
+	f := newFixture(t)
+	f.send(t, "t", "a")
+	// 首投 20ms 不可见，过期
+	if msgs, _ := f.dl.Receive(context.Background(), "g", "t", 0, 10, 20*time.Millisecond, 0, nil); len(msgs) != 1 {
+		t.Fatal("首投失败")
+	}
+	time.Sleep(40 * time.Millisecond)
+	// 第 2 次投递：客户端只要 20ms，但退避下限 10s 生效
+	before := time.Now().UnixMilli()
+	if msgs, _ := f.dl.Receive(context.Background(), "g", "t", 0, 10, 20*time.Millisecond, 0, nil); len(msgs) != 1 {
+		t.Fatal("重投失败")
+	}
+	v, ok, err := f.st.Get(store.InflightKey("g", "t", 0, 0))
+	if err != nil || !ok {
+		t.Fatalf("inflight 缺失: %v", err)
+	}
+	st2, err := core.DecodeInflight(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st2.ExpireAtMs-before < (10 * time.Second).Milliseconds() {
+		t.Fatalf("退避下限未生效: expire 距 now 仅 %dms", st2.ExpireAtMs-before)
+	}
+}
+
+// TestExhaustedAttemptsGoToDLQ 投递次数耗尽后转入 %DLQ%{group}，原队列不再投递。
+func TestExhaustedAttemptsGoToDLQ(t *testing.T) {
+	// 缩小退避基数，让第 2 次投递快速过期（var 供测试注入，见实现注释）
+	oldBase := retryBackoffBase
+	retryBackoffBase = 10 * time.Millisecond
+	defer func() { retryBackoffBase = oldBase }()
+
+	f := newFixtureMaxAttempts(t, 2)
+	f.send(t, "t", "poison")
+	// 第 1、2 次投递均不 ack、任其过期
+	for i := 0; i < 2; i++ {
+		msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 20*time.Millisecond, 0, nil)
+		if err != nil || len(msgs) != 1 {
+			t.Fatalf("第 %d 次投递: %d %v", i+1, len(msgs), err)
+		}
+		time.Sleep(60 * time.Millisecond) // > invisible 与退避的较大者
+	}
+	// 第 3 次 Receive 触发 DLQ 转入，原队列返回空
+	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(msgs) != 0 {
+		t.Fatalf("超限后原队列不应再投: %d %v", len(msgs), err)
+	}
+	// inflight 已删
+	if _, ok, _ := f.st.Get(store.InflightKey("g", "t", 0, 0)); ok {
+		t.Fatal("DLQ 转入后 inflight 未删除")
+	}
+	// 死信可从 %DLQ%g 消费，带来源属性
+	dlq, err := f.dl.Receive(context.Background(), "dlq-reader", meta.DLQTopicName("g"), 0, 10, time.Minute, 0, nil)
+	if err != nil || len(dlq) != 1 {
+		t.Fatalf("DLQ 消费: %d %v", len(dlq), err)
+	}
+	if string(dlq[0].Body) != "poison" || dlq[0].Properties["sq-origin-topic"] != "t" {
+		t.Fatalf("死信内容/来源属性不符: %s %v", dlq[0].Body, dlq[0].Properties)
 	}
 }
