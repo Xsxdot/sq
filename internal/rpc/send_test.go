@@ -315,6 +315,38 @@ func TestSendDelayMessageGoesToDelayAreaNotDeliverable(t *testing.T) {
 	}
 }
 
+// TestSendDelayEpochTimestampNotDemotedToNormal 锁定 DELAY 消息携带非正到期
+// 时间戳（1970 epoch 或零值 time.Time）不被静默降级成 NORMAL：存在性校验只查
+// "带了没有"，不查正负；若这里不把 <=0 的到期时间钳到正数，DeliverAtMs 停在 0，
+// SendMessage 的路由门 m.DeliverAtMs>0 走不到 AppendDelay，消息就被当普通消息
+// 落盘——DELAY 类型与 DeliveryTimestamp 回读双双丢失（而且完全静默）。钳到
+// 1ms 后由 AppendDelay 的已过期直通逻辑立即投递，DeliverAtMs 原样保留：普通
+// 消息的 DeliverAtMs 恒为 0（types.go），取回的消息 >0 即证明仍是延时语义。
+func TestSendDelayEpochTimestampNotDemotedToNormal(t *testing.T) {
+	env := newTestEnv(t, true)
+	c, dl := env.client, env.dl
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "dly-epoch"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:       pb.MessageType_DELAY,
+				DeliveryTimestamp: timestamppb.New(time.UnixMilli(0)),
+			},
+			Body: []byte("epoch"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("DELAY+epoch 时间戳应被接受（直通立即投递）: %v %v", resp.GetStatus(), err)
+	}
+	msgs, err := dl.Receive(context.Background(), "g", "dly-epoch", 0, 10, time.Second, 5*time.Second, nil)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("直通投递应可取到 1 条: %d %v", len(msgs), err)
+	}
+	if msgs[0].DeliverAtMs <= 0 {
+		t.Fatalf("DeliverAtMs 应为正（DELAY 语义被保留），实际 %d——消息被降级成了 NORMAL", msgs[0].DeliverAtMs)
+	}
+}
+
 func TestSendDelayMissingTimestampRejected(t *testing.T) {
 	c := newTestClient(t)
 	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{

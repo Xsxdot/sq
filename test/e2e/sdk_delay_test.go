@@ -115,15 +115,31 @@ func TestOfficialGoSDKDelayDelivery(t *testing.T) {
 // broker 侧单测覆盖，这里只断言到达与内容）。
 func TestOfficialGoSDKDelayRestartRecovery(t *testing.T) {
 	cfgPath, endpoint := writeBrokerConfig(t)
-	logPath := filepath.Join(filepath.Dir(cfgPath), "broker.log")
+	dir := filepath.Dir(cfgPath)
+	run1Log := filepath.Join(dir, "broker-run1.log")
+	run2Log := filepath.Join(dir, "broker-run2.log")
 	const (
 		topic = "e2e-delay-restart"
 		group = "e2e-delay-restart-g"
 		body  = "survive-restart"
 	)
 
+	// cur 指向当前活着的一代进程；亲手停起，Cleanup 只兜底"用例中途 Fatal
+	// 时还有进程活着"的情况。失败时两代日志都展开——重启用例最难排查的
+	// 就是"问题出在哪一代"（与 sdk_recovery_test.go 的约定一致）。
+	var cur *brokerHandle
+	t.Cleanup(func() {
+		if cur != nil {
+			cur.stop(t)
+		}
+		if t.Failed() {
+			dumpBrokerLog(t, run1Log)
+			dumpBrokerLog(t, run2Log)
+		}
+	})
+
 	// 第一代：发送延时消息后停机
-	h1 := launchBroker(t, cfgPath, endpoint, logPath)
+	cur = launchBroker(t, cfgPath, endpoint, run1Log)
 	producer, err := rmq.NewProducer(&rmq.Config{
 		Endpoint:    endpoint,
 		Credentials: &credentials.SessionCredentials{},
@@ -141,11 +157,11 @@ func TestOfficialGoSDKDelayRestartRecovery(t *testing.T) {
 		t.Fatalf("Send: %v", err)
 	}
 	producer.GracefulStop()
-	h1.stop(t)
+	cur.stop(t)
+	cur = nil
 
 	// 第二代：同一数据目录重启，到期后消费到
-	h2 := launchBroker(t, cfgPath, endpoint, logPath)
-	t.Cleanup(func() { h2.stop(t) })
+	cur = launchBroker(t, cfgPath, endpoint, run2Log)
 	consumer := newDelayConsumer(t, endpoint, group, topic)
 	deadline := due.Add(90 * time.Second)
 	for time.Now().Before(deadline) {

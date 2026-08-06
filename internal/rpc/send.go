@@ -103,7 +103,17 @@ func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 			return nil, errStatus(pb.Code_ILLEGAL_DELIVERY_TIME, "DELAY 消息缺少 delivery_timestamp")
 		}
 		delayAt = sp.GetDeliveryTimestamp().AsTime().UnixMilli()
+		// 时间戳存在但落在非正区间（1970 epoch 或零值 time.Time）时不能静默
+		// 降级成 NORMAL：DeliverAtMs 停在 0 会让 SendMessage 的路由门
+		// m.DeliverAtMs>0 走不到 AppendDelay，消息被当普通消息落盘，类型与
+		// 时间戳回读双双丢失。钳到 1ms 保证路由进门，已过期由 AppendDelay
+		// 的直通逻辑立即投递，DELAY 语义原样保留。
+		if delayAt <= 0 {
+			delayAt = 1
+		}
 	case pb.MessageType_FIFO:
+		// MessageGroup 定队列已在 produce 实现，但消费端顺序锁是 M4——
+		// 拒绝 FIFO 消息，避免"能发不能保序"的假象。
 		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "顺序消息将在 M4 支持")
 	case pb.MessageType_TRANSACTION:
 		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "事务消息将在 M6 支持")
