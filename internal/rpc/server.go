@@ -12,6 +12,7 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 
@@ -85,12 +86,29 @@ func (s *Server) messageQueues(tc meta.TopicConfig, topic *pb.Resource) []*pb.Me
 
 // QueryRoute 返回 topic 路由。autoCreate 开启时未知 topic 在此自动创建——
 // 生产者发送消息前必须先查路由，若这里不建，topic 永远没有机会被创建出来。
+//
+// EnsureTopic 的失败原因需要按性质分类，不能全部折叠成一个 Code：
+// 名字本身不合法（ErrBadName，客户端输入错误）与 topic 未注册且未开自动创建
+// （ErrTopicNotFound，同样是客户端可自行处理的情况）分属不同语义；两者之外
+// 的失败（如自动创建时的 store 持久化错误）是服务端内部故障，绝不能报成
+// 「你的输入非法」——那会让一个本该重试的瞬时错误被客户端当成永久性错误放弃。
 func (s *Server) QueryRoute(ctx context.Context, req *pb.QueryRouteRequest) (*pb.QueryRouteResponse, error) {
 	name := req.GetTopic().GetName()
 	tc, err := s.mt.EnsureTopic(name)
 	if err != nil {
-		s.logger.Warn("QueryRoute 失败", "topic", name, "err", err)
-		return &pb.QueryRouteResponse{Status: errStatus(pb.Code_TOPIC_NOT_FOUND, err.Error())}, nil
+		switch {
+		case errors.Is(err, meta.ErrBadName):
+			s.logger.Warn("QueryRoute 失败：topic 名字非法", "topic", name, "err", err)
+			return &pb.QueryRouteResponse{Status: errStatus(pb.Code_ILLEGAL_TOPIC, err.Error())}, nil
+		case errors.Is(err, meta.ErrTopicNotFound):
+			s.logger.Warn("QueryRoute 失败：topic 不存在", "topic", name, "err", err)
+			return &pb.QueryRouteResponse{Status: errStatus(pb.Code_TOPIC_NOT_FOUND, err.Error())}, nil
+		default:
+			// 已排除掉两类客户端输入错误，剩下的都是服务端内部故障
+			// （如自动创建 topic 时的 store 持久化失败），用 Error 级别记录。
+			s.logger.Error("QueryRoute 内部错误", "topic", name, "err", err)
+			return &pb.QueryRouteResponse{Status: errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error())}, nil
+		}
 	}
 	s.logger.Debug("QueryRoute", "topic", name, "queues", tc.Queues)
 	return &pb.QueryRouteResponse{Status: okStatus(), MessageQueues: s.messageQueues(tc, req.GetTopic())}, nil
@@ -98,11 +116,20 @@ func (s *Server) QueryRoute(ctx context.Context, req *pb.QueryRouteRequest) (*pb
 
 // Heartbeat 客户端保活；携带消费组名时顺带注册该组（消费组首次出现即注册，
 // 与 topic 的 autoCreate 开关无关）。
+//
+// 与 QueryRoute 同理：EnsureGroup 失败要按性质分类。ErrBadName（名字非法）
+// 才是真正的「ILLEGAL_CONSUMER_GROUP」（该 Code 本身定义为 "Format of
+// consumer group is illegal"）；其余失败（如注册时的 store 持久化错误）
+// 是服务端内部故障，报成客户端输入错误会误导客户端停止本该重试的请求。
 func (s *Server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
 	if g := req.GetGroup().GetName(); g != "" {
 		if _, err := s.mt.EnsureGroup(g); err != nil {
-			s.logger.Warn("Heartbeat 注册消费组失败", "group", g, "err", err)
-			return &pb.HeartbeatResponse{Status: errStatus(pb.Code_ILLEGAL_CONSUMER_GROUP, err.Error())}, nil
+			if errors.Is(err, meta.ErrBadName) {
+				s.logger.Warn("Heartbeat 注册消费组失败：名字非法", "group", g, "err", err)
+				return &pb.HeartbeatResponse{Status: errStatus(pb.Code_ILLEGAL_CONSUMER_GROUP, err.Error())}, nil
+			}
+			s.logger.Error("Heartbeat 注册消费组内部错误", "group", g, "err", err)
+			return &pb.HeartbeatResponse{Status: errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error())}, nil
 		}
 	}
 	return &pb.HeartbeatResponse{Status: okStatus()}, nil
