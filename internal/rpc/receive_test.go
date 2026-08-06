@@ -7,6 +7,14 @@
 //   - 覆盖 Task 7 review 修复的 attempt 令牌语义：一条消息被重投后，用重投前
 //     （陈旧 attempt）的 handle 去 Ack 必须失败，且不能影响重投后的新记录——
 //     否则会重演"迟到的 Ack 误删新记录，消息永久丢失"的问题
+//   - 覆盖协议层错误分类：ReceiveMessage 对非法消费组名字必须报
+//     ILLEGAL_CONSUMER_GROUP 而不是 INTERNAL_SERVER_ERROR（同 QueryAssignment
+//     对 EnsureTopic 错误的分类原则，不能把客户端输入错误折叠成服务端故障）
+//   - 覆盖 AckMessage 顶层 Status 的汇总语义：批量结果不全相同时必须报
+//     MULTIPLE_RESULTS，不能固定 OK（只看顶层 Status 的客户端否则会把
+//     部分失败的批次误判为全部成功，永远不会重试）
+//   - 覆盖 handle 解析失败的 entry 必须回填 ReceiptHandle，供客户端在
+//     MessageId 为空时仍能关联回自己请求里的哪个 entry
 //
 // 边界：
 //   - 只测协议适配层的行为（请求→响应/状态码/handle 格式），不重复测
@@ -64,26 +72,14 @@ func sendOne(t *testing.T, c pb.MessagingServiceClient, topic, body string) {
 func TestReceiveAckRoundTrip(t *testing.T) {
 	c := newTestClient(t)
 	sendOne(t, c, "rt", "hello")
-	// topic 只有 4 个队列，轮询首条必落 queue 0……但为免脆弱，四个队列都试
+	// topic 只有 4 个队列，轮询首条必落 queue 0……但为免脆弱，四个队列都试。
+	// 用 receiveOne（内部 2s 的有限 context）而不是 context.Background()：
+	// 没消息的队列会长轮询到 longPollWait 算出的等待时长，用无限 context
+	// 会导致每个未命中的队列各自等满 20s，最坏情况把这条本该几十毫秒完成
+	// 的测试拖到接近 60s。
 	var got *pb.Message
 	for q := int32(0); q < 4 && got == nil; q++ {
-		stream, err := c.ReceiveMessage(context.Background(), &pb.ReceiveMessageRequest{
-			Group: &pb.Resource{Name: "g-rt"},
-			MessageQueue: &pb.MessageQueue{
-				Topic: &pb.Resource{Name: "rt"}, Id: q,
-			},
-			FilterExpression:  &pb.FilterExpression{Type: pb.FilterType_TAG, Expression: "*"},
-			BatchSize:         10,
-			InvisibleDuration: durationpb.New(time.Minute),
-			AutoRenew:         false,
-		})
-		if err != nil {
-			t.Fatalf("ReceiveMessage: %v", err)
-		}
-		msgs, _ := recvAll(t, stream)
-		if len(msgs) > 0 {
-			got = msgs[0]
-		}
+		got = receiveOne(t, c, "g-rt", "rt", q, time.Minute)
 	}
 	if got == nil {
 		t.Fatal("未收到消息")
@@ -256,5 +252,119 @@ func TestAckWithStaleAttemptTokenFailsAndMessageStaysRedeliverable(t *testing.T)
 	}
 	if len(freshAck.GetEntries()) != 1 || freshAck.GetEntries()[0].GetStatus().GetCode() != pb.Code_OK {
 		t.Fatalf("当前 handle 确认应成功，实际 %v", freshAck.GetEntries())
+	}
+}
+
+// TestReceiveMessageRejectsIllegalConsumerGroup 验证消费组名字非法
+// （deliver.Receive 内部 EnsureGroup 报 meta.ErrBadName）时返回
+// Code_ILLEGAL_CONSUMER_GROUP——这是客户端可自行处理（改名字重试没用，
+// 但也不该无脑重试）的输入错误，不能被折叠成 Code_INTERNAL_SERVER_ERROR。
+// 折叠成后者会诱导一个用非法组名轮询的消费者把它当瞬时故障无限重试，
+// 在轮询频率下形成 Error 级别的日志洪水，而这个错误永远不会因为重试变好。
+func TestReceiveMessageRejectsIllegalConsumerGroup(t *testing.T) {
+	c := newTestClient(t)
+	stream, err := c.ReceiveMessage(context.Background(), &pb.ReceiveMessageRequest{
+		Group:             &pb.Resource{Name: "bad/group"},
+		MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: "rt-illegal-group"}, Id: 0},
+		FilterExpression:  &pb.FilterExpression{Type: pb.FilterType_TAG, Expression: "*"},
+		BatchSize:         10,
+		InvisibleDuration: durationpb.New(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ReceiveMessage: %v", err)
+	}
+	_, st := recvAll(t, stream)
+	if st.GetCode() != pb.Code_ILLEGAL_CONSUMER_GROUP {
+		t.Fatalf("status: 期望 ILLEGAL_CONSUMER_GROUP，得到 %v", st)
+	}
+}
+
+// TestAckMessageAggregatesMixedResultsAsMultipleResults 验证批量确认里一条
+// 成功、一条失败（用已经确认过一次、因而失效的 handle）时，顶层 Status 必须
+// 是 Code_MULTIPLE_RESULTS，而不是固定 OK——只检查顶层 Status 的客户端
+// （常见 SDK 形状）需要靠这个字段判断"这批是否需要重试"，固定 OK 会让它
+// 把失败的那条误判为已确认，永远不会重试。
+func TestAckMessageAggregatesMixedResultsAsMultipleResults(t *testing.T) {
+	c := newTestClient(t)
+	const topic = "ack-mixed"
+	const group = "g-ack-mixed"
+	sendOne(t, c, topic, "a")
+	sendOne(t, c, topic, "b")
+
+	// produce 按 topic 轮询分配队列，两条消息各落在不同队列；把 4 个队列
+	// 都试一遍凑够 2 条（凑够即停，不会在没消息的队列上多等）。
+	var msgs []*pb.Message
+	for q := int32(0); q < 4 && len(msgs) < 2; q++ {
+		if m := receiveOne(t, c, group, topic, q, time.Minute); m != nil {
+			msgs = append(msgs, m)
+		}
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("期望收到 2 条消息，实际 %d", len(msgs))
+	}
+
+	// 先把第一条 ack 掉，让它的 handle 变成"已失效"（第二次 ack 会落空）。
+	h0 := msgs[0].GetSystemProperties().GetReceiptHandle()
+	id0 := msgs[0].GetSystemProperties().GetMessageId()
+	pre, err := c.AckMessage(context.Background(), &pb.AckMessageRequest{
+		Group: &pb.Resource{Name: group}, Topic: &pb.Resource{Name: topic},
+		Entries: []*pb.AckMessageEntry{{ReceiptHandle: h0, MessageId: id0}},
+	})
+	if err != nil || pre.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("预备 ack 失败: %v %v", pre.GetStatus(), err)
+	}
+
+	// 批量确认：entry0 用已失效的 h0（应失败），entry1 用未 ack 过的 h1（应成功）。
+	h1 := msgs[1].GetSystemProperties().GetReceiptHandle()
+	id1 := msgs[1].GetSystemProperties().GetMessageId()
+	resp, err := c.AckMessage(context.Background(), &pb.AckMessageRequest{
+		Group: &pb.Resource{Name: group}, Topic: &pb.Resource{Name: topic},
+		Entries: []*pb.AckMessageEntry{
+			{ReceiptHandle: h0, MessageId: id0},
+			{ReceiptHandle: h1, MessageId: id1},
+		},
+	})
+	if err != nil {
+		t.Fatalf("AckMessage: %v", err)
+	}
+	if resp.GetStatus().GetCode() != pb.Code_MULTIPLE_RESULTS {
+		t.Fatalf("顶层 status 应为 MULTIPLE_RESULTS，实际 %v", resp.GetStatus())
+	}
+	if len(resp.GetEntries()) != 2 ||
+		resp.GetEntries()[0].GetStatus().GetCode() != pb.Code_INVALID_RECEIPT_HANDLE ||
+		resp.GetEntries()[1].GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("entries: %v", resp.GetEntries())
+	}
+}
+
+// TestAckMessageMalformedHandleEntryIncludesReceiptHandle 验证 handle 解析
+// 失败的 entry 仍然带上原始（虽然非法）ReceiptHandle：MessageId 在请求里
+// 可能为空（proto 字段非必填），此时 ReceiptHandle 是客户端把这条失败结果
+// 关联回自己请求里对应 entry 的唯一线索，遗漏它会让调用方在 MessageId
+// 为空时无法定位是哪条 ack 失败了。顺带验证单条失败时顶层 Status 也如实
+// 反映失败（不是被固定成 OK）。
+func TestAckMessageMalformedHandleEntryIncludesReceiptHandle(t *testing.T) {
+	c := newTestClient(t)
+	const badHandle = "not-a-valid-handle!!"
+	resp, err := c.AckMessage(context.Background(), &pb.AckMessageRequest{
+		Group:   &pb.Resource{Name: "g-malformed"},
+		Topic:   &pb.Resource{Name: "malformed"},
+		Entries: []*pb.AckMessageEntry{{ReceiptHandle: badHandle}},
+	})
+	if err != nil {
+		t.Fatalf("AckMessage: %v", err)
+	}
+	if resp.GetStatus().GetCode() != pb.Code_INVALID_RECEIPT_HANDLE {
+		t.Fatalf("顶层 status 应反映唯一 entry 的失败，实际 %v", resp.GetStatus())
+	}
+	if len(resp.GetEntries()) != 1 {
+		t.Fatalf("entries: %v", resp.GetEntries())
+	}
+	e := resp.GetEntries()[0]
+	if e.GetStatus().GetCode() != pb.Code_INVALID_RECEIPT_HANDLE {
+		t.Fatalf("entry status: %v", e.GetStatus())
+	}
+	if e.GetReceiptHandle() != badHandle {
+		t.Fatalf("ReceiptHandle 应回显原始值，实际 %q", e.GetReceiptHandle())
 	}
 }

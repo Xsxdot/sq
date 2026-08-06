@@ -63,15 +63,45 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 
 	msgs, err := s.dl.Receive(stream.Context(), group, topic, queueID, batch, invisible, wait)
 	if err != nil {
-		s.logger.Error("ReceiveMessage 失败", "group", group, "topic", topic, "queue", queueID, "err", err)
-		return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
-			Status: errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error()),
-		}})
+		// deliver.Receive 的错误不是铁板一块，必须按性质分类（同 QueryAssignment
+		// 对 EnsureTopic 错误的分类原则）：
+		//   - meta.ErrBadName：group 名字非法，是客户端输入错误。折叠成
+		//     INTERNAL_SERVER_ERROR 会让轮询消费者把它当成瞬时故障无限重试，
+		//     在轮询频率下形成 Error 级别的日志洪水，而这个错误本身永远不会
+		//     通过重试变好。
+		//   - context.Canceled/DeadlineExceeded：客户端主动断开（关闭消费者、
+		//     rebalance）或者内部长轮询循环的 ctx.Done() 分支被触发，都是
+		//     正常的流生命周期事件，不是服务端故障，不能打 Error；这种情况下
+		//     stream 的底层 ctx 已经失效，不再尝试 Send 一个 status 帧
+		//     （大概率也会失败），直接把 ctx 的错误原样返回给 gRPC 框架，
+		//     由它按标准方式结束这个流。
+		//   - 其余：真正的服务端内部故障，维持原有 INTERNAL_SERVER_ERROR + Error 日志。
+		switch {
+		case errors.Is(err, meta.ErrBadName):
+			s.logger.Warn("ReceiveMessage 拒绝：消费组名字非法", "group", group, "topic", topic, "queue", queueID, "err", err)
+			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
+				Status: errStatus(pb.Code_ILLEGAL_CONSUMER_GROUP, err.Error()),
+			}})
+		case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
+			s.logger.Debug("ReceiveMessage 结束：客户端取消或等待超时", "group", group, "topic", topic, "queue", queueID, "err", err)
+			return err
+		default:
+			s.logger.Error("ReceiveMessage 失败", "group", group, "topic", topic, "queue", queueID, "err", err)
+			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
+				Status: errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error()),
+			}})
+		}
 	}
-	for _, m := range msgs {
+	for i, m := range msgs {
 		if err := stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Message{
 			Message: s.toPBMessage(m, group),
 		}}); err != nil {
+			// 推送到一半流断了（客户端提前关闭/网络问题），前面已经发出的消息
+			// 已经生效（inflight 已写），只是本次响应没能完整送达——这属于
+			// brief Step 5 要求覆盖的"错误路径带上下文"，之前这里是唯一
+			// 没有记录任何信息就直接返回的分支，排查"客户端说没收全"时无从查起。
+			s.logger.Warn("ReceiveMessage 推送消息失败，流可能已被客户端关闭",
+				"group", group, "topic", topic, "queue", queueID, "index", i, "total", len(msgs), "err", err)
 			return err
 		}
 	}
@@ -144,18 +174,26 @@ func (s *Server) toPBMessage(m *core.Message, group string) *pb.Message {
 }
 
 // AckMessage 批量确认。逐条独立处理：handle 解析失败或 ack 落空都不影响其它条目，
-// 由每条 entry 各自的 Status 反映结果（整体 Status 固定 OK——协议约定，
-// "批量部分失败"通过 entry 级别表达，不是整体失败）。
+// 每条 entry 各自的 Status 反映该条结果；顶层 Status 由 ackAggregateStatus
+// 从这些 entry 状态汇总而来，不是固定 OK（见该函数注释：只看顶层 Status 的
+// 客户端——常见 SDK 形状——需要靠这个字段判断"这批是否需要重试"）。
 func (s *Server) AckMessage(ctx context.Context, req *pb.AckMessageRequest) (*pb.AckMessageResponse, error) {
 	entries := make([]*pb.AckMessageResultEntry, 0, len(req.GetEntries()))
 	for _, e := range req.GetEntries() {
 		g, topic, q, off, attempt, err := receiptDecode(e.GetReceiptHandle())
 		if err != nil {
 			// 非法 handle 是客户端问题（篡改/损坏/过期协议版本），Warn 即可，
-			// 不是服务端故障。
-			s.logger.Warn("ack handle 非法", "handle", e.GetReceiptHandle(), "err", err)
+			// 不是服务端故障。handle 是客户端可控的任意长度字符串，日志里只留
+			// 截断预览（truncateForLog），不把不受信任的输入原样灌进日志。
+			s.logger.Warn("ack handle 非法", "handle", truncateForLog(e.GetReceiptHandle()), "err", err)
 			entries = append(entries, &pb.AckMessageResultEntry{
-				Status: errStatus(pb.Code_INVALID_RECEIPT_HANDLE, err.Error()), MessageId: e.GetMessageId(),
+				// ReceiptHandle 必须回填：MessageId 在客户端请求里可能为空
+				// （proto 字段非必填），此时 ReceiptHandle 是客户端把这条失败
+				// 结果关联回自己请求里对应 entry 的唯一线索，遗漏它会让
+				// 调用方在 MessageId 为空时无法定位是哪条 ack 失败了。
+				Status:        errStatus(pb.Code_INVALID_RECEIPT_HANDLE, err.Error()),
+				MessageId:     e.GetMessageId(),
+				ReceiptHandle: e.GetReceiptHandle(),
 			})
 			continue
 		}
@@ -175,7 +213,34 @@ func (s *Server) AckMessage(ctx context.Context, req *pb.AckMessageRequest) (*pb
 		}
 		entries = append(entries, &pb.AckMessageResultEntry{Status: st, MessageId: e.GetMessageId(), ReceiptHandle: e.GetReceiptHandle()})
 	}
-	return &pb.AckMessageResponse{Status: okStatus(), Entries: entries}, nil
+	return &pb.AckMessageResponse{Status: ackAggregateStatus(entries), Entries: entries}, nil
+}
+
+// ackAggregateStatus 由各 entry 的 Status 汇总出批量响应的顶层 Status：
+// 全部条目状态码一致就直接复用那个码；出现不一致就返回
+// Code_MULTIPLE_RESULTS（生成协议里 30000 号码，doc 明确写"Generic code
+// for multiple return results"——这正是"批量结果不全相同"该用的信号）。
+//
+// 为什么不能像最初实现那样固定顶层 OK：常见的 SDK 只检查顶层
+// resp.GetStatus() 就判定整批是否成功，entry 级别的细节它未必会逐条查看。
+// 如果一批里有条目因为 store 内部错误真正失败（INTERNAL_SERVER_ERROR），
+// 但顶层仍然报 OK，这类客户端会把失败的那条误判为已确认，永远不会重试，
+// 消息因此在事实上被跳过确认却又不会被重投——这是比"多打一个错误码"更
+// 严重的静默数据问题。
+func ackAggregateStatus(entries []*pb.AckMessageResultEntry) *pb.Status {
+	if len(entries) == 0 {
+		return okStatus()
+	}
+	code := entries[0].GetStatus().GetCode()
+	for _, e := range entries[1:] {
+		if e.GetStatus().GetCode() != code {
+			return errStatus(pb.Code_MULTIPLE_RESULTS, "批量确认结果不一致，请检查各 entry 的 status")
+		}
+	}
+	if code == pb.Code_OK {
+		return okStatus()
+	}
+	return errStatus(code, entries[0].GetStatus().GetMessage())
 }
 
 // ChangeInvisibleDuration 重设不可见时长，返回原 handle——handle 的内容
@@ -184,7 +249,7 @@ func (s *Server) AckMessage(ctx context.Context, req *pb.AckMessageRequest) (*pb
 func (s *Server) ChangeInvisibleDuration(ctx context.Context, req *pb.ChangeInvisibleDurationRequest) (*pb.ChangeInvisibleDurationResponse, error) {
 	g, topic, q, off, attempt, err := receiptDecode(req.GetReceiptHandle())
 	if err != nil {
-		s.logger.Warn("改不可见时长 handle 非法", "handle", req.GetReceiptHandle(), "err", err)
+		s.logger.Warn("改不可见时长 handle 非法", "handle", truncateForLog(req.GetReceiptHandle()), "err", err)
 		return &pb.ChangeInvisibleDurationResponse{Status: errStatus(pb.Code_INVALID_RECEIPT_HANDLE, err.Error())}, nil
 	}
 	ok, err := s.dl.ChangeInvisible(g, topic, q, off, attempt, req.GetInvisibleDuration().AsDuration())
@@ -229,4 +294,20 @@ func (s *Server) QueryAssignment(ctx context.Context, req *pb.QueryAssignmentReq
 	}
 	s.logger.Debug("QueryAssignment", "topic", name, "group", req.GetGroup().GetName(), "assignments", len(asgs))
 	return &pb.QueryAssignmentResponse{Status: okStatus(), Assignments: asgs}, nil
+}
+
+// logPreviewLen 日志里展示的 receipt handle 前缀长度上限。
+const logPreviewLen = 32
+
+// truncateForLog 截断字符串用于日志展示。receipt handle 是客户端可控的
+// 任意长度字符串——一个篡改或异常的客户端可以喂进任意大小的值——错误日志
+// 不能把这种不受信任的输入原样、无界地写进去，否则等于把日志系统暴露成
+// 一个客户端可控的写入面（日志量放大、潜在的日志注入）。只按字节截断即可：
+// handle 是 base64 编码，全部落在 ASCII 范围内，不存在截断到多字节字符
+// 中间导致乱码的问题。
+func truncateForLog(s string) string {
+	if len(s) <= logPreviewLen {
+		return s
+	}
+	return s[:logPreviewLen] + "...(truncated)"
 }
