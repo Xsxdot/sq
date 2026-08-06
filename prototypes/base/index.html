@@ -126,7 +126,7 @@
   document.getElementById('v-res').textContent = `${o.topics} / ${o.groups}`;
   SQ.spark(document.getElementById('s-qps'), SQ.wave(24, 2400, 1200, 1), 'var(--chart-1)');
   SQ.spark(document.getElementById('s-lag'), SQ.wave(24, 5000, 3000, 2), 'var(--chart-2)');
-  SQ.spark(document.getElementById('s-fly'), SQ.wave(24, 160, 90, 3), 'var(--warn)');
+  SQ.spark(document.getElementById('s-fly'), SQ.wave(24, 160, 90, 3), 'var(--text-3)');
   SQ.spark(document.getElementById('s-dly'), SQ.wave(24, 1100, 500, 4), 'var(--text-3)');
 
   // 三档范围对应两层数据源：1h 读内存环（5 秒粒度），24h/7d 读 Pebble（分钟粒度取峰值）

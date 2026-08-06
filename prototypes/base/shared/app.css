@@ -57,13 +57,16 @@
   --chart-2:    #0891b2;
   --chart-grid: #f1f1f4;
 
-  /* 带子 */
-  --track:      #ebebef;
-  --track-tick: rgba(9,9,11,.05);
-  --fill-ok:    #34c98d;
-  --fill-warn:  #f0b429;
-  --fill-bad:   #f0685f;
-  --fill-fly:   repeating-linear-gradient(135deg, #cfcbe6 0 3px, #b9b4d8 3px 6px);
+  /* 带子。填充是中性的强调色浅调，不按严重程度换色：带子长度已经表达了
+     落后多少，再上警示黄等于同一件事说两遍，代价是整行都在喊。 */
+  --track:      #efeff3;
+  --track-tick: rgba(9,9,11,.045);
+  --fill-ok:    #bdb6ee;
+  --fill-warn:  #bdb6ee;
+  --fill-bad:   #e6a3a3;
+  --fill-fly:   repeating-linear-gradient(135deg, #d5d0f5 0 3px, #c3bcec 3px 6px);
+  --rail-warn:  #e8b563;
+  --rail-bad:   #e08b8b;
 
   --shadow-1: 0 1px 2px rgba(9,9,11,.04);
   --shadow-2: 0 4px 12px -4px rgba(9,9,11,.10), 0 1px 2px rgba(9,9,11,.04);
@@ -118,10 +121,12 @@
 
   --track:      #1f1f25;
   --track-tick: rgba(255,255,255,.04);
-  --fill-ok:    #2f9e78;
-  --fill-warn:  #c9971f;
-  --fill-bad:   #cf5a52;
-  --fill-fly:   repeating-linear-gradient(135deg, #3d3a54 0 3px, #302d44 3px 6px);
+  --fill-ok:    #5b53a8;
+  --fill-warn:  #5b53a8;
+  --fill-bad:   #8f5252;
+  --fill-fly:   repeating-linear-gradient(135deg, #423b6b 0 3px, #372f5c 3px 6px);
+  --rail-warn:  #8a6a2a;
+  --rail-bad:   #96504e;
 
   --shadow-1: 0 1px 2px rgba(0,0,0,.5);
   --shadow-2: 0 4px 14px -4px rgba(0,0,0,.6), 0 1px 2px rgba(0,0,0,.4);
@@ -326,12 +331,14 @@ tbody tr:last-child td { border-bottom: 0; }
 tbody tr.row { transition: background .1s; }
 tbody tr.row:hover { background: var(--surface-2); cursor: pointer; }
 .m-ok { background: var(--ok); } .m-warn { background: var(--warn); } .m-bad { background: var(--bad); }
-/* 表格 auto 布局会把剩余宽度分给这一列，声明 width 拦不住它，整格上色就成了一大块
-   色块，抢在内容前面被读到。改用渐变只画最左侧 3px，无论单元格被撑多宽都只显示细杠。 */
+/* 行状态条：正常的行不给任何颜色，只有需要例外处理的行才着色，而且用去饱和的
+   色调、2px 宽。满高的饱和绿/红竖条是红绿灯式配色，每行都在喊，反而没有重点。
+   另外表格 auto 布局会把剩余宽度分给这一列，声明 width 拦不住它，整格上色会变成
+   一大块色块，所以用渐变只画最左侧 2px。 */
 td.mark { width: 3px; max-width: 3px; padding: 0; }
-td.mark.m-ok   { background: linear-gradient(90deg, var(--ok)   0 3px, transparent 3px); }
-td.mark.m-warn { background: linear-gradient(90deg, var(--warn) 0 3px, transparent 3px); }
-td.mark.m-bad  { background: linear-gradient(90deg, var(--bad)  0 3px, transparent 3px); }
+td.mark.m-ok   { background: none; }
+td.mark.m-warn { background: linear-gradient(90deg, var(--rail-warn) 0 2px, transparent 2px); }
+td.mark.m-bad  { background: linear-gradient(90deg, var(--rail-bad)  0 2px, transparent 2px); }
 .name { font-size: 13px; font-weight: 500; }
 .name a { text-decoration: none; color: var(--text); }
 .name a:hover { color: var(--accent); }
@@ -369,9 +376,10 @@ td.mono { font-size: 12.5px; white-space: nowrap; }
   content: ''; position: absolute; inset: 0; pointer-events: none;
   background: repeating-linear-gradient(90deg, transparent 0 23px, var(--track-tick) 23px 24px);
 }
+/* 位点标记表示「读到哪了」，是坐标不是状态，所以用中性色而不是绿色 */
 .ribbon .cursor {
   position: absolute; left: 0; top: 0; bottom: 0; width: 2px;
-  background: var(--ok); z-index: 1;
+  background: var(--text-3); opacity: .7; z-index: 1;
 }
 .ribbon .caught {
   position: absolute; left: 9px; top: 50%; transform: translateY(-50%);
