@@ -9,7 +9,7 @@
 //   - QueryAssignment：单机版路由查询，复用 QueryRoute 的 messageQueues
 //
 // 边界：
-//   - Tag 过滤 M1 仅接受 "*"（真实过滤属 M2），不实现投递次数上限/DLQ
+//   - Tag 过滤支持 "*" / 单 tag / "a || b"，SQL92 属性过滤计划 v1.1
 //   - 不直接操作 store/meta 以外的状态，翻译逻辑之外的业务规则全部在
 //     deliver 包（本包不重复实现 attempt 校验、inflight 生命周期等）
 package rpc
@@ -26,6 +26,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/xushixin/sq/internal/core"
+	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
@@ -55,14 +56,23 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 	topic := mq.GetTopic().GetName()
 	queueID := uint32(mq.GetId())
 
-	if fe := req.GetFilterExpression(); fe != nil &&
-		!(fe.GetType() == pb.FilterType_TAG && fe.GetExpression() == "*") {
-		s.logger.Warn("ReceiveMessage 拒绝：不支持的过滤表达式",
-			"group", group, "topic", topic, "queue", queueID,
-			"filter_type", fe.GetType(), "filter_expr", fe.GetExpression())
-		return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
-			Status: errStatus(pb.Code_ILLEGAL_FILTER_EXPRESSION, "M1 仅支持 TAG 过滤表达式 *（M2 支持真实过滤）"),
-		}})
+	// TAG 表达式解析（M2）：支持 "*" / 单 tag / "a || b"。SQL92 → v1.1。
+	var filter *deliver.TagFilter
+	if fe := req.GetFilterExpression(); fe != nil {
+		if fe.GetType() != pb.FilterType_TAG {
+			s.logger.Warn("不支持的过滤类型", "group", group, "topic", topic, "type", fe.GetType())
+			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
+				Status: errStatus(pb.Code_ILLEGAL_FILTER_EXPRESSION, "仅支持 TAG 过滤（SQL92 计划 v1.1）"),
+			}})
+		}
+		f, err := deliver.ParseTagFilter(fe.GetExpression())
+		if err != nil {
+			s.logger.Warn("TAG 表达式非法", "group", group, "topic", topic, "expr", fe.GetExpression(), "err", err)
+			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
+				Status: errStatus(pb.Code_ILLEGAL_FILTER_EXPRESSION, err.Error()),
+			}})
+		}
+		filter = f
 	}
 	invisible := req.GetInvisibleDuration().AsDuration()
 	if invisible <= 0 {
@@ -74,7 +84,7 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 	}
 	wait := s.longPollWait(stream.Context())
 
-	msgs, err := s.dl.Receive(stream.Context(), group, topic, queueID, batch, invisible, wait, nil)
+	msgs, err := s.dl.Receive(stream.Context(), group, topic, queueID, batch, invisible, wait, filter)
 	if err != nil {
 		// deliver.Receive 的错误不是铁板一块，必须按性质分类（同 QueryAssignment
 		// 对 EnsureTopic 错误的分类原则）：

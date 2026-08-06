@@ -502,6 +502,100 @@ func TestAckMessageMalformedHandleEntryIncludesReceiptHandle(t *testing.T) {
 	}
 }
 
+// sendTagged 发送带 tag 的消息（Tag 是 *string，需取址）。
+func sendTagged(t *testing.T, c pb.MessagingServiceClient, topic, body, tag string) {
+	t.Helper()
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic:            &pb.Resource{Name: topic},
+			SystemProperties: &pb.SystemProperties{MessageType: pb.MessageType_NORMAL, Tag: &tag},
+			Body:             []byte(body),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("send: %v %v", resp.GetStatus(), err)
+	}
+}
+
+// receiveQueue 从指定队列收一次，返回消息（helper：给过滤用例复用）。
+// 3s deadline 让空队列长轮询快速返回（服务端 wait=deadline-1s≈2s），
+// 否则无 deadline 时默认长轮询 20s，空队列用例会拖慢整个测试。
+func receiveQueue(t *testing.T, c pb.MessagingServiceClient, group, topic string, q int32, expr string) []*pb.Message {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := c.ReceiveMessage(ctx, &pb.ReceiveMessageRequest{
+		Group:             &pb.Resource{Name: group},
+		MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: topic}, Id: q},
+		FilterExpression:  &pb.FilterExpression{Type: pb.FilterType_TAG, Expression: expr},
+		BatchSize:         16,
+		InvisibleDuration: durationpb.New(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ReceiveMessage: %v", err)
+	}
+	msgs, _ := recvAll(t, stream)
+	return msgs
+}
+
+// TestReceiveTagFilter 8 条消息 tagA/tagB 交替，按 tagA 过滤只收 4 条 A；
+// 被过滤的 B 已被位点跳过，事后用 "*" 也收不到。
+func TestReceiveTagFilter(t *testing.T) {
+	c := newTestClient(t)
+	for i := 0; i < 8; i++ {
+		tag, body := "tagA", "a"
+		if i%2 == 1 {
+			tag, body = "tagB", "b"
+		}
+		sendTagged(t, c, "tf", body, tag)
+	}
+	var got []string
+	for q := int32(0); q < 4; q++ {
+		for _, m := range receiveQueue(t, c, "g-tf", "tf", q, "tagA") {
+			got = append(got, string(m.GetBody()))
+		}
+	}
+	if len(got) != 4 {
+		t.Fatalf("tagA 消息数: %d (%v)", len(got), got)
+	}
+	for _, b := range got {
+		if b != "a" {
+			t.Fatalf("混入非 tagA 消息: %v", got)
+		}
+	}
+	for q := int32(0); q < 4; q++ {
+		if rest := receiveQueue(t, c, "g-tf", "tf", q, "*"); len(rest) != 0 {
+			t.Fatalf("被过滤消息不应可再收: %d", len(rest))
+		}
+	}
+}
+
+// TestReceiveRejectsUnsupportedFilter SQL92 与非法 TAG 表达式返回 ILLEGAL_FILTER_EXPRESSION。
+func TestReceiveRejectsUnsupportedFilter(t *testing.T) {
+	c := newTestClient(t)
+	sendOne(t, c, "tf-bad", "x")
+	cases := []*pb.FilterExpression{
+		{Type: pb.FilterType_SQL, Expression: "a > 1"},
+		{Type: pb.FilterType_TAG, Expression: "a ||"},
+	}
+	for _, fe := range cases {
+		stream, err := c.ReceiveMessage(context.Background(), &pb.ReceiveMessageRequest{
+			Group:             &pb.Resource{Name: "g-bad"},
+			MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: "tf-bad"}, Id: 0},
+			FilterExpression:  fe,
+			BatchSize:         1,
+			InvisibleDuration: durationpb.New(time.Minute),
+		})
+		if err != nil {
+			t.Fatalf("ReceiveMessage: %v", err)
+		}
+		msgs, st := recvAll(t, stream)
+		if len(msgs) != 0 || st.GetCode() != pb.Code_ILLEGAL_FILTER_EXPRESSION {
+			t.Fatalf("期望 ILLEGAL_FILTER_EXPRESSION，得到 %v (msgs=%d)", st, len(msgs))
+		}
+	}
+}
+
 // TestReceiveMessageEmptyPollReportsMessageNotFound 锁定长轮询空结果的协议表述：
 // 必须是一帧 MESSAGE_NOT_FOUND status，且不带任何消息帧。
 //
