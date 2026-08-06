@@ -58,31 +58,35 @@ type BodyDigest struct {
 
 // Message 消息的内部表示。落盘字段见 json tag；DeliveryAttempt 仅投递时填充。
 //
-// BodyEncoding/BodyDigest/BornHost/TraceContext 是"sq 不解释、只负责原样带回"
-// 的生产者属性：写入时从协议里收下，投递时原样还给消费者。少带任何一个都不是
-// 无害的省略——BodyEncoding 丢失会让压缩过的 Body 被消费端当成明文交给应用
+// BodyEncoding/BodyDigest/BornHost/TraceContext/DeliverAtMs 是"sq 不解释、只负责
+// 原样带回"的生产者属性：写入时从协议里收下，投递时原样还给消费者。少带任何一个
+// 都不是无害的省略——BodyEncoding 丢失会让压缩过的 Body 被消费端当成明文交给应用
 // （静默的数据损坏），TraceContext 丢失则让分布式链路在经过 sq 时直接断掉。
 //
 // 这几个字段全部带 omitempty：本结构升级前落盘的消息 JSON 里没有对应的键，
 // encoding/json 对缺失键不做任何写入、保持字段零值，因此旧数据无需迁移即可
 // 继续解码；反过来，未设置这些字段的新消息编码结果与升级前逐字节相同。
 type Message struct {
-	ID              string            `json:"id"`
-	Topic           string            `json:"topic"`
-	QueueID         uint32            `json:"queue_id"`
-	Offset          uint64            `json:"offset"`
-	Tag             string            `json:"tag,omitempty"`
-	Keys            []string          `json:"keys,omitempty"`
-	MessageGroup    string            `json:"message_group,omitempty"`
-	Properties      map[string]string `json:"properties,omitempty"`
-	Body            []byte            `json:"body"`
-	BodyEncoding    BodyEncoding      `json:"body_encoding,omitempty"`
-	BodyDigest      *BodyDigest       `json:"body_digest,omitempty"`
-	BornAtMs        int64             `json:"born_at_ms"`
-	BornHost        string            `json:"born_host,omitempty"`
-	StoreAtMs       int64             `json:"store_at_ms"`
-	TraceContext    string            `json:"trace_context,omitempty"`
-	DeliveryAttempt int32             `json:"-"`
+	ID           string            `json:"id"`
+	Topic        string            `json:"topic"`
+	QueueID      uint32            `json:"queue_id"`
+	Offset       uint64            `json:"offset"`
+	Tag          string            `json:"tag,omitempty"`
+	Keys         []string          `json:"keys,omitempty"`
+	MessageGroup string            `json:"message_group,omitempty"`
+	Properties   map[string]string `json:"properties,omitempty"`
+	Body         []byte            `json:"body"`
+	BodyEncoding BodyEncoding      `json:"body_encoding,omitempty"`
+	BodyDigest   *BodyDigest       `json:"body_digest,omitempty"`
+	BornAtMs     int64             `json:"born_at_ms"`
+	BornHost     string            `json:"born_host,omitempty"`
+	StoreAtMs    int64             `json:"store_at_ms"`
+	// DeliverAtMs 延时消息的到期投递时间（UnixMilli）；0 = 普通消息。
+	// 移入 msg/ 后仍保留：投递时协议层据此回填 MessageType_DELAY 与
+	// DeliveryTimestamp，SDK 消费端才能读到自己当初设置的延时时间。
+	DeliverAtMs     int64  `json:"deliver_at_ms,omitempty"`
+	TraceContext    string `json:"trace_context,omitempty"`
+	DeliveryAttempt int32  `json:"-"`
 }
 
 // EncodeMessage 序列化消息用于落盘。

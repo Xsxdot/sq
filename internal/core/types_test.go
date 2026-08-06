@@ -4,6 +4,7 @@
 package core
 
 import (
+	"bytes"
 	"reflect"
 	"strings"
 	"testing"
@@ -68,6 +69,30 @@ func TestEncodeMessageOmitsUnsetPassthroughFields(t *testing.T) {
 		if strings.Contains(string(b), key) {
 			t.Fatalf("未设置的字段 %q 不应出现在编码结果里: %s", key, b)
 		}
+	}
+}
+
+func TestMessageDeliverAtMsRoundTripAndCompat(t *testing.T) {
+	// 新字段往返
+	m := &Message{ID: "x", Topic: "t", Body: []byte("b"), DeliverAtMs: 12345}
+	raw, err := EncodeMessage(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeMessage(raw)
+	if err != nil || got.DeliverAtMs != 12345 {
+		t.Fatalf("DeliverAtMs 往返失败: %+v %v", got, err)
+	}
+	// 旧数据兼容：M2 及以前落盘的 JSON 没有 deliver_at_ms 键，解码得零值
+	old, err := DecodeMessage([]byte(`{"id":"y","topic":"t","body":"Yg=="}`))
+	if err != nil || old.DeliverAtMs != 0 {
+		t.Fatalf("旧数据兼容失败: %+v %v", old, err)
+	}
+	// 零值不产生新键：普通消息编码结果与升级前逐字节一致
+	m2 := &Message{ID: "z", Topic: "t", Body: []byte("b")}
+	raw2, _ := EncodeMessage(m2)
+	if bytes.Contains(raw2, []byte("deliver_at_ms")) {
+		t.Fatal("零值 DeliverAtMs 不应出现在 JSON 中")
 	}
 }
 
