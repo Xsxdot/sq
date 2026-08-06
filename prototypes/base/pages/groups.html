@@ -1,0 +1,178 @@
+<!--
+  sq 控制台原型 · 消费组列表
+
+  职责：
+    - 列出全部消费组，把该组在所有 topic 上的消费关系聚合成一行读数：
+      订阅数、总落后、总在途、死信、最后消费时间
+    - 行首状态条给一眼可判的健康度；提供删除消费组入口，删除走二次确认
+
+  对应 M5a Admin API：GET /admin/groups、DELETE /admin/groups/{name}
+
+  边界：
+    - 零依赖、纯 mock、file:// 直开；数据只取自 shared/mock.js，页面内不另造假数据
+    - 只做聚合视图，不画 offset 带：不同 topic 的落后量量纲不同，
+      混在一条带子里会误导；逐 topic 的带子在 group-detail.html 里看
+-->
+<meta charset="utf-8">
+<title>sq 控制台 · 消费组</title>
+<link rel="stylesheet" href="../shared/app.css">
+<script src="../shared/mock.js"></script>
+
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><b>sq</b><span>SIMPLE QUEUE</span></div>
+    <nav>
+      <a href="../index.html" class="nav-item">总览</a>
+      <div class="nav-group">资源</div>
+      <a href="topics.html" class="nav-item">Topic</a>
+      <a href="groups.html" class="nav-item active" aria-current="page">消费组</a>
+      <a href="delay.html" class="nav-item">延时队列</a>
+      <div class="nav-group">排查</div>
+      <a href="messages.html" class="nav-item">消息查询</a>
+      <a href="dlq.html" class="nav-item">死信队列</a>
+      <a href="send.html" class="nav-item">发送测试消息</a>
+    </nav>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <span class="page-title">消费组</span>
+      <span class="spacer"></span>
+      <span class="endpoint">127.0.0.1:8081</span>
+      <span class="live"><i class="dot"></i>5s 后刷新</span>
+      <button class="btn">立即刷新</button>
+      <a class="btn" href="login.html">退出登录</a>
+    </header>
+
+    <main class="content">
+      <div class="filters">
+        <input class="search" type="text" id="q" placeholder="按组名过滤，如 notify">
+        <span class="count" id="count"></span>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th style="width:3px"></th>
+            <th>组名</th>
+            <th class="r" style="width:88px">订阅 TOPIC</th>
+            <th class="r" style="width:112px">MAX ATTEMPTS</th>
+            <th class="r" style="width:96px">总落后</th>
+            <th class="r" style="width:72px">总在途</th>
+            <th class="r" style="width:72px">死信</th>
+            <th class="r" style="width:96px">最后消费</th>
+            <th class="r" style="width:72px">操作</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+
+      <div class="empty" id="empty" hidden>
+        <p>没有匹配的消费组</p>
+        <div class="hint">消费组由消费者首次订阅时自动创建，这里只做查看与清理</div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- 删除消费组：会丢掉位点，后果比删 topic 更容易被低估，确认框写清重放影响 -->
+<dialog id="dlg-del">
+  <h3>删除消费组</h3>
+  <div class="dialog-body">
+    <div class="notice bad">
+      <span>即将删除消费组 <b id="del-name"></b>。该操作<b>不可恢复</b>。</span>
+    </div>
+    <div class="kv">
+      <dt>订阅关系</dt>
+      <dd id="del-subs"></dd>
+      <dt>丢弃进度</dt>
+      <dd id="del-progress"></dd>
+    </div>
+    <p class="muted">删除会清除该组的所有消费位点与在途记录；正在运行的消费者一旦重连，
+      会按各 topic 的最早可用位点<b>从头开始消费</b>，历史消息将被重复投递。
+      该组的死信条目也会一并失去归属。请先停掉消费者再执行。</p>
+  </div>
+  <div class="dialog-foot">
+    <button class="btn" type="button" data-close>取消</button>
+    <button class="btn danger" type="button" id="del-confirm">确认删除</button>
+  </div>
+</dialog>
+
+<script>
+  const tbody = document.getElementById('tbody');
+  const emptyBox = document.getElementById('empty');
+  const q = document.getElementById('q');
+
+  // 把一个组在所有 topic 上的消费关系聚合成一行读数
+  function agg(name) {
+    const cs = SQ.byGroup(name);
+    return {
+      subs: cs.length,
+      lag: cs.reduce((s, c) => s + SQ.lagOf(c), 0),
+      fly: cs.reduce((s, c) => s + c.fly, 0),
+      dlq: cs.reduce((s, c) => s + c.dlq, 0),
+      // 组级「最后消费」取各订阅里最近的一次，只要有一条在动就说明组是活的
+      lastMs: cs.length ? Math.max(...cs.map(c => c.lastMs)) : 0,
+      topics: cs.map(c => c.topic),
+    };
+  }
+
+  // 行状态：有死信=异常，总落后超阈值=关注，否则正常。与 SQ.markOf 同一套阈值，
+  // 但这里是组级聚合量，不能直接复用单条消费关系的 markOf。
+  const markOf = a => a.dlq > 0 ? 'm-bad' : a.lag > 500 ? 'm-warn' : 'm-ok';
+
+  function render() {
+    const kw = q.value.trim().toLowerCase();
+    const rows = SQ.groups.filter(g => g.name.toLowerCase().includes(kw));
+    tbody.innerHTML = '';
+
+    rows.forEach(g => {
+      const a = agg(g.name);
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="mark ${markOf(a)}"></td>
+        <td class="name"><a href="group-detail.html?name=${encodeURIComponent(g.name)}">${g.name}</a>
+          <small>${a.topics.join(' · ') || '未订阅任何 topic'}</small></td>
+        <td class="num ${a.subs ? '' : 'zero'}">${a.subs}</td>
+        <td class="num muted">${g.maxAttempts}</td>
+        <td class="num ${a.lag > 500 ? 'bad' : a.lag === 0 ? 'zero' : ''}">${SQ.fmt(a.lag)}</td>
+        <td class="num ${a.fly ? '' : 'zero'}">${SQ.fmt(a.fly)}</td>
+        <td class="num ${a.dlq ? 'bad' : 'zero'}">${SQ.fmt(a.dlq)}</td>
+        <td class="num muted">${a.lastMs ? SQ.ago(a.lastMs) : '—'}</td>
+        <td class="num"><button class="btn danger" data-del="${g.name}">删除</button></td>`;
+      tbody.appendChild(tr);
+    });
+
+    emptyBox.hidden = rows.length > 0;
+    document.getElementById('count').textContent = `${rows.length} / ${SQ.groups.length} 个消费组`;
+  }
+
+  q.addEventListener('input', render);
+  render();
+
+  /* ---------- 删除 ---------- */
+  const dlgDel = document.getElementById('dlg-del');
+  let pending = null;
+
+  tbody.addEventListener('click', e => {
+    const btn = e.target.closest('[data-del]');
+    if (!btn) return;
+    pending = SQ.group(btn.dataset.del);
+    const a = agg(pending.name);
+    document.getElementById('del-name').textContent = pending.name;
+    document.getElementById('del-subs').textContent =
+      a.subs ? `${a.subs} 个 topic：${a.topics.join('、')}` : '当前无订阅关系';
+    document.getElementById('del-progress').textContent =
+      `落后 ${SQ.fmt(a.lag)} 条 · 在途 ${SQ.fmt(a.fly)} 条 · 死信 ${SQ.fmt(a.dlq)} 条`;
+    dlgDel.showModal();
+  });
+
+  document.getElementById('del-confirm').addEventListener('click', () => {
+    dlgDel.close();
+    SQ.notify(`已删除消费组 <b>${pending.name}</b>，其消费位点与在途记录一并清除（mock）`, 'ok');
+    pending = null;
+  });
+
+  document.querySelectorAll('dialog [data-close]').forEach(b =>
+    b.addEventListener('click', () => b.closest('dialog').close()));
+</script>

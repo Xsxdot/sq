@@ -1,0 +1,67 @@
+<!--
+  sq 控制台原型 · 登录
+
+  职责：
+    - 控制台唯一的入口页：校验用户名 / 密码后进入总览
+    - 说明凭据从哪来（broker 配置文件），以及两项留空即免登录的行为
+
+  对应 M5a Admin API：POST /admin/login
+
+  边界：
+    - 零依赖、纯 mock、file:// 直开；不做任何真实鉴权，填了就放行
+    - 不套 .app-shell 外壳：未登录时不应看见侧栏导航，也没有 .content 容器，
+      因此本页不使用 SQ.notify，错误提示直接写进页面上的 .notice 元素
+    - 错误文案统一为「用户名或密码不正确」，不区分是哪一项错，避免账号枚举
+-->
+<meta charset="utf-8">
+<title>sq 控制台 · 登录</title>
+<link rel="stylesheet" href="../shared/app.css">
+<script src="../shared/mock.js"></script>
+
+<div class="login-wrap">
+  <div class="login-card">
+    <div class="brand"><b>sq</b><span>SIMPLE QUEUE</span></div>
+    <p class="login-sub">内嵌运维控制台 · 127.0.0.1:8081</p>
+
+    <div class="notice bad" id="err" hidden>
+      <span>用户名或密码不正确</span>
+    </div>
+
+    <form class="form" id="form-login">
+      <div class="field">
+        <label>用户名</label>
+        <input type="text" name="username" id="username" autocomplete="username" autofocus>
+      </div>
+      <div class="field">
+        <label>密码</label>
+        <input type="password" name="password" id="password" autocomplete="current-password">
+      </div>
+      <button class="btn primary" type="submit" style="width:100%; padding:7px">登录</button>
+    </form>
+
+    <p class="dim" style="margin:16px 0 0; font-size:11.5px">
+      用户名与密码在 broker 配置文件的
+      <span class="mono">admin_username</span> / <span class="mono">admin_password</span> 中设置；
+      两项都留空时控制台免登录。
+    </p>
+  </div>
+</div>
+
+<script>
+  const err = document.getElementById('err');
+
+  document.getElementById('form-login').addEventListener('submit', e => {
+    e.preventDefault();
+    const u = document.getElementById('username').value.trim();
+    const p = document.getElementById('password').value;
+
+    // 原型不做真实校验：两项都填了就当通过。任一为空都用同一句错误文案，
+    // 不提示「用户名不存在」这类信息，防止被用来枚举账号。
+    if (!u || !p) {
+      err.hidden = false;
+      return;
+    }
+    err.hidden = true;
+    location.href = '../index.html';
+  });
+</script>

@@ -1,0 +1,57 @@
+<!--
+  sq 控制台原型 · 外壳样板（供复制，不被引用执行）
+
+  职责：
+    - 提供侧边栏 + 顶部条的唯一结构来源，保证页面间跳转时框架不跳动
+
+  边界：
+    - 本文件不参与运行，只作复制样板
+    - 两套相对路径：根目录的 index.html 用 shared/、pages/ 下的页面用 ../shared/
+
+  用法：
+    1. 整段复制 .app-shell 进页面 <body>
+    2. 改 .page-title；需要面包屑时在标题后加 <span class="crumb">
+    3. 当前页对应的 <a> 加 class="active" + aria-current="page"，其余去掉
+    4. pages/ 下的页面把所有 href 与 src 前面加 ../（index.html 除外，见下）
+-->
+
+<!-- ① 根目录 index.html 用这套路径 -->
+<link rel="stylesheet" href="shared/app.css">
+<script src="shared/mock.js"></script>
+
+<!-- ② pages/ 下的页面用这套路径
+<link rel="stylesheet" href="../shared/app.css">
+<script src="../shared/mock.js"></script>
+-->
+
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><b>sq</b><span>SIMPLE QUEUE</span></div>
+    <nav>
+      <a href="index.html" class="nav-item active" aria-current="page">总览</a>
+      <div class="nav-group">资源</div>
+      <a href="pages/topics.html" class="nav-item">Topic</a>
+      <a href="pages/groups.html" class="nav-item">消费组</a>
+      <a href="pages/delay.html" class="nav-item">延时队列</a>
+      <div class="nav-group">排查</div>
+      <a href="pages/messages.html" class="nav-item">消息查询</a>
+      <a href="pages/dlq.html" class="nav-item">死信队列</a>
+      <a href="pages/send.html" class="nav-item">发送测试消息</a>
+    </nav>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <span class="page-title">当前页标题</span>
+      <span class="spacer"></span>
+      <span class="endpoint">127.0.0.1:8081</span>
+      <span class="live"><i class="dot"></i>5s 后刷新</span>
+      <button class="btn">立即刷新</button>
+      <a class="btn" href="pages/login.html">退出登录</a>
+    </header>
+
+    <main class="content">
+      <!-- 页面主体内容放这里 -->
+    </main>
+  </div>
+</div>

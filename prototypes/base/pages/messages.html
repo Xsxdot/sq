@@ -1,0 +1,237 @@
+<!--
+  sq 控制台原型 · 消息查询
+
+  职责：
+    - 提供两种排查入口：按业务 Keys 检索、按队列 + 起始 offset 顺序浏览
+    - 列出命中的消息摘要，并可展开单条消息的全部字段与消息体
+    - 对应 M5a Admin API：GET /admin/messages
+
+  边界：
+    - 零依赖、纯 mock、file:// 直开，不发任何真实请求
+    - 数据与渲染函数全部来自 shared/mock.js，页面内不另造假数据
+    - 只查不改：不提供在此页重投/删除消息的入口（重投属于死信页）
+    - M5a 不支持按 msgId 精确查询，页面上以 panel-note 明确标注该边界
+-->
+<meta charset="utf-8">
+<title>sq 控制台 · 消息查询</title>
+<link rel="stylesheet" href="../shared/app.css">
+<script src="../shared/mock.js"></script>
+
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><b>sq</b><span>SIMPLE QUEUE</span></div>
+    <nav>
+      <a href="../index.html" class="nav-item">总览</a>
+      <div class="nav-group">资源</div>
+      <a href="topics.html" class="nav-item">Topic</a>
+      <a href="groups.html" class="nav-item">消费组</a>
+      <a href="delay.html" class="nav-item">延时队列</a>
+      <div class="nav-group">排查</div>
+      <a href="messages.html" class="nav-item active" aria-current="page">消息查询</a>
+      <a href="dlq.html" class="nav-item">死信队列</a>
+      <a href="send.html" class="nav-item">发送测试消息</a>
+    </nav>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <span class="page-title">消息查询</span>
+      <span class="spacer"></span>
+      <span class="endpoint">127.0.0.1:8081</span>
+      <span class="live"><i class="dot"></i>5s 后刷新</span>
+      <button class="btn">立即刷新</button>
+      <a class="btn" href="login.html">退出登录</a>
+    </header>
+
+    <main class="content">
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-title">查询条件</span>
+          <span class="panel-note">GET /admin/messages</span>
+        </div>
+        <div class="panel-body">
+          <div class="tabs">
+            <button class="tab active" data-mode="keys">按 Keys 检索</button>
+            <button class="tab" data-mode="queue">按队列浏览</button>
+          </div>
+
+          <form id="form-query">
+            <div class="filters">
+              <select id="q-topic" title="topic"></select>
+
+              <input type="text" id="q-keys" class="search" placeholder="业务 Keys，如 ORD-20260806-8842">
+
+              <select id="q-queue" title="queue_id" hidden></select>
+              <input type="number" id="q-offset" min="0" value="0" title="起始 offset" hidden style="width:120px">
+
+              <input type="number" id="q-limit" min="1" max="200" value="32" title="条数 limit" style="width:78px">
+              <button type="submit" class="btn primary">查询</button>
+              <span class="count" id="count"></span>
+            </div>
+          </form>
+
+          <div class="panel-note" style="margin-top:4px">
+            边界：M5a <b>不支持按 msgId 精确查询</b> —— 那需要额外维护一份全局 msgId 索引，
+            与 retention 按 offset 区间整段删除的存储模型冲突。排查请用 Keys 检索，
+            或已知坐标时按队列 + 起始 offset 顺序浏览。
+          </div>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-title">查询结果</span>
+          <span class="panel-note" id="result-note"></span>
+        </div>
+        <table id="result-table">
+          <thead>
+            <tr>
+              <th style="width:250px">MSG_ID</th>
+              <th style="width:120px">TOPIC</th>
+              <th style="width:110px">QUEUE / OFFSET</th>
+              <th>KEYS</th>
+              <th style="width:80px">TAG</th>
+              <th style="width:78px">类型</th>
+              <th style="width:160px">写入时间</th>
+              <th class="r" style="width:70px">操作</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+        <div id="empty" hidden class="empty">
+          <p>没有命中任何消息</p>
+          <div class="hint">换个 Keys，或改用「按队列浏览」从已知 offset 附近翻</div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- 单条消息详情：全字段 + 原始消息体 -->
+<dialog id="dlg-msg">
+  <h3>消息详情</h3>
+  <div class="dialog-body">
+    <dl class="kv" id="msg-kv"></dl>
+    <div class="detail-head" style="margin-top:16px">消息体 BODY</div>
+    <div class="mono" style="word-break:break-all" id="msg-body"></div>
+  </div>
+  <div class="dialog-foot">
+    <button class="btn" id="msg-close">关闭</button>
+  </div>
+</dialog>
+
+<script>
+  const params = new URLSearchParams(location.search);
+  const selTopic = document.getElementById('q-topic');
+  const selQueue = document.getElementById('q-queue');
+  const elKeys = document.getElementById('q-keys');
+  const elOffset = document.getElementById('q-offset');
+  const elLimit = document.getElementById('q-limit');
+
+  // topic 下拉直接来自 mock 的 topic 列表；URL 带 ?topic= 时预选
+  selTopic.innerHTML = SQ.topics.map(t => `<option value="${t.name}">${t.name}</option>`).join('');
+  const preset = params.get('topic');
+  if (preset && SQ.topic(preset)) selTopic.value = preset;
+
+  // 队列下拉随 topic 变化：不同 topic 的队列数不同，切换后旧 queue_id 可能越界
+  function syncQueues() {
+    const t = SQ.topic(selTopic.value);
+    selQueue.innerHTML = (t ? t.queuesDetail : [])
+      .map(q => `<option value="${q.queueId}">queue ${q.queueId} · 写入头 ${SQ.fmt(q.nextOffset)}</option>`).join('');
+  }
+  selTopic.addEventListener('change', () => { syncQueues(); run(); });
+  syncQueues();
+
+  /* ---------------- 两种查询方式切换 ---------------- */
+  let mode = 'keys';
+  function applyMode() {
+    elKeys.hidden = mode !== 'keys';
+    selQueue.hidden = mode !== 'queue';
+    elOffset.hidden = mode !== 'queue';
+  }
+  document.querySelectorAll('.tab').forEach(tab => {
+    tab.addEventListener('click', () => {
+      document.querySelectorAll('.tab').forEach(x => x.classList.toggle('active', x === tab));
+      mode = tab.dataset.mode;
+      applyMode();
+      run();
+    });
+  });
+  applyMode();
+
+  /* ---------------- 结果渲染 ---------------- */
+  const tbody = document.getElementById('tbody');
+  const table = document.getElementById('result-table');
+  const empty = document.getElementById('empty');
+  let shown = [];
+
+  function query() {
+    const topic = selTopic.value;
+    const limit = Math.max(1, +elLimit.value || 32);
+    let list = SQ.messages.filter(m => m.topic === topic);
+    if (mode === 'keys') {
+      const k = elKeys.value.trim();
+      // Keys 是业务侧写入的检索键，允许一条消息带多个，这里按包含匹配
+      if (k) list = list.filter(m => (m.keys || '').includes(k));
+    } else {
+      const q = +selQueue.value, from = +elOffset.value || 0;
+      list = list.filter(m => m.queueId === q && m.offset >= from)
+                 .sort((a, b) => a.offset - b.offset);
+    }
+    return list.slice(0, limit);
+  }
+
+  function run() {
+    shown = query();
+    tbody.innerHTML = shown.map((m, i) => `
+      <tr>
+        <td class="mono" style="font-size:11px">${m.msgId}</td>
+        <td class="name">${m.topic}</td>
+        <td class="mono muted">${m.queueId} / ${SQ.fmt(m.offset)}</td>
+        <td class="mono">${m.keys || '<span class="dim">—</span>'}</td>
+        <td class="mono muted">${m.tag || '<span class="dim">—</span>'}</td>
+        <td><span class="badge type">${m.type}</span></td>
+        <td class="mono muted">${SQ.time(m.storeAtMs)}</td>
+        <td style="text-align:right"><button class="btn" data-i="${i}">查看</button></td>
+      </tr>`).join('');
+
+    const none = shown.length === 0;
+    table.hidden = none;
+    empty.hidden = !none;
+    document.getElementById('count').textContent = `命中 ${shown.length} 条`;
+    document.getElementById('result-note').textContent = mode === 'keys'
+      ? `topic=${selTopic.value} · 按 Keys 检索 · 最多 ${elLimit.value} 条`
+      : `topic=${selTopic.value} · queue ${selQueue.value} · 自 offset ${elOffset.value} 起 · 最多 ${elLimit.value} 条`;
+  }
+
+  document.getElementById('form-query').addEventListener('submit', e => {
+    e.preventDefault();                       // 原型不连后端，就地在内存里过滤
+    run();
+    SQ.notify(`已按当前条件查询（mock）`, 'ok');
+  });
+
+  /* ---------------- 单条详情 ---------------- */
+  const dlg = document.getElementById('dlg-msg');
+  tbody.addEventListener('click', e => {
+    const btn = e.target.closest('button[data-i]');
+    if (!btn) return;
+    const m = shown[+btn.dataset.i];
+    document.getElementById('msg-kv').innerHTML = `
+      <dt>MSG_ID</dt><dd>${m.msgId}</dd>
+      <dt>TOPIC</dt><dd>${m.topic}</dd>
+      <dt>QUEUE</dt><dd>${m.queueId}</dd>
+      <dt>OFFSET</dt><dd>${SQ.fmt(m.offset)}</dd>
+      <dt>KEYS</dt><dd>${m.keys || '—'}</dd>
+      <dt>TAG</dt><dd>${m.tag || '—'}</dd>
+      <dt>类型</dt><dd><span class="badge type">${m.type}</span></dd>
+      <dt>生产时间</dt><dd>${SQ.time(m.bornAtMs)}</dd>
+      <dt>写入时间</dt><dd>${SQ.time(m.storeAtMs)} <span class="dim">(${SQ.ago(m.storeAtMs)})</span></dd>
+      ${m.deliverAtMs ? `<dt>投递时间</dt><dd>${SQ.time(m.deliverAtMs)} <span class="dim">(${SQ.until(m.deliverAtMs)})</span></dd>` : ''}
+      ${m.group ? `<dt>顺序分组</dt><dd>${m.group}</dd>` : ''}`;
+    document.getElementById('msg-body').textContent = m.body;
+    dlg.showModal();
+  });
+  document.getElementById('msg-close').addEventListener('click', () => dlg.close());
+
+  run();
+</script>
