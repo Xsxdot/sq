@@ -55,3 +55,44 @@ func TestInflightKeyRoundTrip(t *testing.T) {
 		t.Fatalf("round trip: %v %v %v %v %v", g, topic, q, off, err)
 	}
 }
+
+func TestKeyIdxKeyRoundTrip(t *testing.T) {
+	k := KeyIdxKey("orders", "oid-1", 1700000000000, 3, 42)
+	topic, key, ms, q, off, err := ParseKeyIdxKey(k)
+	if err != nil || topic != "orders" || key != "oid-1" || ms != 1700000000000 || q != 3 || off != 42 {
+		t.Fatalf("round trip: %v %v %v %v %v %v", topic, key, ms, q, off, err)
+	}
+}
+
+// TestKeyIdxKeyWithSlashInKey 用户 key 可含 '/'：必须尾部定长解析，不能 Split。
+func TestKeyIdxKeyWithSlashInKey(t *testing.T) {
+	k := KeyIdxKey("t", "a/b/c", 1, 0, 7)
+	_, key, _, _, off, err := ParseKeyIdxKey(k)
+	if err != nil || key != "a/b/c" || off != 7 {
+		t.Fatalf("含 '/' 的 key: %v %v %v", key, off, err)
+	}
+}
+
+// TestKeyIdxPrefixNoFalseMatch key "oid" 的查询前缀不得命中 "oid2"；
+// 命中 "oid/x"（路径前缀伪命中）时能靠剩余长度 != 20 区分。
+func TestKeyIdxPrefixNoFalseMatch(t *testing.T) {
+	p := KeyIdxKeyPrefix("t", "oid")
+	if bytes.HasPrefix(KeyIdxKey("t", "oid2", 1, 0, 1), p) {
+		t.Fatal("前缀误匹配 oid2")
+	}
+	sub := KeyIdxKey("t", "oid/x", 1, 0, 1)
+	if !bytes.HasPrefix(sub, p) {
+		t.Fatal("测试前提不成立：oid/x 应落在 oid/ 前缀区间")
+	}
+	if len(sub)-len(p) == 20 {
+		t.Fatal("应能靠剩余长度区分子路径 key")
+	}
+}
+
+func TestParseKeyIdxKeyRejectsGarbage(t *testing.T) {
+	for _, bad := range [][]byte{[]byte("keyidx/"), []byte("keyidx/t"), []byte("keyidx/t/short"), []byte("msg/t/x")} {
+		if _, _, _, _, _, err := ParseKeyIdxKey(bad); err == nil {
+			t.Fatalf("应拒绝非法 key %q", bad)
+		}
+	}
+}

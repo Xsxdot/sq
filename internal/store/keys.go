@@ -24,6 +24,7 @@ const (
 	allocPrefix     = "alloc/"
 	cursorPrefix    = "cursor/"
 	inflightPrefix  = "inflight/"
+	keyIdxPrefix    = "keyidx/"
 )
 
 // PutU64 大端编码。
@@ -160,4 +161,58 @@ func PrefixUpperBound(prefix []byte) []byte {
 		}
 	}
 	return nil
+}
+
+// KeyIdxKey Keys 业务索引：keyidx/{topic}/{key}/{storeMs:8B}{queueID:4B}{offset:8B}，值为空。
+//
+// 注意：key 是用户任意字符串（可含 '/'，与 topic/group 名不同），
+// 解析必须从尾部定长回推（见 ParseKeyIdxKey），不能按 '/' 分割。
+// storeMs 用消息 StoreAtMs：同一 key 多条消息按写入时间排序，retention 清理同用此值。
+func KeyIdxKey(topic, key string, storeMs int64, queueID uint32, offset uint64) []byte {
+	k := make([]byte, 0, len(keyIdxPrefix)+len(topic)+1+len(key)+1+20)
+	k = append(k, keyIdxPrefix...)
+	k = append(k, topic...)
+	k = append(k, '/')
+	k = append(k, key...)
+	k = append(k, '/')
+	k = append(k, PutU64(uint64(storeMs))...)
+	k = append(k, putU32(queueID)...)
+	k = append(k, PutU64(offset)...)
+	return k
+}
+
+// KeyIdxKeyPrefix 按 (topic, key) 精确查询的扫描下界（含末尾 '/'）。
+// 区间内可能混入「以本 key 为路径前缀」的其他 key（如查 "a" 命中 "a/b"），
+// 调用方须用 ParseKeyIdxKey 成功 + key 等值过滤（见 query.ByKey）。
+func KeyIdxKeyPrefix(topic, key string) []byte {
+	k := KeyIdxKey(topic, key, 0, 0, 0)
+	return k[:len(k)-20]
+}
+
+// KeyIdxTopicPrefix 某 topic 全部索引的扫描下界（retention 清理用）。
+func KeyIdxTopicPrefix(topic string) []byte {
+	return []byte(keyIdxPrefix + topic + "/")
+}
+
+// ParseKeyIdxKey 解析索引 key。key 段可能含 '/'，因此从尾部回推：
+// 末 20 字节为定长二进制（8B storeMs + 4B queueID + 8B offset），其前必须是 '/'；
+// topic 后第一个 '/' 与该分隔符之间的全部内容为 key。
+func ParseKeyIdxKey(k []byte) (topic, key string, storeMs int64, queueID uint32, offset uint64, err error) {
+	rest, ok := bytes.CutPrefix(k, []byte(keyIdxPrefix))
+	if !ok {
+		return "", "", 0, 0, 0, fmt.Errorf("非法 keyidx key: %q", k)
+	}
+	i := bytes.IndexByte(rest, '/')
+	if i < 0 {
+		return "", "", 0, 0, 0, fmt.Errorf("keyidx key 结构错误: %q", k)
+	}
+	topic = string(rest[:i])
+	rest = rest[i+1:]
+	if len(rest) < 1+20 || rest[len(rest)-21] != '/' {
+		return "", "", 0, 0, 0, fmt.Errorf("keyidx key 结构错误: %q", k)
+	}
+	key = string(rest[:len(rest)-21])
+	bin := rest[len(rest)-20:]
+	return topic, key, int64(binary.BigEndian.Uint64(bin[:8])),
+		binary.BigEndian.Uint32(bin[8:12]), binary.BigEndian.Uint64(bin[12:]), nil
 }
