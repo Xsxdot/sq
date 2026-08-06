@@ -76,3 +76,25 @@ func TestGroupProgressAndResetCursor(t *testing.T) {
 		t.Fatal("组注册表应已删除")
 	}
 }
+
+// queue_id 越界的位点重置应 400，而不是写入孤儿 cursor 键（会在组进度里显示为幽灵队列）。
+func TestGroupResetCursorQueueOutOfRange(t *testing.T) {
+	s, _, mt, _, _ := newTestServer(t, "", "")
+	h := s.Handler()
+	if _, err := mt.CreateTopic("t1", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := mt.EnsureGroup("g1"); err != nil {
+		t.Fatal(err)
+	}
+	// 1 队列 topic 上重置 queue_id=99 → 400
+	if w := doJSON(t, h, "POST", "/admin/groups/g1/reset-cursor", "",
+		map[string]any{"topic": "t1", "queue_id": 99, "offset": 0}); w.Code != http.StatusBadRequest {
+		t.Fatalf("queue_id 越界应 400，得到 %d body=%s", w.Code, w.Body)
+	}
+	// 合法边界值 queue_id=0 不受影响 → 204
+	if w := doJSON(t, h, "POST", "/admin/groups/g1/reset-cursor", "",
+		map[string]any{"topic": "t1", "queue_id": 0, "offset": 0}); w.Code != http.StatusNoContent {
+		t.Fatalf("合法 queue_id 应 204，得到 %d body=%s", w.Code, w.Body)
+	}
+}

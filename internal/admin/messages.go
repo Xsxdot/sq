@@ -60,12 +60,12 @@ func (s *Server) handleMessagesQuery(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
 	topic := q.Get("topic")
 	if topic == "" {
-		httpError(w, http.StatusBadRequest, "缺少 topic 参数")
+		s.httpError(w, http.StatusBadRequest, "缺少 topic 参数")
 		return
 	}
 	limit64, err := queryUint(r, "limit", 0)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, "limit 非法: %v", err)
+		s.httpError(w, http.StatusBadRequest, "limit 非法: %v", err)
 		return
 	}
 	var msgs []*core.Message
@@ -74,35 +74,35 @@ func (s *Server) handleMessagesQuery(w http.ResponseWriter, r *http.Request) {
 	} else if q.Get("queue_id") != "" {
 		var qid, from uint64
 		if qid, err = queryUint(r, "queue_id", 0); err != nil {
-			httpError(w, http.StatusBadRequest, "queue_id 非法: %v", err)
+			s.httpError(w, http.StatusBadRequest, "queue_id 非法: %v", err)
 			return
 		}
 		if from, err = queryUint(r, "from_offset", 0); err != nil {
-			httpError(w, http.StatusBadRequest, "from_offset 非法: %v", err)
+			s.httpError(w, http.StatusBadRequest, "from_offset 非法: %v", err)
 			return
 		}
 		msgs, err = query.Browse(s.st, topic, uint32(qid), from, int(limit64))
 	} else {
-		httpError(w, http.StatusBadRequest, "必须提供 key（Keys 查询）或 queue_id（顺序浏览）之一")
+		s.httpError(w, http.StatusBadRequest, "必须提供 key（Keys 查询）或 queue_id（顺序浏览）之一")
 		return
 	}
 	if err != nil {
 		s.logger.Error("admin 消息查询失败", "topic", topic, "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	out := make([]msgJSON, 0, len(msgs))
 	for _, m := range msgs {
 		out = append(out, toMsgJSON(m))
 	}
-	writeJSON(w, http.StatusOK, out)
+	s.writeJSON(w, http.StatusOK, out)
 }
 
 // handleMessageSend POST /admin/messages/send：控制台"发送测试消息"。
 // 与 gRPC 写路径同受磁盘水位拒写约束——管理面不该有绕过保护的后门。
 func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 	if s.writeBlocked != nil && s.writeBlocked.Load() {
-		httpError(w, http.StatusServiceUnavailable, "磁盘水位超限，写入已暂停")
+		s.httpError(w, http.StatusServiceUnavailable, "磁盘水位超限，写入已暂停")
 		return
 	}
 	var req struct {
@@ -111,15 +111,15 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 		Tag   string   `json:"tag"`
 		Keys  []string `json:"keys"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Topic == "" {
-		httpError(w, http.StatusBadRequest, "缺少 topic")
+		s.httpError(w, http.StatusBadRequest, "缺少 topic")
 		return
 	}
 	if _, err := s.mt.EnsureTopic(req.Topic); err != nil {
-		httpError(w, http.StatusBadRequest, "topic 不可用: %v", err)
+		s.httpError(w, http.StatusBadRequest, "topic 不可用: %v", err)
 		return
 	}
 	now := time.Now().UnixMilli()
@@ -130,12 +130,12 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 	m, err := s.pr.Append(m)
 	if err != nil {
 		s.logger.Error("admin 测试消息发送失败", "topic", req.Topic, "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	s.logger.Info("admin 测试消息已发送", "topic", req.Topic, "msg_id", m.ID,
 		"queue", m.QueueID, "offset", m.Offset)
-	writeJSON(w, http.StatusCreated, map[string]any{
+	s.writeJSON(w, http.StatusCreated, map[string]any{
 		"msg_id": m.ID, "queue_id": m.QueueID, "offset": m.Offset,
 	})
 }
@@ -145,7 +145,7 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 // 行为一致。
 func (s *Server) handleDLQResend(w http.ResponseWriter, r *http.Request) {
 	if s.writeBlocked != nil && s.writeBlocked.Load() {
-		httpError(w, http.StatusServiceUnavailable, "磁盘水位超限，写入已暂停")
+		s.httpError(w, http.StatusServiceUnavailable, "磁盘水位超限，写入已暂停")
 		return
 	}
 	group := r.PathValue("group")
@@ -153,34 +153,34 @@ func (s *Server) handleDLQResend(w http.ResponseWriter, r *http.Request) {
 		QueueID uint32 `json:"queue_id"`
 		Offset  uint64 `json:"offset"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 	dlqTopic := meta.DLQTopicName(group)
 	raw, ok, err := s.st.Get(store.MsgKey(dlqTopic, req.QueueID, req.Offset))
 	if err != nil {
 		s.logger.Error("admin 读死信失败", "group", group, "offset", req.Offset, "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	if !ok {
-		httpError(w, http.StatusNotFound, "死信不存在 (dlq=%s q=%d off=%d)", dlqTopic, req.QueueID, req.Offset)
+		s.httpError(w, http.StatusNotFound, "死信不存在 (dlq=%s q=%d off=%d)", dlqTopic, req.QueueID, req.Offset)
 		return
 	}
 	m, err := core.DecodeMessage(raw)
 	if err != nil {
 		s.logger.Error("admin 死信解码失败", "group", group, "offset", req.Offset, "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	origin := m.Properties["sq-origin-topic"]
 	if origin == "" {
 		// 老死信或手工放入的消息没有溯源属性——没有目的地，重发无从谈起
-		httpError(w, http.StatusUnprocessableEntity, "死信缺少 sq-origin-topic 溯源属性，无法定位原 topic")
+		s.httpError(w, http.StatusUnprocessableEntity, "死信缺少 sq-origin-topic 溯源属性，无法定位原 topic")
 		return
 	}
 	if _, err := s.mt.EnsureTopic(origin); err != nil {
-		httpError(w, http.StatusBadRequest, "原 topic %s 不可用: %v", origin, err)
+		s.httpError(w, http.StatusBadRequest, "原 topic %s 不可用: %v", origin, err)
 		return
 	}
 	// ID 保留：全链路追踪同一条消息；Properties 保留溯源坐标（再次超限入 DLQ
@@ -192,12 +192,12 @@ func (s *Server) handleDLQResend(w http.ResponseWriter, r *http.Request) {
 	resend, err = s.pr.Append(resend)
 	if err != nil {
 		s.logger.Error("admin 死信重发失败", "group", group, "origin", origin, "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	s.logger.Info("admin 死信已重发", "group", group, "msg_id", resend.ID,
 		"origin_topic", origin, "queue", resend.QueueID, "offset", resend.Offset)
-	writeJSON(w, http.StatusCreated, map[string]any{
+	s.writeJSON(w, http.StatusCreated, map[string]any{
 		"msg_id": resend.ID, "topic": origin, "queue_id": resend.QueueID, "offset": resend.Offset,
 	})
 }
@@ -206,7 +206,7 @@ func (s *Server) handleDLQResend(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleDelayList(w http.ResponseWriter, r *http.Request) {
 	limit64, err := queryUint(r, "limit", 64)
 	if err != nil {
-		httpError(w, http.StatusBadRequest, "limit 非法: %v", err)
+		s.httpError(w, http.StatusBadRequest, "limit 非法: %v", err)
 		return
 	}
 	type delayEntry struct {
@@ -233,10 +233,10 @@ func (s *Server) handleDelayList(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		s.logger.Error("admin 延时视图扫描失败", "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, out)
+	s.writeJSON(w, http.StatusOK, out)
 }
 
 // handleOverview GET /admin/overview：总览计数（复用 metrics.Collect，
@@ -245,7 +245,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	st, err := metrics.Collect(s.st, s.mt)
 	if err != nil {
 		s.logger.Error("admin 总览采集失败", "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	var written, pending uint64
@@ -259,7 +259,7 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	for _, n := range st.Inflight {
 		inflight += n
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	s.writeJSON(w, http.StatusOK, map[string]any{
 		"topics": st.Topics, "groups": st.Groups, "delay_depth": st.DelayDepth,
 		"total_written": written, "total_pending": pending, "total_inflight": inflight,
 	})

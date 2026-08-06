@@ -26,33 +26,33 @@ const tokenTTL = 24 * time.Hour
 // 不泄露"用户名对不对"这一位信息。
 func (s *Server) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if s.username == "" {
-		httpError(w, http.StatusBadRequest, "服务端未配置登录，无需认证")
+		s.httpError(w, http.StatusBadRequest, "服务端未配置登录，无需认证")
 		return
 	}
 	var req struct {
 		Username string `json:"username"`
 		Password string `json:"password"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 	userOK := subtle.ConstantTimeCompare([]byte(req.Username), []byte(s.username)) == 1
 	passOK := subtle.ConstantTimeCompare([]byte(req.Password), []byte(s.password)) == 1
 	if !userOK || !passOK {
 		s.logger.Warn("admin 登录失败", "username", req.Username, "remote", r.RemoteAddr)
-		httpError(w, http.StatusUnauthorized, "用户名或密码错误")
+		s.httpError(w, http.StatusUnauthorized, "用户名或密码错误")
 		return
 	}
 	buf := make([]byte, 32)
 	if _, err := rand.Read(buf); err != nil {
 		s.logger.Error("生成登录 token 失败", "err", err)
-		httpError(w, http.StatusInternalServerError, "生成 token 失败")
+		s.httpError(w, http.StatusInternalServerError, "生成 token 失败")
 		return
 	}
 	token := hex.EncodeToString(buf)
 	s.tokens.Store(token, time.Now().Add(tokenTTL))
 	s.logger.Info("admin 登录成功", "username", req.Username, "remote", r.RemoteAddr)
-	writeJSON(w, http.StatusOK, map[string]string{"token": token})
+	s.writeJSON(w, http.StatusOK, map[string]string{"token": token})
 }
 
 // protected 包装需要登录的 handler。未配置用户名密码 = 免登录直通（默认关闭语义）。
@@ -64,19 +64,19 @@ func (s *Server) protected(h http.HandlerFunc) http.HandlerFunc {
 		}
 		token, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		if !ok || token == "" {
-			httpError(w, http.StatusUnauthorized, "缺少 Bearer token，请先 POST /admin/login")
+			s.httpError(w, http.StatusUnauthorized, "缺少 Bearer token，请先 POST /admin/login")
 			return
 		}
 		exp, found := s.tokens.Load(token)
 		if !found {
-			httpError(w, http.StatusUnauthorized, "token 无效")
+			s.httpError(w, http.StatusUnauthorized, "token 无效")
 			return
 		}
 		if time.Now().After(exp.(time.Time)) {
 			// 惰性清理：过期 token 在下次被使用时删除，无后台清扫协程——
 			// token 量级 = 登录次数，单机管理面不会累积成内存问题
 			s.tokens.Delete(token)
-			httpError(w, http.StatusUnauthorized, "token 已过期，请重新登录")
+			s.httpError(w, http.StatusUnauthorized, "token 已过期，请重新登录")
 			return
 		}
 		h(w, r)

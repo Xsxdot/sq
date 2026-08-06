@@ -27,7 +27,7 @@ func (s *Server) handleGroupsList(w http.ResponseWriter, r *http.Request) {
 	for _, gc := range gcs {
 		out = append(out, groupJSON{Name: gc.Name, MaxAttempts: gc.EffectiveMaxAttempts(), CreatedAtMs: gc.CreatedAtMs})
 	}
-	writeJSON(w, http.StatusOK, out)
+	s.writeJSON(w, http.StatusOK, out)
 }
 
 // queueProgress 单队列消费进度。
@@ -45,7 +45,7 @@ func (s *Server) handleGroupGet(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	gc, ok := s.mt.GetGroup(name)
 	if !ok {
-		httpError(w, http.StatusNotFound, "消费组 %s 不存在", name)
+		s.httpError(w, http.StatusNotFound, "消费组 %s 不存在", name)
 		return
 	}
 	byTopic := map[string][]queueProgress{}
@@ -78,7 +78,7 @@ func (s *Server) handleGroupGet(w http.ResponseWriter, r *http.Request) {
 	})
 	if err != nil {
 		s.logger.Error("admin 组进度推导失败", "group", name, "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	type topicProgress struct {
@@ -91,7 +91,7 @@ func (s *Server) handleGroupGet(w http.ResponseWriter, r *http.Request) {
 		topics = append(topics, topicProgress{Topic: tp, Queues: qs})
 	}
 	sort.Slice(topics, func(i, j int) bool { return topics[i].Topic < topics[j].Topic })
-	writeJSON(w, http.StatusOK, struct {
+	s.writeJSON(w, http.StatusOK, struct {
 		Name        string          `json:"name"`
 		MaxAttempts int32           `json:"max_attempts"`
 		Topics      []topicProgress `json:"topics"`
@@ -103,7 +103,7 @@ func (s *Server) handleGroupGet(w http.ResponseWriter, r *http.Request) {
 func (s *Server) handleGroupResetCursor(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if _, ok := s.mt.GetGroup(name); !ok {
-		httpError(w, http.StatusNotFound, "消费组 %s 不存在", name)
+		s.httpError(w, http.StatusNotFound, "消费组 %s 不存在", name)
 		return
 	}
 	var req struct {
@@ -111,17 +111,23 @@ func (s *Server) handleGroupResetCursor(w http.ResponseWriter, r *http.Request) 
 		QueueID uint32 `json:"queue_id"`
 		Offset  uint64 `json:"offset"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
-	if _, ok := s.mt.GetTopic(req.Topic); !ok {
-		httpError(w, http.StatusNotFound, "topic %s 不存在", req.Topic)
+	tc, ok := s.mt.GetTopic(req.Topic)
+	if !ok {
+		s.httpError(w, http.StatusNotFound, "topic %s 不存在", req.Topic)
+		return
+	}
+	// queue_id 越界会写入永远无人消费的孤儿 cursor 键，在组进度里显示为幽灵队列
+	if req.QueueID >= tc.Queues {
+		s.httpError(w, http.StatusBadRequest, "queue_id 越界: topic %s 共 %d 个队列，得到 %d", req.Topic, tc.Queues, req.QueueID)
 		return
 	}
 	if err := s.dl.ResetCursor(name, req.Topic, req.QueueID, req.Offset); err != nil {
 		s.logger.Error("admin 位点重置失败", "group", name, "topic", req.Topic,
 			"queue", req.QueueID, "offset", req.Offset, "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	s.logger.Info("admin 位点重置", "group", name, "topic", req.Topic,
@@ -133,17 +139,17 @@ func (s *Server) handleGroupResetCursor(w http.ResponseWriter, r *http.Request) 
 func (s *Server) handleGroupDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	if _, ok := s.mt.GetGroup(name); !ok {
-		httpError(w, http.StatusNotFound, "消费组 %s 不存在", name)
+		s.httpError(w, http.StatusNotFound, "消费组 %s 不存在", name)
 		return
 	}
 	if err := adminops.PurgeGroupData(s.st, name, s.logger); err != nil {
 		s.logger.Error("admin 清理组数据失败", "group", name, "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	if err := s.mt.DeleteGroup(name); err != nil && !errors.Is(err, meta.ErrGroupNotFound) {
 		s.logger.Error("admin 删除组注册表失败", "group", name, "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	s.logger.Info("admin 删除消费组", "group", name)

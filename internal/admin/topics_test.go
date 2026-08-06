@@ -81,3 +81,18 @@ func TestTopicCRUD(t *testing.T) {
 		t.Fatalf("重复删除应 404，得到 %d", w.Code)
 	}
 }
+
+// 创建时负 retention_ms 应 400（与 PATCH 校验对齐），0 保持原语义（用默认值）。
+func TestTopicCreateNegativeRetention(t *testing.T) {
+	s, _, _, _, _ := newTestServer(t, "", "")
+	h := s.Handler()
+	if w := doJSON(t, h, "POST", "/admin/topics", "",
+		map[string]any{"name": "t1", "queues": 1, "retention_ms": -1}); w.Code != http.StatusBadRequest {
+		t.Fatalf("负 retention_ms 应 400，得到 %d body=%s", w.Code, w.Body)
+	}
+	// retention_ms=0 创建成功（走默认 retention）
+	if w := doJSON(t, h, "POST", "/admin/topics", "",
+		map[string]any{"name": "t1", "queues": 1, "retention_ms": 0}); w.Code != http.StatusCreated {
+		t.Fatalf("retention_ms=0 应 201，得到 %d body=%s", w.Code, w.Body)
+	}
+}

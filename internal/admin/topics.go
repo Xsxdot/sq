@@ -32,7 +32,7 @@ func (s *Server) handleTopicsList(w http.ResponseWriter, r *http.Request) {
 		out = append(out, topicJSON{Name: tc.Name, Queues: tc.Queues,
 			RetentionMs: tc.RetentionMs, CreatedAtMs: tc.CreatedAtMs})
 	}
-	writeJSON(w, http.StatusOK, out)
+	s.writeJSON(w, http.StatusOK, out)
 }
 
 // handleTopicCreate POST /admin/topics。409 语义：CreateTopic 本身幂等返回旧配置，
@@ -43,36 +43,40 @@ func (s *Server) handleTopicCreate(w http.ResponseWriter, r *http.Request) {
 		Queues      uint32 `json:"queues"`
 		RetentionMs int64  `json:"retention_ms"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !s.decodeJSON(w, r, &req) {
+		return
+	}
+	if req.RetentionMs < 0 {
+		s.httpError(w, http.StatusBadRequest, "retention_ms 不能为负，得到 %d（0 表示用默认）", req.RetentionMs)
 		return
 	}
 	if req.Queues < 1 || req.Queues > config.MaxDefaultQueueNums {
-		httpError(w, http.StatusBadRequest, "queues 必须在 1..%d，得到 %d", config.MaxDefaultQueueNums, req.Queues)
+		s.httpError(w, http.StatusBadRequest, "queues 必须在 1..%d，得到 %d", config.MaxDefaultQueueNums, req.Queues)
 		return
 	}
 	if _, ok := s.mt.GetTopic(req.Name); ok {
-		httpError(w, http.StatusConflict, "topic %s 已存在", req.Name)
+		s.httpError(w, http.StatusConflict, "topic %s 已存在", req.Name)
 		return
 	}
 	tc, err := s.mt.CreateTopic(req.Name, req.Queues)
 	if err != nil {
 		if errors.Is(err, meta.ErrBadName) {
-			httpError(w, http.StatusBadRequest, "%v", err)
+			s.httpError(w, http.StatusBadRequest, "%v", err)
 			return
 		}
 		s.logger.Error("admin 创建 topic 失败", "topic", req.Name, "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	if req.RetentionMs > 0 {
 		if tc, err = s.mt.UpdateTopicRetention(req.Name, req.RetentionMs); err != nil {
 			s.logger.Error("admin 设置 retention 失败", "topic", req.Name, "err", err)
-			httpError(w, http.StatusInternalServerError, "%v", err)
+			s.httpError(w, http.StatusInternalServerError, "%v", err)
 			return
 		}
 	}
 	s.logger.Info("admin 创建 topic", "topic", tc.Name, "queues", tc.Queues, "retention_ms", tc.RetentionMs)
-	writeJSON(w, http.StatusCreated, topicJSON{Name: tc.Name, Queues: tc.Queues,
+	s.writeJSON(w, http.StatusCreated, topicJSON{Name: tc.Name, Queues: tc.Queues,
 		RetentionMs: tc.RetentionMs, CreatedAtMs: tc.CreatedAtMs})
 }
 
@@ -81,7 +85,7 @@ func (s *Server) handleTopicGet(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	tc, ok := s.mt.GetTopic(name)
 	if !ok {
-		httpError(w, http.StatusNotFound, "topic %s 不存在", name)
+		s.httpError(w, http.StatusNotFound, "topic %s 不存在", name)
 		return
 	}
 	type queueDetail struct {
@@ -94,7 +98,7 @@ func (s *Server) handleTopicGet(w http.ResponseWriter, r *http.Request) {
 		raw, ok, err := s.st.Get(store.AllocKey(name, q))
 		if err != nil {
 			s.logger.Error("admin 读 alloc 失败", "topic", name, "queue", q, "err", err)
-			httpError(w, http.StatusInternalServerError, "%v", err)
+			s.httpError(w, http.StatusInternalServerError, "%v", err)
 			return
 		}
 		if ok {
@@ -102,7 +106,7 @@ func (s *Server) handleTopicGet(w http.ResponseWriter, r *http.Request) {
 		}
 		qs = append(qs, queueDetail{QueueID: q, NextOffset: next})
 	}
-	writeJSON(w, http.StatusOK, struct {
+	s.writeJSON(w, http.StatusOK, struct {
 		topicJSON
 		QueuesDetail []queueDetail `json:"queues_detail"`
 	}{topicJSON{Name: tc.Name, Queues: tc.Queues, RetentionMs: tc.RetentionMs, CreatedAtMs: tc.CreatedAtMs}, qs})
@@ -114,24 +118,24 @@ func (s *Server) handleTopicPatch(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		RetentionMs int64 `json:"retention_ms"`
 	}
-	if !decodeJSON(w, r, &req) {
+	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 	if req.RetentionMs <= 0 {
-		httpError(w, http.StatusBadRequest, "retention_ms 必须 >0")
+		s.httpError(w, http.StatusBadRequest, "retention_ms 必须 >0")
 		return
 	}
 	tc, err := s.mt.UpdateTopicRetention(name, req.RetentionMs)
 	if err != nil {
 		if errors.Is(err, meta.ErrTopicNotFound) {
-			httpError(w, http.StatusNotFound, "%v", err)
+			s.httpError(w, http.StatusNotFound, "%v", err)
 			return
 		}
 		s.logger.Error("admin 更新 retention 失败", "topic", name, "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	writeJSON(w, http.StatusOK, topicJSON{Name: tc.Name, Queues: tc.Queues,
+	s.writeJSON(w, http.StatusOK, topicJSON{Name: tc.Name, Queues: tc.Queues,
 		RetentionMs: tc.RetentionMs, CreatedAtMs: tc.CreatedAtMs})
 }
 
@@ -141,17 +145,17 @@ func (s *Server) handleTopicDelete(w http.ResponseWriter, r *http.Request) {
 	name := r.PathValue("name")
 	tc, ok := s.mt.GetTopic(name)
 	if !ok {
-		httpError(w, http.StatusNotFound, "topic %s 不存在", name)
+		s.httpError(w, http.StatusNotFound, "topic %s 不存在", name)
 		return
 	}
 	if err := adminops.PurgeTopicData(s.st, tc, s.logger); err != nil {
 		s.logger.Error("admin 清理 topic 数据失败", "topic", name, "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	if err := s.mt.DeleteTopic(name); err != nil {
 		s.logger.Error("admin 删除 topic 注册表失败", "topic", name, "err", err)
-		httpError(w, http.StatusInternalServerError, "%v", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	s.logger.Info("admin 删除 topic", "topic", name)
