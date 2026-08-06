@@ -37,13 +37,16 @@ func Open(dir string, syncWrites bool, logger *slog.Logger) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("打开 Pebble(%s): %w", dir, err)
 	}
-	logger.Info("store 已打开", "mod", "store", "dir", dir, "sync", syncWrites)
-	return &Store{db: db, sync: syncWrites, logger: logger}, nil
+	// mod 一次性绑在 logger 上（与 meta/produce/deliver/rpc 各包的做法一致），
+	// 之后各调用点不再逐条重复这对键值。
+	l := logger.With("mod", "store")
+	l.Info("store 已打开", "dir", dir, "sync", syncWrites)
+	return &Store{db: db, sync: syncWrites, logger: l}, nil
 }
 
 // Close 关闭底层库。之后任何操作都会 panic（Pebble 语义），不做二次防护。
 func (s *Store) Close() error {
-	s.logger.Info("store 关闭", "mod", "store")
+	s.logger.Info("store 关闭")
 	return s.db.Close()
 }
 
@@ -62,14 +65,29 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 }
 
 // NewBatch 创建写批次。批次有两条合法的终止路径，且仅能选一条：
-//   1. 组装后交给 Apply 提交（Apply 负责关闭）
-//   2. 组装后不提交则必须自行调用 Close() 以回收内存
+//  1. 组装后交给 Apply 提交——此后批次归 Apply 处置，调用方不再碰它
+//     （成功即回收，失败则弃给 GC，理由见 Apply 注释）
+//  2. 决定不提交，则必须自行调用 Close() 以回收内存
+//
 // 不可同时执行两条路径，也不可多次 Close。
 func (s *Store) NewBatch() *pebble.Batch { return s.db.NewBatch() }
 
 // Apply 原子提交批次并按配置刷盘。这是唯一写入口（见类型注释）。
+//
 // 成功时批次由 Apply 关闭并回收到 Pebble 内存池；调用方不再拥有此批次。
-// 失败时调用方持有批次，必须调用 Close() 回收，但不可继续向批次写入。
+//
+// 失败时批次被有意丢给 GC，调用方不需要（也不应该）再调 Close()。这与 Pebble
+// 自己的做法一致：DB.Set/DB.Delete 内部同样是 `if err := d.Apply(b, opts);
+// err != nil { return err }`，并在注释里写明 "Only release the batch on
+// success"。理由有三条，缺一不可：
+//   - Batch.release() 明确拒绝回收出过错的批次，Close() 换不回内存池复用，
+//     只是把一次本可以省掉的调用加到每个错误分支上；
+//   - DB.Close() 会追踪泄漏的迭代器、快照与 memtable 预留，唯独不追踪批次，
+//     所以一个没关的失败批次就是一块普通垃圾，不会让 Close 报泄漏；
+//   - 提交失败的批次内部状态已不可信，再去碰它没有任何收益。
+//
+// 写下这段是为了防止有人"顺手修好"：本项目 6 个调用点全都在 Apply 出错后直接
+// 返回，这是刻意的，不是遗漏。
 func (s *Store) Apply(b *pebble.Batch) error {
 	opt := pebble.NoSync
 	if s.sync {

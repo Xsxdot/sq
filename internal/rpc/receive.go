@@ -6,7 +6,7 @@
 //     并在此注入自包含的 receipt handle（见 receipt.go）
 //   - AckMessage/ChangeInvisibleDuration：解出 handle 后转发给
 //     deliver.Deliverer，把 (bool,error) 结果映射为协议 Status
-//   - QueryAssignment：单机版路由查询，复用 Task 9 的 messageQueues
+//   - QueryAssignment：单机版路由查询，复用 QueryRoute 的 messageQueues
 //
 // 边界：
 //   - Tag 过滤 M1 仅接受 "*"（真实过滤属 M2），不实现投递次数上限/DLQ
@@ -36,12 +36,12 @@ const longPollWaitMargin = time.Second
 
 // ReceiveMessage POP 取件（服务端流）。流格式：先逐条消息，最后一帧 status。
 //
-// 关于帧顺序（Task 13 已用官方 SDK 实测，不再是悬案）：官方 Go SDK 并不依赖
-// 任何顺序——它把整条流读到 io.EOF 收集成一个切片后才统一处理，Status 帧无论
-// 出现在头部还是尾部都会被同样地取用。上游 Apache proxy 是 status 在前，sq
-// 选择 status 收尾：它同时也是"服务端已经把本批全部发完"的天然信号，而且
-// 消息推送中途失败时不会留下一个"已经宣称 OK 却没发全"的流。两种顺序都在
-// test/e2e 里实跑验证过（见 task-13 报告），此处的选择不影响 SDK 兼容性。
+// 关于帧顺序（已用官方 SDK 实测，不是推测）：官方 Go SDK 并不依赖任何顺序——
+// 它把整条流读到 io.EOF 收集成一个切片后才统一处理，Status 帧无论出现在头部
+// 还是尾部都会被同样地取用。上游 Apache proxy 是 status 在前，sq 选择 status
+// 收尾：它同时也是"服务端已经把本批全部发完"的天然信号，而且消息推送中途失败
+// 时不会留下一个"已经宣称 OK 却没发全"的流。两种顺序都在 test/e2e 里用真实
+// SDK 实跑验证过，此处的选择不影响 SDK 兼容性。
 //
 // 空结果不走这条格式：长轮询到期无消息时只发一帧 MESSAGE_NOT_FOUND status，
 // 理由见下方该分支的注释。
@@ -125,9 +125,9 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 			Message: s.toPBMessage(m, group),
 		}}); err != nil {
 			// 推送到一半流断了（客户端提前关闭/网络问题），前面已经发出的消息
-			// 已经生效（inflight 已写），只是本次响应没能完整送达——这属于
-			// brief Step 5 要求覆盖的"错误路径带上下文"，之前这里是唯一
-			// 没有记录任何信息就直接返回的分支，排查"客户端说没收全"时无从查起。
+			// 已经生效（inflight 已写），只是本次响应没能完整送达。这条日志必须
+			// 带上 index/total：没有它，排查"客户端说没收全"时只知道流断了，
+			// 不知道断在第几条，也就无从判断有多少条消息会靠不可见超时重投回来。
 			s.logger.Warn("ReceiveMessage 推送消息失败，流可能已被客户端关闭",
 				"group", group, "topic", topic, "queue", queueID, "index", i, "total", len(msgs), "err", err)
 			return err
@@ -142,7 +142,7 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 // longPollWait 由 gRPC 请求 deadline 推导长轮询时长：deadline 减去安全余量，
 // 上限为 defaultLongPolling；没有 deadline 时直接用默认值。
 //
-// 两个边界都要守住（brief 字面代码在此处有缺陷，这里是修正版）：
+// 两个边界都要守住：
 //   - 余量不能让结果变负：deadline 很近（< longPollWaitMargin）时，
 //     remain-margin 会算出负数，必须钳到 0（不等待、取一次就返回），
 //     不能让 time.Now().Add(负数) 悄悄退化成"立即过期"以外的语义，
@@ -170,20 +170,37 @@ func (s *Server) longPollWait(ctx context.Context) time.Duration {
 // toPBMessage core.Message → proto（读方向翻译，receipt handle 在此注入）。
 // handle 编入 m.DeliveryAttempt——deliver.Receive 已经把首投/重投的正确
 // attempt 值填好在这个字段上，这里原样取用即可，无需额外传参。
+//
+// 本函数必须回填 toCoreMessage 收下的每一个透传字段：写方向存了、读方向不发，
+// 效果与压根没存一样，只是更难发现（盘上数据看着是对的）。改动其中一侧时
+// 请同时改另一侧，两者的类型映射集中在 sysprops.go。
 func (s *Server) toPBMessage(m *core.Message, group string) *pb.Message {
 	handle := receiptEncode(group, m.Topic, m.QueueID, m.Offset, m.DeliveryAttempt)
 	attempt := m.DeliveryAttempt
 	offset := int64(m.Offset)
+	// 盘上的 token 只可能来自 bodyEncodingToCore，正常不会认不出来；真认不出来
+	// 说明数据被外部改写或两个方向被改得不再对称，宁可发一个"未声明"也要留日志。
+	enc, known := bodyEncodingToPB(m.BodyEncoding)
+	if !known {
+		s.logger.Warn("投递消息时遇到无法映射回协议的 body_encoding，按未声明下发",
+			"topic", m.Topic, "queue", m.QueueID, "offset", m.Offset,
+			"msg_id", m.ID, "body_encoding", string(m.BodyEncoding))
+	}
 	sp := &pb.SystemProperties{
 		MessageId:       m.ID,
 		MessageType:     pb.MessageType_NORMAL,
 		Keys:            m.Keys,
+		BodyEncoding:    enc,
+		BodyDigest:      digestToPB(m.BodyDigest),
 		BornTimestamp:   timestamppb.New(time.UnixMilli(m.BornAtMs)),
+		BornHost:        m.BornHost,
 		StoreTimestamp:  timestamppb.New(time.UnixMilli(m.StoreAtMs)),
 		DeliveryAttempt: &attempt,
 		ReceiptHandle:   &handle,
 		QueueId:         int32(m.QueueID),
-		QueueOffset:     &offset, // *int64（不是 *int32），见 task-8-report 的字段核对
+		// QueueOffset 在生成代码里是 *int64（不是 *int32，也不是值类型），
+		// 上面的 offset 局部变量就是为了取地址而存在的。
+		QueueOffset: &offset,
 	}
 	if m.Tag != "" {
 		tag := m.Tag
@@ -192,6 +209,10 @@ func (s *Server) toPBMessage(m *core.Message, group string) *pb.Message {
 	if m.MessageGroup != "" {
 		mg := m.MessageGroup
 		sp.MessageGroup = &mg
+	}
+	if m.TraceContext != "" {
+		tc := m.TraceContext
+		sp.TraceContext = &tc
 	}
 	return &pb.Message{
 		Topic:            &pb.Resource{Name: m.Topic},
@@ -293,27 +314,12 @@ func (s *Server) ChangeInvisibleDuration(ctx context.Context, req *pb.ChangeInvi
 }
 
 // QueryAssignment 单机版：全部队列归属本节点，直接复用 messageQueues。
-//
-// EnsureTopic 失败原因分类与 QueryRoute 同理（见 server.go 的 QueryRoute
-// 注释）：名字非法（ErrBadName）与 topic 不存在且未自动创建（ErrTopicNotFound）
-// 是两种不同性质的客户端可处理错误，不能都折叠成 TOPIC_NOT_FOUND；
-// 两者之外的失败是服务端内部故障，必须用 Error 级别单独记录，不能让客户端
-// 把一个本该重试的瞬时错误误判成"topic 真的不存在"。
+// EnsureTopic 失败按性质分类，规则见 server.go 的 topicErrStatus。
 func (s *Server) QueryAssignment(ctx context.Context, req *pb.QueryAssignmentRequest) (*pb.QueryAssignmentResponse, error) {
 	name := req.GetTopic().GetName()
 	tc, err := s.mt.EnsureTopic(name)
 	if err != nil {
-		switch {
-		case errors.Is(err, meta.ErrBadName):
-			s.logger.Warn("QueryAssignment 失败：topic 名字非法", "topic", name, "err", err)
-			return &pb.QueryAssignmentResponse{Status: errStatus(pb.Code_ILLEGAL_TOPIC, err.Error())}, nil
-		case errors.Is(err, meta.ErrTopicNotFound):
-			s.logger.Warn("QueryAssignment 失败：topic 不存在", "topic", name, "err", err)
-			return &pb.QueryAssignmentResponse{Status: errStatus(pb.Code_TOPIC_NOT_FOUND, err.Error())}, nil
-		default:
-			s.logger.Error("QueryAssignment 内部错误", "topic", name, "err", err)
-			return &pb.QueryAssignmentResponse{Status: errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error())}, nil
-		}
+		return &pb.QueryAssignmentResponse{Status: s.topicErrStatus("QueryAssignment", name, err)}, nil
 	}
 	qs := s.messageQueues(tc, req.GetTopic())
 	asgs := make([]*pb.Assignment, 0, len(qs))

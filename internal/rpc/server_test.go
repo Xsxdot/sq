@@ -1,8 +1,10 @@
-// server_test.go 验证 rpc.Server 的 gRPC 服务基座。
+// server_test.go 验证 rpc.Server 的 gRPC 服务基座，并提供本包全部 gRPC 测试
+// 共用的环境搭建 helper（newTestEnv）。
 //
 // 职责：
-//   - 用 bufconn 起真实 gRPC server + client，覆盖 QueryRoute 自动建 topic、
-//     Heartbeat 注册消费组、Telemetry settings 协商三条主链路
+//   - newTestEnv：起全真组件 + bufconn 上的真 gRPC server/client
+//   - 用它覆盖 QueryRoute 自动建 topic、Heartbeat 注册消费组、
+//     Telemetry settings 协商三条主链路
 //   - 覆盖 QueryRoute/Heartbeat 的错误分类分支：非法名字 vs topic 不存在，
 //     确保 Code 枚举没有把不同性质的失败折叠成同一个码
 //
@@ -15,6 +17,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"testing"
 	"time"
@@ -31,50 +34,73 @@ import (
 	"github.com/xushixin/sq/internal/store"
 )
 
-// newTestClient 起全真组件（autoCreate=true）+ bufconn gRPC，返回客户端 stub。
-func newTestClient(t *testing.T) pb.MessagingServiceClient {
-	t.Helper()
-	return newTestClientWithAutoCreate(t, true)
+// testEnv 是一套完整的被测环境：真实的 Pebble store（临时目录，测试结束自动
+// 清理）、meta/produce/deliver 三个引擎、bufconn 上的真 gRPC server，以及连着
+// 它的 client stub。三个字段按测试关心的角度各取所需——
+//   - client：绝大多数用例只需要它
+//   - srv：停机行为（Shutdown 让 Telemetry 长流收尾）只能从服务端这一侧触发
+//   - dl：需要绕开协议层、直接查"盘上到底有没有这条消息"时用
+type testEnv struct {
+	srv    *Server
+	client pb.MessagingServiceClient
+	dl     *deliver.Deliverer
 }
 
-// newTestClientWithAutoCreate 与 newTestClient 相同，但 autoCreate 由调用方指定——
-// 用于覆盖 autoCreate=false 时 QueryRoute 对未知合法 topic 返回 TOPIC_NOT_FOUND 的分支，
-// 不影响 newTestClient 现有三个用例默认的 autoCreate=true 行为。
-func newTestClientWithAutoCreate(t *testing.T, autoCreate bool) pb.MessagingServiceClient {
-	t.Helper()
-	_, c := newTestServerAndClient(t, autoCreate)
-	return c
-}
-
-// newTestServerAndClient 与 newTestClientWithAutoCreate 相同，但把 *Server 也交出来——
-// 停机行为（Shutdown 让 Telemetry 长流收尾）只能从服务端这一侧触发，
-// 光有客户端 stub 测不了。
-func newTestServerAndClient(t *testing.T, autoCreate bool) (*Server, pb.MessagingServiceClient) {
+// newTestEnv 起一套测试环境。autoCreate 决定未知 topic 是否自动创建；opts 追加
+// 到 grpc.NewServer 上，供需要特定传输层配置的用例使用（如放宽 MaxRecvMsgSize
+// 好让超限请求真正到达应用层校验，或按生产装配的同款 Option 验证配置本身够用）。
+//
+// 客户端一侧的收发上限刻意放到最大：本包每个用例断言的都是**服务端**的行为，
+// 客户端 stub 只是运输工具。若它自己也带着限制，一条本该由服务端裁决的请求
+// 可能在客户端就被拦下，测试挂在一个与被测对象无关的地方。
+//
+// 全包只此一个搭建入口：曾经三个测试文件各写了一份几乎相同的搭建代码，仅在
+// ServerOption 与返回值上有差别，且各自都留了一段"为什么不复用另一份"的注释。
+// 到第三份时这个理由已经不成立——差异全部可以用参数表达。
+func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEnv {
 	t.Helper()
 	st, err := store.Open(t.TempDir(), true, slog.Default())
 	if err != nil {
-		t.Fatalf("store: %v", err)
+		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, _ := meta.New(st, autoCreate, 4, slog.Default())
+	mt, err := meta.New(st, autoCreate, 4, slog.Default())
+	if err != nil {
+		t.Fatalf("meta.New: %v", err)
+	}
 	pr := produce.New(st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
-	cfg, _ := config.Load("")
+	cfg, err := config.Load("")
+	if err != nil {
+		t.Fatalf("config.Load: %v", err)
+	}
 	srv := New(cfg, mt, pr, dl, slog.Default())
 
 	lis := bufconn.Listen(1 << 20)
-	gs := grpc.NewServer()
+	gs := grpc.NewServer(opts...)
 	srv.Register(gs)
 	go gs.Serve(lis)
 	t.Cleanup(gs.Stop)
 	conn, err := grpc.NewClient("passthrough:///bufnet",
 		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) { return lis.DialContext(ctx) }),
-		grpc.WithTransportCredentials(insecure.NewCredentials()))
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultCallOptions(
+			grpc.MaxCallRecvMsgSize(math.MaxInt32),
+			grpc.MaxCallSendMsgSize(math.MaxInt32),
+		),
+	)
 	if err != nil {
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	return srv, pb.NewMessagingServiceClient(conn)
+	return testEnv{srv: srv, client: pb.NewMessagingServiceClient(conn), dl: dl}
+}
+
+// newTestClient 是 newTestEnv 最常用形态的简写：autoCreate=true、无额外
+// ServerOption，只要客户端 stub。
+func newTestClient(t *testing.T) pb.MessagingServiceClient {
+	t.Helper()
+	return newTestEnv(t, true).client
 }
 
 // TestQueryRouteAutoCreatesTopic 验证未知 topic 在 autoCreate 开启时被自动建
@@ -133,7 +159,7 @@ func telemetryNegotiate(t *testing.T, c pb.MessagingServiceClient, client *pb.Se
 // TestTelemetryPublishingSettingsCarryServerLimits 锁定发布端协商结果里那些
 // 「必须由服务端填」的字段。
 //
-// 这条断言的由来是一次真实的互操作故障（Task 13 e2e）：服务端最初把客户端
+// 这条断言的由来是一次真实的互操作故障（用官方 SDK 跑 e2e 时暴露）：服务端最初把客户端
 // 上报的 Settings 原样回发，而官方 Go SDK 的 producerSettings.applySettingsCommand
 // 会无条件把回包里的 Publishing.max_body_size 存成自己的本地上限——客户端
 // 自报的 Publishing 里没有这个字段（它本来就是服务端字段），于是上限被改写成 0，
@@ -243,7 +269,7 @@ func TestTelemetrySettingsWithoutPubSubStaysEmpty(t *testing.T) {
 // 一个合法但未注册过的 topic 名字应归类为「topic 不存在」而不是「名字非法」——
 // 两者是不同性质的失败，Code 不能混用。
 func TestQueryRouteAutoCreateDisabledReturnsTopicNotFound(t *testing.T) {
-	c := newTestClientWithAutoCreate(t, false)
+	c := newTestEnv(t, false).client
 	resp, err := c.QueryRoute(context.Background(), &pb.QueryRouteRequest{
 		Topic: &pb.Resource{Name: "never-created"},
 	})
@@ -289,7 +315,7 @@ func TestHeartbeatMalformedGroupReturnsIllegalConsumerGroup(t *testing.T) {
 // TestShutdownEndsTelemetryStream 锁定 Server.Shutdown 的核心作用：一条已经
 // 建立、客户端既不发也不关的 Telemetry 流，必须在服务端调用 Shutdown 后结束。
 //
-// 这条断言的由来是 Task 13 e2e 实测到的停机故障：Telemetry 是没有自然终点的
+// 这条断言的由来是一次用官方 SDK 实测到的停机故障：Telemetry 是没有自然终点的
 // 双向长流，官方 Go SDK 的 Client.GracefulStop() 又不会关闭它，于是
 // grpc.Server.GracefulStop() 永远等不到这条流结束——接一个 producer 时 sq
 // 停机要 9.5s，再接一个 SimpleConsumer 之后就再也停不下来（实测 30s 上限
@@ -298,7 +324,8 @@ func TestHeartbeatMalformedGroupReturnsIllegalConsumerGroup(t *testing.T) {
 // 若哪天有人把 Telemetry 的读循环改回裸 stream.Recv()，本用例会挂在
 // stream.Recv() 上直到测试超时——这正是我们要防的回归。
 func TestShutdownEndsTelemetryStream(t *testing.T) {
-	srv, c := newTestServerAndClient(t, true)
+	env := newTestEnv(t, true)
+	srv, c := env.srv, env.client
 	stream, err := c.Telemetry(context.Background())
 	if err != nil {
 		t.Fatalf("Telemetry: %v", err)

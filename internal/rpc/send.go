@@ -44,14 +44,22 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 	// N-1 条已经真正落盘且无法撤回——没有跨消息的原子写入机制。但这与上面
 	// 两遍处理要解决的问题不同：这是运行时 I/O 故障，不是"客户端输入非法"，
 	// 属于 MQ 客户端本就要容忍的 at-least-once 场景（收到失败状态后重试，
-	// 服务端凭 msgId 或消费端幂等处理去重），保留 brief 原有的"整批返回该错误"
-	// 行为即可，不额外引入多消息原子写入的复杂度。
+	// 服务端凭 msgId 或消费端幂等处理去重），因此仍然整批返回该错误，
+	// 不额外引入多消息原子写入的复杂度。
 	entries := make([]*pb.SendResultEntry, 0, len(msgs))
 	for _, m := range msgs {
 		stored, err := s.pr.Append(m)
 		if err != nil {
-			s.logger.Error("SendMessage 写入失败", "topic", m.Topic, "msg_id", m.ID, "err", err)
-			return &pb.SendMessageResponse{Status: errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error())}, nil
+			// Append 内部会调用 meta.EnsureTopic，因此它的失败同样分"客户端输入
+			// 错误"与"服务端内部故障"两类，必须按 topicErrStatus 的规则分开
+			// （详见该函数注释）。写路径上这一点比读路径更要紧：关掉
+			// auto_create_topic 的部署里，往未建的 topic 发消息本是运维配置问题，
+			// 若折叠成 INTERNAL_SERVER_ERROR，客户端会按 sq 自己下发的退避策略
+			// 把三次重试全部烧掉，最后报一个"服务端内部错误"，而服务端这边则为
+			// 一台完全健康的 broker 打三条 Error 日志。
+			return &pb.SendMessageResponse{
+				Status: s.topicErrStatus("SendMessage", m.Topic, err, "msg_id", m.ID),
+			}, nil
 		}
 		entries = append(entries, &pb.SendResultEntry{
 			Status:    okStatus(),
@@ -100,6 +108,16 @@ func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 	if ts := sp.GetBornTimestamp(); ts != nil {
 		born = ts.AsTime().UnixMilli()
 	}
+	// 编码方式必须收下并落盘：sq 只存字节、不解压，若这里丢掉 body_encoding，
+	// 投递时就只能回一个"未声明"，消费端拿到压缩过的 Body 却以为是明文——
+	// 交给应用的就是一段乱码，而且没有任何一层会报错。未知编码无法落盘
+	// （core 存不下自己不认识的 token），至少要留一条日志说明丢了什么。
+	enc, known := bodyEncodingToCore(sp.GetBodyEncoding())
+	if !known {
+		s.logger.Warn("SendMessage 收到本版本不认识的 body_encoding，将按未声明落盘",
+			"topic", pm.GetTopic().GetName(), "msg_id", sp.GetMessageId(),
+			"body_encoding", sp.GetBodyEncoding())
+	}
 	return &core.Message{
 		ID:           sp.GetMessageId(), // 客户端生成的 msgId，保留以便端到端对账
 		Topic:        pm.GetTopic().GetName(),
@@ -108,6 +126,12 @@ func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 		MessageGroup: sp.GetMessageGroup(),
 		Properties:   pm.GetUserProperties(),
 		Body:         pm.GetBody(),
+		BodyEncoding: enc,
+		BodyDigest:   digestToCore(sp.GetBodyDigest()),
 		BornAtMs:     born,
+		BornHost:     sp.GetBornHost(),
+		// TraceContext 是 W3C traceparent 之类的链路上下文：不带回去，
+		// 分布式追踪就在 sq 这一跳断掉，且断得悄无声息。
+		TraceContext: sp.GetTraceContext(),
 	}, nil
 }

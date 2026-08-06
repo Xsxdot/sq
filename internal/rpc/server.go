@@ -47,9 +47,10 @@ type Server struct {
 	doneOnce sync.Once
 }
 
-// New 构造协议适配层。pr/dl 由 Task 10（SendMessage/AckMessage 等）、
-// Task 11（ReceiveMessage/QueryAssignment）使用；本任务的 4 个 RPC
-// 只用到 mt 与 cfg，但构造签名一次定死，后续任务不再改。
+// New 构造协议适配层。四个依赖各自服务于一组 RPC：cfg 提供对外通告地址与
+// 协商参数，mt 管 topic/group 注册表（QueryRoute/Heartbeat/QueryAssignment），
+// pr 是写路径（SendMessage），dl 是 POP 消费路径
+// （ReceiveMessage/AckMessage/ChangeInvisibleDuration）。
 func New(cfg *config.Config, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, logger *slog.Logger) *Server {
 	return &Server{
 		cfg: cfg, mt: mt, pr: pr, dl: dl, logger: logger.With("mod", "rpc"),
@@ -65,7 +66,7 @@ func New(cfg *config.Config, mt *meta.Meta, pr *produce.Producer, dl *deliver.De
 // 的语义是「等所有在途 RPC 结束」——只要还有一个客户端进程活着且没有关掉这条
 // 流，GracefulStop 就永远不返回。官方 Go SDK 恰好就是这样：它的
 // Client.GracefulStop() 只停自己的后台 goroutine，既不 CloseSend 也不关闭
-// ClientConn。Task 13 的实测结果是：只连一个 producer 时 sq 停机耗时约 9.5s
+// ClientConn。用官方 SDK 实测的结果是：只连一个 producer 时 sq 停机耗时约 9.5s
 // （靠客户端自己的 GOAWAY 恢复逻辑碰巧断开），再加一个 SimpleConsumer 之后
 // 就再也停不下来了，只能靠强制中断兜底。
 //
@@ -87,6 +88,39 @@ func okStatus() *pb.Status { return &pb.Status{Code: pb.Code_OK, Message: "ok"} 
 
 // errStatus 按错误码与信息构造失败状态。
 func errStatus(code pb.Code, msg string) *pb.Status { return &pb.Status{Code: code, Message: msg} }
+
+// topicErrStatus 把一次涉及 meta.EnsureTopic 的失败翻译成协议 Status，并按
+// 失败性质选择日志级别。QueryRoute/QueryAssignment/SendMessage 共用它。
+//
+// 为什么必须分类，而不是一律 INTERNAL_SERVER_ERROR：
+//   - ErrBadName（名字含非法字符或超长）是客户端输入错误，改名字之前重试多少次
+//     都不会变好，对应 ILLEGAL_TOPIC；
+//   - ErrTopicNotFound（topic 未注册且关闭了自动创建）是调用方或运维可自行处理
+//     的情况，对应 TOPIC_NOT_FOUND；
+//   - 其余（如自动创建时的 store 持久化失败）才是服务端内部故障。
+//
+// 把前两类折叠进 INTERNAL_SERVER_ERROR 的代价是双向的：客户端那边，该码的语义
+// 是"服务端坏了，重试我"，于是它会按 sq 自己在 settings.go 里下发的退避策略把
+// 重试次数全部烧掉，最终报一个与真实原因无关的错误；服务端这边，一台完全健康的
+// broker 会为每次重试各打一条 Error 日志。反过来，把内部故障报成"你的输入非法"
+// 同样有害——那会让一个本该重试就能恢复的瞬时错误被客户端当成永久失败放弃。
+//
+// extra 是追加到日志上的额外键值对（如 SendMessage 的 msg_id），只影响日志，
+// 不影响返回的 Status。
+func (s *Server) topicErrStatus(rpcName, topic string, err error, extra ...any) *pb.Status {
+	args := append([]any{"rpc", rpcName, "topic", topic, "err", err}, extra...)
+	switch {
+	case errors.Is(err, meta.ErrBadName):
+		s.logger.Warn("topic 名字非法", args...)
+		return errStatus(pb.Code_ILLEGAL_TOPIC, err.Error())
+	case errors.Is(err, meta.ErrTopicNotFound):
+		s.logger.Warn("topic 不存在且未开启自动创建", args...)
+		return errStatus(pb.Code_TOPIC_NOT_FOUND, err.Error())
+	default:
+		s.logger.Error("服务端内部错误", args...)
+		return errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error())
+	}
+}
 
 // endpoints 返回对外通告地址（QueryRoute/QueryAssignment 共用）。
 func (s *Server) endpoints() *pb.Endpoints {
@@ -118,29 +152,12 @@ func (s *Server) messageQueues(tc meta.TopicConfig, topic *pb.Resource) []*pb.Me
 
 // QueryRoute 返回 topic 路由。autoCreate 开启时未知 topic 在此自动创建——
 // 生产者发送消息前必须先查路由，若这里不建，topic 永远没有机会被创建出来。
-//
-// EnsureTopic 的失败原因需要按性质分类，不能全部折叠成一个 Code：
-// 名字本身不合法（ErrBadName，客户端输入错误）与 topic 未注册且未开自动创建
-// （ErrTopicNotFound，同样是客户端可自行处理的情况）分属不同语义；两者之外
-// 的失败（如自动创建时的 store 持久化错误）是服务端内部故障，绝不能报成
-// 「你的输入非法」——那会让一个本该重试的瞬时错误被客户端当成永久性错误放弃。
+// EnsureTopic 的失败按性质分类，规则见 topicErrStatus。
 func (s *Server) QueryRoute(ctx context.Context, req *pb.QueryRouteRequest) (*pb.QueryRouteResponse, error) {
 	name := req.GetTopic().GetName()
 	tc, err := s.mt.EnsureTopic(name)
 	if err != nil {
-		switch {
-		case errors.Is(err, meta.ErrBadName):
-			s.logger.Warn("QueryRoute 失败：topic 名字非法", "topic", name, "err", err)
-			return &pb.QueryRouteResponse{Status: errStatus(pb.Code_ILLEGAL_TOPIC, err.Error())}, nil
-		case errors.Is(err, meta.ErrTopicNotFound):
-			s.logger.Warn("QueryRoute 失败：topic 不存在", "topic", name, "err", err)
-			return &pb.QueryRouteResponse{Status: errStatus(pb.Code_TOPIC_NOT_FOUND, err.Error())}, nil
-		default:
-			// 已排除掉两类客户端输入错误，剩下的都是服务端内部故障
-			// （如自动创建 topic 时的 store 持久化失败），用 Error 级别记录。
-			s.logger.Error("QueryRoute 内部错误", "topic", name, "err", err)
-			return &pb.QueryRouteResponse{Status: errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error())}, nil
-		}
+		return &pb.QueryRouteResponse{Status: s.topicErrStatus("QueryRoute", name, err)}, nil
 	}
 	s.logger.Debug("QueryRoute", "topic", name, "queues", tc.Queues)
 	return &pb.QueryRouteResponse{Status: okStatus(), MessageQueues: s.messageQueues(tc, req.GetTopic())}, nil

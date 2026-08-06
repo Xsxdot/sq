@@ -4,9 +4,12 @@
 // 职责：
 //   - 覆盖 Receive→Ack 主链路、QueryAssignment 返回全部队列、receipt handle
 //     的编解码往返
-//   - 覆盖 Task 7 review 修复的 attempt 令牌语义：一条消息被重投后，用重投前
-//     （陈旧 attempt）的 handle 去 Ack 必须失败，且不能影响重投后的新记录——
-//     否则会重演"迟到的 Ack 误删新记录，消息永久丢失"的问题
+//   - 覆盖 attempt 令牌语义：一条消息被重投后，用重投前（陈旧 attempt）的
+//     handle 去 Ack 必须失败，且不能影响重投后的新记录——否则会重演"迟到的
+//     Ack 误删新记录，消息永久丢失"的问题
+//   - 覆盖 SystemProperties 透传字段（body_encoding/body_digest/born_host/
+//     trace_context）的收发往返：这几个字段 sq 不解释，但少带任何一个都会造成
+//     消费端可见的损失（编码丢失 → Body 被误解释；trace_context 丢失 → 链路断开）
 //   - 覆盖协议层错误分类：ReceiveMessage 对非法消费组名字必须报
 //     ILLEGAL_CONSUMER_GROUP 而不是 INTERNAL_SERVER_ERROR（同 QueryAssignment
 //     对 EnsureTopic 错误的分类原则，不能把客户端输入错误折叠成服务端故障）
@@ -110,6 +113,74 @@ func TestReceiveAckRoundTrip(t *testing.T) {
 	}
 }
 
+// TestSendReceivePreservesPassthroughSystemProperties 锁定四个"sq 不解释、
+// 只负责原样带回"的 SystemProperties 字段能完整走完 发送 → 落盘 → 投递 的往返：
+// body_encoding、body_digest、born_host、trace_context。
+//
+// 这四个字段曾经写方向和读方向都没接，于是被静默丢弃。危害各不相同，但没有
+// 一个是无害的：
+//   - body_encoding：最严重。sq 只存字节、从不解压，若丢掉这个字段，一个把
+//     Body 压缩过再发的生产者（Java SDK 超过压缩阈值就会这么做）在消费端会
+//     拿回 ENCODING_UNSPECIFIED——SDK 走不到解压分支，直接把压缩字节交给应用。
+//     没有任何一层会报错，是静默的数据损坏。
+//   - trace_context：分布式链路在 sq 这一跳断掉，且断得无声无息。
+//   - body_digest：消费端失去校验消息体完整性的依据。
+//   - born_host：排查"这条消息是谁发的"时失去唯一线索。
+//
+// 这里刻意用 GZIP 而不是 IDENTITY：IDENTITY 恰好是官方 Go SDK 硬编码的值，
+// 用它就分不清"字段真的透传了"还是"某处把它写死成了 IDENTITY"。
+func TestSendReceivePreservesPassthroughSystemProperties(t *testing.T) {
+	c := newTestClient(t)
+	const topic = "passthrough"
+	const traceContext = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01"
+	const bornHost = "10.0.0.7:54321"
+	const checksum = "3610a686"
+
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: topic},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:  pb.MessageType_NORMAL,
+				BodyEncoding: pb.Encoding_GZIP,
+				BodyDigest:   &pb.Digest{Type: pb.DigestType_CRC32, Checksum: checksum},
+				BornHost:     bornHost,
+				TraceContext: strPtr(traceContext),
+			},
+			Body: []byte("compressed-payload"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("SendMessage: %v %v", resp.GetStatus(), err)
+	}
+
+	var got *pb.Message
+	for q := int32(0); q < 4 && got == nil; q++ {
+		got = receiveOne(t, c, "g-passthrough", topic, q, time.Minute)
+	}
+	if got == nil {
+		t.Fatal("未收到消息")
+	}
+	sp := got.GetSystemProperties()
+	if sp.GetBodyEncoding() != pb.Encoding_GZIP {
+		t.Fatalf("body_encoding 应原样带回 GZIP，实际 %v（消费端会把压缩字节当明文交给应用）",
+			sp.GetBodyEncoding())
+	}
+	if sp.GetBodyDigest().GetType() != pb.DigestType_CRC32 || sp.GetBodyDigest().GetChecksum() != checksum {
+		t.Fatalf("body_digest 应原样带回，实际 %v", sp.GetBodyDigest())
+	}
+	if sp.GetBornHost() != bornHost {
+		t.Fatalf("born_host 应原样带回 %q，实际 %q", bornHost, sp.GetBornHost())
+	}
+	// TraceContext 是 proto3 optional（*string）：先断言指针非 nil 再比值，
+	// 否则 Getter 的零值会把"压根没下发"伪装成"下发了空串"。
+	if sp.TraceContext == nil {
+		t.Fatal("trace_context 缺失：分布式链路在 sq 这一跳断掉了")
+	}
+	if sp.GetTraceContext() != traceContext {
+		t.Fatalf("trace_context 应原样带回 %q，实际 %q", traceContext, sp.GetTraceContext())
+	}
+}
+
 func TestQueryAssignmentReturnsAllQueues(t *testing.T) {
 	c := newTestClient(t)
 	sendOne(t, c, "qa", "x") // 触发 topic 创建
@@ -160,8 +231,8 @@ func receiveOne(t *testing.T, c pb.MessagingServiceClient, group, topic string, 
 	return msgs[0]
 }
 
-// TestAckWithStaleAttemptTokenFailsAndMessageStaysRedeliverable 锁定 Task 7 review
-// 修复的核心行为端到端：消息 X 首投给消费者（attempt=1，短不可见窗口），窗口过期后
+// TestAckWithStaleAttemptTokenFailsAndMessageStaysRedeliverable 端到端锁定
+// attempt 令牌：消息 X 首投给消费者（attempt=1，短不可见窗口），窗口过期后
 // 被重投（attempt=2）。用第一次投递的陈旧 handle（attempt=1）去 Ack，必须返回非 OK
 // 状态；随后证明消息没有丢——用当前（attempt=2）的 handle 仍能成功 Ack。
 //
