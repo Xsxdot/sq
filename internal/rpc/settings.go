@@ -89,8 +89,8 @@ func (s *Server) negotiateSettings(client *pb.Settings) *pb.Settings {
 			Topics:      ps.Publishing.GetTopics(),
 			MaxBodySize: produce.MaxBodySize,
 			// 开启客户端侧消息类型校验：sq 的 QueryRoute 通告
-			// AcceptMessageTypes=[NORMAL, DELAY]（M3 起），让客户端在本地就
-			// 拒掉顺序/事务消息，比让它发出去再收一个
+			// AcceptMessageTypes=[NORMAL, DELAY, FIFO]（M4 起），让客户端在本地就
+			// 拒掉事务消息，比让它发出去再收一个
 			// MESSAGE_PROPERTY_CONFLICT_WITH_TYPE 更早、更清楚。
 			ValidateMessageType: true,
 		}}

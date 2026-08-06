@@ -399,4 +399,133 @@ func TestQueryRouteAdvertisesDelayType(t *testing.T) {
 	}
 }
 
+// FIFO 消息经全链路投递且遵守顺序锁：发 2 条同组，deliver 一次只吐 1 条
+func TestSendFifoMessageOrderedThroughStack(t *testing.T) {
+	env := newTestEnv(t, true)
+	for _, body := range []string{"f1", "f2"} {
+		resp, err := env.client.SendMessage(context.Background(), &pb.SendMessageRequest{
+			Messages: []*pb.Message{{
+				Topic: &pb.Resource{Name: "fifo"},
+				SystemProperties: &pb.SystemProperties{
+					MessageType:  pb.MessageType_FIFO,
+					MessageGroup: strPtr("grp-1"),
+				},
+				Body: []byte(body),
+			}},
+		})
+		if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+			t.Fatalf("FIFO 发送应成功: %v %v", resp.GetStatus(), err)
+		}
+	}
+	// 同组消息落同一队列；顺序锁下首轮只投 f1。队列号由 hash 决定，逐队列探测。
+	got := 0
+	for q := uint32(0); q < 4; q++ {
+		msgs, err := env.dl.Receive(context.Background(), "g", "fifo", q, 10, time.Minute, 0, nil)
+		if err != nil {
+			t.Fatalf("Receive q%d: %v", q, err)
+		}
+		got += len(msgs)
+		for _, m := range msgs {
+			if string(m.Body) != "f1" || m.MessageGroup != "grp-1" {
+				t.Fatalf("首轮只应投 f1 且组名保留: %+v", m)
+			}
+		}
+	}
+	if got != 1 {
+		t.Fatalf("顺序锁下首轮应恰投 1 条，实际 %d", got)
+	}
+}
+
+func TestSendFifoMissingGroupRejected(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic:            &pb.Resource{Name: "fifo"},
+			SystemProperties: &pb.SystemProperties{MessageType: pb.MessageType_FIFO},
+			Body:             []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_ILLEGAL_MESSAGE_GROUP {
+		t.Fatalf("期望 ILLEGAL_MESSAGE_GROUP，得到 %v %v", resp.GetStatus(), err)
+	}
+}
+
+func TestSendFifoWithDeliveryTimestampRejected(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "fifo"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:       pb.MessageType_FIFO,
+				MessageGroup:      strPtr("grp"),
+				DeliveryTimestamp: timestamppb.New(time.Now().Add(time.Hour)),
+			},
+			Body: []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE {
+		t.Fatalf("期望 MESSAGE_PROPERTY_CONFLICT_WITH_TYPE，得到 %v %v", resp.GetStatus(), err)
+	}
+}
+
+// NORMAL/DELAY 携带 message_group 被拒：SDK 只要设了组就自动标 FIFO，
+// 标其他类型却带组的只可能是行为异常的客户端；静默收下会让消息悄悄获得/
+// 失去顺序语义（与 M3 的 NORMAL+delivery_timestamp 拒绝完全同型）
+func TestSendNormalWithMessageGroupRejected(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "fifo"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:  pb.MessageType_NORMAL,
+				MessageGroup: strPtr("grp"),
+			},
+			Body: []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE {
+		t.Fatalf("期望 MESSAGE_PROPERTY_CONFLICT_WITH_TYPE，得到 %v %v", resp.GetStatus(), err)
+	}
+}
+
+func TestSendDelayWithMessageGroupRejected(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "fifo"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:       pb.MessageType_DELAY,
+				MessageGroup:      strPtr("grp"),
+				DeliveryTimestamp: timestamppb.New(time.Now().Add(time.Hour)),
+			},
+			Body: []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE {
+		t.Fatalf("期望 MESSAGE_PROPERTY_CONFLICT_WITH_TYPE，得到 %v %v", resp.GetStatus(), err)
+	}
+}
+
+// 守护 SDK 客户端侧校验（与 M3 的 DELAY 守护测试同型）：ValidateMessageType=true
+// 时 SDK 发送前检查路由的 AcceptMessageTypes，缺 FIFO 则顺序消息在客户端本地
+// 就被拒（producer.go:191）
+func TestQueryRouteAdvertisesFifoType(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.QueryRoute(context.Background(), &pb.QueryRouteRequest{Topic: &pb.Resource{Name: "fifo"}})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("QueryRoute: %v %v", resp.GetStatus(), err)
+	}
+	for _, mq := range resp.GetMessageQueues() {
+		hasFifo := false
+		for _, mt := range mq.GetAcceptMessageTypes() {
+			if mt == pb.MessageType_FIFO {
+				hasFifo = true
+			}
+		}
+		if !hasFifo {
+			t.Fatalf("队列 %d 未通告 FIFO 类型", mq.GetId())
+		}
+	}
+}
+
 func strPtr(s string) *string { return &s }

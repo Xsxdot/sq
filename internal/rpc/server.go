@@ -149,8 +149,11 @@ func (s *Server) messageQueues(tc meta.TopicConfig, topic *pb.Resource) []*pb.Me
 				pb.MessageType_NORMAL,
 				// M3 起接受延时消息。不能漏：SDK 开着 ValidateMessageType，
 				// 发送前用本列表在客户端本地校验，缺了 DELAY 则延时消息
-				// 根本发不出来（M4/M6 时继续追加 FIFO/TRANSACTION）
+				// 根本发不出来
 				pb.MessageType_DELAY,
+				// M4 起接受顺序消息，理由同上（缺了 FIFO 顺序消息在客户端
+				// 本地就被拒；M6 时继续追加 TRANSACTION）
+				pb.MessageType_FIFO,
 			},
 		})
 	}

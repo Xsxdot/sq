@@ -1,5 +1,5 @@
 // SendMessage 相关：proto Message ↔ core.Message 的写方向翻译。
-// 边界：NORMAL 与 DELAY（M3）；M4 FIFO / M6 事务在各自里程碑打开。
+// 边界：NORMAL、DELAY（M3）与 FIFO（M4）；M6 事务在其里程碑打开。
 package rpc
 
 import (
@@ -98,9 +98,32 @@ func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 			return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,
 				"NORMAL 消息不应携带 delivery_timestamp")
 		}
+		// 同理（M4）：SDK 设了 messageGroup 就自动标 FIFO，标 NORMAL 却带组
+		// 意味着这条消息会在 deliver 侧获得顺序锁语义而发送端不自知——拒绝。
+		if sp.GetMessageGroup() != "" {
+			return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,
+				"NORMAL 消息不应携带 message_group")
+		}
+	case pb.MessageType_FIFO:
+		// 顺序消息（M4）：MessageGroup 是顺序语义的全部依据（hash 定队列 +
+		// 消费端顺序锁），缺了它"顺序"无从谈起，用协议专用码报错。
+		if sp.GetMessageGroup() == "" {
+			return nil, errStatus(pb.Code_ILLEGAL_MESSAGE_GROUP, "FIFO 消息缺少 message_group")
+		}
+		if sp.GetDeliveryTimestamp() != nil {
+			return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,
+				"FIFO 消息不应携带 delivery_timestamp")
+		}
 	case pb.MessageType_DELAY:
 		if sp.GetDeliveryTimestamp() == nil {
 			return nil, errStatus(pb.Code_ILLEGAL_DELIVERY_TIME, "DELAY 消息缺少 delivery_timestamp")
+		}
+		// 延时与顺序不可组合（M4）：SDK 两者都设时按组判定标 FIFO（上面的
+		// 分支拒绝），裸客户端标 DELAY 带组同样拒绝——到期搬运经 AppendWith
+		// 重新入队，无法承诺组内相对顺序。
+		if sp.GetMessageGroup() != "" {
+			return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,
+				"DELAY 消息不应携带 message_group")
 		}
 		delayAt = sp.GetDeliveryTimestamp().AsTime().UnixMilli()
 		// 时间戳存在但落在非正区间（1970 epoch 或零值 time.Time）时不能静默
@@ -111,10 +134,6 @@ func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 		if delayAt <= 0 {
 			delayAt = 1
 		}
-	case pb.MessageType_FIFO:
-		// MessageGroup 定队列已在 produce 实现，但消费端顺序锁是 M4——
-		// 拒绝 FIFO 消息，避免"能发不能保序"的假象。
-		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "顺序消息将在 M4 支持")
 	case pb.MessageType_TRANSACTION:
 		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "事务消息将在 M6 支持")
 	default:
