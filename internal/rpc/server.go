@@ -183,6 +183,20 @@ func (s *Server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.H
 func (s *Server) Telemetry(stream pb.MessagingService_TelemetryServer) error {
 	// 缓冲 1 + readerDone：handler 先返回时，读 goroutine 手上可能正好有一条
 	// 没人接收的结果，靠缓冲位或 readerDone 分支退出，不会永久阻塞在发送上。
+	//
+	// 另一种情形是 handler 返回时读 goroutine 还阻塞在 stream.Recv() 里，这同样
+	// 不会泄漏：handler 一返回，gRPC 就会结束并清理这个流，那次 Recv 随即带错误
+	// 返回；此时 defer 已经 close(readerDone)，goroutine 走 readerDone 分支直接
+	// 退出（就算它抢到了缓冲位，写完也会因为 err != nil 而返回）。既不会空转，
+	// 也不会有第二次 Recv。
+	//
+	// 需要说明的是这条结论的依据：grpc-go 明确文档化的是**并发**约束
+	// （同一个流上不得并发调用 RecvMsg），而本函数从头到尾只有这一个 goroutine
+	// 调 Recv，不违反它；"handler 返回后仍在途的 Recv 会被唤醒"则属于 grpc-go
+	// 的实现行为（v1.83.0 已确认），并非它承诺的 API 契约。之所以可以依赖：
+	// 一旦哪天不成立，后果也仅限于每条已关闭的 telemetry 流残留一个 goroutine，
+	// 而 Shutdown 本身是进程停机路径——残留 goroutine 随进程一起消失，
+	// 不会累积成运行期泄漏。
 	type recvResult struct {
 		cmd *pb.TelemetryCommand
 		err error

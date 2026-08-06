@@ -204,12 +204,27 @@ func TestTelemetrySubscriptionSettingsMatchClientType(t *testing.T) {
 	if sub.Subscription.GetGroup().GetName() != "g-settings" {
 		t.Fatalf("消费组应原样带回，实际 %v", sub.Subscription.GetGroup())
 	}
-	if sub.Subscription.GetFifo() {
+	// Fifo/ReceiveBatchSize/LongPollingTimeout 都是 proto3 optional（指针字段），
+	// 必须先断言指针非 nil 再断言取值：Getter 对 nil 返回零值，光看
+	// GetFifo()==false 分不清「显式下发了 false」和「压根没下发」这两种情况，
+	// 而后者正是这条用例要防的回归——字段被漏填时 Getter 依然一片祥和。
+	if sub.Subscription.Fifo == nil {
+		t.Fatal("fifo 必须显式下发（当前为 nil，客户端只能靠默认值猜）")
+	}
+	if *sub.Subscription.Fifo {
 		t.Fatal("M1 不支持顺序消费，fifo 必须显式下发 false")
 	}
-	if sub.Subscription.GetLongPollingTimeout().AsDuration() != defaultLongPolling {
-		t.Fatalf("长轮询上限应下发服务端真实值 %v，实际 %v",
-			defaultLongPolling, sub.Subscription.GetLongPollingTimeout().AsDuration())
+	if sub.Subscription.ReceiveBatchSize == nil {
+		t.Fatal("receive_batch_size 必须显式下发：漏填时 push 消费者拿到的批量大小是 0")
+	}
+	if got := sub.Subscription.GetReceiveBatchSize(); got != pushReceiveBatchSize {
+		t.Fatalf("receive_batch_size 应为 %d，实际 %d", pushReceiveBatchSize, got)
+	}
+	if sub.Subscription.LongPollingTimeout == nil {
+		t.Fatal("long_polling_timeout 必须显式下发（当前为 nil）")
+	}
+	if got := sub.Subscription.GetLongPollingTimeout().AsDuration(); got != defaultLongPolling {
+		t.Fatalf("长轮询上限应下发服务端真实值 %v，实际 %v", defaultLongPolling, got)
 	}
 }
 

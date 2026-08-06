@@ -68,6 +68,19 @@ const (
 	// gracefulStopTimeout（30s），否则测试会在 sq 的强制中断兜底生效之前
 	// 就把它杀掉，等于把「sq 能否自己停下来」这件事测掉了。
 	brokerStopTimeout = 45 * time.Second
+
+	// brokerForcedStopBackstop 是 cmd/sq/main.go 里 gracefulStopTimeout 的值，
+	// 只用于断言失败时的提示文案（那个常量不导出，这里刻意不去引用它——
+	// e2e 不该为了一句报错信息去改被测代码的可见性）。
+	brokerForcedStopBackstop = 30 * time.Second
+
+	// brokerStopBudget SIGTERM 到进程退出之间允许的最长间隔。
+	//
+	// 取值依据是实测数据的两端：修好之后，producer + consumer 都在线时停机
+	// 耗时 0.04s；退回去（不调 srv.Shutdown）则一定会走满 30s 的强制中断兜底。
+	// 5s 落在这两个数量级中间——比正常值宽出两个数量级，不会因为 CI 机器慢、
+	// 进程调度抖动而误报；又远低于 30s，回归一旦发生必然被抓住。
+	brokerStopBudget = 5 * time.Second
 )
 
 // brokerBinary 由 TestMain 编译出来的 sq 可执行文件路径，全部用例共用。
@@ -260,27 +273,55 @@ func waitBrokerReady(t *testing.T, endpoint string, waitDone <-chan error, logPa
 	t.Fatalf("broker 在 %v 内未开始监听 %s", brokerStartTimeout, endpoint)
 }
 
-// stopBroker 先 SIGTERM 走 main.go 的优雅停机路径，超时再 SIGKILL 兜底。
+// stopBroker 先 SIGTERM 走 main.go 的优雅停机路径，超时再 SIGKILL 兜底，
+// 并对停机结果做断言——这是 main.go 停机链路唯一的回归护栏。
+//
+// 为什么这里必须 Errorf 而不是只 Logf：cmd/sq/main.go 的停机由两步组成，
+// 顺序还是承重的——先 srv.Shutdown() 收尾没有自然终点的 Telemetry 长流，
+// 再 gracefulStop() 排空在途 RPC。这两步任何一步被删掉或调换顺序，
+// GracefulStop 都会挂在那条永不结束的流上，直到 30s 的强制中断兜底才退出。
+// 而 30s < brokerStopTimeout(45s)，进程最终仍会以退出码 0 正常退出——
+// 也就是说：**光看"能不能停下来"，回归是完全静默的，全部用例照样通过，
+// 只是每条慢 30 秒。** rpc 包里的 TestShutdownEndsTelemetryStream 只能覆盖
+// Server.Shutdown 本身，看不见 main.go 里的调用与顺序。
+//
+// 因此这里同时钉住两件事：
+//   - 退出码为 0：SIGTERM 被正常处理，不是被信号杀死、也不是启动期就崩了
+//   - SIGTERM 到退出的间隔在 brokerStopBudget 之内：证明走的是"主动收尾"
+//     这条快路径，而不是掉进 30s 强制中断兜底
 func stopBroker(t *testing.T, cmd *exec.Cmd, waitDone <-chan error) {
 	t.Helper()
 	if cmd.Process == nil {
 		return
 	}
 	select {
-	case <-waitDone: // 已经退出了（多半是异常退出，日志里有）
+	case err := <-waitDone:
+		// 用例还没跑完 broker 就自己退出了：无论退出码是什么都是故障
+		// （正常情况下它应当一直服务到本函数发出 SIGTERM 为止）。
+		t.Errorf("broker 进程在用例结束前就已退出: %v", err)
 		return
 	default:
 	}
 	if err := cmd.Process.Signal(syscall.SIGTERM); err != nil {
-		t.Logf("向 broker 发送 SIGTERM 失败: %v", err)
+		t.Errorf("向 broker 发送 SIGTERM 失败: %v", err)
+		return
 	}
+	sentAt := time.Now()
 	select {
 	case err := <-waitDone:
+		elapsed := time.Since(sentAt)
 		if err != nil {
-			t.Logf("broker 进程退出: %v", err)
+			t.Errorf("broker 未能干净退出：SIGTERM 后 cmd.Wait 返回 %v（期望退出码 0）", err)
 		}
+		if elapsed > brokerStopBudget {
+			t.Errorf("broker 收到 SIGTERM 后耗时 %v 才退出，超过预算 %v："+
+				"说明优雅停机没走主动收尾路径，而是掉进了 cmd/sq/main.go 的 %v 强制中断兜底——"+
+				"检查 srv.Shutdown() 是否仍在 gracefulStop() 之前被调用",
+				elapsed, brokerStopBudget, brokerForcedStopBackstop)
+		}
+		t.Logf("broker 收到 SIGTERM 后 %v 退出（预算 %v）", elapsed, brokerStopBudget)
 	case <-time.After(brokerStopTimeout):
-		t.Logf("broker 在 %v 内未响应 SIGTERM，强制杀掉", brokerStopTimeout)
+		t.Errorf("broker 在 %v 内完全没有响应 SIGTERM，强制杀掉", brokerStopTimeout)
 		cmd.Process.Kill()
 		<-waitDone
 	}
