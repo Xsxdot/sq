@@ -16,7 +16,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"sort"
 	"sync"
 	"sync/atomic"
 
@@ -65,6 +64,14 @@ func (s *Server) routes(reg *prometheus.Registry) {
 	s.mux.HandleFunc("POST /admin/login", s.handleLogin)
 	s.mux.Handle("GET /metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
 	s.mux.HandleFunc("GET /admin/topics", s.protected(s.handleTopicsList))
+	s.mux.HandleFunc("POST /admin/topics", s.protected(s.handleTopicCreate))
+	s.mux.HandleFunc("GET /admin/topics/{name}", s.protected(s.handleTopicGet))
+	s.mux.HandleFunc("PATCH /admin/topics/{name}", s.protected(s.handleTopicPatch))
+	s.mux.HandleFunc("DELETE /admin/topics/{name}", s.protected(s.handleTopicDelete))
+	s.mux.HandleFunc("GET /admin/groups", s.protected(s.handleGroupsList))
+	s.mux.HandleFunc("GET /admin/groups/{name}", s.protected(s.handleGroupGet))
+	s.mux.HandleFunc("POST /admin/groups/{name}/reset-cursor", s.protected(s.handleGroupResetCursor))
+	s.mux.HandleFunc("DELETE /admin/groups/{name}", s.protected(s.handleGroupDelete))
 }
 
 // Handler 返回根 handler（测试注入用）。
@@ -84,24 +91,4 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	}
 	s.logger.Info("admin HTTP 停机")
 	return s.hs.Shutdown(ctx)
-}
-
-// topicJSON topic 的 API 序列化形状（列表与详情共用）。
-type topicJSON struct {
-	Name        string `json:"name"`
-	Queues      uint32 `json:"queues"`
-	RetentionMs int64  `json:"retention_ms"`
-	CreatedAtMs int64  `json:"created_at_ms"`
-}
-
-// handleTopicsList GET /admin/topics：全部 topic 按名字序。
-func (s *Server) handleTopicsList(w http.ResponseWriter, r *http.Request) {
-	tcs := s.mt.Topics()
-	sort.Slice(tcs, func(i, j int) bool { return tcs[i].Name < tcs[j].Name })
-	out := make([]topicJSON, 0, len(tcs))
-	for _, tc := range tcs {
-		out = append(out, topicJSON{Name: tc.Name, Queues: tc.Queues,
-			RetentionMs: tc.RetentionMs, CreatedAtMs: tc.CreatedAtMs})
-	}
-	writeJSON(w, http.StatusOK, out)
 }
