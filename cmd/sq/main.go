@@ -100,10 +100,18 @@ func run() error {
 	// UserProperties，会让恰好达到文档宣称的 4MB 上限的消息在到达应用层校验
 	// 之前就被传输层拒绝（见 internal/rpc/limits.go 的详细推导）。
 	// ReceiveMessage 会把同样大小的 body 流式发回，所以发送方向也要同步放宽。
-	gs := grpc.NewServer(
+	gopts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(rpc.MaxGRPCMessageSize),
 		grpc.MaxSendMsgSize(rpc.MaxGRPCMessageSize),
-	)
+	}
+	// AK/SK 认证按配置装配（spec §6 默认关闭）。拦截器必须 unary+stream 成对装：
+	// 只装 unary 会让 ReceiveMessage/Telemetry 两条流绕过认证。
+	if cfg.AccessKey != "" {
+		au, as := rpc.NewAuthInterceptors(cfg.AccessKey, cfg.SecretKey, logger)
+		gopts = append(gopts, grpc.ChainUnaryInterceptor(au), grpc.ChainStreamInterceptor(as))
+		logger.Info("gRPC AK/SK 认证已启用", "access_key", cfg.AccessKey)
+	}
+	gs := grpc.NewServer(gopts...)
 	srv := rpc.New(cfg, mt, pr, dl, writeBlocked, logger)
 	srv.Register(gs)
 
