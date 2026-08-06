@@ -1,3 +1,13 @@
+// Package config 提供 sq 的配置加载测试。
+//
+// 职责：
+//   - 验证 Config 默认值正确性
+//   - 验证 YAML 文件覆盖默认值的行为
+//   - 确保配置加载不产生预期外的错误
+//
+// 边界：
+//   - 不测试业务语义校验（如端口合法性）
+//   - 不测试文件系统异常情况
 package config
 
 import (
@@ -19,7 +29,9 @@ func TestLoadDefaults(t *testing.T) {
 
 func TestLoadYAMLOverride(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "sq.yaml")
-	os.WriteFile(p, []byte("grpc_listen: \":9081\"\nfsync: async\n"), 0o644)
+	if err := os.WriteFile(p, []byte("grpc_listen: \":9081\"\nfsync: async\n"), 0o644); err != nil {
+		t.Fatalf("WriteFile: %v", err)
+	}
 	cfg, err := Load(p)
 	if err != nil {
 		t.Fatalf("Load: %v", err)
