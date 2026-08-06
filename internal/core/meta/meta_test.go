@@ -154,3 +154,77 @@ func TestTopicsSnapshot(t *testing.T) {
 		t.Fatalf("Topics 快照: %d", got)
 	}
 }
+
+// TestTopicUpdateAndDelete 修改 retention、删除 topic 与错误路径。
+func TestTopicUpdateAndDelete(t *testing.T) {
+	st, err := store.Open(t.TempDir(), true, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	m, err := New(st, true, 4, 16, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.CreateTopic("t1", 2); err != nil {
+		t.Fatal(err)
+	}
+	tc, err := m.UpdateTopicRetention("t1", 1000)
+	if err != nil || tc.RetentionMs != 1000 {
+		t.Fatalf("更新 retention 失败: %+v %v", tc, err)
+	}
+	// 持久化必须生效：重开 meta 后新值仍在
+	m2, err := New(st, true, 4, 16, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tc, _ := m2.GetTopic("t1"); tc.RetentionMs != 1000 {
+		t.Fatalf("retention 未持久化: %+v", tc)
+	}
+	if _, err := m.UpdateTopicRetention("t1", 0); err == nil {
+		t.Fatal("retention<=0 应拒绝")
+	}
+	if _, err := m.UpdateTopicRetention("nope", 1000); !errors.Is(err, ErrTopicNotFound) {
+		t.Fatalf("不存在的 topic 应返回 ErrTopicNotFound: %v", err)
+	}
+	if err := m.DeleteTopic("t1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := m.GetTopic("t1"); ok {
+		t.Fatal("删除后不应可见")
+	}
+	if err := m.DeleteTopic("t1"); !errors.Is(err, ErrTopicNotFound) {
+		t.Fatalf("重复删除应返回 ErrTopicNotFound: %v", err)
+	}
+}
+
+// TestGroupAccessorsAndDelete GetGroup/Groups/DeleteGroup。
+func TestGroupAccessorsAndDelete(t *testing.T) {
+	st, err := store.Open(t.TempDir(), true, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	m, err := New(st, true, 4, 16, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.EnsureGroup("g1"); err != nil {
+		t.Fatal(err)
+	}
+	if gc, ok := m.GetGroup("g1"); !ok || gc.Name != "g1" {
+		t.Fatalf("GetGroup 不符: %+v %v", gc, ok)
+	}
+	if _, ok := m.GetGroup("nope"); ok {
+		t.Fatal("不存在的组不应命中")
+	}
+	if gs := m.Groups(); len(gs) != 1 || gs[0].Name != "g1" {
+		t.Fatalf("Groups 快照不符: %+v", gs)
+	}
+	if err := m.DeleteGroup("g1"); err != nil {
+		t.Fatal(err)
+	}
+	if err := m.DeleteGroup("g1"); !errors.Is(err, ErrGroupNotFound) {
+		t.Fatalf("重复删除应返回 ErrGroupNotFound: %v", err)
+	}
+}

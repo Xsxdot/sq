@@ -27,6 +27,9 @@ var ErrTopicNotFound = errors.New("topic 不存在")
 // ErrBadName 名字不符合 ^[A-Za-z0-9_%\-]{1,127}$。
 var ErrBadName = errors.New("名字含非法字符或长度超限")
 
+// ErrGroupNotFound 订阅组不存在（Admin API 删除/查询用）。
+var ErrGroupNotFound = errors.New("订阅组不存在")
+
 // DefaultMaxAttempts 订阅组默认最大投递次数（超过即转 DLQ），与 RocketMQ 默认一致。
 const DefaultMaxAttempts = 16
 
@@ -217,4 +220,83 @@ func (m *Meta) Topics() []TopicConfig {
 		out = append(out, tc)
 	}
 	return out
+}
+
+// GetGroup 查询订阅组配置（只读，不注册——与 EnsureGroup 的区别）。
+func (m *Meta) GetGroup(name string) (GroupConfig, bool) {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	gc, ok := m.groups[name]
+	return gc, ok
+}
+
+// Groups 返回全部订阅组配置快照（Admin API/metrics 用；乱序）。
+func (m *Meta) Groups() []GroupConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]GroupConfig, 0, len(m.groups))
+	for _, gc := range m.groups {
+		out = append(out, gc)
+	}
+	return out
+}
+
+// UpdateTopicRetention 修改 topic 保留时长并持久化。retentionMs 必须 >0：
+// 0 在 TopicConfig 里是"M1 旧数据回退默认"的哨兵值，允许写入会让两种语义混淆。
+func (m *Meta) UpdateTopicRetention(name string, retentionMs int64) (TopicConfig, error) {
+	if retentionMs <= 0 {
+		return TopicConfig{}, fmt.Errorf("retention_ms 必须 >0，得到 %d", retentionMs)
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	tc, ok := m.topics[name]
+	if !ok {
+		return TopicConfig{}, fmt.Errorf("%w: %s", ErrTopicNotFound, name)
+	}
+	tc.RetentionMs = retentionMs
+	raw, _ := json.Marshal(tc)
+	b := m.st.NewBatch()
+	b.Set(store.TopicMetaKey(name), raw, nil)
+	if err := m.st.Apply(b); err != nil {
+		return TopicConfig{}, fmt.Errorf("持久化 topic %s: %w", name, err)
+	}
+	m.topics[name] = tc
+	m.logger.Info("topic retention 已更新", "topic", name, "retention_ms", retentionMs)
+	return tc, nil
+}
+
+// DeleteTopic 删除 topic 注册表条目。只删注册表——msg/keyidx/alloc 等数据清理
+// 是 adminops.PurgeTopicData 的职责（本包边界：不管队列内容）。不存在返回
+// ErrTopicNotFound，让 Admin API 能区分 404 与 500。
+func (m *Meta) DeleteTopic(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.topics[name]; !ok {
+		return fmt.Errorf("%w: %s", ErrTopicNotFound, name)
+	}
+	b := m.st.NewBatch()
+	b.Delete(store.TopicMetaKey(name), nil)
+	if err := m.st.Apply(b); err != nil {
+		return fmt.Errorf("删除 topic %s: %w", name, err)
+	}
+	delete(m.topics, name)
+	m.logger.Info("topic 已删除", "topic", name)
+	return nil
+}
+
+// DeleteGroup 删除订阅组注册表条目（cursor/inflight 清理归 adminops.PurgeGroupData）。
+func (m *Meta) DeleteGroup(name string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if _, ok := m.groups[name]; !ok {
+		return fmt.Errorf("%w: %s", ErrGroupNotFound, name)
+	}
+	b := m.st.NewBatch()
+	b.Delete(store.GroupMetaKey(name), nil)
+	if err := m.st.Apply(b); err != nil {
+		return fmt.Errorf("删除 group %s: %w", name, err)
+	}
+	delete(m.groups, name)
+	m.logger.Info("消费组已删除", "group", name)
+	return nil
 }

@@ -136,3 +136,31 @@ func TestParseDelayKeyRejectsGarbage(t *testing.T) {
 		}
 	}
 }
+
+// TestCursorKeyRoundTrip Cursor key 的构造/解析闭环与前缀正确性。
+func TestCursorKeyRoundTrip(t *testing.T) {
+	k := CursorKey("g1", "t1", 7)
+	g, tp, q, err := ParseCursorKey(k)
+	if err != nil || g != "g1" || tp != "t1" || q != 7 {
+		t.Fatalf("解析不符: %s %s %d %v", g, tp, q, err)
+	}
+	if !bytes.HasPrefix(k, CursorGroupPrefix("g1")) {
+		t.Fatal("CursorGroupPrefix 应是 CursorKey 的前缀")
+	}
+	if !bytes.HasPrefix(k, CursorPrefix()) {
+		t.Fatal("CursorPrefix 应是 CursorKey 的前缀")
+	}
+	// 组名前缀必须带 '/'：不带的话 "g1" 会误扫 "g10" 的位点
+	if bytes.HasPrefix(CursorKey("g10", "t1", 0), CursorGroupPrefix("g1")) {
+		t.Fatal("CursorGroupPrefix(\"g1\") 不得匹配 g10 的 key")
+	}
+	if _, _, _, err := ParseCursorKey([]byte("cursor/损坏")); err == nil {
+		t.Fatal("坏 key 应报错")
+	}
+	if !bytes.HasPrefix(InflightKey("g1", "t1", 0, 0), InflightGroupPrefix("g1")) {
+		t.Fatal("InflightGroupPrefix 应是 InflightKey 的前缀")
+	}
+	if !bytes.HasPrefix(InflightKey("g1", "t1", 0, 0), InflightAllPrefix()) {
+		t.Fatal("InflightAllPrefix 应是 InflightKey 的前缀")
+	}
+}
