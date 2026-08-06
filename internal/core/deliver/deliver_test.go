@@ -78,6 +78,14 @@ func (f *fixture) sendTagged(t *testing.T, topic, body, tag string) {
 	}
 }
 
+// sendGrouped 发送一条顺序消息（MessageGroup 非空，M4 顺序锁用例专用辅助）
+func (f *fixture) sendGrouped(t *testing.T, topic, body, group string) {
+	t.Helper()
+	if _, err := f.pr.Append(&core.Message{Topic: topic, Body: []byte(body), MessageGroup: group}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+}
+
 func TestReceiveAckFlow(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t", "a")
@@ -500,5 +508,162 @@ func TestExhaustedAttemptsGoToDLQ(t *testing.T) {
 	}
 	if string(dlq[0].Body) != "poison" || dlq[0].Properties["sq-origin-topic"] != "t" {
 		t.Fatalf("死信内容/来源属性不符: %s %v", dlq[0].Body, dlq[0].Properties)
+	}
+}
+
+// 顺序消息一次只投一条：未 ack 时后续顺序消息全部被拦，ack 后放行下一条
+func TestOrderedDeliversOneAtATime(t *testing.T) {
+	f := newFixture(t)
+	f.sendGrouped(t, "t", "a", "g1")
+	f.sendGrouped(t, "t", "b", "g1")
+	f.sendGrouped(t, "t", "c", "g1")
+	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(msgs) != 1 || string(msgs[0].Body) != "a" {
+		t.Fatalf("maxMsgs=10 也只能投第 1 条顺序消息: %d %v", len(msgs), err)
+	}
+	// 未 ack 期间再取：空（顺序锁占用）
+	again, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(again) != 0 {
+		t.Fatalf("未 ack 不应投出后续顺序消息: %d %v", len(again), err)
+	}
+	// ack 后放行下一条
+	if _, err := f.dl.Ack("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	next, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(next) != 1 || string(next[0].Body) != "b" {
+		t.Fatalf("ack 后应投第 2 条: %d %v", len(next), err)
+	}
+}
+
+// 卡住语义：过期重投的还是队头那条（attempt 递增），绝不先投下一条；
+// 且重投后顺序锁仍占用（Ordered 标记在重投时被保留）
+func TestOrderedStuckOnExpiredRedelivery(t *testing.T) {
+	f := newFixture(t)
+	f.sendGrouped(t, "t", "a", "g1")
+	f.sendGrouped(t, "t", "b", "g1")
+	first, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 30*time.Millisecond, 0, nil)
+	if err != nil || len(first) != 1 || string(first[0].Body) != "a" {
+		t.Fatalf("首投: %d %v", len(first), err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	red, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(red) != 1 || string(red[0].Body) != "a" || red[0].DeliveryAttempt != 2 {
+		t.Fatalf("过期后应重投队头 a（attempt=2）而非跳到 b: %+v %v", red, err)
+	}
+	// 重投后 b 仍被拦（Ordered 标记未在重投中丢失）
+	blocked, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(blocked) != 0 {
+		t.Fatalf("重投后 b 仍应被顺序锁拦住: %d %v", len(blocked), err)
+	}
+	// ack 重投那次的句柄（attempt=2）后放行 b
+	if _, err := f.dl.Ack("g", "t", 0, red[0].Offset, red[0].DeliveryAttempt); err != nil {
+		t.Fatalf("Ack: %v", err)
+	}
+	next, _ := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	if len(next) != 1 || string(next[0].Body) != "b" {
+		t.Fatalf("ack 后应投 b: %d", len(next))
+	}
+}
+
+// 顺序消息重投不设指数退避下限（spec §5 流程 6 退避仅限非顺序消息）：
+// 用远小于 retryBackoffBase(10s) 的不可见时长连续重投，attempt 快速递增。
+// 若误用退避下限，attempt=3 那次要等 10s，本用例会超时失败。
+func TestOrderedRedeliveryNoBackoffFloor(t *testing.T) {
+	f := newFixture(t)
+	f.sendGrouped(t, "t", "a", "g1")
+	m, err := f.dl.Receive(context.Background(), "g", "t", 0, 1, 30*time.Millisecond, 0, nil)
+	if err != nil || len(m) != 1 {
+		t.Fatalf("首投: %d %v", len(m), err)
+	}
+	for want := int32(2); want <= 3; want++ {
+		time.Sleep(50 * time.Millisecond)
+		m, err = f.dl.Receive(context.Background(), "g", "t", 0, 1, 30*time.Millisecond, 0, nil)
+		if err != nil || len(m) != 1 || m[0].DeliveryAttempt != want {
+			t.Fatalf("顺序重投应立即可得（无退避下限），attempt 期望 %d: %+v %v", want, m, err)
+		}
+	}
+}
+
+// 超限转 DLQ 后队列解锁推进：卡住的消息进 %DLQ%{group}，下一条顺序消息可投
+func TestOrderedExhaustedToDLQUnblocksQueue(t *testing.T) {
+	f := newFixtureMaxAttempts(t, 2)
+	f.sendGrouped(t, "t", "a", "g1")
+	f.sendGrouped(t, "t", "b", "g1")
+	// attempt 1、2 各一轮，均不 ack、放到过期
+	for i := 0; i < 2; i++ {
+		m, err := f.dl.Receive(context.Background(), "g", "t", 0, 1, 30*time.Millisecond, 0, nil)
+		if err != nil || len(m) != 1 || string(m[0].Body) != "a" {
+			t.Fatalf("第 %d 轮应投 a: %+v %v", i+1, m, err)
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// attempts 已达上限：本轮把 a 转 DLQ 并解锁，b 在同轮或下一轮可投
+	next, err := f.dl.Receive(context.Background(), "g", "t", 0, 1, time.Minute, 0, nil)
+	if err != nil || len(next) != 1 || string(next[0].Body) != "b" {
+		t.Fatalf("a 入 DLQ 后应投 b: %+v %v", next, err)
+	}
+	// DLQ 里恰有 a，且 MessageGroup 已清空（死信不再参与顺序，moveToDLQ 既有行为）
+	dlq, err := f.dl.Receive(context.Background(), "g", meta.DLQTopicName("g"), 0, 10, time.Minute, 0, nil)
+	if err != nil || len(dlq) != 1 || string(dlq[0].Body) != "a" || dlq[0].MessageGroup != "" {
+		t.Fatalf("DLQ 内容不符: %+v %v", dlq, err)
+	}
+}
+
+// 混发队列的队头阻塞语义（设计决策 3）：顺序消息被投出后，其后的普通消息
+// 照常投（顺序锁只拦顺序消息）；被锁拦下的顺序消息则连同其后的一切消息
+// 都取不到（位点停在它前面），ack 解锁后继续。
+func TestMixedQueueHeadOfLineBlocking(t *testing.T) {
+	f := newFixture(t)
+	f.sendGrouped(t, "t", "a", "g1") // offset 0
+	f.send(t, "t", "n")              // offset 1，普通消息
+	f.sendGrouped(t, "t", "c", "g1") // offset 2
+	f.send(t, "t", "d")              // offset 3，普通消息，被 c 队头阻塞
+	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(msgs) != 2 || string(msgs[0].Body) != "a" || string(msgs[1].Body) != "n" {
+		t.Fatalf("应投出 a 与 n，c/d 被拦: %+v %v", msgs, err)
+	}
+	// 位点停在 c（offset 2）之前——崩溃重启后 c 仍是下一条候选
+	v, ok, err := f.st.Get(store.CursorKey("g", "t", 0))
+	if err != nil || !ok || store.GetU64(v) != 2 {
+		t.Fatalf("位点应停在被拦消息处（2）: %v %v", v, err)
+	}
+	if _, err := f.dl.Ack("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt); err != nil {
+		t.Fatalf("Ack a: %v", err)
+	}
+	next, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(next) != 2 || string(next[0].Body) != "c" || string(next[1].Body) != "d" {
+		t.Fatalf("解锁后应投 c 与 d: %+v %v", next, err)
+	}
+}
+
+// Tag 过滤先于顺序锁（设计决策 3）：不匹配的顺序消息永久跳过、推进位点，
+// 不会被锁拦成永久堵塞
+func TestOrderedTagFilteredStillSkipped(t *testing.T) {
+	f := newFixture(t)
+	if _, err := f.pr.Append(&core.Message{Topic: "t", Body: []byte("a"), MessageGroup: "g1", Tag: "keep"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pr.Append(&core.Message{Topic: "t", Body: []byte("b"), MessageGroup: "g1", Tag: "drop"}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.pr.Append(&core.Message{Topic: "t", Body: []byte("c"), MessageGroup: "g1", Tag: "keep"}); err != nil {
+		t.Fatal(err)
+	}
+	filter, err := ParseTagFilter("keep")
+	if err != nil {
+		t.Fatal(err)
+	}
+	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, filter)
+	if err != nil || len(msgs) != 1 || string(msgs[0].Body) != "a" {
+		t.Fatalf("首投 a: %+v %v", msgs, err)
+	}
+	if _, err := f.dl.Ack("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt); err != nil {
+		t.Fatal(err)
+	}
+	// b 不匹配被永久跳过，直接投 c
+	next, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, filter)
+	if err != nil || len(next) != 1 || string(next[0].Body) != "c" {
+		t.Fatalf("b 应被过滤跳过、投出 c: %+v %v", next, err)
 	}
 }

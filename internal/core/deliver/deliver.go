@@ -14,6 +14,7 @@
 //   - 投递次数超上限的消息在重投检查时惰性转入死信 %DLQ%{group}（1 队列）；
 //     重投指数退避靠不可见时长下限实现，详见 retryBackoff 注释
 //   - Tag 过滤已落地（"*"/"tagA"/"tagA || tagB"），SQL92 属性过滤属 v1.1
+//   - 顺序消息（M4）：队列级顺序锁，MessageGroup 非空即顺序；重投无退避、超限入 DLQ 解锁
 //
 // 位点语义说明（对应 spec §5.2"推进到最小未 ack"的实现形态）：
 //
@@ -175,8 +176,13 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 	type redeliver struct {
 		offset   uint64
 		attempts int32
+		ordered  bool
 	}
 	var reds []redeliver
+	// orderedBusy：本队列是否存在未终结的顺序 inflight（顺序锁的内存判据，
+	// spec §5 流程 4）。不变式「每队列至多 1 条 Ordered inflight」由阶段 2 的
+	// 投递门维护，因此单个 bool 足够，无需计数。
+	orderedBusy := false
 	pfx := store.InflightPrefix(group, topic, queueID)
 	err := d.st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) {
 		_, _, _, off, err := store.ParseInflightKey(k)
@@ -187,10 +193,17 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 		if err != nil {
 			return false, err
 		}
-		if ist.ExpireAtMs <= now {
-			reds = append(reds, redeliver{offset: off, attempts: ist.Attempts})
+		if ist.Ordered {
+			orderedBusy = true
 		}
-		return len(reds)+1 <= maxMsgs, nil
+		if ist.ExpireAtMs <= now && len(reds) < maxMsgs {
+			reds = append(reds, redeliver{offset: off, attempts: ist.Attempts, ordered: ist.Ordered})
+		}
+		// M1-M3 在收满 maxMsgs 个重投候选后提前停扫；M4 起必须看完整个队列的
+		// inflight——顺序锁判据 orderedBusy 需要完整视野，提前停会漏看排在
+		// 后面的 Ordered 记录，导致顺序锁形同虚设。代价可控：单队列 inflight
+		// 条数以未 ack 消息数为上界，远小于消息总量。
+		return true, nil
 	})
 	if err != nil {
 		b.Close() // 未提交，按批次生命周期契约自行回收
@@ -210,6 +223,10 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 			d.logger.Warn("inflight 指向的消息不存在，清理孤儿记录", "group", group, "topic", topic, "queue", queueID, "offset", r.offset)
 			b.Delete(store.InflightKey(group, topic, queueID, r.offset), nil)
 			staged = true
+			if r.ordered {
+				// 被清理的正是持有顺序锁的记录：锁随记录消失（不变式保证至多一条）
+				orderedBusy = false
+			}
 			continue
 		}
 		m, err := core.DecodeMessage(raw)
@@ -228,16 +245,29 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 				b.Close()
 				return nil, err
 			}
+			if r.ordered {
+				// 卡住队头的顺序消息已随 inflight 一并移除：顺序锁释放，
+				// 本轮阶段 2 即可投出下一条顺序消息（卡住→超限→推进，spec 流程 4/6）
+				orderedBusy = false
+				d.logger.Info("顺序消息超限入死信，队列解锁", "group", group, "topic", topic,
+					"queue", queueID, "offset", r.offset, "msg_id", m.ID)
+			}
 			continue
 		}
 		m.DeliveryAttempt = r.attempts + 1
-		// 指数退避：不可见时长取客户端要求与退避下限的较大者
+		// 指数退避只作用于非顺序消息（spec §5 流程 6）：顺序消息要的是原地
+		// 快速重投（卡队头），退避会把整条队列拖住数分钟——不可见时长直接用
+		// 客户端值。协议层 InvisibleDuration 回填用同一判据（receive.go）。
 		exp := expireAt
-		if bo := retryBackoff(m.DeliveryAttempt); bo > invisible {
-			exp = now + bo.Milliseconds()
+		if !r.ordered {
+			if bo := retryBackoff(m.DeliveryAttempt); bo > invisible {
+				exp = now + bo.Milliseconds()
+			}
 		}
+		// 重投必须原样保留 Ordered 标记：丢了它，重投后的记录不再被视为
+		// 顺序锁占用，下一条顺序消息会与卡在队头的这条并发投递，顺序即破。
 		b.Set(store.InflightKey(group, topic, queueID, r.offset),
-			core.EncodeInflight(&core.InflightState{ExpireAtMs: exp, Attempts: m.DeliveryAttempt}), nil)
+			core.EncodeInflight(&core.InflightState{ExpireAtMs: exp, Attempts: m.DeliveryAttempt, Ordered: r.ordered}), nil)
 		out = append(out, m)
 		staged = true
 	}
@@ -267,18 +297,35 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 			if err != nil {
 				return false, err
 			}
-			// 位点始终越过已检视消息：Tag 不匹配即对本消费组永久跳过
-			//（spec §5 流程 2：不投递、不占 inflight、推进本组视角位点）。
-			// 全部被过滤（out 为空）时位点也必须持久化——newCursor 前进即触发
-			// 下方既有的 staged 判定进 Apply——否则下趟重复扫描同一批不匹配消息。
-			newCursor = m.Offset + 1
+			// Tag 过滤在顺序锁之前：不匹配的消息（含顺序消息）对本消费组永久
+			// 跳过、推进位点（spec §5 流程 2 语义不变）。顺序消息被过滤跳过不
+			// 破坏顺序——它对本组从未投递，"已投递消息间"的相对顺序完好。
+			// 若把顺序锁放在前面，被锁拦住的不匹配消息会永远堵住位点。
 			if !filter.Match(m.Tag) {
+				newCursor = m.Offset + 1
 				skipped++
 				return true, nil
 			}
+			// 顺序锁（spec §5 流程 4）：队列存在未终结的顺序 inflight 时，
+			// 后续顺序消息不投。停止扫描且【不推进 newCursor】——这条消息
+			// 未被投递，位点停在它前面，崩溃重启后它仍是下一条候选（卡住
+			// 而不跳过的实现根基）。副作用：其后的普通消息一并等待（队头
+			// 阻塞，设计决策 3，README 建议顺序消息用专用 topic）。
+			if m.MessageGroup != "" && orderedBusy {
+				d.logger.Debug("顺序锁阻塞取件", "group", group, "topic", topic,
+					"queue", queueID, "blocked_offset", m.Offset)
+				return false, nil
+			}
+			newCursor = m.Offset + 1
 			m.DeliveryAttempt = 1
+			ordered := m.MessageGroup != ""
+			if ordered {
+				// 投出即占锁：本轮扫描内的下一条顺序消息就会被上面的判定拦下，
+				// 由此维持「每队列至多 1 条 Ordered inflight」不变式
+				orderedBusy = true
+			}
 			b.Set(store.InflightKey(group, topic, queueID, m.Offset),
-				core.EncodeInflight(&core.InflightState{ExpireAtMs: expireAt, Attempts: 1}), nil)
+				core.EncodeInflight(&core.InflightState{ExpireAtMs: expireAt, Attempts: 1, Ordered: ordered}), nil)
 			out = append(out, m)
 			return len(out) < maxMsgs, nil
 		})
