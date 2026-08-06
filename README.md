@@ -11,7 +11,7 @@ go build -o sq ./cmd/sq
 ```
 
 用官方 RocketMQ 5.x SDK（Java/Go/Python/C#/C++）直接连接 `127.0.0.1:8081` 收发。
-当前状态：M1（普通消息）。里程碑与设计见 docs/superpowers/specs/。
+当前状态：M2（重试/DLQ、Tag 过滤、Keys 索引、retention）。里程碑与设计见 docs/superpowers/specs/。
 
 停机用 `SIGINT`/`SIGTERM` 即可：收到信号后先让协议层结束没有自然终点的长流
 （`Telemetry`），再等在途 RPC 处理完（gRPC `GracefulStop`），最后关闭底层存储，
@@ -29,6 +29,27 @@ go build -o sq ./cmd/sq
 被中断的 `ReceiveMessage` 不会丢消息——inflight 记录已落盘，消费者没收到就不会
 确认，不可见窗口一过即重投。
 
+## 功能列表
+
+- 普通消息收发：官方 SDK 直连，gRPC + Pebble 存储，消息体上限 4MB
+- Tag 过滤：服务端按订阅表达式过滤（`"*"`/单 tag/`a || b`），被过滤消息跳过并
+  永久越过位点，不占消费 inflight
+- 重试与死信：投递失败按指数退避重投（10s 起、每次 ×2、封顶 5min），超过订阅组
+  `default_max_attempts` 后原子转入 `%DLQ%{group}` 死信队列并带 `sq-origin-*`
+  溯源属性（见「消费失败链路」）
+- Keys 业务索引：发送时可带 keys，按 key 检索消息
+- 消息 retention：按 topic 保留时长后台清理（默认 3 天），消息与 key 索引一并删除
+- 磁盘水位保护：磁盘使用率超过阈值（默认 85%）时拒写保读，低于阈值自动恢复
+
+## 消费失败链路
+
+消息投递后若消费者未确认（Receive 超时、ack 失败），会在不可见窗口过后重投；
+非顺序消息的两次投递之间按指数退避：10s 起、每次 ×2、封顶 5 分钟。投递次数超过
+订阅组的 `default_max_attempts`（默认 16）后，消息被原子转入死信队列
+`%DLQ%{group}`（group 为原消费组名）并从原队列移除，不再重投。转入时写入
+`sq-origin-topic`/`sq-origin-queue`/`sq-origin-offset` 溯源属性，可用任意
+RocketMQ SDK 把 `%DLQ%{group}` 当普通 topic 订阅，做人工处理或重放。
+
 ## 配置
 
 ```yaml
@@ -40,6 +61,9 @@ data_dir: "./data"
 fsync: sync                   # sync|async
 auto_create_topic: true
 default_queue_nums: 4
+default_max_attempts: 16       # 新订阅组默认最大投递次数，超过转入 %DLQ%{group}
+retention_check_interval: 5m   # 过期清理扫描间隔（Go duration 格式）
+disk_watermark_percent: 85     # 磁盘使用率超过即拒写保读；0=关闭
 log_level: info
 ```
 
@@ -49,7 +73,7 @@ log_level: info
 ./sq -config sq.yaml
 ```
 
-## 限制（M1）
+## 限制
 
 - 消息体上限 4MB（`produce.MaxBodySize`）；默认同步刷盘（`fsync: sync`）。
-- 未实现：延时/顺序/事务消息、Tag 过滤、Keys 索引、retention、DLQ、控制台。
+- 未实现：延时/顺序/事务消息、控制台、多 broker 集群。
