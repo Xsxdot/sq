@@ -41,6 +41,12 @@ type Config struct {
 	RetentionCheckInterval string `yaml:"retention_check_interval"` // 过期清理扫描间隔（Go duration 格式）
 	DiskWatermarkPercent   int    `yaml:"disk_watermark_percent"`   // 超过即拒写，0=关闭
 	LogLevel               string `yaml:"log_level"`                // debug|info|warn|error
+	// —— M5 认证与管理面 ——
+	AdminListen   string `yaml:"admin_listen"`   // Admin HTTP 监听地址，"" = 关闭；默认 :8082
+	AdminUsername string `yaml:"admin_username"` // Admin API 登录用户名（与密码成对，均空 = 免登录）
+	AdminPassword string `yaml:"admin_password"` // Admin API 登录密码
+	AccessKey     string `yaml:"access_key"`     // gRPC 静态 AK（与 secret_key 成对，均空 = 不鉴权，spec §6 默认关闭）
+	SecretKey     string `yaml:"secret_key"`     // gRPC 静态 SK
 }
 
 // Load 加载配置。path 为空时返回纯默认值；文件存在则按字段覆盖。
@@ -51,6 +57,7 @@ func Load(path string) (*Config, error) {
 		AutoCreateTopic: true, DefaultQueueNums: 4, DefaultMaxAttempts: 16, LogLevel: "info",
 		RetentionCheckInterval: "5m",
 		DiskWatermarkPercent:   85,
+		AdminListen:            ":8082",
 	}
 	if path == "" {
 		return cfg, nil
@@ -98,6 +105,15 @@ func Load(path string) (*Config, error) {
 	case "debug", "info", "warn", "error":
 	default:
 		return nil, fmt.Errorf("配置 log_level 只接受 debug|info|warn|error，得到 %q", cfg.LogLevel)
+	}
+	// 认证配置必须成对出现：只填一半几乎必然是笔误——比如配了 access_key 忘了
+	// secret_key，此时"启用但秘钥为空"和"未启用"两种解释都会让用户在真出事时
+	// 误判认证状态，启动即报错是唯一不含糊的处理。
+	if (cfg.AccessKey == "") != (cfg.SecretKey == "") {
+		return nil, fmt.Errorf("配置 access_key/secret_key 必须成对设置（或都留空以关闭 gRPC 认证）")
+	}
+	if (cfg.AdminUsername == "") != (cfg.AdminPassword == "") {
+		return nil, fmt.Errorf("配置 admin_username/admin_password 必须成对设置（或都留空以免登录）")
 	}
 	return cfg, nil
 }

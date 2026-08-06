@@ -142,3 +142,54 @@ func TestRetentionInterval(t *testing.T) {
 		t.Fatal("应拒绝非法 interval")
 	}
 }
+
+// TestLoadAuthPairValidation 认证配置必须成对：只填一半是笔误，启动即报错，
+// 不能静默变成"看起来配了认证实际没生效"。
+func TestLoadAuthPairValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		yaml string
+	}{
+		{"只有access_key", "access_key: ak\n"},
+		{"只有secret_key", "secret_key: sk\n"},
+		{"只有admin_username", "admin_username: root\n"},
+		{"只有admin_password", "admin_password: pw\n"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "sq.yaml")
+			if err := os.WriteFile(p, []byte(c.yaml), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := Load(p); err == nil {
+				t.Fatalf("半配置 %q 应报错", c.yaml)
+			}
+		})
+	}
+}
+
+// TestLoadAuthDefaults 默认值：认证全关、admin 监听 :8082；成对配置能被加载。
+func TestLoadAuthDefaults(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AccessKey != "" || cfg.SecretKey != "" || cfg.AdminUsername != "" || cfg.AdminPassword != "" {
+		t.Fatalf("认证默认应全空: %+v", cfg)
+	}
+	if cfg.AdminListen != ":8082" {
+		t.Fatalf("admin_listen 默认应为 :8082，得到 %q", cfg.AdminListen)
+	}
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	y := "access_key: ak\nsecret_key: sk\nadmin_username: root\nadmin_password: pw\nadmin_listen: \"\"\n"
+	if err := os.WriteFile(p, []byte(y), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.AccessKey != "ak" || cfg.AdminUsername != "root" || cfg.AdminListen != "" {
+		t.Fatalf("成对配置加载不符: %+v", cfg)
+	}
+}
