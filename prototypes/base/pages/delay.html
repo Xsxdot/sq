@@ -134,7 +134,7 @@
     ? `${SQ.until(sorted[0].deliverAtMs)}<small>${SQ.time(sorted[0].deliverAtMs)}</small>`
     : '<small>无</small>';
   document.getElementById('v-topics').textContent = new Set(sorted.map(d => d.topic)).size;
-  SQ.spark(document.getElementById('s-depth'), SQ.wave(24, 1100, 500, 4), 'var(--dim)');
+  SQ.spark(document.getElementById('s-depth'), SQ.wave(24, 1100, 500, 4), 'var(--text-3)');
 
   /* ---------- 列表 ---------- */
   function render() {

@@ -71,8 +71,8 @@
           <span class="panel-title">写入速率与落后</span>
           <span class="spacer"></span>
           <span class="legend">
-            <span><i style="background:var(--copper)"></i>写入 msg/s</span>
-            <span><i style="background:var(--patina)"></i>落后条数</span>
+            <span><i style="background:var(--chart-1)"></i>写入 msg/s</span>
+            <span><i style="background:var(--chart-2)"></i>落后条数</span>
           </span>
           <div class="range" id="range">
             <button class="active" data-r="1h">1h</button>
@@ -124,10 +124,10 @@
   document.getElementById('v-dly').textContent = SQ.fmt(o.delayDepth);
   document.getElementById('v-dlq').textContent = SQ.fmt(o.dlq);
   document.getElementById('v-res').textContent = `${o.topics} / ${o.groups}`;
-  SQ.spark(document.getElementById('s-qps'), SQ.wave(24, 2400, 1200, 1), 'var(--copper)');
-  SQ.spark(document.getElementById('s-lag'), SQ.wave(24, 5000, 3000, 2), 'var(--patina)');
-  SQ.spark(document.getElementById('s-fly'), SQ.wave(24, 160, 90, 3), 'var(--ochre)');
-  SQ.spark(document.getElementById('s-dly'), SQ.wave(24, 1100, 500, 4), 'var(--dim)');
+  SQ.spark(document.getElementById('s-qps'), SQ.wave(24, 2400, 1200, 1), 'var(--chart-1)');
+  SQ.spark(document.getElementById('s-lag'), SQ.wave(24, 5000, 3000, 2), 'var(--chart-2)');
+  SQ.spark(document.getElementById('s-fly'), SQ.wave(24, 160, 90, 3), 'var(--warn)');
+  SQ.spark(document.getElementById('s-dly'), SQ.wave(24, 1100, 500, 4), 'var(--text-3)');
 
   // 三档范围对应两层数据源：1h 读内存环（5 秒粒度），24h/7d 读 Pebble（分钟粒度取峰值）
   const SERIES = {
@@ -155,9 +155,9 @@
     }).join('');
     const line = SQ.linePath(qps, w, h, pad);
     el.innerHTML = `${grid}
-      <path d="${line} L${w - pad},${h - pad} L${pad},${h - pad} Z" fill="var(--chart-fill)"/>
-      <path d="${line}" fill="none" stroke="var(--copper)" stroke-width="1.4"/>
-      <path d="${SQ.linePath(lag, w, h, pad)}" fill="none" stroke="var(--patina)" stroke-width="1.4" stroke-dasharray="3 2"/>`;
+      <path d="${line} L${w - pad},${h - pad} L${pad},${h - pad} Z" fill="var(--chart-1-fp)"/>
+      <path d="${line}" fill="none" stroke="var(--chart-1)" stroke-width="1.4"/>
+      <path d="${SQ.linePath(lag, w, h, pad)}" fill="none" stroke="var(--chart-2)" stroke-width="1.4" stroke-dasharray="3 2"/>`;
     document.getElementById('chart-axis').innerHTML =
       [1, .75, .5, .25, 0].map(f => `<span>${axisLabel(SQ.NOW - span * f, span)}</span>`).join('');
     document.getElementById('chart-note').textContent = note;
@@ -220,7 +220,7 @@
         if (e.target.closest('a')) return;
         detail.hidden = !detail.hidden;
       });
-      SQ.spark(tr.querySelector('svg[data-sp]'), SQ.wave(24, c.qps || 40, (c.qps || 40) * .5, i), c.qps ? 'var(--copper)' : 'var(--dim)');
+      SQ.spark(tr.querySelector('svg[data-sp]'), SQ.wave(24, c.qps || 40, (c.qps || 40) * .5, i), c.qps ? 'var(--chart-1)' : 'var(--text-3)');
     });
     document.getElementById('count').textContent = `${rows.length} / ${SQ.consumption.length} 条消费关系`;
   }
