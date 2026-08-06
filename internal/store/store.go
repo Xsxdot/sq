@@ -61,12 +61,15 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 	return out, true, nil
 }
 
-// NewBatch 创建写批次。调用方组装后必须交给 Apply 提交。
+// NewBatch 创建写批次。批次有两条合法的终止路径，且仅能选一条：
+//   1. 组装后交给 Apply 提交（Apply 负责关闭）
+//   2. 组装后不提交则必须自行调用 Close() 以回收内存
+// 不可同时执行两条路径，也不可多次 Close。
 func (s *Store) NewBatch() *pebble.Batch { return s.db.NewBatch() }
 
 // Apply 原子提交批次并按配置刷盘。这是唯一写入口（见类型注释）。
-// 成功后批次被关闭并回收到 Pebble 的内存池；失败时批次由调用方处理。
-// 调用方不应在 Apply 后重用或关闭批次（除非 Apply 失败）。
+// 成功时批次由 Apply 关闭并回收到 Pebble 内存池；调用方不再拥有此批次。
+// 失败时调用方持有批次，必须调用 Close() 回收，但不可继续向批次写入。
 func (s *Store) Apply(b *pebble.Batch) error {
 	opt := pebble.NoSync
 	if s.sync {
