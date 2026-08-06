@@ -14,6 +14,7 @@ package produce
 import (
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/xushixin/sq/internal/core"
@@ -154,5 +155,89 @@ func TestAppendWithExtraAtomic(t *testing.T) {
 	}
 	if _, ok, _ := st.Get(marker); !ok {
 		t.Fatal("extra 写操作未随消息落盘")
+	}
+}
+
+// sendDelay 构造一条延时消息并 AppendDelay（测试辅助）
+func sendDelay(t *testing.T, p *Producer, topic string, body string, dueMs int64) *core.Message {
+	t.Helper()
+	m, err := p.AppendDelay(&core.Message{Topic: topic, Body: []byte(body), DeliverAtMs: dueMs})
+	if err != nil {
+		t.Fatalf("AppendDelay: %v", err)
+	}
+	return m
+}
+
+func countPrefix(t *testing.T, st *store.Store, lower, upper []byte) int {
+	t.Helper()
+	n := 0
+	if err := st.Scan(lower, upper, 0, func(k, v []byte) (bool, error) { n++; return true, nil }); err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	return n
+}
+
+func TestAppendDelayWritesDelayEntryNotMsg(t *testing.T) {
+	p, st := newTestProducer(t, t.TempDir())
+	defer st.Close()
+	due := time.Now().Add(time.Hour).UnixMilli()
+	m := sendDelay(t, p, "t", "later", due)
+	if m.ID == "" {
+		t.Fatal("应分配消息 ID")
+	}
+	dpfx := []byte(store.DelayPrefix)
+	if n := countPrefix(t, st, dpfx, store.PrefixUpperBound(dpfx)); n != 1 {
+		t.Fatalf("delay 条目数 = %d，期望 1", n)
+	}
+	mpfx := []byte("msg/")
+	if n := countPrefix(t, st, mpfx, store.PrefixUpperBound(mpfx)); n != 0 {
+		t.Fatalf("msg/ 应为空，实际 %d 条", n)
+	}
+}
+
+func TestAppendDelayPastDueFallsThroughToImmediate(t *testing.T) {
+	p, st := newTestProducer(t, t.TempDir())
+	defer st.Close()
+	m := sendDelay(t, p, "t", "now", time.Now().Add(-time.Second).UnixMilli())
+	// 已过期：直接普通写入，分配了队列与 offset，delay 区为空
+	raw, ok, err := st.Get(store.MsgKey("t", m.QueueID, m.Offset))
+	if err != nil || !ok {
+		t.Fatalf("过期延时消息应立即入 msg/: %v", err)
+	}
+	got, _ := core.DecodeMessage(raw)
+	if got.DeliverAtMs == 0 {
+		t.Fatal("直通写入也要保留 DeliverAtMs（投递时回填协议字段用）")
+	}
+	dpfx := []byte(store.DelayPrefix)
+	if n := countPrefix(t, st, dpfx, store.PrefixUpperBound(dpfx)); n != 0 {
+		t.Fatal("过期延时消息不应写 delay 条目")
+	}
+}
+
+func TestAppendDelayRejectsInvalid(t *testing.T) {
+	p, st := newTestProducer(t, t.TempDir())
+	defer st.Close()
+	if _, err := p.AppendDelay(&core.Message{Topic: "t", Body: nil, DeliverAtMs: time.Now().Add(time.Hour).UnixMilli()}); err == nil {
+		t.Fatal("空 body 应拒绝")
+	}
+	if _, err := p.AppendDelay(&core.Message{Topic: "t", Body: []byte("x"), DeliverAtMs: 0}); err == nil {
+		t.Fatal("DeliverAtMs<=0 是编程错误，应拒绝")
+	}
+}
+
+func TestAppendDelaySeqPersistsAcrossReopen(t *testing.T) {
+	dir := t.TempDir()
+	p, st := newTestProducer(t, dir)
+	due := time.Now().Add(time.Hour).UnixMilli()
+	sendDelay(t, p, "t", "a", due)
+	sendDelay(t, p, "t", "b", due)
+	st.Close()
+	// 重开：seq 计数器从盘上恢复，不与已有条目撞 key
+	p2, st2 := newTestProducer(t, dir)
+	defer st2.Close()
+	sendDelay(t, p2, "t", "c", due)
+	dpfx := []byte(store.DelayPrefix)
+	if n := countPrefix(t, st2, dpfx, store.PrefixUpperBound(dpfx)); n != 3 {
+		t.Fatalf("重启后 delay 条目数 = %d，期望 3（seq 撞 key 会覆盖变 2）", n)
 	}
 }

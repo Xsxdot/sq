@@ -4,9 +4,10 @@
 //   - Append：一次语义写 = 消息体 + alloc 计数器，同一 Batch 原子提交
 //   - offset 分配采用持久化计数器（alloc/ key），重启 O(1) 恢复且绝不回退
 //   - 长轮询唤醒：按 topic 的 close-broadcast 信号
+//   - AppendDelay：延时消息写 delay/ 暂存区，seq 计数器同批原子提交
 //
 // 边界：
-//   - 不判定延时/事务（M3/M6 在 Append 之前分流，本包不感知）
+//   - 延时判定入口在此（AppendDelay），到期搬运是 delay 包的事；事务（M6）仍在 Append 之前分流
 //   - 不做消费可见性判断（deliver 的事）
 package produce
 
@@ -32,10 +33,12 @@ type Producer struct {
 	mt     *meta.Meta
 	logger *slog.Logger
 
-	mu     sync.Mutex
-	next   map[string]uint64        // "topic/4Bqid" -> 下一 offset（内存缓存，与 alloc/ key 同步）
-	rr     map[string]uint32        // topic -> 轮询游标
-	wakers map[string]chan struct{} // topic -> 长轮询唤醒信号
+	mu          sync.Mutex
+	next        map[string]uint64 // "topic/4Bqid" -> 下一 offset（内存缓存，与 alloc/ key 同步）
+	delayNext   uint64            // 下一延时 seq（内存缓存，与 delayalloc key 同步；delayLoaded 后有效）
+	delayLoaded bool
+	rr          map[string]uint32        // topic -> 轮询游标
+	wakers      map[string]chan struct{} // topic -> 长轮询唤醒信号
 }
 
 // New 构造 Producer。next 缓存懒加载（首写某队列时读一次 alloc/ key）。
@@ -132,6 +135,80 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *pebble.Batch)) (*co
 	p.wakeLocked(m.Topic)
 	p.logger.Debug("消息已写入", "topic", m.Topic, "queue", m.QueueID, "offset", m.Offset, "msg_id", m.ID, "keys", len(m.Keys))
 	return m, nil
+}
+
+// AppendDelay 将延时消息写入 delay/ 暂存区（spec §5 流程 3 前半）。
+//
+// 参数：m.DeliverAtMs 必须 >0（协议层已保证 DELAY 消息带 delivery_timestamp，
+// <=0 属编程错误直接报错）。到期时间已过（<=now）时直通 AppendWith 立即投递：
+// 语义上"到期的延时消息"就是普通消息，绕道暂存区再被调度器搬回来只是
+// 多一次读写放大，结果完全相同。
+//
+// 返回：写入后的消息。注意暂存态消息没有队列与 offset（m.QueueID/Offset
+// 保持零值）——它们在到期移入 msg/ 时才由正常写入路径分配。
+//
+// 原子性：delay 条目与 seq 计数器同一 Batch 提交，理由与 Append 的
+// offset 计数器完全相同（崩溃后计数器与已写条目严格一致，seq 绝不复用）。
+func (p *Producer) AppendDelay(m *core.Message) (*core.Message, error) {
+	if m.DeliverAtMs <= 0 {
+		return nil, fmt.Errorf("AppendDelay 要求 DeliverAtMs>0，得到 %d", m.DeliverAtMs)
+	}
+	if len(m.Body) == 0 || len(m.Body) > MaxBodySize {
+		return nil, fmt.Errorf("消息体大小非法: %d（上限 %d）", len(m.Body), MaxBodySize)
+	}
+	// 写入时就确认 topic 存在（autoCreate 时创建）：错误要在发送端立刻暴露，
+	// 不能等到几小时后到期移入时才发现 topic 不存在、消息无处可去。
+	if _, err := p.mt.EnsureTopic(m.Topic); err != nil {
+		return nil, err
+	}
+	if m.DeliverAtMs <= time.Now().UnixMilli() {
+		return p.AppendWith(m, nil)
+	}
+	if m.ID == "" {
+		m.ID = core.NewMessageID()
+	}
+	if m.BornAtMs == 0 {
+		m.BornAtMs = time.Now().UnixMilli()
+	}
+	m.StoreAtMs = time.Now().UnixMilli()
+	raw, err := core.EncodeMessage(m)
+	if err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	seq, err := p.nextDelaySeqLocked()
+	if err != nil {
+		return nil, err
+	}
+	b := p.st.NewBatch()
+	b.Set(store.DelayKey(m.DeliverAtMs, seq), raw, nil)
+	b.Set(store.DelayAllocKey(), store.PutU64(seq+1), nil)
+	if err := p.st.Apply(b); err != nil {
+		return nil, fmt.Errorf("写入延时消息 %s (topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
+	}
+	// 与 Append 同理：Apply 成功后才推进内存缓存，失败的写不能烧掉 seq
+	p.delayNext = seq + 1
+	p.delayLoaded = true
+	p.logger.Debug("延时消息已暂存", "topic", m.Topic, "msg_id", m.ID,
+		"due_ms", m.DeliverAtMs, "seq", seq)
+	return m, nil
+}
+
+// nextDelaySeqLocked 取下一延时 seq。缓存未命中时读盘上 delayalloc 计数器，
+// 崩溃/重启后 O(1) 恢复。调用方必须持有 p.mu。
+func (p *Producer) nextDelaySeqLocked() (uint64, error) {
+	if p.delayLoaded {
+		return p.delayNext, nil
+	}
+	v, ok, err := p.st.Get(store.DelayAllocKey())
+	if err != nil {
+		return 0, fmt.Errorf("读取延时 seq 计数器: %w", err)
+	}
+	if !ok {
+		return 0, nil
+	}
+	return store.GetU64(v), nil
 }
 
 // Append 写入一条普通消息（M1 签名保持不变）。
