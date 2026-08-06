@@ -167,7 +167,56 @@ window.SQ = (function () {
     bar.scrollIntoView({ block: 'nearest' });
   }
 
+  /* ---------------- 主题 ---------------- */
+
+  // file:// 下 localStorage 可能被浏览器按安全策略拒绝，读写都要兜住，
+  // 失败时退化为「本次会话内有效」，不能让整个脚本挂掉
+  function readTheme() {
+    try { return localStorage.getItem('sq-theme'); } catch (e) { return null; }
+  }
+  function writeTheme(v) {
+    try { localStorage.setItem('sq-theme', v); } catch (e) { /* 忽略：不影响当前页生效 */ }
+  }
+
+  // 本脚本在 <head> 里同步执行，此时 body 尚未渲染，
+  // 在这里就把主题打到 <html> 上可以避免切换主题后刷新出现白闪
+  function applyTheme(v) {
+    document.documentElement.dataset.theme = v === 'dark' ? 'dark' : 'light';
+  }
+  applyTheme(readTheme() || 'light');
+
+  function toggleTheme() {
+    const next = document.documentElement.dataset.theme === 'dark' ? 'light' : 'dark';
+    applyTheme(next);
+    writeTheme(next);
+    syncToggle();
+  }
+
+  function syncToggle() {
+    const btn = document.querySelector('.theme-toggle');
+    if (!btn) return;
+    const dark = document.documentElement.dataset.theme === 'dark';
+    // 用汉字而不是 ☀/☾ 符号：符号在部分系统字体里退化成方框或星号，
+    // 汉字在任何中文环境下都稳定可读。按钮上写的是「点了会变成什么」
+    btn.textContent = dark ? '明色' : '暗色';
+    btn.title = dark ? '切换到明色主题' : '切换到暗色主题';
+    btn.setAttribute('aria-label', btn.title);
+  }
+
+  // 十个页面各自复制了一份顶部条，主题按钮由脚本统一插入，
+  // 避免同一段标记散落到每个文件里、改一次要改十处
+  document.addEventListener('DOMContentLoaded', function () {
+    const bar = document.querySelector('.topbar');
+    if (!bar || bar.querySelector('.theme-toggle')) return;
+    const btn = document.createElement('button');
+    btn.className = 'btn theme-toggle';
+    btn.addEventListener('click', toggleTheme);
+    const logout = bar.querySelector('a[href$="login.html"]');
+    bar.insertBefore(btn, logout || null);
+    syncToggle();
+  });
+
   return { NOW, topics, groups, consumption, messages, dlq, delay, overview,
            fmt, ago, until, time, dur, wave, linePath, spark, ribbon, markOf,
-           lagOf, maxLag, byGroup, byTopic, topic, group, notify };
+           lagOf, maxLag, byGroup, byTopic, topic, group, notify, toggleTheme };
 })();

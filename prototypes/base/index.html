@@ -151,11 +151,11 @@
     const w = el.clientWidth || 900, h = 170, pad = 12;
     const grid = [0, .25, .5, .75, 1].map(f => {
       const y = (pad + (h - pad * 2) * f).toFixed(1);
-      return `<line x1="0" x2="${w}" y1="${y}" y2="${y}" stroke="var(--rule-2)"/>`;
+      return `<line x1="0" x2="${w}" y1="${y}" y2="${y}" stroke="var(--chart-grid)"/>`;
     }).join('');
     const line = SQ.linePath(qps, w, h, pad);
     el.innerHTML = `${grid}
-      <path d="${line} L${w - pad},${h - pad} L${pad},${h - pad} Z" fill="rgba(164,90,40,.10)"/>
+      <path d="${line} L${w - pad},${h - pad} L${pad},${h - pad} Z" fill="var(--chart-fill)"/>
       <path d="${line}" fill="none" stroke="var(--copper)" stroke-width="1.4"/>
       <path d="${SQ.linePath(lag, w, h, pad)}" fill="none" stroke="var(--patina)" stroke-width="1.4" stroke-dasharray="3 2"/>`;
     document.getElementById('chart-axis').innerHTML =
