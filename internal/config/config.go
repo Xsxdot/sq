@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
@@ -37,6 +38,7 @@ type Config struct {
 	AutoCreateTopic    bool   `yaml:"auto_create_topic"`    // QueryRoute/Send 未知 topic 时自动建
 	DefaultQueueNums   uint32 `yaml:"default_queue_nums"`   // 自动建 topic 的队列数
 	DefaultMaxAttempts int32  `yaml:"default_max_attempts"` // 新订阅组默认最大投递次数
+	RetentionCheckInterval string `yaml:"retention_check_interval"` // 过期清理扫描间隔（Go duration 格式）
 	LogLevel           string `yaml:"log_level"`            // debug|info|warn|error
 }
 
@@ -46,6 +48,7 @@ func Load(path string) (*Config, error) {
 		GRPCListen: ":8081", AdvertiseHost: "127.0.0.1", AdvertisePort: 8081,
 		DataDir: "./data", Fsync: "sync",
 		AutoCreateTopic: true, DefaultQueueNums: 4, DefaultMaxAttempts: 16, LogLevel: "info",
+		RetentionCheckInterval: "5m",
 	}
 	if path == "" {
 		return cfg, nil
@@ -76,6 +79,11 @@ func Load(path string) (*Config, error) {
 	if cfg.DefaultMaxAttempts <= 0 {
 		return nil, fmt.Errorf("配置 default_max_attempts 必须 >0，得到 %d", cfg.DefaultMaxAttempts)
 	}
+	// retention_check_interval 必须是正 duration：空串（yaml 漏填）或拼写错误
+	// 都不能让 retention 任务以 0 间隔空转或整趟跳过，启动时挡住。
+	if d, err := time.ParseDuration(cfg.RetentionCheckInterval); err != nil || d <= 0 {
+		return nil, fmt.Errorf("配置 retention_check_interval 须为正 duration（如 5m），得到 %q", cfg.RetentionCheckInterval)
+	}
 	// log_level 与 SetupSlog 的 switch 分支必须同步：这里不挡住，SetupSlog 的
 	// default 分支会把拼错的级别静默降级成 info，错误从此不可见。
 	switch cfg.LogLevel {
@@ -84,6 +92,12 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("配置 log_level 只接受 debug|info|warn|error，得到 %q", cfg.LogLevel)
 	}
 	return cfg, nil
+}
+
+// RetentionInterval 解析后的清理扫描间隔（Load 已校验合法，此处不会失败）。
+func (c *Config) RetentionInterval() time.Duration {
+	d, _ := time.ParseDuration(c.RetentionCheckInterval)
+	return d
 }
 
 // SetupSlog 按配置初始化全局 slog（JSON 输出到 stdout）。

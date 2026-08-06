@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoadDefaults(t *testing.T) {
@@ -115,5 +116,17 @@ func TestDefaultMaxAttempts(t *testing.T) {
 	os.WriteFile(p, []byte("default_max_attempts: 0\n"), 0o644)
 	if _, err := Load(p); err == nil {
 		t.Fatal("应拒绝 default_max_attempts=0")
+	}
+}
+
+func TestRetentionInterval(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil || cfg.RetentionInterval() != 5*time.Minute {
+		t.Fatalf("默认 retention 间隔: %v %v", cfg.RetentionCheckInterval, err)
+	}
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	os.WriteFile(p, []byte("retention_check_interval: nonsense\n"), 0o644)
+	if _, err := Load(p); err == nil {
+		t.Fatal("应拒绝非法 interval")
 	}
 }

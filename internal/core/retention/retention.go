@@ -1,0 +1,150 @@
+// Package retention 实现消息过期清理后台任务（spec §5 流程 7）。
+//
+// 职责：
+//   - 周期扫描全部 topic：按各自 retention 时长清理过期 msg/（DeleteRange）
+//     与对应 keyidx/ 条目
+//   - 单趟工作量有上限（maxPurgePerQueue），超出留待下趟并记日志（不静默截断）
+//
+// 边界：
+//   - 不清理 cursor/inflight：消费位点扫描天然越过已删区间；指向已删消息的
+//     inflight 由 deliver 的孤儿清理兜底（M1 已实现并有用例钉住）
+//   - msg 能按 offset 边界 DeleteRange（队列内 StoreAtMs 随 offset 单调）；
+//     keyidx 按 key 排序，只能全扫按嵌入 storeMs 逐条删——中小规模可接受，
+//     量级上来后的优化（时间副索引）留给真实瓶颈出现时
+package retention
+
+import (
+	"context"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"github.com/xushixin/sq/internal/core"
+	"github.com/xushixin/sq/internal/core/meta"
+	"github.com/xushixin/sq/internal/store"
+)
+
+// maxPurgePerQueue 单队列/单索引扫描单趟最多清理条数，防止单趟长时间占用。
+const maxPurgePerQueue = 10000
+
+// Manager 过期清理任务。单 goroutine 运行（Run），Pass 可单独调用（测试/未来 Admin 触发）。
+type Manager struct {
+	st       *store.Store
+	mt       *meta.Meta
+	interval time.Duration
+	logger   *slog.Logger
+}
+
+// New 构造清理任务。interval 为扫描间隔（config.RetentionInterval()）。
+func New(st *store.Store, mt *meta.Meta, interval time.Duration, logger *slog.Logger) *Manager {
+	return &Manager{st: st, mt: mt, interval: interval, logger: logger.With("mod", "retention")}
+}
+
+// Run 阻塞运行清理循环：启动即跑一趟，此后每 interval 一趟；ctx 取消即返回。
+// 调用方（main）负责放入独立 goroutine 并在停机时先取消再关 store。
+func (m *Manager) Run(ctx context.Context) {
+	m.logger.Info("retention 任务启动", "interval", m.interval.String())
+	t := time.NewTicker(m.interval)
+	defer t.Stop()
+	for {
+		if n, err := m.Pass(); err != nil {
+			m.logger.Error("retention 清理失败", "err", err)
+		} else if n > 0 {
+			m.logger.Info("retention 清理完成", "purged_msgs", n)
+		}
+		select {
+		case <-ctx.Done():
+			m.logger.Info("retention 任务退出")
+			return
+		case <-t.C:
+		}
+	}
+}
+
+// Pass 执行一趟全量清理，返回清掉的消息条数（keyidx 条目不计入）。
+func (m *Manager) Pass() (int, error) {
+	now := time.Now().UnixMilli()
+	total := 0
+	for _, tc := range m.mt.Topics() {
+		cutoff := now - tc.EffectiveRetention().Milliseconds()
+		for q := uint32(0); q < tc.Queues; q++ {
+			n, err := m.purgeQueue(tc.Name, q, cutoff)
+			if err != nil {
+				return total, fmt.Errorf("清理 %s/q%d: %w", tc.Name, q, err)
+			}
+			total += n
+		}
+		if err := m.purgeKeyIdx(tc.Name, cutoff); err != nil {
+			return total, fmt.Errorf("清理 keyidx %s: %w", tc.Name, err)
+		}
+	}
+	return total, nil
+}
+
+// purgeQueue 找到 [队首, 首条未过期) 边界并 DeleteRange 整段删除。
+// 队列内消息按 offset 追加写入、StoreAtMs 单调不减，扫到首条未过期即可停。
+func (m *Manager) purgeQueue(topic string, q uint32, cutoff int64) (int, error) {
+	pfx := store.MsgQueuePrefix(topic, q)
+	var boundary uint64
+	found := 0
+	err := m.st.Scan(pfx, store.PrefixUpperBound(pfx), maxPurgePerQueue, func(k, v []byte) (bool, error) {
+		msg, err := core.DecodeMessage(v)
+		if err != nil {
+			return false, fmt.Errorf("解码 %q: %w", k, err)
+		}
+		if msg.StoreAtMs >= cutoff {
+			return false, nil
+		}
+		boundary = msg.Offset + 1
+		found++
+		return true, nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	if found == 0 {
+		return 0, nil
+	}
+	b := m.st.NewBatch()
+	// DeleteRange 从 offset 0 起：此前趟次已删的区间为空集，重复覆盖无害
+	b.DeleteRange(store.MsgKey(topic, q, 0), store.MsgKey(topic, q, boundary), nil)
+	if err := m.st.Apply(b); err != nil {
+		return 0, fmt.Errorf("DeleteRange 提交: %w", err)
+	}
+	if found == maxPurgePerQueue {
+		m.logger.Info("retention 达单趟上限，剩余留待下趟", "topic", topic, "queue", q)
+	}
+	m.logger.Debug("retention 清理队列", "topic", topic, "queue", q, "purged", found, "boundary", boundary)
+	return found, nil
+}
+
+// purgeKeyIdx 清理 topic 下 storeMs < cutoff 的索引条目（全扫逐删，见文件头边界说明）。
+func (m *Manager) purgeKeyIdx(topic string, cutoff int64) error {
+	pfx := store.KeyIdxTopicPrefix(topic)
+	b := m.st.NewBatch()
+	n := 0
+	err := m.st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) {
+		_, _, ms, _, _, perr := store.ParseKeyIdxKey(k)
+		if perr != nil {
+			return false, perr
+		}
+		if ms < cutoff {
+			b.Delete(k, nil) // Batch 编码时即拷贝 key，回调切片可直接用
+			n++
+		}
+		return n < maxPurgePerQueue, nil
+	})
+	if err != nil {
+		b.Close()
+		return err
+	}
+	if n == 0 {
+		b.Close()
+		return nil
+	}
+	if err := m.st.Apply(b); err != nil {
+		return fmt.Errorf("索引删除提交: %w", err)
+	}
+	m.logger.Debug("retention 清理索引", "topic", topic, "purged_idx", n)
+	return nil
+}

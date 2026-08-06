@@ -3,11 +3,13 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -17,6 +19,7 @@ import (
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/core/retention"
 	"github.com/xushixin/sq/internal/rpc"
 	"github.com/xushixin/sq/internal/store"
 )
@@ -62,6 +65,16 @@ func run() error {
 	}
 	pr := produce.New(st, mt, logger)
 	dl := deliver.New(st, mt, pr, logger)
+
+	// retention 后台清理。停机顺序关键：先取消并等待清理 goroutine 退出，
+	// 再让 defer 关闭 store——否则可能在 store 关闭后提交清理批次（panic）。
+	// defer 为 LIFO：本 defer 注册在 st.Close 的 defer 之后，故先执行。
+	retCtx, retCancel := context.WithCancel(context.Background())
+	var retWG sync.WaitGroup
+	rm := retention.New(st, mt, cfg.RetentionInterval(), logger)
+	retWG.Add(1)
+	go func() { defer retWG.Done(); rm.Run(retCtx) }()
+	defer func() { retCancel(); retWG.Wait() }()
 
 	lis, err := net.Listen("tcp", cfg.GRPCListen)
 	if err != nil {

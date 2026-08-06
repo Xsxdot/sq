@@ -217,6 +217,10 @@ func writeBrokerConfig(t *testing.T) (cfgPath, endpoint string) {
 		AutoCreateTopic:    true,
 		DefaultQueueNums:   4,
 		DefaultMaxAttempts: 16,
+		// 必须显式给非零值：yaml.Marshal 对空串照实序列化，而 broker 的 Load
+		// 会拒绝空 retention_check_interval，序列化出去反而起不来（与
+		// DefaultMaxAttempts 同款陷阱）。
+		RetentionCheckInterval: "5m",
 		// debug 级别：broker 侧的投递/确认日志是排查「消息没到」的唯一线索，
 		// 失败时由 dumpBrokerLog 打进测试输出。
 		LogLevel: "debug",
