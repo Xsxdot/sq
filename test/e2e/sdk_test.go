@@ -53,8 +53,9 @@ import (
 )
 
 const (
-	// preferredPort 首选监听端口（brief 指定）。被占用时回退到随机空闲端口，
-	// 避免因为本机端口冲突把一次真实的协议回归误报成失败。
+	// preferredPort e2e 专用的首选监听端口，刻意避开默认的 8081，免得撞上
+	// 开发机上正跑着的 sq。被占用时回退到随机空闲端口，避免因为本机端口冲突
+	// 把一次真实的协议回归误报成失败。
 	preferredPort = 18081
 
 	topicName = "e2e-normal"

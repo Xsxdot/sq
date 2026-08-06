@@ -10,10 +10,11 @@
 //     未知 offset 返回 (false, nil) 而非报错
 //   - 验证长轮询：空结果时阻塞等待，新消息写入后立即唤醒返回
 //   - 验证不同消费组游标互相独立
-//   - 验证阶段 2（新消息扫描）不会因为阶段 1（过期重投）填满 out 而失控扫描整个队列
-//     （对应实现里的裁定 1：len(out)>=maxMsgs 时必须跳过阶段 2，store.Scan 的
-//     limit<=0 语义是"不限"，若误传 0 会吐出整条剩余队列）
-//   - 验证阶段 1 的孤儿 inflight 清理会真正提交（裁定 2），且不误报为投递成功
+//   - 验证阶段 2（新消息扫描）不会因为阶段 1（过期重投）填满 out 而失控扫描整个队列：
+//     len(out)>=maxMsgs 时必须整体跳过阶段 2，因为 store.Scan 的 limit<=0 语义是
+//     "不限"，把算出来的 0 传进去会吐出整条剩余队列
+//   - 验证阶段 1 的孤儿 inflight 清理会真正提交（提交判据是"有无暂存写入"而非
+//     "有无可投递消息"），且不误报为投递成功
 //
 // 边界：
 //   - 仅测试 deliver.Deliverer 及其导出方法的行为
@@ -88,12 +89,12 @@ func TestUnackedRedeliveryAfterExpire(t *testing.T) {
 	f.send(t, "t", "a")
 	// 第一次取出，不可见时间设 300ms 且不 ack。
 	//
-	// 注意（Minor 4 flake 修复）：这里原来用 30ms 不可见 + 紧接着的第二次
-	// Receive 断言"仍不可见"，在 -race 或机器负载较高时，两次 Receive
-	// 之间的调度延迟就可能逼近甚至超过 30ms，导致消息真的合法过期重投，
-	// 断言假失败——不是被测代码的 bug，是测试自己的时间预算太紧。
-	// 300ms/400ms 给出足够裕量，其余计时类用例的容错方向本来就是安全的
-	// （宁可多等，不会误判"过早重投"），无需一并调整。
+	// 时间预算说明（这是一次真实 flake 的修复，别再调小）：不可见时间不能取到
+	// 30ms 这个量级——本用例紧接着还要再 Receive 一次并断言"仍不可见"，而在
+	// -race 或机器负载较高时，两次 Receive 之间的调度延迟本身就可能逼近甚至超过
+	// 30ms，消息于是合法过期重投，断言假失败。这不是被测代码的 bug，是测试自己
+	// 的时间预算太紧。300ms/400ms 留出足够裕量。其余计时类用例不用一并调整：
+	// 它们的容错方向本来就是安全的（宁可多等，不会误判"过早重投"）。
 	msgs, _ := f.dl.Receive(context.Background(), "g", "t", 0, 10, 300*time.Millisecond, 0)
 	if len(msgs) != 1 {
 		t.Fatalf("首取: %d", len(msgs))
@@ -154,7 +155,7 @@ func TestTwoGroupsIndependentCursors(t *testing.T) {
 	}
 }
 
-// TestRedeliveryFillDoesNotUnboundNewMessageScan 锁定裁定 1：
+// TestRedeliveryFillDoesNotUnboundNewMessageScan 锁定取件批量上限：
 // 阶段 1（过期重投）填满 maxMsgs 后，阶段 2 必须整体跳过，不能因为
 // maxMsgs-len(out)==0 被 store.Scan 当作"不限"扫出整条剩余队列。
 //
@@ -189,7 +190,7 @@ func TestRedeliveryFillDoesNotUnboundNewMessageScan(t *testing.T) {
 	}
 }
 
-// TestOrphanInflightCleanupPersistsAndDoesNotReportDelivery 锁定裁定 2：
+// TestOrphanInflightCleanupPersistsAndDoesNotReportDelivery 锁定批次提交判据：
 // 阶段 1 清理"孤儿" inflight（消息已不在但 inflight 记录还在）时暂存的
 // Delete 必须真正提交到盘上，且清理本身不能被当作"投递成功"上报给调用方。
 //
@@ -203,8 +204,8 @@ func TestRedeliveryFillDoesNotUnboundNewMessageScan(t *testing.T) {
 //  2. 孤儿 inflight 记录被真正从盘上删除——直接读 store 验证，
 //     而不是只看 Receive 的返回值
 //
-// 若走了 brief 原有的"len(out)==0 就 Close 丢弃整个 batch"早退路径，
-// 这条 Delete 会被悄悄丢弃，孤儿记录永远留在盘上，第 2 项断言会失败。
+// 若把早退判据写成"len(out)==0 就 Close 丢弃整个 batch"，这条 Delete 会被
+// 悄悄丢弃，孤儿记录永远留在盘上，第 2 项断言会失败。
 func TestOrphanInflightCleanupPersistsAndDoesNotReportDelivery(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t", "a")
@@ -236,7 +237,7 @@ func TestOrphanInflightCleanupPersistsAndDoesNotReportDelivery(t *testing.T) {
 	}
 }
 
-// TestAckStaleAttemptRejected 锁定 Important 1 的修复：Ack 现在按
+// TestAckStaleAttemptRejected 锁定 Ack 的定位方式：必须按
 // (group,topic,queue,offset,attempt) 定位 inflight 记录。消费者 A 拿到的是
 // attempt=1 的句柄，处理超时后消息被过期重投给了下一轮（attempt=2）；A 迟到
 // 的 Ack 若不校验 attempt 会误删这条"属于下一轮"的记录，导致消息从此既无
@@ -275,7 +276,7 @@ func TestAckStaleAttemptRejected(t *testing.T) {
 	}
 }
 
-// TestAckCorrectAttemptSucceeds 锁定 Important 1：携带与当前 inflight 记录一致的
+// TestAckCorrectAttemptSucceeds 是上一条的正向对照：携带与当前 inflight 记录一致的
 // attempt 时，ack 正常生效并真正删除记录（用"立即重复 ack 幂等失败"侧面证明已删除）。
 func TestAckCorrectAttemptSucceeds(t *testing.T) {
 	f := newFixture(t)
@@ -299,9 +300,10 @@ func TestAckCorrectAttemptSucceeds(t *testing.T) {
 	}
 }
 
-// TestChangeInvisibleExtendsWindow 锁定 Important 3：ChangeInvisible 延长
-// 不可见时间后，原本会因超时而过期重投的消息应被压下。这是 Task 11 gRPC
-// ChangeInvisible 端点的直接依赖，此前 7 个用例没有一个覆盖过它。
+// TestChangeInvisibleExtendsWindow 验证 ChangeInvisible 的核心作用：延长不可见
+// 时间后，原本会因超时而过期重投的消息应被压下。协议层的
+// ChangeInvisibleDuration 端点直接依赖这条语义——消费者靠它为处理较慢的消息
+// 续期，续期失效就意味着消息会在消费者还在处理时被重投给别人。
 func TestChangeInvisibleExtendsWindow(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t", "a")
@@ -347,8 +349,9 @@ func TestChangeInvisiblePreservesAttempts(t *testing.T) {
 }
 
 // TestChangeInvisibleUnknownOffsetReturnsFalse 验证目标 offset 不存在（从未投递，
-// 或已被 ack/已被别的 attempt 覆盖）时返回 (false,nil) 而非报错——Task 11 的 gRPC
-// 端点要靠这个区分"句柄已失效，正常忽略"与"真正的系统错误"。
+// 或已被 ack/已被别的 attempt 覆盖）时返回 (false,nil) 而非报错——协议层要靠
+// 这个区分"句柄已失效，正常忽略"与"真正的系统错误"：前者回
+// INVALID_RECEIPT_HANDLE 让客户端静默丢弃，后者才是 INTERNAL_SERVER_ERROR。
 func TestChangeInvisibleUnknownOffsetReturnsFalse(t *testing.T) {
 	f := newFixture(t)
 	ok, err := f.dl.ChangeInvisible("g", "t", 0, 999, 1, time.Minute)

@@ -39,7 +39,8 @@ import (
 // 三者共同读写同一片 inflight 键空间，若只有 Receive 持锁而 Ack/
 // ChangeInvisible 不持锁，会出现"重投覆盖后的记录被陈旧 Ack 误删"
 // "ChangeInvisible 的读-改-写覆盖掉并发重投写入的新 attempts"等竞态——
-// 这正是本类型曾经的注释里"并发安全"这句话不成立的地方，现在三者统一持锁后才真正成立。
+// 因此上面这句"并发安全"是有条件的：它成立的前提就是这三个方法统一持队列锁，
+// 新增任何直接读写 inflight 的方法时必须一并纳入，否则这句话立刻不再成立。
 type Deliverer struct {
 	st     *store.Store
 	mt     *meta.Meta
@@ -157,8 +158,9 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 		}
 		if !ok {
 			// 消息已被 retention 清理但 inflight 残留：清掉记录并跳过（M2 起 retention 会同步清理）。
-			// 这条 Delete 必须真正提交——见收尾处的裁定 2 说明，否则孤儿记录永不消失，
-			// 长轮询每 100ms 轮询一次就会反复扫描、反复打这条 Warn，形成永久日志洪水。
+			// 这条 Delete 必须真正提交——见本函数收尾处关于 staged 的说明，否则孤儿
+			// 记录永不消失，长轮询每 100ms 轮询一次就会反复扫描、反复打这条 Warn，
+			// 形成永久日志洪水。
 			d.logger.Warn("inflight 指向的消息不存在，清理孤儿记录", "group", group, "topic", topic, "queue", queueID, "offset", r.offset)
 			b.Delete(store.InflightKey(group, topic, queueID, r.offset), nil)
 			staged = true
@@ -178,11 +180,11 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 
 	// 阶段 2：从 fetch 位点取新消息。
 	//
-	// 裁定 1（修正 brief 缺陷）：仅当 len(out) < maxMsgs 时才进入本阶段。
+	// 仅当 len(out) < maxMsgs 时才进入本阶段，不能只靠 Scan 的 limit 参数收敛：
 	// store.Scan 的 limit<=0 语义是"不限"；若阶段 1 已把 out 填满 maxMsgs，
-	// maxMsgs-len(out) 算出来是 0，若仍然传给 Scan 会被当成"不限"，
-	// 从 cursor 开始把整条剩余队列都扫出来——远超调用方约定的批量上限，
-	// 在长轮询兜底轮询（每 100ms 一次）下尤其致命。因此这里整体跳过阶段 2，
+	// maxMsgs-len(out) 算出来正好是 0，传给 Scan 会被当成"不限"，从 cursor 开始
+	// 把整条剩余队列都扫出来——远超调用方约定的批量上限，在长轮询兜底轮询
+	// （每 100ms 一次）下尤其致命。因此这里整体跳过阶段 2，
 	// 而不是传负数或改动 store.Scan 的既有约定。
 	cursor := uint64(0)
 	if v, ok, err := d.st.Get(store.CursorKey(group, topic, queueID)); err != nil {
@@ -216,11 +218,11 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 		}
 	}
 
-	// 裁定 2（修正 brief 缺陷）：早退路径只在"确无任何暂存写入"时才 Close 放弃批次；
-	// 只要 staged 为 true（哪怕 out 本身是空的——比如本轮只清理了孤儿 inflight，
-	// 没有可投递的消息），也必须 Apply 提交。原 brief 的条件是 len(out)==0 就
-	// Close，会把阶段 1 里暂存的孤儿清理 Delete 一并悄悄丢弃：孤儿记录永远留在
-	// 盘上，下次 Receive 还会扫到、还会再打一次 Warn。
+	// 早退判据必须是 staged（是否有暂存写入），不能是 len(out)==0（是否取到消息）：
+	// 只要 staged 为 true 就必须 Apply 提交，哪怕 out 本身是空的——比如本轮只清理了
+	// 孤儿 inflight、没有可投递的消息。若按 len(out)==0 就 Close，阶段 1 里暂存的
+	// 孤儿清理 Delete 会被一并悄悄丢弃：孤儿记录永远留在盘上，下次 Receive 还会
+	// 扫到、还会再打一次 Warn。
 	//
 	// 注意返回值语义：孤儿清理这种"有暂存写入但无可投递消息"的情况，out 仍然
 	// 是空的——不能因为提交了批次就伪造出一条消息。Receive 的循环靠
@@ -235,6 +237,14 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 	}
 	if err := d.st.Apply(b); err != nil {
 		return nil, fmt.Errorf("提交取件批次 (group=%s topic=%s q=%d): %w", group, topic, queueID, err)
+	}
+	if len(out) == 0 {
+		// 本轮唯一做的事是清理孤儿 inflight（上面那条 Warn 已说明是哪几条）。
+		// 单独一句话，不与投递共用消息：这恰恰是运维最需要读懂的一轮——
+		// 打成"投递消息 count=0"会让人以为队列空转，从而忽略掉刚刚发生的数据修复。
+		d.logger.Debug("本轮无可投递消息，仅清理了孤儿 inflight 记录",
+			"group", group, "topic", topic, "queue", queueID, "cursor", newCursor)
+		return out, nil
 	}
 	d.logger.Debug("投递消息", "group", group, "topic", topic, "queue", queueID,
 		"count", len(out), "redelivered", len(reds), "cursor", newCursor)

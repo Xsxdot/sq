@@ -2,8 +2,8 @@
 //
 // 职责：
 //   - 推导并导出 MaxGRPCMessageSize：cmd/sq/main.go 用它配置
-//     grpc.MaxRecvMsgSize/MaxSendMsgSize；Task 13 的端到端测试用它验证
-//     「消息体上限 4MB」这条 spec 约束在真实传输链路上确实可达
+//     grpc.MaxRecvMsgSize/MaxSendMsgSize；测试用它验证「消息体上限 4MB」
+//     这条 spec 约束在真实传输链路上确实可达
 //
 // 边界：
 //   - 只定义常量，不做任何运行时逻辑

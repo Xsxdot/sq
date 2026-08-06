@@ -11,7 +11,7 @@
 // 请求体里的 group/topic 字段——这是 RocketMQ pop receipt 的设计思路，避免
 // 请求体字段与 handle 实际指向的记录不一致。
 //
-// 为什么还要把 attempt 揉进 handle（这是 Task 7 review 修复的关键点）：没有
+// 为什么还要把 attempt 揉进 handle（这一条堵的是一条真实的消息丢失路径）：没有
 // attempt，消费者 A 收到消息 X（attempt=1）后处理超时，X 会被过期重投给
 // 消费者 B（attempt=2，全新的不可见窗口）；此时 A 迟到的 Ack(X) 若只按
 // (group,topic,queue,offset) 定位记录，会直接删掉 B 持有的那条新记录——

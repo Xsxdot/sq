@@ -65,6 +65,21 @@ func (p *Producer) Append(m *core.Message) (*core.Message, error) {
 	}
 	m.StoreAtMs = time.Now().UnixMilli()
 
+	// 关于这把锁的范围——已知的吞吐瓶颈，先记在这里，不在 M1 动它：
+	//
+	// p.mu 是整个 Producer 唯一的一把锁，覆盖队列选择、offset 分配、store.Apply
+	// （fsync 就发生在里面）以及唤醒长轮询。也就是说所有 topic 的所有生产者都在
+	// 这一个临界区里排队，任意两次 Apply 永远不可能重叠。
+	//
+	// 由此产生的直接后果：Pebble 的 group commit 在 sq 上是失效的。它的原理是把
+	// 同一时刻并发到达的多个 commit 合并成一次 fsync 摊薄开销，而设计文档正是
+	// 以此为依据才敢把"默认同步刷盘"当成可以接受的默认值。既然并发不存在，
+	// 也就无从合并——持续写入时的实际形态是每条消息一次 fsync，且全局单线程。
+	//
+	// 为什么现在不改：正确的做法是把锁按队列拆开，或者在进入 Apply 之前就放锁
+	// （offset 一旦分配完，写入本身不需要互斥）。但两者都会改变"offset 分配与
+	// 落盘之间是否可能交错"的前提，而 M1 没有任何吞吐量基准，改完既无法证明变快，
+	// 也无法证明没有引入乱序。等到真正测吞吐时再连同基准一起做。
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	// 队列选择：MessageGroup 定死队列（顺序语义的根基，M4 复用）；否则轮询

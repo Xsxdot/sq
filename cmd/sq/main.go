@@ -139,10 +139,10 @@ const gracefulStopTimeout = 30 * time.Second
 // 只要有一个 RPC 因为 bug 或对端异常挂住，裸 GracefulStop 就是一次无限期阻塞，
 // 对外表现为 systemctl stop 卡死、容器被超时 SIGKILL。这个上限就是那道兜底。
 //
-// Task 13 的实测数据（未接 Shutdown 之前）说明了这类阻塞有多真实：无客户端时
-// 停机 0.03s；接一个官方 SDK producer 时 9.5s（靠客户端自己的 GOAWAY 恢复逻辑
-// 碰巧断开）；再加一个 SimpleConsumer 之后就再也没有停下来过，只能靠这里的
-// 强制中断兜底。
+// 用官方 SDK 实测的数据（在接上 rpc.Server.Shutdown 之前）说明了这类阻塞有多
+// 真实：无客户端时停机 0.03s；接一个 producer 时 9.5s（靠客户端自己的 GOAWAY
+// 恢复逻辑碰巧断开）；再加一个 SimpleConsumer 之后就再也没有停下来过，只能靠
+// 这里的强制中断兜底。
 //
 // 超时后调用 Stop() 是有意为之：Stop 会立即中断所有在途 RPC，并让阻塞中的
 // GracefulStop 返回。被中断的 ReceiveMessage 不会造成消息丢失——那些消息的

@@ -17,6 +17,16 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// MaxDefaultQueueNums 是 default_queue_nums 允许的上限。
+//
+// 取 1024 的依据：RocketMQ 单个 topic 的队列数惯例在个位到两位数（默认 4~16），
+// 队列数的意义是消费并行度上限，远超消费者实例数之后只会让每个队列更空、
+// 长轮询更频繁。1024 已给出两个数量级的余量，同时守住两条硬边界——它远小于
+// int32 上限（路由响应里的队列 id 是 int32(i)，越界会变成负数），
+// 且每次 QueryRoute/QueryAssignment 都要展开这么多个 MessageQueue 条目，
+// 响应体大小必须有个头。
+const MaxDefaultQueueNums = 1024
+
 // Config 为 sq 全部运行配置。零值无意义，必须经 Load 构造。
 type Config struct {
 	GRPCListen       string `yaml:"grpc_listen"`        // gRPC 监听地址，默认 :8081
@@ -48,6 +58,17 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Fsync != "sync" && cfg.Fsync != "async" {
 		return nil, fmt.Errorf("配置 fsync 只接受 sync|async，得到 %q", cfg.Fsync)
+	}
+	// 队列数必须在启动时挡住，不能等到运行时才发作：
+	//   - 写 0（或漏填成 0）时，每一次 EnsureTopic 都会失败，而这个失败会一路
+	//     翻译成客户端看到的 INTERNAL_SERVER_ERROR——一个配置笔误从此伪装成
+	//     "broker 坏了"，运维要顺着服务端日志找很久才知道问题在自己的 yaml 里；
+	//   - 写一个超大值（如 3000000000）时，路由响应里的队列 id 由 int32(i) 得出，
+	//     越过 2^31 之后直接变成负数，客户端拿到一批负 id 的队列。
+	// 两种情况都不该由客户端来承担，进程干脆不要起来。
+	if cfg.DefaultQueueNums < 1 || cfg.DefaultQueueNums > MaxDefaultQueueNums {
+		return nil, fmt.Errorf("配置 default_queue_nums 必须在 1..%d 之间，得到 %d",
+			MaxDefaultQueueNums, cfg.DefaultQueueNums)
 	}
 	return cfg, nil
 }
