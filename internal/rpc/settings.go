@@ -88,9 +88,9 @@ func (s *Server) negotiateSettings(client *pb.Settings) *pb.Settings {
 			// 日志/抓包里时能一眼看出这次协商对应哪个发布端。
 			Topics:      ps.Publishing.GetTopics(),
 			MaxBodySize: produce.MaxBodySize,
-			// 开启客户端侧消息类型校验：sq 的 QueryRoute 只通告
-			// AcceptMessageTypes=[NORMAL]，M1 也确实只接受普通消息。让客户端
-			// 在本地就拒掉延时/顺序/事务消息，比让它发出去再收一个
+			// 开启客户端侧消息类型校验：sq 的 QueryRoute 通告
+			// AcceptMessageTypes=[NORMAL, DELAY]（M3 起），让客户端在本地就
+			// 拒掉顺序/事务消息，比让它发出去再收一个
 			// MESSAGE_PROPERTY_CONFLICT_WITH_TYPE 更早、更清楚。
 			ValidateMessageType: true,
 		}}

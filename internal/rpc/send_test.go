@@ -24,9 +24,11 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/xushixin/sq/internal/core/produce"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
+	"github.com/xushixin/sq/internal/store"
 )
 
 // bigMsgSize 超限 body 测试专用的 gRPC server 端 MaxRecvMsgSize。
@@ -281,6 +283,88 @@ func TestSendMessageRejectedWhenDiskBlocked(t *testing.T) {
 	}
 	blocked.Store(false)
 	sendOne(t, c, "dw", "x") // 恢复后可写
+}
+
+func TestSendDelayMessageGoesToDelayAreaNotDeliverable(t *testing.T) {
+	env := newTestEnv(t, true)
+	due := time.Now().Add(time.Hour)
+	resp, err := env.client.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "dly"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:       pb.MessageType_DELAY,
+				DeliveryTimestamp: timestamppb.New(due),
+			},
+			Body: []byte("later"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("延时发送应成功: %v %v", resp.GetStatus(), err)
+	}
+	// 未到期：正常消费链路取不到
+	msgs, err := env.dl.Receive(context.Background(), "g", "dly", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(msgs) != 0 {
+		t.Fatalf("未到期不应可消费: %d %v", len(msgs), err)
+	}
+	// 盘上 delay/ 恰有一条
+	pfx := []byte(store.DelayPrefix)
+	n := 0
+	env.st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) { n++; return true, nil })
+	if n != 1 {
+		t.Fatalf("delay 条目数 = %d，期望 1", n)
+	}
+}
+
+func TestSendDelayMissingTimestampRejected(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic:            &pb.Resource{Name: "dly"},
+			SystemProperties: &pb.SystemProperties{MessageType: pb.MessageType_DELAY},
+			Body:             []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_ILLEGAL_DELIVERY_TIME {
+		t.Fatalf("期望 ILLEGAL_DELIVERY_TIME，得到 %v %v", resp.GetStatus(), err)
+	}
+}
+
+func TestSendNormalWithDeliveryTimestampRejected(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "dly"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:       pb.MessageType_NORMAL,
+				DeliveryTimestamp: timestamppb.New(time.Now().Add(time.Hour)),
+			},
+			Body: []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE {
+		t.Fatalf("期望 MESSAGE_PROPERTY_CONFLICT_WITH_TYPE，得到 %v %v", resp.GetStatus(), err)
+	}
+}
+
+func TestQueryRouteAdvertisesDelayType(t *testing.T) {
+	// 守护 SDK 客户端侧校验：ValidateMessageType=true 时 SDK 发送前检查路由的
+	// AcceptMessageTypes，缺 DELAY 则延时消息在客户端本地就被拒（producer.go:191）
+	c := newTestClient(t)
+	resp, err := c.QueryRoute(context.Background(), &pb.QueryRouteRequest{Topic: &pb.Resource{Name: "dly"}})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("QueryRoute: %v %v", resp.GetStatus(), err)
+	}
+	for _, mq := range resp.GetMessageQueues() {
+		hasDelay := false
+		for _, mt := range mq.GetAcceptMessageTypes() {
+			if mt == pb.MessageType_DELAY {
+				hasDelay = true
+			}
+		}
+		if !hasDelay {
+			t.Fatalf("队列 %d 未通告 DELAY 类型", mq.GetId())
+		}
+	}
 }
 
 func strPtr(s string) *string { return &s }

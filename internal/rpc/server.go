@@ -146,7 +146,11 @@ func (s *Server) messageQueues(tc meta.TopicConfig, topic *pb.Resource) []*pb.Me
 			Permission: pb.Permission_READ_WRITE,
 			Broker:     &pb.Broker{Name: brokerName, Id: 0, Endpoints: s.endpoints()},
 			AcceptMessageTypes: []pb.MessageType{
-				pb.MessageType_NORMAL, // M3/M4/M6 时追加 DELAY/FIFO/TRANSACTION
+				pb.MessageType_NORMAL,
+				// M3 起接受延时消息。不能漏：SDK 开着 ValidateMessageType，
+				// 发送前用本列表在客户端本地校验，缺了 DELAY 则延时消息
+				// 根本发不出来（M4/M6 时继续追加 FIFO/TRANSACTION）
+				pb.MessageType_DELAY,
 			},
 		})
 	}

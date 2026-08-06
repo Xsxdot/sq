@@ -1,5 +1,5 @@
 // SendMessage 相关：proto Message ↔ core.Message 的写方向翻译。
-// 边界：仅 NORMAL 类型（M3 延时 / M4 FIFO 属性 / M6 事务在各自里程碑打开）。
+// 边界：NORMAL 与 DELAY（M3）；M4 FIFO / M6 事务在各自里程碑打开。
 package rpc
 
 import (
@@ -54,7 +54,15 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 	// 不额外引入多消息原子写入的复杂度。
 	entries := make([]*pb.SendResultEntry, 0, len(msgs))
 	for _, m := range msgs {
-		stored, err := s.pr.Append(m)
+		var stored *core.Message
+		var err error
+		if m.DeliverAtMs > 0 {
+			// 延时消息进暂存区（未分配 offset，entry 里 Offset 回 0——SDK 的
+			// SendReceipt 只消费 MessageId，offset 字段对延时场景无意义）
+			stored, err = s.pr.AppendDelay(m)
+		} else {
+			stored, err = s.pr.Append(m)
+		}
 		if err != nil {
 			// Append 内部会调用 meta.EnsureTopic，因此它的失败同样分"客户端输入
 			// 错误"与"服务端内部故障"两类，必须按 topicErrStatus 的规则分开
@@ -80,14 +88,23 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 // 此时不产生任何副作用（不触碰 store/meta）。
 func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 	sp := pm.GetSystemProperties()
+	var delayAt int64
 	switch sp.GetMessageType() {
 	case pb.MessageType_NORMAL:
-	case pb.MessageType_FIFO:
-		// FIFO 消息的写入路径与 NORMAL 相同（MessageGroup 定队列已在 produce 实现），
-		// 但消费端顺序锁是 M4——为避免"能发不能保序"的假象，M1 一并拒绝。
-		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "顺序消息将在 M4 支持")
+		// SDK 只要带 deliveryTimestamp 就自动标 DELAY 类型，标 NORMAL 却带
+		// 到期时间的只可能是行为异常的客户端。静默忽略该时间戳等于把"延时"
+		// 悄悄变成"立即投递"，必须显式拒绝。
+		if sp.GetDeliveryTimestamp() != nil {
+			return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,
+				"NORMAL 消息不应携带 delivery_timestamp")
+		}
 	case pb.MessageType_DELAY:
-		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "延时消息将在 M3 支持")
+		if sp.GetDeliveryTimestamp() == nil {
+			return nil, errStatus(pb.Code_ILLEGAL_DELIVERY_TIME, "DELAY 消息缺少 delivery_timestamp")
+		}
+		delayAt = sp.GetDeliveryTimestamp().AsTime().UnixMilli()
+	case pb.MessageType_FIFO:
+		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "顺序消息将在 M4 支持")
 	case pb.MessageType_TRANSACTION:
 		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "事务消息将在 M6 支持")
 	default:
@@ -136,6 +153,9 @@ func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 		BodyDigest:   digestToCore(sp.GetBodyDigest()),
 		BornAtMs:     born,
 		BornHost:     sp.GetBornHost(),
+		// DELAY 消息才有值；任意未来时间都接受（spec：任意秒级延时，不设上限），
+		// 已过期的时间戳由 AppendDelay 直通立即投递
+		DeliverAtMs: delayAt,
 		// TraceContext 是 W3C traceparent 之类的链路上下文：不带回去，
 		// 分布式追踪就在 sq 这一跳断掉，且断得悄无声息。
 		TraceContext: sp.GetTraceContext(),
