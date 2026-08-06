@@ -11,7 +11,7 @@ go build -o sq ./cmd/sq
 ```
 
 用官方 RocketMQ 5.x SDK（Java/Go/Python/C#/C++）直接连接 `127.0.0.1:8081` 收发。
-当前状态：M3（延时消息，任意秒级延时、重启不丢）。里程碑与设计见 docs/superpowers/specs/。
+当前状态：M4（顺序消息）。里程碑与设计见 docs/superpowers/specs/。
 
 停机用 `SIGINT`/`SIGTERM` 即可：收到信号后先让协议层结束没有自然终点的长流
 （`Telemetry`），再等在途 RPC 处理完（gRPC `GracefulStop`），最后关闭底层存储，
@@ -41,6 +41,7 @@ go build -o sq ./cmd/sq
 - 消息 retention：按 topic 保留时长后台清理（默认 3 天），消息与 key 索引一并删除
 - 磁盘水位保护：磁盘使用率超过阈值（默认 85%）时拒写保读，低于阈值自动恢复
 - 延时消息：任意秒级延时（deliveryTimestamp），重启不丢，精度 ~100ms 调度间隔
+- 顺序消息：同 MessageGroup 严格按序（FIFO），失败卡队头重投、超限入 DLQ 后推进；建议顺序消息使用专用 topic（顺序锁按队列生效，与普通消息混发会队头阻塞）
 
 ## 消费失败链路
 
@@ -77,4 +78,4 @@ log_level: info
 ## 限制
 
 - 消息体上限 4MB（`produce.MaxBodySize`）；默认同步刷盘（`fsync: sync`）。
-- 未实现：顺序/事务消息、控制台、多 broker 集群。
+- 未实现：事务消息、控制台、多 broker 集群。
