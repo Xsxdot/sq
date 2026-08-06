@@ -468,6 +468,68 @@ func (d *Deliverer) ChangeInvisible(group, topic string, queueID uint32, offset 
 	return true, nil
 }
 
+// ForwardToDLQ 将一条 inflight 消息显式转入死信 %DLQ%{group}（协议
+// ForwardMessageToDeadLetterQueue，spec §6：顺序消息重试超限时客户端显式
+// 入 DLQ；对非顺序消息同样可用）。
+//
+// 参数与校验规则与 Ack 完全一致：attempt 必须与当前持久化的 Attempts 匹配，
+// 陈旧句柄（已被重投覆盖）幂等返回 (false, nil)，绝不误伤新一轮投递的记录。
+//
+// 返回：(true, nil) 已转入（或目标消息已被 retention 清理、孤儿 inflight 已
+// 清除——调用方要的"这条消息别再投了"两种情况下都已成立）；(false, nil)
+// 目标不存在或句柄陈旧；错误仅在存储故障时返回。
+func (d *Deliverer) ForwardToDLQ(group, topic string, queueID uint32, offset uint64, attempt int32) (bool, error) {
+	// 与 Ack/ChangeInvisible 同理：直接读写 inflight 必须持队列锁（类型注释
+	// 声明的并发安全前提），否则与过期重投的读-改-写交错
+	qlock := d.lockQueue(group, topic, queueID)
+	qlock.Lock()
+	defer qlock.Unlock()
+
+	k := store.InflightKey(group, topic, queueID, offset)
+	v, ok, err := d.st.Get(k)
+	if err != nil {
+		return false, fmt.Errorf("forward 查询 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+	}
+	if !ok {
+		d.logger.Debug("forward 目标不存在（已 ack 或已重投）", "group", group, "topic", topic, "queue", queueID, "offset", offset)
+		return false, nil
+	}
+	ist, err := core.DecodeInflight(v)
+	if err != nil {
+		return false, fmt.Errorf("解码 inflight (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+	}
+	if ist.Attempts != attempt {
+		d.logger.Debug("forward attempt 不匹配（陈旧句柄，已被重投覆盖）",
+			"group", group, "topic", topic, "queue", queueID, "offset", offset,
+			"want_attempt", ist.Attempts, "got_attempt", attempt)
+		return false, nil
+	}
+	raw, ok, err := d.st.Get(store.MsgKey(topic, queueID, offset))
+	if err != nil {
+		return false, fmt.Errorf("读取 forward 消息 (topic=%s q=%d off=%d): %w", topic, queueID, offset, err)
+	}
+	if !ok {
+		// 消息已被 retention 清理但 inflight 残留：与 receiveOnce 的孤儿清理
+		// 同理删除止损。对调用方视为成功——"这条消息别再投了"已经成立。
+		b := d.st.NewBatch()
+		b.Delete(k, nil)
+		if err := d.st.Apply(b); err != nil {
+			return false, fmt.Errorf("清理孤儿 inflight (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+		}
+		d.logger.Warn("forward 目标消息已不存在，清理孤儿 inflight", "group", group, "topic", topic, "queue", queueID, "offset", offset)
+		return true, nil
+	}
+	m, err := core.DecodeMessage(raw)
+	if err != nil {
+		return false, fmt.Errorf("解码 forward 消息 (topic=%s q=%d off=%d): %w", topic, queueID, offset, err)
+	}
+	// moveToDLQ 内部：DLQ 写入与 inflight 删除同批原子提交，并打 Info 日志
+	if err := d.moveToDLQ(group, topic, queueID, offset, m); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // moveToDLQ 将投递次数耗尽的消息复制入 %DLQ%{group} 并原子删除源 inflight。
 //
 // 死信保留原消息 ID/Body/Tag/Keys（ID 不变便于全链路追踪），来源坐标写入

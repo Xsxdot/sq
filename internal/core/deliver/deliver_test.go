@@ -667,3 +667,46 @@ func TestOrderedTagFilteredStillSkipped(t *testing.T) {
 		t.Fatalf("b 应被过滤跳过、投出 c: %+v %v", next, err)
 	}
 }
+
+// 显式转入 DLQ：inflight 删除、消息入 %DLQ%{group}、顺序锁释放
+func TestForwardToDLQHappyPathUnblocksOrdered(t *testing.T) {
+	f := newFixture(t)
+	f.sendGrouped(t, "t", "a", "g1")
+	f.sendGrouped(t, "t", "b", "g1")
+	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 1, time.Minute, 0, nil)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("首投: %d %v", len(msgs), err)
+	}
+	ok, err := f.dl.ForwardToDLQ("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt)
+	if err != nil || !ok {
+		t.Fatalf("ForwardToDLQ: %v %v", ok, err)
+	}
+	// 顺序锁已释放：b 可投
+	next, err := f.dl.Receive(context.Background(), "g", "t", 0, 1, time.Minute, 0, nil)
+	if err != nil || len(next) != 1 || string(next[0].Body) != "b" {
+		t.Fatalf("forward 后应投 b: %+v %v", next, err)
+	}
+	// DLQ 里有 a
+	dlq, err := f.dl.Receive(context.Background(), "g", meta.DLQTopicName("g"), 0, 10, time.Minute, 0, nil)
+	if err != nil || len(dlq) != 1 || string(dlq[0].Body) != "a" {
+		t.Fatalf("DLQ 内容不符: %+v %v", dlq, err)
+	}
+}
+
+// 陈旧句柄幂等拒绝（语义与 Ack 的 attempt 校验一致）：不存在或 attempt
+// 不匹配都返回 (false, nil)，不误伤重投后的新记录
+func TestForwardToDLQStaleHandle(t *testing.T) {
+	f := newFixture(t)
+	f.sendGrouped(t, "t", "a", "g1")
+	msgs, _ := f.dl.Receive(context.Background(), "g", "t", 0, 1, time.Minute, 0, nil)
+	if ok, err := f.dl.ForwardToDLQ("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt+1); ok || err != nil {
+		t.Fatalf("attempt 不匹配应幂等拒绝: %v %v", ok, err)
+	}
+	if ok, err := f.dl.ForwardToDLQ("g", "t", 0, 999, 1); ok || err != nil {
+		t.Fatalf("不存在的 offset 应幂等拒绝: %v %v", ok, err)
+	}
+	// 原 inflight 未被误删：a 仍可 ack
+	if ok, err := f.dl.Ack("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt); !ok || err != nil {
+		t.Fatalf("原记录应完好: %v %v", ok, err)
+	}
+}
