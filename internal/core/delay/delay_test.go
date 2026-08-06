@@ -130,7 +130,7 @@ func TestPassRespectsBudgetAndDrains(t *testing.T) {
 	f := newFixture(t)
 	past := time.Now().Add(-time.Second).UnixMilli()
 	for i := uint64(0); i < 5; i++ {
-		f.putDelay(t, i, past, &core.Message{ID: string(rune('a'+i)), Topic: "t", Body: []byte("x")})
+		f.putDelay(t, i, past, &core.Message{ID: string(rune('a' + i)), Topic: "t", Body: []byte("x")})
 	}
 	// 单趟受预算限制
 	moved, err := f.sc.Pass()
