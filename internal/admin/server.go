@@ -29,6 +29,12 @@ import (
 	"github.com/xushixin/sq/internal/sysinfo"
 )
 
+// ConnCounter 提供当前在线连接数（rpc.Server 实现，admin 只读消费）。
+// 为 nil 时总览的 connections 回 0——测试构造或未装配时不该炸管理面。
+type ConnCounter interface {
+	ConnectionCount() int
+}
+
 // Server Admin HTTP 服务。
 type Server struct {
 	st       *store.Store
@@ -41,6 +47,7 @@ type Server struct {
 	// /admin/system 返回 503，拒写判定一律视为未拒写（测试构造用）
 	sys    *sysinfo.Reporter
 	sp     *metrics.Sampler // 时序采样器；admin_listen 关闭时 main 不装配，为 nil
+	conns  ConnCounter      // 在线连接数来源；为 nil 时总览 connections 回 0
 	logger *slog.Logger
 
 	tokens sync.Map // token(string) → 过期时间(time.Time)
@@ -50,13 +57,15 @@ type Server struct {
 
 // New 构造 Admin 服务并装配全部路由。username/password 均空 = 免登录。
 // sp 为 nil 时时序/总账端点返回 503（采样器未启用，不返回误导性的空数据）；
-// sys 为 nil 时 /admin/system 同理返回 503。
+// sys 为 nil 时 /admin/system 同理返回 503；conns 为 nil 时总览的
+// connections 回 0（测试构造等未装配场景，管理面不因缺读数来源而报错）。
 func New(st *store.Store, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer,
 	username, password string, sys *sysinfo.Reporter, sp *metrics.Sampler,
-	reg *prometheus.Registry, logger *slog.Logger) *Server {
+	reg *prometheus.Registry, conns ConnCounter, logger *slog.Logger) *Server {
 	s := &Server{
 		st: st, mt: mt, pr: pr, dl: dl,
 		username: username, password: password, sys: sys, sp: sp,
+		conns:  conns,
 		logger: logger.With("mod", "admin"),
 		mux:    http.NewServeMux(),
 	}
@@ -82,6 +91,7 @@ func (s *Server) routes(reg *prometheus.Registry) {
 	s.mux.HandleFunc("POST /admin/messages/send", s.protected(s.handleMessageSend))
 	s.mux.HandleFunc("POST /admin/dlq/{group}/resend", s.protected(s.handleDLQResend))
 	s.mux.HandleFunc("GET /admin/delay", s.protected(s.handleDelayList))
+	s.mux.HandleFunc("GET /admin/transactions", s.protected(s.handleTransactionsList))
 	s.mux.HandleFunc("GET /admin/overview", s.protected(s.handleOverview))
 	s.mux.HandleFunc("GET /admin/system", s.protected(s.handleSystem))
 	s.mux.HandleFunc("GET /admin/timeseries", s.protected(s.handleTimeseries))

@@ -9,6 +9,7 @@ package admin
 
 import (
 	"encoding/base64"
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"time"
@@ -16,6 +17,7 @@ import (
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/query"
+	"github.com/xushixin/sq/internal/core/txn"
 	"github.com/xushixin/sq/internal/metrics"
 	"github.com/xushixin/sq/internal/store"
 )
@@ -257,6 +259,54 @@ func (s *Server) handleDelayList(w http.ResponseWriter, r *http.Request) {
 	s.writeJSON(w, http.StatusOK, out)
 }
 
+// handleTransactionsList GET /admin/transactions：待决半消息（按下次回查时间升序）。
+// halfidx 里的 Checks 靠二次 Get 取——列表是排查用的低频操作，N+1 读可接受。
+func (s *Server) handleTransactionsList(w http.ResponseWriter, r *http.Request) {
+	limit64, err := queryUint(r, "limit", 64)
+	if err != nil {
+		s.httpError(w, http.StatusBadRequest, "limit 非法: %v", err)
+		return
+	}
+	type txnEntry struct {
+		TxID        string `json:"tx_id"`
+		MsgID       string `json:"msg_id"`
+		Topic       string `json:"topic"`
+		NextCheckMs int64  `json:"next_check_ms"`
+		Checks      int    `json:"checks"`
+		BornMs      int64  `json:"born_ms"`
+	}
+	out := []txnEntry{}
+	hp := []byte(store.HalfPrefix)
+	err = s.st.Scan(hp, store.PrefixUpperBound(hp), int(limit64), func(k, v []byte) (bool, error) {
+		next, txID, perr := store.ParseHalfKey(k)
+		if perr != nil {
+			return false, perr
+		}
+		m, derr := core.DecodeMessage(v)
+		if derr != nil {
+			// 坏条目由回查调度器负责清理（那里删除并 Error 留痕），管理面只读跳过
+			s.logger.Warn("admin 事务视图跳过坏条目", "key", string(k), "err", derr)
+			return true, nil
+		}
+		checks := 0
+		if refRaw, ok, _ := s.st.Get(store.HalfIdxKey(txID)); ok {
+			ref := &txn.HalfRef{}
+			if json.Unmarshal(refRaw, ref) == nil {
+				checks = ref.Checks
+			}
+		}
+		out = append(out, txnEntry{TxID: txID, MsgID: m.ID, Topic: m.Topic,
+			NextCheckMs: next, Checks: checks, BornMs: m.BornAtMs})
+		return true, nil
+	})
+	if err != nil {
+		s.logger.Error("admin 事务视图扫描失败", "err", err)
+		s.httpError(w, http.StatusInternalServerError, "%v", err)
+		return
+	}
+	s.writeJSON(w, http.StatusOK, out)
+}
+
 // handleOverview GET /admin/overview：总览计数（复用 metrics.Collect，
 // 控制台图表与 Prometheus 看到同一份事实源）。
 //
@@ -300,8 +350,14 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 			topics++
 		}
 	}
+	// connections 来自 rpc.Server 的在线会话数；conns 为 nil（测试构造）时回 0
+	conns := 0
+	if s.conns != nil {
+		conns = s.conns.ConnectionCount()
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
 		"topics": topics, "groups": st.Groups, "delay_depth": st.DelayDepth,
+		"half_depth": st.HalfDepth, "connections": conns,
 		"total_written": written, "total_pending": pending, "total_inflight": inflight,
 		"total_dlq": dlq, "qps": qps,
 	})

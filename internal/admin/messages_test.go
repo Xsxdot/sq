@@ -12,6 +12,8 @@ import (
 
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
+	"github.com/xushixin/sq/internal/core/txn"
+	"github.com/xushixin/sq/internal/store"
 )
 
 func TestMessagesSendBrowseAndKeyQuery(t *testing.T) {
@@ -136,6 +138,97 @@ func TestDelayViewAndOverview(t *testing.T) {
 	}
 	if ov.Topics != 1 || ov.DelayDepth != 1 || ov.TotalWritten != 1 {
 		t.Fatalf("总览不符: %+v", ov)
+	}
+}
+
+// fakeConns 测试用 ConnCounter：返回固定连接数（总览 connections 断言用）。
+type fakeConns struct{ n int }
+
+func (f fakeConns) ConnectionCount() int { return f.n }
+
+// TestAdminTransactionsList 事务视图：直写一条 half+halfidx 条目（形状与
+// txn.Stage 一致），GET /admin/transactions?limit=10 应返回该条且字段齐全。
+func TestAdminTransactionsList(t *testing.T) {
+	s, st, _, _, _, _ := newTestServer(t, "", "")
+	h := s.Handler()
+	next := time.Now().Add(time.Hour).UnixMilli()
+	msg := &core.Message{ID: "txn-msg-1", Topic: "t1", Body: []byte("txn"), BornAtMs: 1723000000000}
+	raw, err := core.EncodeMessage(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _ := json.Marshal(&txn.HalfRef{NextCheckMs: next, Checks: 3}) // 结构固定无失败路径
+	b := st.NewBatch()
+	b.Set(store.HalfKey(next, "TX0001"), raw, nil)
+	b.Set(store.HalfIdxKey("TX0001"), ref, nil)
+	if err := st.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	w := doJSON(t, h, "GET", "/admin/transactions?limit=10", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("事务视图应 200，得到 %d body=%s", w.Code, w.Body)
+	}
+	var entries []struct {
+		TxID        string `json:"tx_id"`
+		MsgID       string `json:"msg_id"`
+		Topic       string `json:"topic"`
+		NextCheckMs int64  `json:"next_check_ms"`
+		Checks      int    `json:"checks"`
+		BornMs      int64  `json:"born_ms"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &entries); err != nil || len(entries) != 1 {
+		t.Fatalf("应 1 条半消息: %s %v", w.Body, err)
+	}
+	if e := entries[0]; e.TxID != "TX0001" || e.MsgID != "txn-msg-1" || e.Topic != "t1" ||
+		e.NextCheckMs != next || e.Checks != 3 || e.BornMs != 1723000000000 {
+		t.Fatalf("事务条目不符: %+v", entries[0])
+	}
+}
+
+// TestAdminOverviewHasHalfDepthAndConnections 总览必须带 half_depth 与
+// connections 两键：fake ConnCounter 返回 2 时 connections == 2；直写一条
+// 半消息后 half_depth == 1。nil conns（helper 默认形态）时 connections 回 0。
+func TestAdminOverviewHasHalfDepthAndConnections(t *testing.T) {
+	s, st, _, _, _, _ := newTestServerWithConns(t, "", "", fakeConns{2})
+	h := s.Handler()
+	next := time.Now().Add(time.Hour).UnixMilli()
+	msg := &core.Message{ID: "txn-msg-2", Topic: "t1", Body: []byte("txn")}
+	raw, err := core.EncodeMessage(msg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref, _ := json.Marshal(&txn.HalfRef{NextCheckMs: next, Checks: 0})
+	b := st.NewBatch()
+	b.Set(store.HalfKey(next, "TX0002"), raw, nil)
+	b.Set(store.HalfIdxKey("TX0002"), ref, nil)
+	if err := st.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	w := doJSON(t, h, "GET", "/admin/overview", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("总览应 200，得到 %d", w.Code)
+	}
+	var ov struct {
+		HalfDepth   int `json:"half_depth"`
+		Connections int `json:"connections"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &ov); err != nil {
+		t.Fatal(err)
+	}
+	if ov.HalfDepth != 1 {
+		t.Fatalf("half_depth 应为 1，得到 %d", ov.HalfDepth)
+	}
+	if ov.Connections != 2 {
+		t.Fatalf("connections 应为 2（fake 返回 2），得到 %d", ov.Connections)
+	}
+	// nil conns 容忍：helper 默认传 nil，connections 回 0 而非 500
+	s2, _, _, _, _, _ := newTestServer(t, "", "")
+	w2 := doJSON(t, s2.Handler(), "GET", "/admin/overview", "", nil)
+	var ov2 struct {
+		Connections int `json:"connections"`
+	}
+	if err := json.Unmarshal(w2.Body.Bytes(), &ov2); err != nil || ov2.Connections != 0 {
+		t.Fatalf("nil conns 时 connections 应为 0: %+v %v", ov2, err)
 	}
 }
 
