@@ -17,10 +17,9 @@ import Login from './pages/Login'
 import Overview from './pages/Overview'
 import Topics from './pages/Topics'
 import TopicDetail from './pages/TopicDetail'
-import {
-  Groups, GroupDetail,
-  Messages, Send, Dlq, Delay,
-} from './pages/placeholder'
+import Groups from './pages/Groups'
+import GroupDetail from './pages/GroupDetail'
+import { Messages, Send, Dlq, Delay } from './pages/placeholder'
 import './styles/app.css'
 
 /** 启动时探一次是否需要登录：免登录的服务端上不该逼用户看登录页。 */
