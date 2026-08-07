@@ -40,7 +40,7 @@ export default function Overview() {
   // 过滤成「只看落后的」之后，刻度跟着收紧，剩下几行的差异才看得出来
   const scale = maxLag(rows)
 
-  // 六项读数旁的迷你图共用时序里的 1h 环，避免为了四条小曲线再打四次请求
+  // 六项读数旁的迷你图共用当前档位时序的点，避免为了四条小曲线再打四次请求；切档位时随 ts 一起刷新
   const pts = ts.data?.points ?? []
   const sparks = {
     qps: pts.map(p => p.qps),
@@ -195,7 +195,9 @@ export default function Overview() {
                             <Spark values={sparks.qps} color={r.written_qps ? 'var(--chart-1)' : 'var(--text-3)'} />
                           </div>
                         </td>
-                        <td><Ribbon cursor={r.cursor} head={r.next_offset} fly={r.inflight} scale={scale} compact /></td>
+                        {/* 主表 offset 带非 compact，下方渲染「位点 X / 落后 Y」字幕，与原型 index.html:190 一致；
+                            队列详情行才用 compact（index.html:207） */}
+                        <td><Ribbon cursor={r.cursor} head={r.next_offset} fly={r.inflight} scale={scale} /></td>
                         <td className={`num ${lagOf(r) > 500 ? 'bad' : lagOf(r) === 0 ? 'zero' : ''}`}>{fmt(lagOf(r))}</td>
                         <td className={`num ${r.inflight ? '' : 'zero'}`}>{r.inflight}</td>
                         <td className={`num ${r.dlq ? 'bad' : 'zero'}`}>{r.dlq}</td>
