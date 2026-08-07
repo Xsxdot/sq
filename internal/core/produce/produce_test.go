@@ -192,7 +192,7 @@ func TestAppendConcurrentNoDupNoHole(t *testing.T) {
 		count := 0
 		prev := int64(-1)
 		// 队列区间 = [MsgKey(t,q,0), MsgKey(t,q+1,0))：MsgKey 的 queueID/offset
-		// 均为定长大端编码，区间边界成立（执行时打开 keys.go:65 复核一眼）
+		// 均为定长大端编码，字节序即数值序，因此该区间恰好覆盖队列 q 的全部消息
 		err := st.Scan(store.MsgKey("t-conc", q, 0), store.MsgKey("t-conc", q+1, 0), 0,
 			func(k, v []byte) (bool, error) {
 				_, _, off, perr := store.ParseMsgKey(k)

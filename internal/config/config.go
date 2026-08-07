@@ -30,7 +30,7 @@ const MaxDefaultQueueNums = 1024
 
 // Credential 一条 gRPC 静态鉴权凭据。多条凭据 = 每个接入方一对、可单独吊销。
 type Credential struct {
-	Name      string `yaml:"name"`       // 可选，仅用于日志追溯（如"订单服务"），不参与校验
+	Name      string `yaml:"name"` // 可选，仅用于日志追溯（如"订单服务"），不参与校验
 	AccessKey string `yaml:"access_key"`
 	SecretKey string `yaml:"secret_key"`
 }

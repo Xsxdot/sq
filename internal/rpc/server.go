@@ -65,8 +65,9 @@ type Server struct {
 // （M6）：SendMessage 把 TRANSACTION 半消息交给它暂存，EndTransaction 由它
 // 决断；writeBlocked 是磁盘水位拒写开关（spec §7，由 retention 循环每趟更新），
 // 为 nil 时不拒写；handleSecret 是 receipt handle 的 HMAC-SHA256 签名密钥
-// （LoadOrCreateHandleSecret 产物），nil 时 handle 加签/验签同样按 nil 密钥
-// 计算——校验必失败，正常装配不允许传入 nil。sessions 是 Telemetry 会话注册表
+// （LoadOrCreateHandleSecret 产物），nil 时等于用空密钥做 HMAC——空密钥 MAC
+// 可被轻易伪造，即失去防伪造保护（而非验签必失败），正常装配不允许传入 nil。
+// sessions 是 Telemetry 会话注册表
 // （M6 事务回查通道与连接数口径，本 task 自建，不依赖外部注入）。
 func New(cfg *config.Config, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, tx *txn.Manager, writeBlocked *atomic.Bool, handleSecret []byte, logger *slog.Logger) *Server {
 	return &Server{

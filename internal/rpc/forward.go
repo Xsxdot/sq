@@ -20,7 +20,7 @@ import (
 func (s *Server) ForwardMessageToDeadLetterQueue(ctx context.Context, req *pb.ForwardMessageToDeadLetterQueueRequest) (*pb.ForwardMessageToDeadLetterQueueResponse, error) {
 	g, topic, q, off, attempt, err := receiptDecode(s.handleSecret, req.GetReceiptHandle())
 	if err != nil {
-		s.logger.Warn("forward 句柄无法解析", "handle", req.GetReceiptHandle(), "msg_id", req.GetMessageId(), "err", err)
+		s.logger.Warn("forward 句柄无法解析", "handle", truncateForLog(req.GetReceiptHandle()), "msg_id", req.GetMessageId(), "err", err)
 		return &pb.ForwardMessageToDeadLetterQueueResponse{Status: errStatus(pb.Code_INVALID_RECEIPT_HANDLE, err.Error())}, nil
 	}
 	ok, err := s.dl.ForwardToDLQ(g, topic, q, off, attempt)

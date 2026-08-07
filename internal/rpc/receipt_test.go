@@ -29,9 +29,9 @@ func TestReceiptRejectsTampering(t *testing.T) {
 	h := receiptEncode(secret, "g1", "t1", 0, 1, 1)
 	cases := map[string]string{
 		"payload 篡改": "x" + h[1:],
-		"签名段篡改":     h[:len(h)-2] + "xx",
-		"缺签名段（旧格式）": strings.Split(h, ".")[0],
-		"换密钥":       receiptEncode([]byte("other-secret"), "g1", "t1", 0, 1, 1)[:len(h)], // 用错误密钥签的完整 handle
+		"签名段篡改":      h[:len(h)-2] + "xx",
+		"缺签名段（旧格式）":  strings.Split(h, ".")[0],
+		"换密钥":        receiptEncode([]byte("other-secret"), "g1", "t1", 0, 1, 1)[:len(h)], // 用错误密钥签的完整 handle
 	}
 	for name, bad := range cases {
 		if _, _, _, _, _, err := receiptDecode(secret, bad); err == nil {
