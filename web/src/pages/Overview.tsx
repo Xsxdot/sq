@@ -2,13 +2,15 @@
  * 总览页
  *
  * 职责：
- *   - 上半屏给整体信号：六项读数（写入/总落后/在途/延时待投/死信/TOPIC·消费组）+ 写入与落后趋势图（1h/24h/7d）
+ *   - 上半屏给整体信号：六项业务读数（写入/总落后/在途/延时待投/死信/TOPIC·消费组）
+ *     + 四项系统读数（磁盘/数据目录/Go 内存/运行时长·协程）+ 写入与落后趋势图（1h/24h/7d）
  *   - 下半屏给全部消费关系总账：全表共用一把刻度画 offset 带，可逐行展开到队列级并就地发起操作
  *
  * 边界：
  *   - 详情页与操作页不在此处实现，本页只按路由出链接
  *   - 数据全部来自轮询（api.overview / api.timeseries / api.ledger），不做本地缓存
  *   - 布局与 class 名与 prototypes/base/index.html 逐段一致，class 名一个字不改
+ *   - 系统读数不参与首屏 loading 判定：它是第二梯队，不该拖住业务信号的呈现
  */
 import { Fragment, useEffect, useRef, useState } from 'react'
 import { Link } from 'react-router-dom'
@@ -20,7 +22,7 @@ import { Spark } from '../components/Spark'
 import { Ribbon } from '../components/Ribbon'
 import { TrendChart } from '../components/TrendChart'
 import { lagOf, maxLag, markOf } from '../lib/derive'
-import { fmt, ago } from '../lib/format'
+import { fmt, ago, bytes, uptime } from '../lib/format'
 import type { LedgerRow } from '../api/types'
 
 /** 行的唯一键：一个「组 × 主题」就是一行。 */
@@ -31,6 +33,9 @@ export default function Overview() {
   const [range, setRange] = useState<'1h' | '24h' | '7d'>('1h')
   const ts = usePoll(() => api.timeseries(range))
   const led = usePoll(() => api.ledger())
+  // 系统读数变化远慢于业务读数，15 秒一次足够；后端的数据目录统计本身
+  // 还有 60 秒 TTL 缓存，拉得更勤只是白跑一趟
+  const sys = usePoll(() => api.system(), 15000)
   const [filter, setFilter] = useState<'lag' | 'dlq' | null>(null)
   const [open, setOpen] = useState<Set<string>>(new Set())
 
@@ -66,7 +71,9 @@ export default function Overview() {
     return next
   })
 
-  // 三个数据源首次都为空时整页转「加载中」，之后各自出错各自亮 Notice，不吞错误
+  // 三个业务数据源首次都为空时整页转「加载中」，之后各自出错各自亮 Notice，不吞错误。
+  // sys 刻意不进这个判定：系统读数是第二梯队，让它拖住整页首屏是本末倒置——
+  // 它没到就先显示占位符，到了自然补上
   const loading =
     (ov.loading && !ov.data) || (ts.loading && !ts.data) || (led.loading && !led.data)
 
@@ -123,6 +130,58 @@ export default function Overview() {
               <div>
                 <div className="stat-label">TOPIC / 消费组</div>
                 <div className="stat-val">{ov.data?.topics ?? 0} / {ov.data?.groups ?? 0}</div>
+              </div>
+            </div>
+          </div>
+
+          {/* 系统读数条。布局与 class 名与 prototypes/base/index.html 的第二条 .strip 逐段一致 */}
+          <div className="strip">
+            <div className="stat">
+              <div>
+                <div className="stat-label">磁盘使用</div>
+                {/* disk 为 null = 探测失败或非 unix 平台，显示「—」而不是 0%；
+                    拒写中标红，让这一格自己就能说明「为什么写不进去」 */}
+                <div className={`stat-val ${sys.data?.write_blocked ? 'bad' : ''}`}>
+                  {sys.data?.disk == null ? '—' : sys.data.disk.used_percent.toFixed(1)}
+                  <small>
+                    {sys.data?.disk == null
+                      ? '不可用'
+                      : sys.data.watermark_percent > 0
+                        ? `% / 水位 ${sys.data.watermark_percent}%`
+                        : '% / 水位未启用'}
+                  </small>
+                </div>
+              </div>
+            </div>
+            <div className="stat">
+              <div>
+                <div className="stat-label">数据目录</div>
+                <div className="stat-val">
+                  {sys.data?.data_dir_bytes == null ? '—' : bytes(sys.data.data_dir_bytes)}
+                  <small>{sys.data?.disk ? `可用 ${bytes(sys.data.disk.free_bytes)}` : ''}</small>
+                </div>
+              </div>
+            </div>
+            <div className="stat">
+              <div>
+                <div className="stat-label">GO 运行时内存</div>
+                {/* 口径必须写在标签里：这是 Go 运行时的堆占用，不是进程 RSS。
+                    Go 归还内存有延迟，把它当 RSS 读会得出「内存泄漏」的错误结论 */}
+                <div className="stat-val">
+                  {sys.data ? bytes(sys.data.go_heap_inuse_bytes) : '—'}
+                  <small>{sys.data ? `/ 申请 ${bytes(sys.data.go_sys_bytes)}` : ''}</small>
+                </div>
+              </div>
+            </div>
+            <div className="stat">
+              <div>
+                <div className="stat-label">运行时长 / 协程</div>
+                {/* 运行时长顺带回答「是不是刚重启过」——admin token 重启即失效，
+                    用户被踢回登录页时第一个想确认的就是这件事 */}
+                <div className="stat-val">
+                  {sys.data ? uptime(sys.data.uptime_seconds) : '—'}
+                  <small>{sys.data ? `/ ${sys.data.goroutines}` : ''}</small>
+                </div>
               </div>
             </div>
           </div>
