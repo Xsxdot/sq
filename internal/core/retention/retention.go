@@ -23,6 +23,7 @@ import (
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/store"
+	"github.com/xushixin/sq/internal/sysinfo"
 )
 
 // maxPurgePerQueue 单队列/单索引扫描单趟最多清理条数，防止单趟长时间占用。
@@ -78,21 +79,29 @@ func (m *Manager) Run(ctx context.Context) {
 }
 
 // checkDisk 探测磁盘用量并更新拒写开关。只在状态翻转时打日志（避免每趟刷屏）。
+//
+// 探测实现在 internal/sysinfo：控制台的 /admin/system 与 /metrics 的
+// sq_disk_used_percent 走的是同一个函数，三方看到的百分比必须是同一个数 ——
+// 「日志说拒写了但控制台显示 60%」是最坏的排查体验。
 func (m *Manager) checkDisk() {
 	if m.watermarkPct <= 0 || m.writeBlocked == nil {
 		return
 	}
-	used, err := diskUsedPercent(m.dataDir)
+	d, err := sysinfo.DiskUsage(m.dataDir)
 	if err != nil {
 		m.logger.Warn("磁盘水位检查失败，本趟跳过", "dir", m.dataDir, "err", err)
 		return
 	}
-	blocked := used >= float64(m.watermarkPct)
+	blocked := d.UsedPercent >= float64(m.watermarkPct)
 	if blocked != m.writeBlocked.Load() {
 		if blocked {
-			m.logger.Error("磁盘使用率超过水位线，进入拒写保读", "used_pct", used, "watermark", m.watermarkPct)
+			m.logger.Error("磁盘使用率超过水位线，进入拒写保读",
+				"used_pct", d.UsedPercent, "watermark", m.watermarkPct,
+				"free_bytes", d.FreeBytes, "total_bytes", d.TotalBytes)
 		} else {
-			m.logger.Info("磁盘使用率回落，恢复写入", "used_pct", used, "watermark", m.watermarkPct)
+			m.logger.Info("磁盘使用率回落，恢复写入",
+				"used_pct", d.UsedPercent, "watermark", m.watermarkPct,
+				"free_bytes", d.FreeBytes)
 		}
 		m.writeBlocked.Store(blocked)
 	}
