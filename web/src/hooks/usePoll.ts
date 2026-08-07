@@ -60,6 +60,10 @@ export function usePoll<T>(fn: () => Promise<T>, intervalMs = 5000): PollState<T
     return () => {
       window.clearInterval(timer)
       document.removeEventListener('visibilitychange', onVisible)
+      // 卸载后仍可能有一个 in-flight 请求晚到，它会通过上面的 seq 检查并在
+      // 已卸载的 hook 上 setData；把 seq 顶上去让卸载后的迟到响应全部被丢弃，
+      // 「迟到响应不能覆盖新响应」的约定跨卸载也要成立
+      seqRef.current++
     }
   }, [run, intervalMs])
 

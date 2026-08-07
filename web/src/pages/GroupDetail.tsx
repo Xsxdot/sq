@@ -51,7 +51,14 @@ export default function GroupDetail() {
 
   async function onReset() {
     if (!pendingReset) return
-    const target = Number(offset)
+    // 空输入（用户清空后直接确认）绝不能当成 0：重置到 0 会把整条队列从头重新投递，
+    // 是不可逆的破坏性操作，必须显式报错而不是静默放行（Number('') === 0 会绕过整数校验）
+    const trimmed = offset.trim()
+    if (trimmed === '') {
+      setResetErr('请填写目标位点')
+      return
+    }
+    const target = Number(trimmed)
     if (!Number.isInteger(target) || target < 0) {
       setResetErr('目标 offset 必须是不小于 0 的整数')
       return
@@ -201,7 +208,7 @@ export default function GroupDetail() {
               </div>
               <div className="field">
                 <label>目标 OFFSET</label>
-                <input type="number" min={0} value={offset}
+                <input type="number" min={0} value={offset} required
                   onChange={e => { setOffset(e.target.value); setResetErr(null) }} />
                 <div className="hint">
                   当前位点 {fmt(pendingReset.queue.cursor)}，写入头 {fmt(pendingReset.queue.next_offset)}；

@@ -12,7 +12,8 @@
  *   - 只负责「造一条消息」，不负责验证消费结果；消费进度看总览与消费组页
  *   - 这是真实写入路径，不是 dry-run：真实环境下发出去的消息会被消费者消费，
  *     因此页面顶部常驻生产环境告警
- *   - MessageGroup 不做前端必填校验——留给后端报错，避免前端校验与后端规则漂移
+ *   - 延时/顺序的专属字段在提交前做前端必填校验：空值/0 会静默降级成普通消息
+ *     立即投递，后端无法区分，必须在前端拦下；其余规则留给后端报错
  */
 import { useEffect, useState, type FormEvent } from 'react'
 import { Link } from 'react-router-dom'
@@ -62,13 +63,26 @@ export default function Send() {
       setErr('请先填写新 topic 的名称')
       return
     }
+    // 延时：空值/0/垃圾输入直接拒绝——delay_ms 为 0 时后端「>0 才是延时」的判定
+    // 会把它当作普通消息立即投递，这条真实写入路径上属于静默的类型降级
+    const delayNum = Number(delayVal)
+    if (type === 'DELAY' && (!Number.isInteger(delayNum) || delayNum <= 0)) {
+      setErr('延时消息需要填写大于 0 的时长')
+      return
+    }
+    // 顺序：MessageGroup 为空时后端无法与普通消息区分，会静默降级成立即投递
+    const group = messageGroup.trim()
+    if (type === 'FIFO' && !group) {
+      setErr('顺序消息需要填写 MessageGroup')
+      return
+    }
     setBusy(true)
     setErr(null)
     setSent(null)
     try {
       const body: Record<string, unknown> = { topic: realTopic, body: text, tag, keys: keys ? [keys] : [] }
-      if (type === 'DELAY') body.delay_ms = (Number(delayVal) || 0) * UNIT_MS[delayUnit]
-      if (type === 'FIFO') body.message_group = messageGroup
+      if (type === 'DELAY') body.delay_ms = delayNum * UNIT_MS[delayUnit]
+      if (type === 'FIFO') body.message_group = group
       const r = await api.send(body)
       setSent({ msgId: r.msg_id, topic: realTopic })
     } catch (e) {
