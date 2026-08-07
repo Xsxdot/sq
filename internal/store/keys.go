@@ -27,10 +27,14 @@ const (
 	keyIdxPrefix    = "keyidx/"
 	delayPrefix     = "delay/"
 	metricPrefix    = "metric/"
+	halfPrefix      = "half/"
+	halfIdxPrefix   = "halfidx/"
 	// DelayPrefix 延时暂存区扫描下界（导出供 delay 包使用）。
 	DelayPrefix = delayPrefix
 	// MetricPrefix 时序采样点扫描下界（导出供 metrics/admin 包使用）。
 	MetricPrefix = metricPrefix
+	// HalfPrefix 事务半消息暂存区扫描下界（导出供 txn/metrics/admin 扫描）。
+	HalfPrefix = halfPrefix
 	// delayAllocKey 全局单 key，与 alloc/{topic} 的按队列计数器不同：
 	// 延时条目移入前不属于任何队列，无法按队列维护计数器。
 	delayAllocKey = "delayalloc"
@@ -201,6 +205,34 @@ func ParseDelayKey(k []byte) (int64, uint64, error) {
 
 // DelayAllocKey 延时 seq 全局计数器（值为下一可用 seq 的 8B 大端编码）。
 func DelayAllocKey() []byte { return []byte(delayAllocKey) }
+
+// HalfKey 事务半消息暂存条目：half/{nextCheckMs:8B}{txID}，值为完整编码消息（spec §4）。
+// nextCheckMs 是下次回查时间（墙钟 UnixMilli 恒为正），大端编码保证扫描按到期升序；
+// txID 由服务端生成（core.NewMessageID，定长 32 位十六进制），天然唯一故无需 seq。
+func HalfKey(nextCheckMs int64, txID string) []byte {
+	k := make([]byte, 0, len(halfPrefix)+8+len(txID))
+	k = append(k, halfPrefix...)
+	k = append(k, PutU64(uint64(nextCheckMs))...)
+	return append(k, txID...)
+}
+
+// HalfScanUpperBound 到期回查扫描 [HalfPrefix, 本上界) 的开区间上界：
+// nextCheckMs+1 的空 txID key，恰好纳入 nowMs 内全部条目（任意 txID 均排在
+// 空串之后同一毫秒段内），不含 nowMs+1 的任何条目——与 DelayScanUpperBound 同构。
+func HalfScanUpperBound(nowMs int64) []byte { return HalfKey(nowMs+1, "") }
+
+// ParseHalfKey 解析半消息条目 key：前缀后先 8B 定长 ms，剩余全部为 txID（非空）。
+func ParseHalfKey(k []byte) (int64, string, error) {
+	rest, ok := bytes.CutPrefix(k, []byte(halfPrefix))
+	if !ok || len(rest) <= 8 {
+		return 0, "", fmt.Errorf("非法 half key: %q", k)
+	}
+	return int64(binary.BigEndian.Uint64(rest[:8])), string(rest[8:]), nil
+}
+
+// HalfIdxKey 半消息反查索引：halfidx/{txID}，值为 JSON 编码的回查状态
+// （见 txn.HalfRef）。EndTransaction 只拿到 txID，靠它反查 half/ 条目当前位置。
+func HalfIdxKey(txID string) []byte { return []byte(halfIdxPrefix + txID) }
 
 // KeyIdxKey Keys 业务索引：keyidx/{topic}/{key}/{storeMs:8B}{queueID:4B}{offset:8B}，值为空。
 //
