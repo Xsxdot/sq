@@ -159,3 +159,69 @@ func TestPassSkipsEntryEndedInBetween(t *testing.T) {
 		t.Fatalf("已决断事务被回查: sent=%d got=%v err=%v", sent, n.got, err)
 	}
 }
+
+func TestPassDeletesBadHalfKeyAndContinues(t *testing.T) {
+	// 坏 key（ParseHalfKey 拒绝）排在到期扫描头部时，旧实现直接中断整趟，
+	// 其后健康条目永久饿死（RunChecker 只记日志每秒重扫）。修复后应删坏止损
+	// 并继续处理健康条目（同 delay 删坏条目精神）
+	f := newFixture(t, 30*time.Second, 15)
+	txID := stageOverdue(t, f, "t-badkey")
+	// "half/\x00"：前缀后仅 1B（≤8B）必被 ParseHalfKey 拒绝，且字典序排在
+	// 任何合法 half 键（8B 大端 ms 首字节 0x00）之前——正好落在到期扫描头部，
+	// 复现"坏条目堵死其后全部条目"的形态
+	badKey := append([]byte(store.HalfPrefix), 0x00)
+	b := f.st.NewBatch()
+	b.Set(badKey, []byte("whatever"), nil)
+	if err := f.st.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	n := &fakeNotifier{send: true}
+	sent, err := f.mgr.Pass(n)
+	if err != nil || sent != 2 {
+		t.Fatalf("Pass: sent=%d err=%v（坏 key 1 条 + 健康 1 条均计入 handled）", sent, err)
+	}
+	if _, ok, _ := f.st.Get(badKey); ok {
+		t.Fatal("坏 key 未被删除（否则每趟重扫重报，永久日志洪水）")
+	}
+	if f.halfCount(t) != 1 {
+		t.Fatalf("half 条目数 = %d（期望只剩健康一条）", f.halfCount(t))
+	}
+	refRaw, ok, _ := f.st.Get(store.HalfIdxKey(txID))
+	if !ok {
+		t.Fatal("健康条目 halfidx 缺失")
+	}
+	ref := &HalfRef{}
+	mustUnmarshal(t, refRaw, ref)
+	if ref.Checks != 1 || ref.NextCheckMs <= time.Now().UnixMilli() {
+		t.Fatalf("健康条目未被正常改期: %+v", ref)
+	}
+	if len(n.got) != 1 || n.got[0] != txID {
+		t.Fatalf("健康条目回查未下发: %v", n.got)
+	}
+}
+
+func TestPassDeletesCorruptHalfIdxAndContinues(t *testing.T) {
+	// halfidx 被外部改写为坏 JSON：旧实现在 checkOne 解码失败即中断本趟。
+	// 修复后应靠扫描解析出的 half key 把两键同批删除止损，Pass 不报错
+	f := newFixture(t, 30*time.Second, 15)
+	txID := stageOverdue(t, f, "t-badidx")
+	b := f.st.NewBatch()
+	b.Set(store.HalfIdxKey(txID), []byte("not-json"), nil)
+	if err := f.st.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	n := &fakeNotifier{send: true}
+	sent, err := f.mgr.Pass(n)
+	if err != nil || sent != 1 {
+		t.Fatalf("Pass: sent=%d err=%v（坏 halfidx 条目计入 handled）", sent, err)
+	}
+	if f.halfCount(t) != 0 {
+		t.Fatal("坏 halfidx 的 half 条目未被删除")
+	}
+	if _, ok, _ := f.st.Get(store.HalfIdxKey(txID)); ok {
+		t.Fatal("坏 halfidx 未被删除")
+	}
+	if len(n.got) != 0 {
+		t.Fatalf("坏条目不应触发回查下发: %v", n.got)
+	}
+}

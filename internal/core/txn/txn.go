@@ -7,7 +7,7 @@
 //   - End：commit 经 produce.AppendWith 原子移入 msg/ 并删除两键；
 //     rollback 原子删除两键；txID 不存在时幂等返回 found=false
 //   - RunChecker：周期扫描到期半消息，经 Notifier 下发回查、改期重扫，
-//     超限丢弃（Task 4 实现）
+//     超限丢弃；坏 half 条目/坏 half key 删除止损，不阻塞扫描（Task 4 实现）
 //
 // 边界：
 //   - 不 import 任何 proto/pb（回查命令的协议编码在 rpc 层，经 Notifier 反转）
@@ -221,28 +221,52 @@ func (t *Manager) RunChecker(ctx context.Context, n Notifier) {
 	}
 }
 
-// Pass 执行一趟到期回查，返回处理条数（下发+改期、或超限丢弃，均计入）。
+// Pass 执行一趟到期回查，返回处理条数（下发+改期、超限丢弃、坏条目清理，均计入）。
 func (t *Manager) Pass(n Notifier) (int, error) {
 	now := time.Now().UnixMilli()
-	// 先收集后处理：Scan 回调里不能开写事务（迭代器与写入交错），拷贝出来
+	// 先收集后处理：Scan 回调里不能开写事务（迭代器与写入交错会破坏迭代），
+	// 坏 key 也只能拷贝原始字节、扫描结束后统一批量删除（为什么见下方注释）
 	type dueEntry struct {
-		txID string
-		raw  []byte
+		txID    string
+		raw     []byte
+		halfKey []byte // 扫描解析出的 half 键：halfidx 损坏时两键只能靠它重建删除目标
 	}
 	var dues []dueEntry
+	var badKeys [][]byte // ParseHalfKey 拒绝的坏 key，按原始 key 删除
 	err := t.st.Scan([]byte(store.HalfPrefix), store.HalfScanUpperBound(now), maxCheckPerPass,
 		func(k, v []byte) (bool, error) {
 			_, txID, perr := store.ParseHalfKey(k)
 			if perr != nil {
-				return false, perr
+				// 坏 key 无法解析出 txID，留着会永远排在到期头部，每趟重报错、
+				// 并把其后健康条目饿死（同 delay 删坏条目精神）。为什么不能
+				// 在这里直接写：迭代器与写入交错会破坏迭代——所以只拷贝原始
+				// key 字节，扫描结束后统一批量删除
+				badKeys = append(badKeys, append([]byte(nil), k...))
+				return true, nil
 			}
-			dues = append(dues, dueEntry{txID: txID, raw: append([]byte(nil), v...)})
+			dues = append(dues, dueEntry{txID: txID, raw: append([]byte(nil), v...),
+				halfKey: append([]byte(nil), k...)})
 			return true, nil
 		})
 	if err != nil {
 		return 0, fmt.Errorf("扫描 half 暂存区: %w", err)
 	}
-	handled := 0
+	// 坏 key 批量删除（一个 batch 多个 Delete）后再逐条 Error 留痕。坏 key
+	// 解析不出 txID，无法定位它的 halfidx——孤儿 idx 由 End 的既有孤儿清理
+	// 兜底，无需在此处理
+	if len(badKeys) > 0 {
+		b := t.st.NewBatch()
+		for _, k := range badKeys {
+			b.Delete(k, nil)
+		}
+		if err := t.st.Apply(b); err != nil {
+			return 0, fmt.Errorf("删除坏 half key: %w", err)
+		}
+		for _, k := range badKeys {
+			t.logger.Error("half key 无法解析，删除坏条目", "key", fmt.Sprintf("%q", k))
+		}
+	}
+	handled := len(badKeys)
 	for _, d := range dues {
 		m, err := core.DecodeMessage(d.raw)
 		if err != nil {
@@ -253,9 +277,10 @@ func (t *Manager) Pass(n Notifier) (int, error) {
 			if err := t.dropLocked(d.txID); err != nil {
 				return handled, err
 			}
+			handled++
 			continue
 		}
-		send, err := t.checkOne(d.txID, m)
+		send, err := t.checkOne(d.halfKey, d.txID, m)
 		if err != nil {
 			// 失败即中断本趟：条目未动，下一趟重扫自然重试
 			return handled, err
@@ -275,12 +300,16 @@ func (t *Manager) Pass(n Notifier) (int, error) {
 // checkOne 处理一条到期半消息：重验存在性→超限丢弃或改期。返回 send=true
 // 表示调用方应继续下发回查命令。
 //
+// halfKey 是扫描回调解析出的 half/ 键：halfidx 正常时旧键从 idx 侧重建即可；
+// halfidx 损坏时（JSON 解码失败）重建不出 half key（NextCheckMs 在坏的 idx
+// 里），只能靠传入的 halfKey 定位删除止损。
+//
 // 为什么改期在下发之前、且全程持 mu：客户端的 EndTransaction 随时可能并发
 // 到达。改期（搬 half 键）与 End（删 half 键）都以 halfidx 为准且都持 mu，
 // 因此任一方总能看到另一方的完整结果；若先下发后改期，客户端可能在两者的
 // 间隙完成 End，改期一方再按旧键重写就把已决断的事务复活成僵尸。
 // 下发本身是网络操作，放在锁外，避免一个慢客户端拖住全部事务状态迁移。
-func (t *Manager) checkOne(txID string, m *core.Message) (bool, error) {
+func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, error) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	refRaw, ok, err := t.st.Get(store.HalfIdxKey(txID))
@@ -293,7 +322,19 @@ func (t *Manager) checkOne(txID string, m *core.Message) (bool, error) {
 	}
 	ref := &HalfRef{}
 	if err := json.Unmarshal(refRaw, ref); err != nil {
-		return false, fmt.Errorf("解码 halfidx (tx=%s): %w", txID, err)
+		// halfidx 损坏：两键都无法从 idx 侧重建删除目标，但扫描回调已成功
+		// 解析过本条目 key 的 ms+txID——用「传入的 halfKey + HalfIdxKey(txID)」
+		// 同批删除止损，Error 留痕后返回 false,nil 继续本趟：否则坏 idx 会让
+		// 每趟在此中断、其后健康条目永久饿死（与 End 的孤儿 idx 清理同构）
+		t.logger.Error("halfidx 解码失败，删除坏条目", "tx_id", txID,
+			"key", fmt.Sprintf("%q", halfKey), "err", err)
+		b := t.st.NewBatch()
+		b.Delete(halfKey, nil)
+		b.Delete(store.HalfIdxKey(txID), nil)
+		if aerr := t.st.Apply(b); aerr != nil {
+			return false, fmt.Errorf("删除坏 halfidx 条目 (tx=%s): %w", txID, aerr)
+		}
+		return false, nil
 	}
 	oldKey := store.HalfKey(ref.NextCheckMs, txID)
 	if ref.Checks >= t.maxChecks {
@@ -315,8 +356,21 @@ func (t *Manager) checkOne(txID string, m *core.Message) (bool, error) {
 	// 而不是永远滞留（每轮间隔 checkInterval，丢弃前给了它完整的重连窗口）
 	next := time.Now().Add(t.checkInterval).UnixMilli()
 	raw, ok, err := t.st.Get(oldKey)
-	if err != nil || !ok {
-		return false, fmt.Errorf("重读 half 条目失败 (tx=%s ok=%v): %w", txID, ok, err)
+	if err != nil {
+		return false, fmt.Errorf("重读 half 条目失败 (tx=%s): %w", txID, err)
+	}
+	if !ok {
+		// half 条目消失但 idx 在：两键同批写删，正常不可达（扫描收集与改期
+		// 都持 mu），真发生说明数据被外部改写——与 End 的孤儿 idx 清理同构：
+		// Error 留痕 + 删 idx 止损 + 返回 false,nil，不再中断本趟饿死其后条目
+		t.logger.Error("halfidx 存在但 half 条目缺失，删除孤儿索引",
+			"tx_id", txID, "next_check_ms", ref.NextCheckMs)
+		b := t.st.NewBatch()
+		b.Delete(store.HalfIdxKey(txID), nil)
+		if aerr := t.st.Apply(b); aerr != nil {
+			return false, fmt.Errorf("删除孤儿 halfidx (tx=%s): %w", txID, aerr)
+		}
+		return false, nil
 	}
 	newRef, _ := json.Marshal(&HalfRef{NextCheckMs: next, Checks: ref.Checks + 1})
 	b := t.st.NewBatch()
