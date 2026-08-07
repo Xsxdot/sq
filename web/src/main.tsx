@@ -15,8 +15,10 @@ import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { api } from './api/client'
 import Login from './pages/Login'
 import Overview from './pages/Overview'
+import Topics from './pages/Topics'
+import TopicDetail from './pages/TopicDetail'
 import {
-  Topics, TopicDetail, Groups, GroupDetail,
+  Groups, GroupDetail,
   Messages, Send, Dlq, Delay,
 } from './pages/placeholder'
 import './styles/app.css'
