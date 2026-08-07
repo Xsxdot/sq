@@ -53,11 +53,9 @@ type Snapshot struct {
 // 注意：
 //   - 单个条目读失败会被跳过而不是让整趟失败 —— retention 清理与 Pebble 压实
 //     随时可能删掉刚枚举到的文件，那是常态不是故障；数据目录大小本就是个近似值
-//   - dir 本身不存在时仍然返回错误（那是配置错误，必须暴露）
+//   - dir 本身不存在时仍然返回错误（那是配置错误，必须暴露）——靠下面回调里
+//     的 p == dir 分支实现：WalkDir 对根目录 lstat 失败时会以 root 路径回调
 func dirSize(dir string) (int64, error) {
-	if _, err := filepath.Abs(dir); err != nil {
-		return 0, err
-	}
 	var total int64
 	err := filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error {
 		if err != nil {

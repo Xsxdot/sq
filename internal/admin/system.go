@@ -24,14 +24,11 @@ func (s *Server) handleSystem(w http.ResponseWriter, r *http.Request) {
 		s.httpError(w, http.StatusServiceUnavailable, "系统读数采集器未启用")
 		return
 	}
-	snap := s.sys.Snapshot()
-	// 拒写是会让生产端全挂的状态，每次被查询都记一笔，便于事后对齐
-	// 「控制台什么时候看到的」与「retention 什么时候翻转的」
-	if snap.WriteBlocked {
-		s.logger.Warn("系统读数查询：当前处于拒写保读状态",
-			"watermark_pct", snap.WatermarkPercent, "remote", r.RemoteAddr)
-	}
-	s.writeJSON(w, http.StatusOK, snap)
+	// 刻意不在这里记拒写日志：本端点被全站外壳每 15 秒轮询一次（每个打开的
+	// 标签页各一次，总览页还会再轮一次），拒写可能持续数小时，逐次记录会把
+	// retention 翻转时那一条真正有用的 Error 淹掉。状态翻转的记录归 retention，
+	// 与它「只在状态翻转时打日志」的约定保持一致。
+	s.writeJSON(w, http.StatusOK, s.sys.Snapshot())
 }
 
 // blocked 返回当前是否处于拒写保读状态。sys 未装配时视为未拒写。

@@ -74,9 +74,14 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descBlocked
 }
 
-// Collect 实现 prometheus.Collector：每次抓取现算。失败时上报 invalid metric
-// （抓取端能看到错误）并记 Error 日志，不让一次 store 故障 panic 掉抓取协程。
+// Collect 实现 prometheus.Collector：每次抓取现算。业务指标采集失败时上报
+// invalid metric（抓取端能看到错误）并记 Error 日志，不让一次 store 故障
+// panic 掉抓取协程；系统类指标不受此影响，恒会产出。
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
+	// 系统指标必须先出：下面的业务采集失败会直接 return，而磁盘满导致 Pebble
+	// 写不下去时，恰恰是 sq_write_blocked 最需要被看见的时刻——放在末尾会让
+	// 告警侧看到 absent() 而不是 1。
+	c.collectSystem(ch)
 	s, err := Collect(c.st, c.mt)
 	if err != nil {
 		c.logger.Error("metrics 采集失败", "err", err)
@@ -95,7 +100,6 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	for gt, n := range s.Inflight {
 		ch <- prometheus.MustNewConstMetric(descInflight, prometheus.GaugeValue, float64(n), gt.Group, gt.Topic)
 	}
-	c.collectSystem(ch)
 }
 
 // collectSystem 产出系统类指标。

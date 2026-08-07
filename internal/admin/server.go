@@ -31,17 +31,17 @@ import (
 
 // Server Admin HTTP 服务。
 type Server struct {
-	st           *store.Store
-	mt           *meta.Meta
-	pr           *produce.Producer
-	dl           *deliver.Deliverer
-	username     string
-	password     string
+	st       *store.Store
+	mt       *meta.Meta
+	pr       *produce.Producer
+	dl       *deliver.Deliverer
+	username string
+	password string
 	// sys 运行态读数来源，同时是拒写开关的唯一读取入口。为 nil 时
 	// /admin/system 返回 503，拒写判定一律视为未拒写（测试构造用）
-	sys          *sysinfo.Reporter
-	sp           *metrics.Sampler // 时序采样器；admin_listen 关闭时 main 不装配，为 nil
-	logger       *slog.Logger
+	sys    *sysinfo.Reporter
+	sp     *metrics.Sampler // 时序采样器；admin_listen 关闭时 main 不装配，为 nil
+	logger *slog.Logger
 
 	tokens sync.Map // token(string) → 过期时间(time.Time)
 	mux    *http.ServeMux

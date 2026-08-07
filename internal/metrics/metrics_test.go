@@ -144,3 +144,59 @@ func gatherValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
 	t.Fatalf("未找到指标 %s", name)
 	return 0
 }
+
+// TestSystemMetricsSurviveStoreFailure 钉住系统指标与业务指标的产出顺序。
+//
+// 业务采集失败时 Collect 会直接 return——如果系统指标挂在它后面，磁盘满导致
+// store 写不下去的那一刻，sq_write_blocked 会一起从 /metrics 消失，告警侧看到
+// absent() 而不是 1。而那恰恰是最需要这个指标的时刻。
+func TestSystemMetricsSurviveStoreFailure(t *testing.T) {
+	// 不用 fixture：它注册了 t.Cleanup 关 store，而本用例自己就要提前关掉，
+	// pebble 二次 Close 会 panic
+	st, err := store.Open(t.TempDir(), true, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := produce.New(st, mt, slog.Default())
+	if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	blocked := &atomic.Bool{}
+	blocked.Store(true)
+	sys := sysinfo.New(t.TempDir(), 85, blocked, slog.Default())
+	reg := NewRegistry(st, mt, sys, slog.Default())
+
+	// 关掉 store，让业务采集必然失败（Collect 里的 st.Get/Scan 会报 ErrClosed）
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 这里不能用 gatherNames：Collect 上报的 invalid metric 会让 Gather 返回
+	// 非 nil error，但仍带回全部有效的 metric family——要断言的正是「错误发生时
+	// 哪些指标还在」，所以只取 mfs、不因 err 提前失败
+	mfs, err := reg.Gather()
+	if err == nil {
+		t.Fatal("store 已关闭，业务采集应报错——用例前提不成立")
+	}
+	names := map[string]bool{}
+	var blockedVal float64
+	for _, mf := range mfs {
+		names[mf.GetName()] = true
+		if mf.GetName() == "sq_write_blocked" {
+			blockedVal = mf.GetMetric()[0].GetGauge().GetValue()
+		}
+	}
+	if names["sq_topics"] {
+		t.Fatal("store 已关闭，业务指标不该产出——用例前提不成立")
+	}
+	if !names["sq_write_blocked"] {
+		t.Fatalf("业务采集失败时 sq_write_blocked 仍必须产出，实际有 %v", names)
+	}
+	if blockedVal != 1 {
+		t.Fatalf("拒写中应为 1，得到 %v", blockedVal)
+	}
+}
