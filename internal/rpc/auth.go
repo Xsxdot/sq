@@ -9,9 +9,10 @@
 //   - 不校验 x-mq-date-time 的时效（不做重放窗口）：目标场景是可信内网里挡住
 //     误连与弱隔离，不对抗抓包重放；引入时间窗会让客户端时钟偏移变成一类
 //     极难排查的"随机认证失败"，代价大于收益，边界在 README 写明
-//   - 签名算法与头格式以官方 Go SDK v5.1.4 client.go Sign 方法为准：
-//     authorization = "MQv2-HMAC-SHA1 Credential={ak}//Rocketmq,
-//     SignedHeaders=x-mq-date-time, Signature={hex_lower(hmac_sha1(sk, datetime))}"
+//   - 签名算法与头格式以官方 SDK 为准，且必须容忍各语言实现之间的差异：
+//     Credential 段可能是 "{ak}//Rocketmq"（Go/C++）也可能是裸 "{ak}"
+//     （Java/Python/C#）；签名十六进制可能小写（Go/Java/Python）也可能大写
+//     （C#/C++）。两种差异都在 auth_test.go 的 SDK 形状表里钉住
 package rpc
 
 import (
@@ -81,7 +82,13 @@ func verifyAuth(ctx context.Context, wantAK, secret string, logger *slog.Logger,
 	// 两个比较都走常数时间，且必须同时判定后再短路——先比 AK 再比签名的
 	// 提前返回会泄露"AK 对不对"这一位信息。
 	akOK := subtle.ConstantTimeCompare([]byte(ak), []byte(wantAK)) == 1
-	sigOK := subtle.ConstantTimeCompare([]byte(sig), []byte(expect)) == 1
+	// 官方 SDK 五个语言实现的十六进制大小写并不统一：Go/Java/Python 输出小写
+	// （hex.EncodeToString / encodeHexString(...,false) / hexlify），C#/C++ 输出
+	// 大写（BitConverter.ToString / MixAll::hex 的 'A'-'F' 字典）。服务端统一
+	// 折成小写再比 —— 否则 C#/C++ 客户端开启鉴权后 100% 认证失败，且错误信息
+	// 刻意不区分原因，几乎无法自助排查。
+	// 对客户端送来的串做小写化不泄露密钥的任何信息，常数时间比较的性质不变。
+	sigOK := subtle.ConstantTimeCompare([]byte(strings.ToLower(sig)), []byte(expect)) == 1
 	if !akOK || !sigOK {
 		logger.Warn("认证失败：AK 或签名不匹配", "method", method, "access_key", ak)
 		return status.Error(codes.Unauthenticated, "认证失败")

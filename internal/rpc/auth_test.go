@@ -10,6 +10,7 @@ import (
 	"encoding/hex"
 	"fmt"
 	"log/slog"
+	"strings"
 	"testing"
 
 	"google.golang.org/grpc"
@@ -18,14 +19,29 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// signedCtx 按 SDK 算法构造带签名头的 incoming context。
-func signedCtx(ak, secret, datetime string) context.Context {
+// sdkCtx 按官方 SDK 的头形状构造带签名头的 incoming context。
+//
+// 参数：
+//   - cred: authorization 里 Credential= 后面那一整段。Go/C++ SDK 拼的是
+//     "{ak}//Rocketmq"（带 region/service），Java/Python/C# 只拼裸 "{ak}"
+//   - upper: 签名十六进制是否大写。Go/Java/Python 输出小写，C#/C++ 输出大写
+func sdkCtx(cred, secret, datetime string, upper bool) context.Context {
 	h := hmac.New(sha1.New, []byte(secret))
 	h.Write([]byte(datetime))
-	auth := fmt.Sprintf("MQv2-HMAC-SHA1 Credential=%s//Rocketmq, SignedHeaders=x-mq-date-time, Signature=%s",
-		ak, hex.EncodeToString(h.Sum(nil)))
+	sig := hex.EncodeToString(h.Sum(nil))
+	if upper {
+		sig = strings.ToUpper(sig)
+	}
+	auth := fmt.Sprintf("MQv2-HMAC-SHA1 Credential=%s, SignedHeaders=x-mq-date-time, Signature=%s",
+		cred, sig)
 	md := metadata.Pairs("x-mq-date-time", datetime, "authorization", auth)
 	return metadata.NewIncomingContext(context.Background(), md)
+}
+
+// signedCtx 构造 Go SDK 形状的签名头（其余用例继续用它，形状变化只在
+// TestAuthAcceptsAllOfficialSDKHeaderShapes 里穷举）。
+func signedCtx(ak, secret, datetime string) context.Context {
+	return sdkCtx(ak+"//Rocketmq", secret, datetime, false)
 }
 
 // callUnary 让 ctx 过一遍 unary 拦截器，返回 handler 是否被放行执行。
@@ -87,6 +103,45 @@ func TestAuthStreamRejects(t *testing.T) {
 		func(srv any, stream grpc.ServerStream) error { return nil })
 	if err != nil {
 		t.Fatalf("合法签名应放行: %v", err)
+	}
+}
+
+// TestAuthAcceptsAllOfficialSDKHeaderShapes 钉住五个官方 SDK 的头形状差异。
+//
+// 官方实现自己并不统一：Credential 段 Go/C++ 带 "//Rocketmq"、Java/Python/C#
+// 是裸 AK；签名十六进制 Go/Java/Python 小写、C#/C++ 大写。任何一种形状被拒，
+// 对应语言的客户端在开启鉴权后就是 100% 连不上。
+func TestAuthAcceptsAllOfficialSDKHeaderShapes(t *testing.T) {
+	u, _ := NewAuthInterceptors("ak1", "sk1", slog.Default())
+	cases := []struct {
+		name  string
+		cred  string
+		upper bool
+	}{
+		{"Go: ak//Rocketmq + 小写", "ak1//Rocketmq", false},
+		{"Java/Python: 裸 ak + 小写", "ak1", false},
+		{"C#: 裸 ak + 大写", "ak1", true},
+		{"C++: ak//Rocketmq + 大写", "ak1//Rocketmq", true},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			ctx := sdkCtx(c.cred, "sk1", "20260807T120000Z", c.upper)
+			if err := callUnary(t, u, ctx); err != nil {
+				t.Fatalf("该形状应放行: %v", err)
+			}
+		})
+	}
+}
+
+// TestAuthStillRejectsWrongSecretInBothCases 防止「统一折小写」被误实现成
+// 「跳过签名校验」：密钥错时无论大小写都必须拒。
+func TestAuthStillRejectsWrongSecretInBothCases(t *testing.T) {
+	u, _ := NewAuthInterceptors("ak1", "sk1", slog.Default())
+	for _, upper := range []bool{false, true} {
+		ctx := sdkCtx("ak1", "wrong", "20260807T120000Z", upper)
+		if status.Code(callUnary(t, u, ctx)) != codes.Unauthenticated {
+			t.Fatalf("密钥错误必须拒绝（upper=%v）", upper)
+		}
 	}
 }
 
