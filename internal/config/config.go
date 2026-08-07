@@ -51,6 +51,12 @@ type Config struct {
 	// MetricsRetentionHours 时序采样点的落库保留时长（小时）。0 = 不落库，
 	// 只保留内存环的最近 1 小时（进程重启即丢）。默认 168（7 天）。
 	MetricsRetentionHours int `yaml:"metrics_retention_hours"`
+	// —— M6 事务消息 ——
+	// TxnCheckInterval 半消息回查间隔（Go duration 格式）。半消息落盘后第一次
+	// 回查发生在写入后一个间隔，此后每次回查后再排一个间隔，直到决断或超限。
+	TxnCheckInterval string `yaml:"txn_check_interval"`
+	// TxnMaxChecks 单条半消息最大回查次数，超限即丢弃并记日志（spec §5 流程 5）。
+	TxnMaxChecks int `yaml:"txn_max_checks"`
 }
 
 // Load 加载配置。path 为空时返回纯默认值；文件存在则按字段覆盖。
@@ -63,6 +69,8 @@ func Load(path string) (*Config, error) {
 		DiskWatermarkPercent:   85,
 		AdminListen:            ":8082",
 		MetricsRetentionHours:  168,
+		TxnCheckInterval:       "30s",
+		TxnMaxChecks:           15,
 	}
 	if path == "" {
 		return cfg, nil
@@ -126,12 +134,28 @@ func Load(path string) (*Config, error) {
 	if cfg.MetricsRetentionHours < 0 || cfg.MetricsRetentionHours > 8760 {
 		return nil, fmt.Errorf("配置 metrics_retention_hours 须在 [0,8760]（0=不落库），得到 %d", cfg.MetricsRetentionHours)
 	}
+	// txn_check_interval 必须是正 duration：空串（yaml 漏填）或拼写错误
+	// 都不能让回查调度器以 0 间隔空转或整趟跳过，启动时挡住。
+	if d, err := time.ParseDuration(cfg.TxnCheckInterval); err != nil || d <= 0 {
+		return nil, fmt.Errorf("配置 txn_check_interval 须为正 duration（如 30s），得到 %q", cfg.TxnCheckInterval)
+	}
+	// 上限 1000：回查是丢弃前的最后防线，配大到近乎无限等于永不丢弃，
+	// half/ 区会被永远无人决断的僵尸条目占满
+	if cfg.TxnMaxChecks < 1 || cfg.TxnMaxChecks > 1000 {
+		return nil, fmt.Errorf("配置 txn_max_checks 须在 [1,1000]，得到 %d", cfg.TxnMaxChecks)
+	}
 	return cfg, nil
 }
 
 // RetentionInterval 解析后的清理扫描间隔（Load 已校验合法，此处不会失败）。
 func (c *Config) RetentionInterval() time.Duration {
 	d, _ := time.ParseDuration(c.RetentionCheckInterval)
+	return d
+}
+
+// TxnInterval 解析后的半消息回查间隔（Load 已校验合法，此处不会失败）。
+func (c *Config) TxnInterval() time.Duration {
+	d, _ := time.ParseDuration(c.TxnCheckInterval)
 	return d
 }
 

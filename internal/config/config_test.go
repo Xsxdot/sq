@@ -228,3 +228,35 @@ func TestMetricsRetentionHours(t *testing.T) {
 		}
 	}
 }
+
+func TestTxnConfigDefaults(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TxnCheckInterval != "30s" || cfg.TxnInterval() != 30*time.Second {
+		t.Fatalf("txn_check_interval 默认值错误: %q", cfg.TxnCheckInterval)
+	}
+	if cfg.TxnMaxChecks != 15 {
+		t.Fatalf("txn_max_checks 默认值错误: %d", cfg.TxnMaxChecks)
+	}
+}
+
+func TestTxnConfigValidation(t *testing.T) {
+	// 写盘一个坏配置再 Load，风格对齐既有校验用例
+	for name, body := range map[string]string{
+		"负间隔": "txn_check_interval: \"-1s\"",
+		"零间隔": "txn_check_interval: \"0s\"",
+		"非法串": "txn_check_interval: \"abc\"",
+		"零次数": "txn_max_checks: 0",
+		"负次数": "txn_max_checks: -3",
+	} {
+		p := filepath.Join(t.TempDir(), "sq.yaml")
+		if err := os.WriteFile(p, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(p); err == nil {
+			t.Fatalf("%s 应在启动时报错", name)
+		}
+	}
+}
