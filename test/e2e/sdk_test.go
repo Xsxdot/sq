@@ -225,6 +225,11 @@ func writeBrokerConfig(t *testing.T, mutate ...func(*config.Config)) (cfgPath, e
 		// 会拒绝空 retention_check_interval，序列化出去反而起不来（与
 		// DefaultMaxAttempts 同款陷阱）。
 		RetentionCheckInterval: "5m",
+		// 事务配置同理：零值序列化出去（txn_check_interval: "" 与
+		// txn_max_checks: 0）会被 Load 的校验拒绝，broker 起不来。取值与
+		// config.Load 的默认值一致；需要短间隔的用例经 mutate 覆盖。
+		TxnCheckInterval: "30s",
+		TxnMaxChecks:     15,
 		// e2e 机器磁盘状况不可控，显式关闭水位以免误拒写；0 在校验范围
 		// [0,99] 内表示关闭（缺省是 85，e2e 里磁盘打满会莫名其妙拒写）。
 		DiskWatermarkPercent: 0,
