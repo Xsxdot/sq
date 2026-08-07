@@ -15,7 +15,7 @@ import (
 )
 
 func TestMessagesSendBrowseAndKeyQuery(t *testing.T) {
-	s, _, _, pr, _ := newTestServer(t, "", "")
+	s, _, _, pr, _, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	// 测试发送
 	w := doJSON(t, h, "POST", "/admin/messages/send", "",
@@ -63,7 +63,7 @@ func TestMessagesSendBrowseAndKeyQuery(t *testing.T) {
 }
 
 func TestDLQResend(t *testing.T) {
-	s, _, _, pr, dl := newTestServer(t, "", "")
+	s, _, _, pr, dl, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	// 构造一条死信：与 moveToDLQ 的写入形状一致（origin 坐标在 Properties）。
 	// 不驱动真实重试超限（那是 deliver 测试的职责），这里只验证重发路径。
@@ -96,7 +96,7 @@ func TestDLQResend(t *testing.T) {
 }
 
 func TestDelayViewAndOverview(t *testing.T) {
-	s, _, _, pr, _ := newTestServer(t, "", "")
+	s, _, _, pr, _, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	due := time.Now().Add(time.Hour).UnixMilli()
 	if _, err := pr.AppendDelay(&core.Message{Topic: "t1", Body: []byte("later"), DeliverAtMs: due}); err != nil {
@@ -136,5 +136,123 @@ func TestDelayViewAndOverview(t *testing.T) {
 	}
 	if ov.Topics != 1 || ov.DelayDepth != 1 || ov.TotalWritten != 1 {
 		t.Fatalf("总览不符: %+v", ov)
+	}
+}
+
+// TestOverviewCarriesQPSAndDLQ 总览必须把死信从业务写入量中剔除并单列 total_dlq，
+// qps 在采样器无样本时为 null（语义：不知道），有样本时给出数值。
+func TestOverviewCarriesQPSAndDLQ(t *testing.T) {
+	srv, _, _, pr, _, sp := newTestServer(t, "", "")
+	h := srv.Handler()
+
+	// 空环语义：采样器还没采过样时 qps 应为 null 而非 0——0 意味着「确实没有流量」，
+	// null 意味着「不知道」。newTestServer 不调 Sampler.Run，环恒为空。
+	w := doJSON(t, h, "GET", "/admin/overview", "", nil)
+	if w.Code != http.StatusOK {
+		t.Fatalf("overview 应 200，得到 %d", w.Code)
+	}
+	var got struct {
+		Topics       int      `json:"topics"`
+		TotalWritten uint64   `json:"total_written"`
+		TotalDLQ     uint64   `json:"total_dlq"`
+		QPS          *float64 `json:"qps"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("解析 overview: %v", err)
+	}
+	if got.QPS != nil {
+		t.Fatalf("空环时 qps 应为 null，得到 %v", *got.QPS)
+	}
+
+	// 业务 topic 写入 2 条；死信 topic 写入 3 条（pr.Append 内部 EnsureTopic 自动建 topic）
+	for i := 0; i < 2; i++ {
+		if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i := 0; i < 3; i++ {
+		if _, err := pr.Append(&core.Message{Topic: meta.DLQTopicName("notify-svc"), Body: []byte("dead")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// 启动采样器并等首个样本入环：qps 需要采样器提供，Run 首 tick 立即采一次
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sp.Run(ctx)
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, ok := sp.Latest(); ok {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("采样器未在 2s 内产生首个样本")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	w = doJSON(t, h, "GET", "/admin/overview", "", nil)
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("解析 overview: %v", err)
+	}
+	if got.TotalDLQ != 3 {
+		t.Fatalf("total_dlq 应为 3，得到 %d", got.TotalDLQ)
+	}
+	// 死信不该混进业务写入量：一次故障不应看起来像一次流量高峰
+	if got.TotalWritten != 2 {
+		t.Fatalf("total_written 不应包含死信，期望 2 得到 %d", got.TotalWritten)
+	}
+	// 死信 topic 是系统自建的，不该计入用户建的 topic 数
+	if got.Topics != 1 {
+		t.Fatalf("topics 应剔除死信 topic，期望 1 得到 %d", got.Topics)
+	}
+	if got.QPS == nil {
+		t.Fatal("采样器已产生样本时 qps 不应为 null")
+	}
+}
+
+// TestSendDelayAndFIFO 测试发送支持延时（进 delay 暂存区）与顺序（同组同队列）。
+func TestSendDelayAndFIFO(t *testing.T) {
+	srv, _, _, _, _, _ := newTestServer(t, "", "")
+	h := srv.Handler()
+
+	// 延时消息：进 delay 暂存区，不进正常队列——响应必须带 deliver_at_ms
+	w := doJSON(t, h, "POST", "/admin/messages/send", "", map[string]any{"topic": "tdelay", "body": "hi", "delay_ms": 60000})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("延时发送应 201，得到 %d：%s", w.Code, w.Body)
+	}
+	var got struct {
+		MsgID       string `json:"msg_id"`
+		DeliverAtMs int64  `json:"deliver_at_ms"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("解析响应: %v", err)
+	}
+	if got.DeliverAtMs == 0 {
+		t.Fatal("延时消息响应应带 deliver_at_ms")
+	}
+
+	// 顺序消息：同一 MessageGroup 必须落到同一队列，否则顺序语义不成立
+	var qids []uint32
+	for i := 0; i < 3; i++ {
+		w := doJSON(t, h, "POST", "/admin/messages/send", "", map[string]any{"topic": "tfifo", "body": "x", "message_group": "ORD-1"})
+		if w.Code != http.StatusCreated {
+			t.Fatalf("顺序发送应 201，得到 %d：%s", w.Code, w.Body)
+		}
+		var r struct {
+			QueueID uint32 `json:"queue_id"`
+		}
+		if err := json.Unmarshal(w.Body.Bytes(), &r); err != nil {
+			t.Fatalf("解析响应: %v", err)
+		}
+		qids = append(qids, r.QueueID)
+	}
+	if qids[0] != qids[1] || qids[1] != qids[2] {
+		t.Fatalf("同一 MessageGroup 应落同一队列，得到 %v", qids)
+	}
+
+	// delay_ms 与 message_group 同时给出是语义冲突，必须 400
+	if w := doJSON(t, h, "POST", "/admin/messages/send", "", map[string]any{"topic": "tx", "body": "x", "delay_ms": 1000, "message_group": "G"}); w.Code != http.StatusBadRequest {
+		t.Fatalf("延时+顺序组合应 400，得到 %d", w.Code)
 	}
 }

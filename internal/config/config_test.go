@@ -193,3 +193,38 @@ func TestLoadAuthDefaults(t *testing.T) {
 		t.Fatalf("成对配置加载不符: %+v", cfg)
 	}
 }
+
+func TestMetricsRetentionHours(t *testing.T) {
+	// 默认值：7 天。改这个默认值等于改控制台历史曲线能回看多久，测试钉住它。
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load 默认配置: %v", err)
+	}
+	if cfg.MetricsRetentionHours != 168 {
+		t.Fatalf("默认 metrics_retention_hours 应为 168，得到 %d", cfg.MetricsRetentionHours)
+	}
+
+	dir := t.TempDir()
+	write := func(body string) string {
+		p := filepath.Join(dir, "c.yaml")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatalf("写配置文件: %v", err)
+		}
+		return p
+	}
+
+	// 0 = 只保留内存环、不落库，是合法取值而不是笔误
+	cfg, err = Load(write("metrics_retention_hours: 0\n"))
+	if err != nil {
+		t.Fatalf("0 应被接受: %v", err)
+	}
+	if cfg.MetricsRetentionHours != 0 {
+		t.Fatalf("应为 0，得到 %d", cfg.MetricsRetentionHours)
+	}
+
+	for _, bad := range []string{"-1", "8761"} {
+		if _, err := Load(write("metrics_retention_hours: " + bad + "\n")); err == nil {
+			t.Fatalf("metrics_retention_hours=%s 应被拒绝", bad)
+		}
+	}
+}

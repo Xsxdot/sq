@@ -1,0 +1,188 @@
+<!--
+  sq 控制台原型 · 延时队列
+
+  职责：
+    - 给出延时队列的整体水位：待投递总数、最近一条到期时间、涉及的 topic 数
+    - 按到期时间升序列出尚未到期的延时消息，可逐条查看消息体
+
+  对应 M5a Admin API：GET /admin/delay
+
+  边界：
+    - 零依赖、纯 mock、file:// 直开；数据只取自 shared/mock.js，页面内不另造假数据
+    - 只呈现「未到期」这一段生命周期，不做投递/取消等写操作；
+      已到期投递的消息已经变成对应 topic 的普通消息，要查它们得去 messages.html
+    - 与真实页面的差异：真实 GET /admin/delay 只返回 due_ms/msg_id/topic 三个字段，
+      没有 Keys 与消息体，真实页面因此去掉了本页的「查看消息体」弹窗，改为在
+      panel-note 里说明：延时消息尚在暂存区，要看内容需等它到期后去消息查询页
+      按 msgId 对照。本原型保留弹窗仅作视觉参考
+-->
+<meta charset="utf-8">
+<title>sq 控制台 · 延时队列</title>
+<link rel="stylesheet" href="../shared/app.css">
+<script src="../shared/mock.js"></script>
+
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><b>sq</b><span>SIMPLE QUEUE</span></div>
+    <nav>
+      <a href="../index.html" class="nav-item">总览</a>
+      <div class="nav-group">资源</div>
+      <a href="topics.html" class="nav-item">Topic</a>
+      <a href="groups.html" class="nav-item">消费组</a>
+      <a href="delay.html" class="nav-item active" aria-current="page">延时队列</a>
+      <div class="nav-group">排查</div>
+      <a href="messages.html" class="nav-item">消息查询</a>
+      <a href="dlq.html" class="nav-item">死信队列</a>
+      <a href="send.html" class="nav-item">发送测试消息</a>
+    </nav>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <span class="page-title">延时队列</span>
+      <span class="spacer"></span>
+      <span class="endpoint">127.0.0.1:8081</span>
+      <span class="live"><i class="dot"></i>5s 后刷新</span>
+      <button class="btn">立即刷新</button>
+      <a class="btn" href="login.html">退出登录</a>
+    </header>
+
+    <main class="content">
+      <div class="strip">
+        <div class="stat">
+          <div><div class="stat-label">待投递</div><div class="stat-val" id="v-depth"></div></div>
+          <svg width="60" height="22" id="s-depth"></svg>
+        </div>
+        <div class="stat">
+          <div><div class="stat-label">最近一条到期</div><div class="stat-val" id="v-next"></div></div>
+        </div>
+        <div class="stat">
+          <div><div class="stat-label">涉及 TOPIC</div><div class="stat-val" id="v-topics"></div></div>
+        </div>
+      </div>
+
+      <div class="filters">
+        <label class="panel-note" for="limit">返回条数</label>
+        <select id="limit">
+          <option value="32" selected>32</option>
+          <option value="64">64</option>
+          <option value="128">128</option>
+        </select>
+        <span class="count" id="count"></span>
+      </div>
+
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-title">未到期的延时消息</span>
+          <span class="panel-note">按到期时间升序，最早到期的排在最前</span>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th>MSGID</th>
+              <th style="width:132px">TOPIC</th>
+              <th style="width:180px">KEYS</th>
+              <th class="r" style="width:158px">到期时间</th>
+              <th class="r" style="width:96px">还有多久</th>
+              <th class="r" style="width:72px">操作</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+
+        <div class="empty" id="empty" hidden>
+          <p>当前没有待投递的延时消息</p>
+          <div class="hint">到期后的延时消息会转为普通消息，去「消息查询」按 topic 找</div>
+        </div>
+
+        <div class="panel-body">
+          <div class="panel-note">
+            本页只展示<b>尚未到期投递</b>的延时消息。到期后 broker 会把它写入目标 topic
+            的队列，从此就是一条普通消息，不再出现在这里 —— 要追踪已投递的消息请去「消息查询」。
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<!-- 查看消息体：延时消息在投递前只能看内容，不提供改期或取消（broker 未开放该能力） -->
+<dialog id="dlg-view">
+  <h3>延时消息详情</h3>
+  <div class="dialog-body">
+    <div class="kv">
+      <dt>MSGID</dt><dd id="d-id"></dd>
+      <dt>TOPIC</dt><dd id="d-topic"></dd>
+      <dt>KEYS</dt><dd id="d-keys"></dd>
+      <dt>到期时间</dt><dd id="d-at"></dd>
+      <dt>消息体</dt><dd id="d-body"></dd>
+    </div>
+  </div>
+  <div class="dialog-foot">
+    <button class="btn" type="button" data-close>关闭</button>
+  </div>
+</dialog>
+
+<script>
+  const tbody = document.getElementById('tbody');
+  const emptyBox = document.getElementById('empty');
+  const limitSel = document.getElementById('limit');
+
+  // 副本再排序，避免就地打乱 SQ.delay 影响其它页面（同一份对象被多页共享）
+  const sorted = SQ.delay.slice().sort((a, b) => a.deliverAtMs - b.deliverAtMs);
+
+  /* ---------- 顶部读数 ---------- */
+  document.getElementById('v-depth').textContent = SQ.fmt(SQ.overview.delayDepth);
+  document.getElementById('v-next').innerHTML = sorted.length
+    ? `${SQ.until(sorted[0].deliverAtMs)}<small>${SQ.time(sorted[0].deliverAtMs)}</small>`
+    : '<small>无</small>';
+  document.getElementById('v-topics').textContent = new Set(sorted.map(d => d.topic)).size;
+  SQ.spark(document.getElementById('s-depth'), SQ.wave(24, 1100, 500, 4), 'var(--text-3)');
+
+  /* ---------- 列表 ---------- */
+  function render() {
+    const limit = +limitSel.value;
+    const rows = sorted.slice(0, limit);
+    tbody.innerHTML = '';
+
+    rows.forEach(d => {
+      // 十分钟内到期的标黄：排查「为什么还没投递」时，这批是马上就要动的
+      const soon = d.deliverAtMs - SQ.NOW <= 600000;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="name">${d.msgId}</td>
+        <td class="name">${d.topic}</td>
+        <td class="name">${d.keys || '<span class="dim">—</span>'}</td>
+        <td class="num muted">${SQ.time(d.deliverAtMs)}</td>
+        <td class="num"><span class="badge ${soon ? 'warn' : ''}">${SQ.until(d.deliverAtMs)}</span></td>
+        <td class="num"><button class="btn" data-view="${d.msgId}">查看</button></td>`;
+      tbody.appendChild(tr);
+    });
+
+    emptyBox.hidden = rows.length > 0;
+    document.getElementById('count').textContent =
+      `${rows.length} / ${sorted.length} 条未到期（上限 ${limit}）`;
+  }
+
+  limitSel.addEventListener('change', render);
+  render();
+
+  /* ---------- 查看消息体 ---------- */
+  const dlgView = document.getElementById('dlg-view');
+
+  tbody.addEventListener('click', e => {
+    const btn = e.target.closest('[data-view]');
+    if (!btn) return;
+    const d = sorted.find(x => x.msgId === btn.dataset.view);
+    document.getElementById('d-id').textContent = d.msgId;
+    document.getElementById('d-topic').textContent = d.topic;
+    document.getElementById('d-keys').textContent = d.keys || '—';
+    document.getElementById('d-at').textContent = `${SQ.time(d.deliverAtMs)}（${SQ.until(d.deliverAtMs)}）`;
+    document.getElementById('d-body').textContent = d.body;
+    dlgView.showModal();
+  });
+
+  document.querySelectorAll('dialog [data-close]').forEach(b =>
+    b.addEventListener('click', () => b.closest('dialog').close()));
+</script>

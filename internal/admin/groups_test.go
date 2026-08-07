@@ -12,7 +12,7 @@ import (
 )
 
 func TestGroupProgressAndResetCursor(t *testing.T) {
-	s, _, mt, pr, dl := newTestServer(t, "", "")
+	s, _, mt, pr, dl, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	for i := 0; i < 3; i++ {
 		if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
@@ -79,7 +79,7 @@ func TestGroupProgressAndResetCursor(t *testing.T) {
 
 // queue_id 越界的位点重置应 400，而不是写入孤儿 cursor 键（会在组进度里显示为幽灵队列）。
 func TestGroupResetCursorQueueOutOfRange(t *testing.T) {
-	s, _, mt, _, _ := newTestServer(t, "", "")
+	s, _, mt, _, _, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	if _, err := mt.CreateTopic("t1", 1); err != nil {
 		t.Fatal(err)

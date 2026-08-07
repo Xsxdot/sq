@@ -1,0 +1,200 @@
+<!--
+  sq 控制台原型 · 消费组详情
+
+  职责：
+    - 展示单个消费组的全景：基本信息 + 按 topic 分组的队列级消费进度
+    - 提供队列粒度的「重置消费位点」入口（危险操作，二次确认后才执行）
+    - 对应 M5a Admin API：GET /admin/groups/{name}、POST /admin/groups/{name}/reset-cursor
+
+  边界：
+    - 零依赖、纯 mock、file:// 直开，不发任何真实请求
+    - 数据与渲染函数全部来自 shared/mock.js，页面内不另造假数据
+    - 只读展示 + 位点重置；创建/删除消费组不在本页，属于消费组列表页
+-->
+<meta charset="utf-8">
+<title>sq 控制台 · 消费组详情</title>
+<link rel="stylesheet" href="../shared/app.css">
+<script src="../shared/mock.js"></script>
+
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><b>sq</b><span>SIMPLE QUEUE</span></div>
+    <nav>
+      <a href="../index.html" class="nav-item">总览</a>
+      <div class="nav-group">资源</div>
+      <a href="topics.html" class="nav-item">Topic</a>
+      <a href="groups.html" class="nav-item active" aria-current="page">消费组</a>
+      <a href="delay.html" class="nav-item">延时队列</a>
+      <div class="nav-group">排查</div>
+      <a href="messages.html" class="nav-item">消息查询</a>
+      <a href="dlq.html" class="nav-item">死信队列</a>
+      <a href="send.html" class="nav-item">发送测试消息</a>
+    </nav>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <span class="page-title" id="title">消费组</span>
+      <span class="crumb"><a href="groups.html">← 消费组列表</a></span>
+      <span class="spacer"></span>
+      <span class="endpoint">127.0.0.1:8081</span>
+      <span class="live"><i class="dot"></i>5s 后刷新</span>
+      <button class="btn">立即刷新</button>
+      <a class="btn" href="login.html">退出登录</a>
+    </header>
+
+    <main class="content">
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-title">基本信息</span>
+          <span class="panel-note">GET /admin/groups/{name}</span>
+        </div>
+        <div class="panel-body">
+          <dl class="kv" id="kv"></dl>
+        </div>
+      </section>
+
+      <div id="topics"></div>
+
+      <div class="panel-note" style="margin-top:14px">
+        位点重置在服务端会持该队列的队列锁执行，与正在进行的投递互斥排队，
+        避免重置与投递同时改写同一队列的位点。
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- 重置位点确认框：topic / queue 只读回显，只有目标 offset 可改 -->
+<dialog id="dlg-reset">
+  <h3>重置消费位点</h3>
+  <form id="form-reset">
+    <div class="dialog-body">
+      <div class="notice warn">
+        <span>
+          <b>重置会让该队列从新位点重新投递。</b>
+          位点前移会把已消费但未过期的消息再投一遍（消费者需自行幂等），
+          位点后移会永久跳过区间内尚未消费的消息。
+          <b>请先停掉该组的消费者再操作</b>，否则新位点会与在途投递交叉。
+        </span>
+      </div>
+      <div class="form">
+        <div class="field">
+          <label>TOPIC</label>
+          <div class="mono" id="r-topic"></div>
+        </div>
+        <div class="field">
+          <label>QUEUE_ID</label>
+          <div class="mono" id="r-queue"></div>
+        </div>
+        <div class="field">
+          <label>目标 OFFSET</label>
+          <input type="number" id="r-offset" min="0" required>
+          <div class="hint" id="r-hint"></div>
+        </div>
+      </div>
+    </div>
+    <div class="dialog-foot">
+      <button type="button" class="btn" id="r-cancel">取消</button>
+      <button type="submit" class="btn danger">确认重置</button>
+    </div>
+  </form>
+</dialog>
+
+<script>
+  // 组名来自 query 参数；直接双击打开（无参数）时落到一个有落后和死信的组，便于看形态
+  const NAME = new URLSearchParams(location.search).get('name') || 'notify-svc';
+  const info = SQ.group(NAME);
+  const rows = SQ.byGroup(NAME);
+
+  document.getElementById('title').textContent = `消费组 · ${NAME}`;
+
+  const totalLag = rows.reduce((s, c) => s + SQ.lagOf(c), 0);
+  const totalFly = rows.reduce((s, c) => s + c.fly, 0);
+  const totalDlq = rows.reduce((s, c) => s + c.dlq, 0);
+
+  document.getElementById('kv').innerHTML = `
+    <dt>组名</dt><dd>${NAME}</dd>
+    <dt>MAX_ATTEMPTS</dt><dd>${info ? info.maxAttempts : '—'}</dd>
+    <dt>创建时间</dt><dd>${info ? SQ.time(info.createdAtMs) : '—'}</dd>
+    <dt>订阅 TOPIC</dt><dd>${rows.length}</dd>
+    <dt>总落后</dt><dd>${SQ.fmt(totalLag)}</dd>
+    <dt>总在途</dt><dd>${SQ.fmt(totalFly)}</dd>
+    <dt>死信</dt><dd>${totalDlq ? `<span class="badge bad">${totalDlq}</span> <a href="dlq.html?group=${NAME}">查看死信</a>` : '0'}</dd>`;
+
+  // 全组共用一把刻度（本组内最大的队列落后量），带子长短才能跨 topic 横向比较
+  const SCALE = Math.max(
+    ...rows.flatMap(c => c.queues.map(([, cu, hd]) => hd - cu)), 1);
+
+  const host = document.getElementById('topics');
+  if (!rows.length) {
+    host.innerHTML = `<div class="panel"><div class="empty">
+      <p>该消费组还没有订阅任何 topic</p>
+      <div class="hint">消费者首次拉取时会自动建立消费关系</div></div></div>`;
+  }
+
+  rows.forEach(c => {
+    const sec = document.createElement('section');
+    sec.className = 'panel';
+    sec.innerHTML = `
+      <div class="panel-head">
+        <span class="panel-title">${c.topic}</span>
+        <span class="panel-note">${c.queues.length} 个队列 · 刻度为本组最大落后 ${SQ.fmt(SCALE)} 条</span>
+        <span class="spacer"></span>
+        <a class="btn" href="messages.html?topic=${c.topic}">查询消息</a>
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th style="width:80px">QUEUE</th>
+            <th class="r" style="width:110px">位点 CURSOR</th>
+            <th class="r" style="width:110px">写入头 HEAD</th>
+            <th class="r" style="width:88px">落后</th>
+            <th style="width:200px">落后（同一刻度）</th>
+            <th class="r" style="width:96px">操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          ${c.queues.map(([q, cu, hd]) => {
+            const lag = hd - cu;
+            return `<tr>
+              <td class="name">queue ${q}</td>
+              <td class="num">${SQ.fmt(cu)}</td>
+              <td class="num muted">${SQ.fmt(hd)}</td>
+              <td class="num ${lag > 500 ? 'bad' : lag === 0 ? 'zero' : ''}">${SQ.fmt(lag)}</td>
+              <td>${SQ.ribbon(cu, hd, 0, SCALE, true)}</td>
+              <td style="text-align:right">
+                <button class="btn danger" data-topic="${c.topic}" data-q="${q}" data-cursor="${cu}" data-head="${hd}">重置位点</button>
+              </td>
+            </tr>`;
+          }).join('')}
+        </tbody>
+      </table>`;
+    host.appendChild(sec);
+  });
+
+  /* ---------------- 重置位点确认 ---------------- */
+  const dlg = document.getElementById('dlg-reset');
+  let pending = null;
+
+  host.addEventListener('click', e => {
+    const btn = e.target.closest('button[data-topic]');
+    if (!btn) return;
+    pending = { topic: btn.dataset.topic, queue: btn.dataset.q, cursor: +btn.dataset.cursor, head: +btn.dataset.head };
+    document.getElementById('r-topic').textContent = pending.topic;
+    document.getElementById('r-queue').textContent = `queue ${pending.queue}`;
+    document.getElementById('r-offset').value = pending.cursor;   // 默认填当前位点，等同于「不动」
+    document.getElementById('r-offset').max = pending.head;
+    document.getElementById('r-hint').textContent =
+      `当前位点 ${SQ.fmt(pending.cursor)}，写入头 ${SQ.fmt(pending.head)}；可填 0 ~ ${SQ.fmt(pending.head)}。`;
+    dlg.showModal();
+  });
+
+  document.getElementById('r-cancel').addEventListener('click', () => dlg.close());
+
+  document.getElementById('form-reset').addEventListener('submit', e => {
+    e.preventDefault();                       // 原型不连后端，一律就地拦下
+    const target = document.getElementById('r-offset').value;
+    dlg.close();
+    SQ.notify(`已提交重置：<b>${NAME}</b> / ${pending.topic} / queue ${pending.queue} → offset <b>${SQ.fmt(target)}</b>（mock）`, 'ok');
+  });
+</script>

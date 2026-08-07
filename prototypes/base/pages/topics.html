@@ -1,0 +1,200 @@
+<!--
+  sq 控制台原型 · Topic 列表
+
+  职责：
+    - 列出全部 topic 的静态属性（队列数 / retention / 创建时间）与两个派生量：
+      累计写入（各队列 nextOffset 之和）、订阅它的消费组数
+    - 承载 topic 的创建与删除入口，删除走二次确认
+
+  对应 M5a Admin API：GET /admin/topics、POST /admin/topics、DELETE /admin/topics/{name}
+
+  边界：
+    - 零依赖、纯 mock、file:// 直开；数据只取自 shared/mock.js，页面内不另造假数据
+    - 不展示消费进度细节（那是消费组视角），只给「有几个组订阅」的计数，
+      具体进度点进 topic-detail.html 看
+-->
+<meta charset="utf-8">
+<title>sq 控制台 · Topic</title>
+<link rel="stylesheet" href="../shared/app.css">
+<script src="../shared/mock.js"></script>
+
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><b>sq</b><span>SIMPLE QUEUE</span></div>
+    <nav>
+      <a href="../index.html" class="nav-item">总览</a>
+      <div class="nav-group">资源</div>
+      <a href="topics.html" class="nav-item active" aria-current="page">Topic</a>
+      <a href="groups.html" class="nav-item">消费组</a>
+      <a href="delay.html" class="nav-item">延时队列</a>
+      <div class="nav-group">排查</div>
+      <a href="messages.html" class="nav-item">消息查询</a>
+      <a href="dlq.html" class="nav-item">死信队列</a>
+      <a href="send.html" class="nav-item">发送测试消息</a>
+    </nav>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <span class="page-title">Topic</span>
+      <span class="spacer"></span>
+      <span class="endpoint">127.0.0.1:8081</span>
+      <span class="live"><i class="dot"></i>5s 后刷新</span>
+      <button class="btn">立即刷新</button>
+      <a class="btn" href="login.html">退出登录</a>
+    </header>
+
+    <main class="content">
+      <div class="filters">
+        <input class="search" type="text" id="q" placeholder="按名称过滤，如 order">
+        <span class="count" id="count"></span>
+        <button class="btn primary" id="btn-new">新建 Topic</button>
+      </div>
+
+      <table>
+        <thead>
+          <tr>
+            <th>名称</th>
+            <th class="r" style="width:74px">队列数</th>
+            <th class="r" style="width:96px">RETENTION</th>
+            <th class="r" style="width:112px">累计写入</th>
+            <th class="r" style="width:96px">订阅组数</th>
+            <th class="r" style="width:96px">创建时间</th>
+            <th class="r" style="width:72px">操作</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+
+      <div class="empty" id="empty" hidden>
+        <p>没有匹配的 topic</p>
+        <div class="hint">换个关键字，或点右上角「新建 Topic」</div>
+      </div>
+    </main>
+  </div>
+</div>
+
+<!-- 新建 topic：队列数与 retention 建好后不可随意改，所以表单里给出默认值提示 -->
+<dialog id="dlg-new">
+  <h3>新建 Topic</h3>
+  <form method="dialog" id="form-new">
+    <div class="dialog-body">
+      <div class="form">
+        <div class="field">
+          <label>名称</label>
+          <input type="text" name="name" placeholder="order.created" required>
+          <div class="hint">建议用 <span class="mono">业务.动作</span> 形式，创建后不可重命名</div>
+        </div>
+        <div class="field">
+          <label>队列数</label>
+          <input type="number" name="queues" value="4" min="1" max="64">
+          <div class="hint">决定同一 topic 的最大并行消费度，创建后不可缩减</div>
+        </div>
+        <div class="field">
+          <label>RETENTION（小时）</label>
+          <input type="number" name="retention" min="1" placeholder="留空 = 使用服务端默认 72 小时">
+          <div class="hint">超过该时长的消息会被后台清理，无论是否已被消费</div>
+        </div>
+      </div>
+    </div>
+    <div class="dialog-foot">
+      <button class="btn" type="button" data-close>取消</button>
+      <button class="btn primary" type="submit">创建</button>
+    </div>
+  </form>
+</dialog>
+
+<!-- 删除 topic：破坏性且不可逆，确认框必须写清连带影响 -->
+<dialog id="dlg-del">
+  <h3>删除 Topic</h3>
+  <div class="dialog-body">
+    <div class="notice bad">
+      <span>即将删除 <b id="del-name"></b>。该操作<b>不可恢复</b>。</span>
+    </div>
+    <div class="kv">
+      <dt>连带清空</dt>
+      <dd id="del-queues"></dd>
+      <dt>受影响组</dt>
+      <dd id="del-groups"></dd>
+    </div>
+    <p class="muted">删除会同时清空该 topic 下所有队列的消息数据与写入位点，且不可恢复；
+      仍在订阅它的消费者会立刻开始报错。请先确认没有生产者与消费者在使用该 topic。</p>
+  </div>
+  <div class="dialog-foot">
+    <button class="btn" type="button" data-close>取消</button>
+    <button class="btn danger" type="button" id="del-confirm">确认删除</button>
+  </div>
+</dialog>
+
+<script>
+  const tbody = document.getElementById('tbody');
+  const emptyBox = document.getElementById('empty');
+  const q = document.getElementById('q');
+
+  // 累计写入 = 各队列写入头之和。topic 维度没有单一 offset，只能按队列求和。
+  const written = t => t.queuesDetail.reduce((s, x) => s + x.nextOffset, 0);
+
+  function render() {
+    const kw = q.value.trim().toLowerCase();
+    const rows = SQ.topics.filter(t => t.name.toLowerCase().includes(kw));
+    tbody.innerHTML = '';
+
+    rows.forEach(t => {
+      const subs = SQ.byTopic(t.name);
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="name"><a href="topic-detail.html?name=${encodeURIComponent(t.name)}">${t.name}</a></td>
+        <td class="num">${t.queues}</td>
+        <td class="num muted">${SQ.dur(t.retentionMs)}</td>
+        <td class="num">${SQ.fmt(written(t))}</td>
+        <td class="num ${subs.length ? '' : 'zero'}">${subs.length}</td>
+        <td class="num muted">${SQ.ago(t.createdAtMs)}</td>
+        <td class="num"><button class="btn danger" data-del="${t.name}">删除</button></td>`;
+      tbody.appendChild(tr);
+    });
+
+    emptyBox.hidden = rows.length > 0;
+    document.getElementById('count').textContent = `${rows.length} / ${SQ.topics.length} 个 topic`;
+  }
+
+  q.addEventListener('input', render);
+  render();
+
+  /* ---------- 新建 ---------- */
+  const dlgNew = document.getElementById('dlg-new');
+  document.getElementById('btn-new').addEventListener('click', () => dlgNew.showModal());
+  document.getElementById('form-new').addEventListener('submit', e => {
+    e.preventDefault();
+    const f = new FormData(e.target);
+    const r = f.get('retention');
+    dlgNew.close();
+    SQ.notify(`已创建 topic <b>${f.get('name')}</b>：${f.get('queues')} 个队列，retention ${r ? r + ' 小时' : '使用默认值'}（mock）`, 'ok');
+  });
+
+  /* ---------- 删除 ---------- */
+  const dlgDel = document.getElementById('dlg-del');
+  let pending = null;
+
+  tbody.addEventListener('click', e => {
+    const btn = e.target.closest('[data-del]');
+    if (!btn) return;
+    pending = SQ.topic(btn.dataset.del);
+    const subs = SQ.byTopic(pending.name);
+    document.getElementById('del-name').textContent = pending.name;
+    document.getElementById('del-queues').textContent =
+      `${pending.queues} 个队列 · 约 ${SQ.fmt(written(pending))} 条累计写入`;
+    document.getElementById('del-groups').textContent =
+      subs.length ? subs.map(c => c.group).join('、') : '当前无消费组订阅';
+    dlgDel.showModal();
+  });
+
+  document.getElementById('del-confirm').addEventListener('click', () => {
+    dlgDel.close();
+    SQ.notify(`已删除 topic <b>${pending.name}</b>，其下所有消息数据一并清空（mock）`, 'ok');
+    pending = null;
+  });
+
+  // 两个弹窗的取消按钮统一处理
+  document.querySelectorAll('dialog [data-close]').forEach(b =>
+    b.addEventListener('click', () => b.closest('dialog').close()));
+</script>

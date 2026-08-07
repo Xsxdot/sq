@@ -106,16 +106,25 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req struct {
-		Topic string   `json:"topic"`
-		Body  string   `json:"body"`
-		Tag   string   `json:"tag"`
-		Keys  []string `json:"keys"`
+		Topic        string   `json:"topic"`
+		Body         string   `json:"body"`
+		Tag          string   `json:"tag"`
+		Keys         []string `json:"keys"`
+		DelayMs      int64    `json:"delay_ms"`      // >0 = 延时消息，相对当前时刻
+		MessageGroup string   `json:"message_group"` // 非空 = 顺序消息
 	}
 	if !s.decodeJSON(w, r, &req) {
 		return
 	}
 	if req.Topic == "" {
 		s.httpError(w, http.StatusBadRequest, "缺少 topic")
+		return
+	}
+	// 延时与顺序不能同时给：延时消息到期后才进队列，此时它相对同组其他消息的
+	// 先后已经由到期时间决定，MessageGroup 承诺的「按发送顺序投递」无从保证。
+	// 这与 rpc 层对 SDK 的组合校验是同一条规则，管理面不该有更宽的口子。
+	if req.DelayMs > 0 && req.MessageGroup != "" {
+		s.httpError(w, http.StatusBadRequest, "delay_ms 与 message_group 不能同时指定")
 		return
 	}
 	if _, err := s.mt.EnsureTopic(req.Topic); err != nil {
@@ -125,18 +134,27 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 	now := time.Now().UnixMilli()
 	m := &core.Message{
 		ID: core.NewMessageID(), Topic: req.Topic, Tag: req.Tag, Keys: req.Keys,
-		Body: []byte(req.Body), BornAtMs: now, BornHost: "admin",
+		MessageGroup: req.MessageGroup,
+		Body:         []byte(req.Body), BornAtMs: now, BornHost: "admin",
 	}
-	m, err := s.pr.Append(m)
+	var err error
+	if req.DelayMs > 0 {
+		m.DeliverAtMs = now + req.DelayMs
+		m, err = s.pr.AppendDelay(m)
+	} else {
+		m, err = s.pr.Append(m)
+	}
 	if err != nil {
-		s.logger.Error("admin 测试消息发送失败", "topic", req.Topic, "err", err)
+		s.logger.Error("admin 测试消息发送失败", "topic", req.Topic,
+			"delay_ms", req.DelayMs, "message_group", req.MessageGroup, "err", err)
 		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
 	s.logger.Info("admin 测试消息已发送", "topic", req.Topic, "msg_id", m.ID,
-		"queue", m.QueueID, "offset", m.Offset)
+		"queue", m.QueueID, "offset", m.Offset, "deliver_at_ms", m.DeliverAtMs)
 	s.writeJSON(w, http.StatusCreated, map[string]any{
 		"msg_id": m.ID, "queue_id": m.QueueID, "offset": m.Offset,
+		"deliver_at_ms": m.DeliverAtMs,
 	})
 }
 
@@ -241,6 +259,9 @@ func (s *Server) handleDelayList(w http.ResponseWriter, r *http.Request) {
 
 // handleOverview GET /admin/overview：总览计数（复用 metrics.Collect，
 // 控制台图表与 Prometheus 看到同一份事实源）。
+//
+// 死信从 total_written 里剔除并单列 total_dlq：把死信算进「写入量」会让
+// 一次故障看起来像一次流量高峰，这是总览页最不该出现的误导。
 func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	st, err := metrics.Collect(s.st, s.mt)
 	if err != nil {
@@ -248,9 +269,13 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	var written, pending uint64
+	var written, pending, dlq uint64
 	var inflight int
-	for _, n := range st.Written {
+	for topic, n := range st.Written {
+		if meta.IsDLQTopic(topic) {
+			dlq += n
+			continue
+		}
 		written += n
 	}
 	for _, n := range st.Pending {
@@ -259,8 +284,25 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	for _, n := range st.Inflight {
 		inflight += n
 	}
+	// qps 只有采样器启用时才有：它需要两个时刻的差分，单次快照给不出速率。
+	// 未启用时给 null 而不是 0——0 表示「确实没有流量」，null 表示「不知道」。
+	var qps *float64
+	if s.sp != nil {
+		if p, ok := s.sp.Latest(); ok {
+			v := p.QPS
+			qps = &v
+		}
+	}
+	// topics 计数同样剔除死信 topic：死信队列是系统自建的，不是用户建的 topic
+	topics := 0
+	for _, tc := range s.mt.Topics() {
+		if !meta.IsDLQTopic(tc.Name) {
+			topics++
+		}
+	}
 	s.writeJSON(w, http.StatusOK, map[string]any{
-		"topics": st.Topics, "groups": st.Groups, "delay_depth": st.DelayDepth,
+		"topics": topics, "groups": st.Groups, "delay_depth": st.DelayDepth,
 		"total_written": written, "total_pending": pending, "total_inflight": inflight,
+		"total_dlq": dlq, "qps": qps,
 	})
 }

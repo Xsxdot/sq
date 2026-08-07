@@ -2,3 +2,4 @@
 /data/
 *.log
 .gstack/
+web/node_modules/

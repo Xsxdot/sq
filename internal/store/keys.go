@@ -26,8 +26,11 @@ const (
 	inflightPrefix  = "inflight/"
 	keyIdxPrefix    = "keyidx/"
 	delayPrefix     = "delay/"
+	metricPrefix    = "metric/"
 	// DelayPrefix 延时暂存区扫描下界（导出供 delay 包使用）。
 	DelayPrefix = delayPrefix
+	// MetricPrefix 时序采样点扫描下界（导出供 metrics/admin 包使用）。
+	MetricPrefix = metricPrefix
 	// delayAllocKey 全局单 key，与 alloc/{topic} 的按队列计数器不同：
 	// 延时条目移入前不属于任何队列，无法按队列维护计数器。
 	delayAllocKey = "delayalloc"
@@ -285,4 +288,22 @@ func ParseCursorKey(k []byte) (group, topic string, queueID uint32, err error) {
 	}
 	topic = string(rest[:j])
 	return group, topic, binary.BigEndian.Uint32(rest[j+1:]), nil
+}
+
+// MetricKey 时序采样点主键：metric/{tsMs:8B}，值为 JSON 编码的分钟聚合点。
+//
+// tsMs 是墙钟 UnixMilli 恒为正，按 uint64 大端编码后字节序即数值序，
+// 因此区间扫描天然按时间升序，过期清理也能直接用 DeleteRange 砍掉一段前缀。
+func MetricKey(tsMs int64) []byte {
+	k := make([]byte, 0, len(metricPrefix)+8)
+	k = append(k, metricPrefix...)
+	return append(k, PutU64(uint64(tsMs))...)
+}
+
+// ParseMetricKey 解析时序采样点主键，返回毫秒时间戳。
+func ParseMetricKey(k []byte) (int64, error) {
+	if !bytes.HasPrefix(k, []byte(metricPrefix)) || len(k) != len(metricPrefix)+8 {
+		return 0, fmt.Errorf("非法 metric key: %q", k)
+	}
+	return int64(GetU64(k[len(metricPrefix):])), nil
 }

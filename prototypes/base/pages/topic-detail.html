@@ -1,0 +1,174 @@
+<!--
+  sq 控制台原型 · Topic 详情
+
+  职责：
+    - 展示单个 topic 的属性、每个队列的写入头，以及谁在订阅它、追得上不上
+    - 提供 retention 就地修改入口（topic 唯一可改的属性）
+
+  对应 M5a Admin API：GET /admin/topics/{name}、PATCH /admin/topics/{name}
+
+  边界：
+    - 零依赖、纯 mock、file:// 直开；topic 名从 query 参数 ?name= 取，
+      取不到时退回 order.created，保证双击直开也有内容
+    - 队列数不可改（改了会打乱 hash 分区与既有位点），页面只读展示；
+      消费进度只做只读概览，重置位点等操作在消费组详情页做
+-->
+<meta charset="utf-8">
+<title>sq 控制台 · Topic 详情</title>
+<link rel="stylesheet" href="../shared/app.css">
+<script src="../shared/mock.js"></script>
+
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><b>sq</b><span>SIMPLE QUEUE</span></div>
+    <nav>
+      <a href="../index.html" class="nav-item">总览</a>
+      <div class="nav-group">资源</div>
+      <a href="topics.html" class="nav-item active" aria-current="page">Topic</a>
+      <a href="groups.html" class="nav-item">消费组</a>
+      <a href="delay.html" class="nav-item">延时队列</a>
+      <div class="nav-group">排查</div>
+      <a href="messages.html" class="nav-item">消息查询</a>
+      <a href="dlq.html" class="nav-item">死信队列</a>
+      <a href="send.html" class="nav-item">发送测试消息</a>
+    </nav>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <span class="page-title" id="title">Topic</span>
+      <span class="crumb"><a href="topics.html">← 返回 Topic 列表</a></span>
+      <span class="spacer"></span>
+      <span class="endpoint">127.0.0.1:8081</span>
+      <span class="live"><i class="dot"></i>5s 后刷新</span>
+      <button class="btn">立即刷新</button>
+      <a class="btn" href="login.html">退出登录</a>
+    </header>
+
+    <main class="content">
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-title">基本信息</span>
+          <span class="panel-note">队列数创建后不可改，只有 retention 可调</span>
+        </div>
+        <div class="panel-body">
+          <dl class="kv" id="kv"></dl>
+
+          <form class="form" id="form-retention" style="margin-top:16px">
+            <div class="field">
+              <label>修改 RETENTION（小时）</label>
+              <input type="number" name="retention" id="retention" min="1" required>
+              <div class="hint">调小会让超期消息在下一轮清理时被删除，包括尚未被消费的消息</div>
+            </div>
+            <div class="btn-row">
+              <button class="btn primary" type="submit">保存</button>
+              <span class="panel-note">PATCH /admin/topics/{name}</span>
+            </div>
+          </form>
+        </div>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-title">队列</span>
+          <span class="panel-note" id="q-note"></span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th>QUEUE ID</th>
+              <th class="r" style="width:160px">NEXT OFFSET（写入头）</th>
+              <th class="r" style="width:160px">占累计写入</th>
+            </tr>
+          </thead>
+          <tbody id="q-body"></tbody>
+        </table>
+      </section>
+
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-title">订阅此 Topic 的消费组</span>
+          <span class="panel-note">带子共用同一把刻度：本表最大落后量</span>
+        </div>
+        <table id="sub-table">
+          <thead>
+            <tr>
+              <th style="width:3px"></th>
+              <th>消费组</th>
+              <th style="width:240px">落后（同一刻度）</th>
+              <th class="r" style="width:96px">落后</th>
+              <th class="r" style="width:72px">在途</th>
+              <th class="r" style="width:72px">死信</th>
+              <th class="r" style="width:96px">最后消费</th>
+            </tr>
+          </thead>
+          <tbody id="sub-body"></tbody>
+        </table>
+        <div class="empty" id="sub-empty" hidden>
+          <p>还没有消费组订阅这个 topic</p>
+          <div class="hint">消息会一直堆到 retention 到期被清理，注意确认是否漏配了消费者</div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<script>
+  // 直开（file:// 双击、没带 query）时退回一个有数据的 topic，避免白页
+  const name = new URLSearchParams(location.search).get('name') || 'order.created';
+  const t = SQ.topic(name);
+
+  document.getElementById('title').textContent = t ? t.name : name;
+
+  if (!t) {
+    // topic 不存在：给空态而不是报错，原型里也可能手改了 query
+    document.querySelector('.content').innerHTML =
+      `<div class="empty"><p>找不到 topic <span class="mono">${name}</span></p>
+       <div class="hint"><a href="topics.html">返回 Topic 列表</a></div></div>`;
+  } else {
+    const written = t.queuesDetail.reduce((s, x) => s + x.nextOffset, 0);
+
+    /* ---------- 基本信息 ---------- */
+    document.getElementById('kv').innerHTML = `
+      <dt>名称</dt><dd>${t.name}</dd>
+      <dt>队列数</dt><dd>${t.queues}</dd>
+      <dt>RETENTION</dt><dd>${SQ.dur(t.retentionMs)}（${Math.round(t.retentionMs / 3600000)} 小时）</dd>
+      <dt>创建时间</dt><dd>${SQ.time(t.createdAtMs)} · ${SQ.ago(t.createdAtMs)}</dd>
+      <dt>累计写入</dt><dd>${SQ.fmt(written)} 条</dd>`;
+
+    document.getElementById('retention').value = Math.round(t.retentionMs / 3600000);
+    document.getElementById('form-retention').addEventListener('submit', e => {
+      e.preventDefault();
+      const h = new FormData(e.target).get('retention');
+      SQ.notify(`已把 <b>${t.name}</b> 的 retention 改为 ${h} 小时，下一轮清理生效（mock）`, 'ok');
+    });
+
+    /* ---------- 队列 ---------- */
+    document.getElementById('q-note').textContent =
+      `${t.queuesDetail.length} 个队列 · 累计写入 ${SQ.fmt(written)} 条`;
+    document.getElementById('q-body').innerHTML = t.queuesDetail.map(qd => `
+      <tr>
+        <td class="name">queue ${qd.queueId}</td>
+        <td class="num">${SQ.fmt(qd.nextOffset)}</td>
+        <td class="num muted">${(qd.nextOffset / written * 100).toFixed(1)}%</td>
+      </tr>`).join('');
+
+    /* ---------- 订阅的消费组 ---------- */
+    const subs = SQ.byTopic(t.name);
+    const SCALE = SQ.maxLag(subs);   // 本表共用一把刻度，带子长短才能横向比较
+    document.getElementById('sub-empty').hidden = subs.length > 0;
+    document.getElementById('sub-table').hidden = subs.length === 0;
+    document.getElementById('sub-body').innerHTML = subs.map(c => {
+      const lag = SQ.lagOf(c);
+      return `<tr>
+        <td class="mark ${SQ.markOf(c)}"></td>
+        <td class="name"><a href="group-detail.html?name=${encodeURIComponent(c.group)}">${c.group}</a></td>
+        <td>${SQ.ribbon(c.cursor, c.head, c.fly, SCALE)}</td>
+        <td class="num ${lag > 500 ? 'bad' : lag === 0 ? 'zero' : ''}">${SQ.fmt(lag)}</td>
+        <td class="num ${c.fly ? '' : 'zero'}">${c.fly}</td>
+        <td class="num ${c.dlq ? 'bad' : 'zero'}">${c.dlq}</td>
+        <td class="num muted">${SQ.ago(c.lastMs)}</td>
+      </tr>`;
+    }).join('');
+  }
+</script>
