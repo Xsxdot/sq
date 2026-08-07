@@ -14,13 +14,15 @@ package rpc
 import (
 	"sort"
 	"sync"
-	"unsafe"
 
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 // session 一条已完成 Settings 协商的 Telemetry 流。
 type session struct {
+	id int // 注册序，pickProducer 轮转的稳定排序键
+	// 为什么是自增 id 而不是指针地址：指针地址只是恰好稳定（当前 GC 不移动
+	// 堆对象），不是语言规范承诺的——自增 id 与地址一样单调，且语义明确
 	stream pb.MessagingService_TelemetryServer
 	// sendMu 串行化本流上的所有服务端写：Settings 回包（handler goroutine）
 	// 与回查命令（checker goroutine）可能并发，grpc-go 明确禁止同一流并发
@@ -39,9 +41,10 @@ func (se *session) send(cmd *pb.TelemetryCommand) error {
 
 // sessions 会话注册表。并发安全。
 type sessions struct {
-	mu   sync.Mutex
-	all  map[*session]struct{}
-	next int // pickProducer 轮转游标
+	mu     sync.Mutex
+	all    map[*session]struct{}
+	next   int // pickProducer 轮转游标
+	nextID int // 下一注册序（add 时递增，见 session.id）
 }
 
 func newSessions() *sessions { return &sessions{all: map[*session]struct{}{}} }
@@ -49,6 +52,8 @@ func newSessions() *sessions { return &sessions{all: map[*session]struct{}{}} }
 func (ss *sessions) add(se *session) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
+	se.id = ss.nextID
+	ss.nextID++
 	ss.all[se] = struct{}{}
 }
 
@@ -85,7 +90,8 @@ func (ss *sessions) updateTopics(se *session, fresh map[string]bool) {
 //
 // 轮转必须是「稳定顺序上的轮转」：matches 若按 map 随机迭代序收集，两次
 // 调用得到相同顺序的概率约 1/2，此时 next 游标前进也照样返回同一个会话，
-// 轮转形同虚设。按会话指针排序后再走游标，才保证相邻两次调用一定不同。
+// 轮转形同虚设。按注册序（add 时分配的 id）排序后再走游标，才保证相邻两次
+// 调用一定不同。
 func (ss *sessions) pickProducer(topic string) *session {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
@@ -99,7 +105,7 @@ func (ss *sessions) pickProducer(topic string) *session {
 		return nil
 	}
 	sort.Slice(matches, func(i, j int) bool {
-		return uintptr(unsafe.Pointer(matches[i])) < uintptr(unsafe.Pointer(matches[j]))
+		return matches[i].id < matches[j].id
 	})
 	se := matches[ss.next%len(matches)]
 	ss.next++

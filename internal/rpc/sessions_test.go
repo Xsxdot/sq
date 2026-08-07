@@ -63,4 +63,10 @@ func TestPickProducerRotates(t *testing.T) {
 	if first == second {
 		t.Fatal("多 producer 时应轮转，不能永远打同一个")
 	}
+	// wrap-around：注册序排序 + 游标取模，第三次调用必须回到第一个会话。
+	// 若排序键不稳定（如按指针地址），无法保证这个「回到起点」的确定性
+	third := ss.pickProducer("t1")
+	if third != first {
+		t.Fatalf("轮转应 wrap-around 回到第一个会话，得到 %p（first=%p）", third, first)
+	}
 }

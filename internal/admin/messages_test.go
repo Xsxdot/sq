@@ -148,6 +148,9 @@ func (f fakeConns) ConnectionCount() int { return f.n }
 
 // TestAdminTransactionsList 事务视图：直写一条 half+halfidx 条目（形状与
 // txn.Stage 一致），GET /admin/transactions?limit=10 应返回该条且字段齐全。
+// 另放一条坏 key（前缀后仅 1B，ParseHalfKey 必拒，且字典序排在所有合法
+// half 键之前、正好在扫描头部）：旧实现直接中断整趟返回 500，修复后应与
+// 解码失败分支一致——只读跳过，健康条目照常返回。
 func TestAdminTransactionsList(t *testing.T) {
 	s, st, _, _, _, _ := newTestServer(t, "", "")
 	h := s.Handler()
@@ -159,6 +162,7 @@ func TestAdminTransactionsList(t *testing.T) {
 	}
 	ref, _ := json.Marshal(&txn.HalfRef{NextCheckMs: next, Checks: 3}) // 结构固定无失败路径
 	b := st.NewBatch()
+	b.Set(append([]byte(store.HalfPrefix), 0x00), []byte("whatever"), nil) // 坏 key 排在扫描头部
 	b.Set(store.HalfKey(next, "TX0001"), raw, nil)
 	b.Set(store.HalfIdxKey("TX0001"), ref, nil)
 	if err := st.Apply(b); err != nil {

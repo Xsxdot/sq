@@ -271,10 +271,11 @@ func (t *Manager) Pass(n Notifier) (int, error) {
 		m, err := core.DecodeMessage(d.raw)
 		if err != nil {
 			// 坏条目永远无法决断，删除止损并 Error 留痕（同 delay 清坏条目）。
-			// 注意坏条目只能按 idx 定位删除——half key 需要 NextCheckMs，
-			// 而它在 idx 里，所以两键都从 idx 侧重建
+			// 删除目标直接用扫描解析出的 halfKey + txID——坏条目的值已无法解码，
+			// half key 只能由扫描回调侧给出；从 idx 重建在 idx 缺失/损坏时会失败，
+			// 留下每趟重扫重报的残留窗口（见 dropLocked 注释）
 			t.logger.Error("half 条目解码失败，丢弃坏条目", "tx_id", d.txID, "err", err)
-			if err := t.dropLocked(d.txID); err != nil {
+			if err := t.dropLocked(d.txID, d.halfKey); err != nil {
 				return handled, err
 			}
 			handled++
@@ -386,21 +387,15 @@ func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, 
 	return true, nil
 }
 
-// dropLocked 按 txID 删除 half 两键（坏条目清理用）。自行加锁。
-func (t *Manager) dropLocked(txID string) error {
+// dropLocked 按「扫描解析出的 half 键 + halfidx 键」删除坏条目（坏条目清理用）。自行加锁。
+// 为什么直接传 halfKey 而不是从 idx 重建：坏条目的值已无法解码，删除只能靠
+// half key 定位；若此时 idx 恰好缺失或损坏，从 idx 重建会失败，坏条目将永远
+// 留在盘上、每趟重扫重报（da3a330 修掉坏 key 洪水后的同类残留窗口）。
+func (t *Manager) dropLocked(txID string, halfKey []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	refRaw, ok, err := t.st.Get(store.HalfIdxKey(txID))
-	if err != nil {
-		return fmt.Errorf("读取 halfidx (tx=%s): %w", txID, err)
-	}
 	b := t.st.NewBatch()
-	if ok {
-		ref := &HalfRef{}
-		if err := json.Unmarshal(refRaw, ref); err == nil {
-			b.Delete(store.HalfKey(ref.NextCheckMs, txID), nil)
-		}
-	}
+	b.Delete(halfKey, nil)
 	b.Delete(store.HalfIdxKey(txID), nil)
 	return t.st.Apply(b)
 }

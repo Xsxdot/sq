@@ -280,7 +280,11 @@ func (s *Server) handleTransactionsList(w http.ResponseWriter, r *http.Request) 
 	err = s.st.Scan(hp, store.PrefixUpperBound(hp), int(limit64), func(k, v []byte) (bool, error) {
 		next, txID, perr := store.ParseHalfKey(k)
 		if perr != nil {
-			return false, perr
+			// 坏 key 由回查调度器 ~1s 内删除并 Error 留痕（那里是唯一写入口），
+			// 管理面只读跳过即可——与下方解码失败分支的处置一致，不能中断整个
+			// 扫描把后面的健康条目一起 500 掉
+			s.logger.Warn("admin 事务视图跳过坏 key", "key", string(k), "err", perr)
+			return true, nil
 		}
 		m, derr := core.DecodeMessage(v)
 		if derr != nil {

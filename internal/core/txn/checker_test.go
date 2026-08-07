@@ -225,3 +225,43 @@ func TestPassDeletesCorruptHalfIdxAndContinues(t *testing.T) {
 		t.Fatalf("坏条目不应触发回查下发: %v", n.got)
 	}
 }
+
+func TestPassDeletesCorruptValueWithMissingIdx(t *testing.T) {
+	// 「坏值 + 坏 idx」双重损坏：旧 dropLocked 从 idx 侧重建 half key 来删，
+	// idx 损坏时重建失败，坏 half 条目永远留在盘上、每趟被重扫重报 Error。
+	// 修复后删除目标直接用扫描解析出的 halfKey，两键无条件删除
+	f := newFixture(t, 30*time.Second, 15)
+	txID := stageOverdue(t, f, "t-badval")
+	// 先读健康 idx 拿到当前 half key（此后就要把它弄坏，不能再靠它重建）
+	refRaw, ok, err := f.st.Get(store.HalfIdxKey(txID))
+	if err != nil || !ok {
+		t.Fatalf("halfidx 缺失: %v", err)
+	}
+	ref := &HalfRef{}
+	mustUnmarshal(t, refRaw, ref)
+	halfKey := store.HalfKey(ref.NextCheckMs, txID)
+	// 值覆写成坏字节（DecodeMessage 必败）+ idx 覆写成坏 JSON。选坏 JSON 而非
+	// 直接删 idx：与 TestPassDeletesCorruptHalfIdxAndContinues 同一种「idx 在但
+	// 不可用」的损坏形态，也同时覆盖了旧实现 json.Unmarshal 失败即不删 half 键
+	// 的残留窗口（删 idx 只是它的退化子集）
+	b := f.st.NewBatch()
+	b.Set(halfKey, []byte("not-a-message"), nil)
+	b.Set(store.HalfIdxKey(txID), []byte("not-json"), nil)
+	if err := f.st.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	n := &fakeNotifier{send: true}
+	sent, err := f.mgr.Pass(n)
+	if err != nil || sent != 1 {
+		t.Fatalf("Pass: sent=%d err=%v（坏条目计入 handled，不报错）", sent, err)
+	}
+	if f.halfCount(t) != 0 {
+		t.Fatal("坏值坏 idx 条目未被彻底清除（否则每趟重扫重报）")
+	}
+	if _, ok, _ := f.st.Get(store.HalfIdxKey(txID)); ok {
+		t.Fatal("坏 halfidx 未被删除")
+	}
+	if len(n.got) != 0 {
+		t.Fatalf("坏条目不应触发回查下发: %v", n.got)
+	}
+}
