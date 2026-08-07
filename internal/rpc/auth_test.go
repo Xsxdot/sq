@@ -17,6 +17,8 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
+
+	"github.com/xushixin/sq/internal/config"
 )
 
 // sdkCtx 按官方 SDK 的头形状构造带签名头的 incoming context。
@@ -60,14 +62,14 @@ func callUnary(t *testing.T, u grpc.UnaryServerInterceptor, ctx context.Context)
 }
 
 func TestAuthUnaryAcceptsValidSignature(t *testing.T) {
-	u, _ := NewAuthInterceptors("ak1", "sk1", slog.Default())
+	u, _ := NewAuthInterceptors([]config.Credential{{AccessKey: "ak1", SecretKey: "sk1"}}, slog.Default())
 	if err := callUnary(t, u, signedCtx("ak1", "sk1", "20260806T120000Z")); err != nil {
 		t.Fatalf("合法签名应放行: %v", err)
 	}
 }
 
 func TestAuthUnaryRejects(t *testing.T) {
-	u, _ := NewAuthInterceptors("ak1", "sk1", slog.Default())
+	u, _ := NewAuthInterceptors([]config.Credential{{AccessKey: "ak1", SecretKey: "sk1"}}, slog.Default())
 	cases := []struct {
 		name string
 		ctx  context.Context
@@ -93,7 +95,7 @@ func TestAuthUnaryRejects(t *testing.T) {
 }
 
 func TestAuthStreamRejects(t *testing.T) {
-	_, s := NewAuthInterceptors("ak1", "sk1", slog.Default())
+	_, s := NewAuthInterceptors([]config.Credential{{AccessKey: "ak1", SecretKey: "sk1"}}, slog.Default())
 	err := s(nil, &fakeServerStream{ctx: context.Background()}, &grpc.StreamServerInfo{FullMethod: "/test/S"},
 		func(srv any, stream grpc.ServerStream) error { t.Fatal("拒绝时不应进入 handler"); return nil })
 	if status.Code(err) != codes.Unauthenticated {
@@ -112,7 +114,7 @@ func TestAuthStreamRejects(t *testing.T) {
 // 是裸 AK；签名十六进制 Go/Java/Python 小写、C#/C++ 大写。任何一种形状被拒，
 // 对应语言的客户端在开启鉴权后就是 100% 连不上。
 func TestAuthAcceptsAllOfficialSDKHeaderShapes(t *testing.T) {
-	u, _ := NewAuthInterceptors("ak1", "sk1", slog.Default())
+	u, _ := NewAuthInterceptors([]config.Credential{{AccessKey: "ak1", SecretKey: "sk1"}}, slog.Default())
 	cases := []struct {
 		name  string
 		cred  string
@@ -136,12 +138,39 @@ func TestAuthAcceptsAllOfficialSDKHeaderShapes(t *testing.T) {
 // TestAuthStillRejectsWrongSecretInBothCases 防止「统一折小写」被误实现成
 // 「跳过签名校验」：密钥错时无论大小写都必须拒。
 func TestAuthStillRejectsWrongSecretInBothCases(t *testing.T) {
-	u, _ := NewAuthInterceptors("ak1", "sk1", slog.Default())
+	u, _ := NewAuthInterceptors([]config.Credential{{AccessKey: "ak1", SecretKey: "sk1"}}, slog.Default())
 	for _, upper := range []bool{false, true} {
 		ctx := sdkCtx("ak1", "wrong", "20260807T120000Z", upper)
 		if status.Code(callUnary(t, u, ctx)) != codes.Unauthenticated {
 			t.Fatalf("密钥错误必须拒绝（upper=%v）", upper)
 		}
+	}
+}
+
+// TestAuthMultiCredential 多凭据下的命中/拒绝路径：非首条凭据必须放行；
+// 「命中但签名错」与「AK 不存在（dummy 路径）」两类失败的信息必须一致，
+// 防止 AK 枚举探针。
+func TestAuthMultiCredential(t *testing.T) {
+	creds := []config.Credential{
+		{Name: "订单服务", AccessKey: "AK1", SecretKey: "SK1"},
+		{AccessKey: "AK2", SecretKey: "SK2"},
+	}
+	u, _ := NewAuthInterceptors(creds, slog.Default())
+	// 命中非首条凭据：AK2/SK2 正确签名必须放行
+	if err := callUnary(t, u, signedCtx("AK2", "SK2", "20260807T120000Z")); err != nil {
+		t.Fatalf("第二条凭据应放行: %v", err)
+	}
+	// 命中但签名错（拿别人的 secret 签）与 AK 不存在（dummy 路径）：
+	// 两者必须同为 Unauthenticated，且错误信息完全一致——不泄露"AK 对不对"
+	errHit := callUnary(t, u, signedCtx("AK1", "SK2", "20260807T120000Z"))
+	errMiss := callUnary(t, u, signedCtx("AK9", "SK1", "20260807T120000Z"))
+	for name, err := range map[string]error{"命中但签名错": errHit, "AK不存在": errMiss} {
+		if status.Code(err) != codes.Unauthenticated {
+			t.Fatalf("%s: 应返回 Unauthenticated，得到 %v", name, err)
+		}
+	}
+	if errHit.Error() != errMiss.Error() {
+		t.Fatalf("两类失败的错误信息必须一致（防 AK 枚举探针）: %q vs %q", errHit, errMiss)
 	}
 }
 

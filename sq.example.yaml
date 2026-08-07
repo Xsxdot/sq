@@ -36,9 +36,18 @@ admin_username: ""
 admin_password: ""
 
 # —— gRPC 静态鉴权 ——
-# 与 secret_key 成对；均空 = 不做 gRPC 鉴权；只填一半启动报错
-access_key: ""
-secret_key: ""
+# 凭据列表；空/缺省 = 不做 gRPC 鉴权。每条 access_key/secret_key 必须成对，
+# access_key 全局唯一；name 可选，仅用于日志追溯。
+# credentials:
+#   - name: 订单服务
+#     access_key: "AK1"
+#     secret_key: "SK1"
+credentials: []
 
 # 时序采样落库保留小时数；0 = 只留内存环最近 1 小时；上限 8760
 metrics_retention_hours: 168
+
+# —— 事务消息 ——
+# 半消息回查间隔（Go duration）；单条最大回查次数，超限丢弃并记日志
+txn_check_interval: 30s
+txn_max_checks: 15

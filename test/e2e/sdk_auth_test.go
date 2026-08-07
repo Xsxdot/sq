@@ -22,8 +22,7 @@ import (
 
 func TestOfficialGoSDKAuth(t *testing.T) {
 	endpoint := startBroker(t, func(c *config.Config) {
-		c.AccessKey = "e2e-ak"
-		c.SecretKey = "e2e-sk"
+		c.Credentials = []config.Credential{{Name: "e2e", AccessKey: "e2e-ak", SecretKey: "e2e-sk"}}
 	})
 	const topic = "e2e-auth"
 

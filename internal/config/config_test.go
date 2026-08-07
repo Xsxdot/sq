@@ -143,15 +143,14 @@ func TestRetentionInterval(t *testing.T) {
 	}
 }
 
-// TestLoadAuthPairValidation 认证配置必须成对：只填一半是笔误，启动即报错，
-// 不能静默变成"看起来配了认证实际没生效"。
+// TestLoadAuthPairValidation 管理面认证配置必须成对：只填一半是笔误，启动即报错，
+// 不能静默变成"看起来配了认证实际没生效"。gRPC 凭据的成对校验已由
+// TestLoadCredentials 覆盖，此处只保留 admin 一项。
 func TestLoadAuthPairValidation(t *testing.T) {
 	cases := []struct {
 		name string
 		yaml string
 	}{
-		{"只有access_key", "access_key: ak\n"},
-		{"只有secret_key", "secret_key: sk\n"},
 		{"只有admin_username", "admin_username: root\n"},
 		{"只有admin_password", "admin_password: pw\n"},
 	}
@@ -168,20 +167,21 @@ func TestLoadAuthPairValidation(t *testing.T) {
 	}
 }
 
-// TestLoadAuthDefaults 默认值：认证全关、admin 监听 :8082；成对配置能被加载。
+// TestLoadAuthDefaults 默认值：gRPC 凭据列表为空（不鉴权）、admin 监听 :8082；
+// 成对配置能被加载。
 func TestLoadAuthDefaults(t *testing.T) {
 	cfg, err := Load("")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.AccessKey != "" || cfg.SecretKey != "" || cfg.AdminUsername != "" || cfg.AdminPassword != "" {
+	if len(cfg.Credentials) != 0 || cfg.AdminUsername != "" || cfg.AdminPassword != "" {
 		t.Fatalf("认证默认应全空: %+v", cfg)
 	}
 	if cfg.AdminListen != ":8082" {
 		t.Fatalf("admin_listen 默认应为 :8082，得到 %q", cfg.AdminListen)
 	}
 	p := filepath.Join(t.TempDir(), "sq.yaml")
-	y := "access_key: ak\nsecret_key: sk\nadmin_username: root\nadmin_password: pw\nadmin_listen: \"\"\n"
+	y := "credentials:\n  - access_key: ak\n    secret_key: sk\nadmin_username: root\nadmin_password: pw\nadmin_listen: \"\"\n"
 	if err := os.WriteFile(p, []byte(y), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -189,7 +189,7 @@ func TestLoadAuthDefaults(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.AccessKey != "ak" || cfg.AdminUsername != "root" || cfg.AdminListen != "" {
+	if len(cfg.Credentials) != 1 || cfg.Credentials[0].AccessKey != "ak" || cfg.AdminUsername != "root" || cfg.AdminListen != "" {
 		t.Fatalf("成对配置加载不符: %+v", cfg)
 	}
 }
@@ -239,6 +239,44 @@ func TestTxnConfigDefaults(t *testing.T) {
 	}
 	if cfg.TxnMaxChecks != 15 {
 		t.Fatalf("txn_max_checks 默认值错误: %d", cfg.TxnMaxChecks)
+	}
+}
+
+// TestLoadCredentials 多凭据列表的成对非空与 AK 唯一性校验：
+// 空列表 = 关闭鉴权；缺一半、AK 重复都是启动期笔误，必须挡住。
+func TestLoadCredentials(t *testing.T) {
+	cases := []struct {
+		name    string
+		yaml    string
+		wantErr bool
+		wantN   int
+	}{
+		{"空列表=关闭", "", false, 0},
+		{"两条合法", "credentials:\n  - name: 订单服务\n    access_key: AK1\n    secret_key: SK1\n  - access_key: AK2\n    secret_key: SK2\n", false, 2},
+		{"缺 secret_key", "credentials:\n  - access_key: AK1\n", true, 0},
+		{"缺 access_key", "credentials:\n  - secret_key: SK1\n", true, 0},
+		{"AK 重复", "credentials:\n  - access_key: AK1\n    secret_key: a\n  - access_key: AK1\n    secret_key: b\n", true, 0},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "sq.yaml")
+			if err := os.WriteFile(p, []byte(c.yaml), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := Load(p)
+			if c.wantErr {
+				if err == nil {
+					t.Fatal("期望校验失败，却通过了")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(cfg.Credentials) != c.wantN {
+				t.Fatalf("凭据数 = %d, 期望 %d", len(cfg.Credentials), c.wantN)
+			}
+		})
 	}
 }
 

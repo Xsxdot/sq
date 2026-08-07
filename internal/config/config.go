@@ -28,6 +28,13 @@ import (
 // 响应体大小必须有个头。
 const MaxDefaultQueueNums = 1024
 
+// Credential 一条 gRPC 静态鉴权凭据。多条凭据 = 每个接入方一对、可单独吊销。
+type Credential struct {
+	Name      string `yaml:"name"`       // 可选，仅用于日志追溯（如"订单服务"），不参与校验
+	AccessKey string `yaml:"access_key"`
+	SecretKey string `yaml:"secret_key"`
+}
+
 // Config 为 sq 全部运行配置。零值无意义，必须经 Load 构造。
 type Config struct {
 	GRPCListen             string `yaml:"grpc_listen"`              // gRPC 监听地址，默认 :8081
@@ -45,8 +52,9 @@ type Config struct {
 	AdminListen   string `yaml:"admin_listen"`   // Admin HTTP 监听地址，"" = 关闭；默认 :8082
 	AdminUsername string `yaml:"admin_username"` // Admin API 登录用户名（与密码成对，均空 = 免登录）
 	AdminPassword string `yaml:"admin_password"` // Admin API 登录密码
-	AccessKey     string `yaml:"access_key"`     // gRPC 静态 AK（与 secret_key 成对，均空 = 不鉴权，spec §6 默认关闭）
-	SecretKey     string `yaml:"secret_key"`     // gRPC 静态 SK
+	// Credentials gRPC 静态鉴权凭据列表；空/缺省 = 不鉴权（spec §6 默认关闭）。
+	// v1.0 前的破坏性变更：取代旧的 access_key/secret_key 标量对。
+	Credentials []Credential `yaml:"credentials"`
 
 	// MetricsRetentionHours 时序采样点的落库保留时长（小时）。0 = 不落库，
 	// 只保留内存环的最近 1 小时（进程重启即丢）。默认 168（7 天）。
@@ -119,11 +127,17 @@ func Load(path string) (*Config, error) {
 	default:
 		return nil, fmt.Errorf("配置 log_level 只接受 debug|info|warn|error，得到 %q", cfg.LogLevel)
 	}
-	// 认证配置必须成对出现：只填一半几乎必然是笔误——比如配了 access_key 忘了
-	// secret_key，此时"启用但秘钥为空"和"未启用"两种解释都会让用户在真出事时
-	// 误判认证状态，启动即报错是唯一不含糊的处理。
-	if (cfg.AccessKey == "") != (cfg.SecretKey == "") {
-		return nil, fmt.Errorf("配置 access_key/secret_key 必须成对设置（或都留空以关闭 gRPC 认证）")
+	// 每条凭据必须成对非空（同旧标量时代"只填一半必是笔误"的原则），AK 全局唯一
+	// ——重复 AK 会让 map 构建时后者静默覆盖前者，吊销/排查全部错乱，启动即挡。
+	seen := map[string]int{}
+	for i, c := range cfg.Credentials {
+		if c.AccessKey == "" || c.SecretKey == "" {
+			return nil, fmt.Errorf("配置 credentials[%d] 的 access_key/secret_key 必须成对非空", i)
+		}
+		if j, dup := seen[c.AccessKey]; dup {
+			return nil, fmt.Errorf("配置 credentials[%d] 与 credentials[%d] 的 access_key 重复: %q", i, j, c.AccessKey)
+		}
+		seen[c.AccessKey] = i
 	}
 	if (cfg.AdminUsername == "") != (cfg.AdminPassword == "") {
 		return nil, fmt.Errorf("配置 admin_username/admin_password 必须成对设置（或都留空以免登录）")

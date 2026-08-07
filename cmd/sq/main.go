@@ -186,12 +186,12 @@ func run() error {
 		grpc.MaxRecvMsgSize(rpc.MaxGRPCMessageSize),
 		grpc.MaxSendMsgSize(rpc.MaxGRPCMessageSize),
 	}
-	// AK/SK 认证按配置装配（spec §6 默认关闭）。拦截器必须 unary+stream 成对装：
-	// 只装 unary 会让 ReceiveMessage/Telemetry 两条流绕过认证。
-	if cfg.AccessKey != "" {
-		au, as := rpc.NewAuthInterceptors(cfg.AccessKey, cfg.SecretKey, logger)
+	// AK/SK 认证按配置装配（spec §6 默认关闭，凭据列表为空即不装）。拦截器必须
+	// unary+stream 成对装：只装 unary 会让 ReceiveMessage/Telemetry 两条流绕过认证。
+	if len(cfg.Credentials) > 0 {
+		au, as := rpc.NewAuthInterceptors(cfg.Credentials, logger)
 		gopts = append(gopts, grpc.ChainUnaryInterceptor(au), grpc.ChainStreamInterceptor(as))
-		logger.Info("gRPC AK/SK 认证已启用", "access_key", cfg.AccessKey)
+		logger.Info("gRPC AK/SK 认证已启用", "credentials", len(cfg.Credentials))
 	}
 	gs := grpc.NewServer(gopts...)
 	srv.Register(gs)
