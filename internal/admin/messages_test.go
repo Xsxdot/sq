@@ -15,7 +15,7 @@ import (
 )
 
 func TestMessagesSendBrowseAndKeyQuery(t *testing.T) {
-	s, _, _, pr, _ := newTestServer(t, "", "")
+	s, _, _, pr, _, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	// 测试发送
 	w := doJSON(t, h, "POST", "/admin/messages/send", "",
@@ -63,7 +63,7 @@ func TestMessagesSendBrowseAndKeyQuery(t *testing.T) {
 }
 
 func TestDLQResend(t *testing.T) {
-	s, _, _, pr, dl := newTestServer(t, "", "")
+	s, _, _, pr, dl, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	// 构造一条死信：与 moveToDLQ 的写入形状一致（origin 坐标在 Properties）。
 	// 不驱动真实重试超限（那是 deliver 测试的职责），这里只验证重发路径。
@@ -96,7 +96,7 @@ func TestDLQResend(t *testing.T) {
 }
 
 func TestDelayViewAndOverview(t *testing.T) {
-	s, _, _, pr, _ := newTestServer(t, "", "")
+	s, _, _, pr, _, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	due := time.Now().Add(time.Hour).UnixMilli()
 	if _, err := pr.AppendDelay(&core.Message{Topic: "t1", Body: []byte("later"), DeliverAtMs: due}); err != nil {

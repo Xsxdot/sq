@@ -11,7 +11,7 @@ import (
 )
 
 func TestTopicCRUD(t *testing.T) {
-	s, st, mt, pr, _ := newTestServer(t, "", "")
+	s, st, mt, pr, _, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	// 创建
 	w := doJSON(t, h, "POST", "/admin/topics", "", map[string]any{"name": "t1", "queues": 2, "retention_ms": 60000})
@@ -84,7 +84,7 @@ func TestTopicCRUD(t *testing.T) {
 
 // 创建时负 retention_ms 应 400（与 PATCH 校验对齐），0 保持原语义（用默认值）。
 func TestTopicCreateNegativeRetention(t *testing.T) {
-	s, _, _, _, _ := newTestServer(t, "", "")
+	s, _, _, _, _, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	if w := doJSON(t, h, "POST", "/admin/topics", "",
 		map[string]any{"name": "t1", "queues": 1, "retention_ms": -1}); w.Code != http.StatusBadRequest {

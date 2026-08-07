@@ -81,8 +81,19 @@ func run() error {
 	// 放到它们之后装配就是契约禁止的无同步并发读写。admin_listen 为空 =
 	// 不装配（钩子保持 nil，Apply 路径零开销）。
 	var reg *prometheus.Registry
+	var sp *metrics.Sampler
 	if cfg.AdminListen != "" {
 		reg = metrics.NewRegistry(st, mt, logger)
+
+		// 时序采样器。停机顺序与 retention/delay 同理：本 defer 注册在
+		// st.Close 的 defer 之后（LIFO 先执行），保证不会在 store 关闭后落库。
+		serCtx, serCancel := context.WithCancel(context.Background())
+		var serWG sync.WaitGroup
+		sp = metrics.NewSampler(st, mt,
+			time.Duration(cfg.MetricsRetentionHours)*time.Hour, logger)
+		serWG.Add(1)
+		go func() { defer serWG.Done(); sp.Run(serCtx) }()
+		defer func() { serCancel(); serWG.Wait() }()
 	}
 
 	// retention 后台清理。停机顺序关键：先取消并等待清理 goroutine 退出，
@@ -111,7 +122,7 @@ func run() error {
 	// 注册在 st.Close 的 defer 之后（LIFO 先执行），保证 handler 不会在 store
 	// 关闭后还在读写它。
 	if cfg.AdminListen != "" {
-		adm := admin.New(st, mt, pr, dl, cfg.AdminUsername, cfg.AdminPassword, writeBlocked, reg, logger)
+		adm := admin.New(st, mt, pr, dl, cfg.AdminUsername, cfg.AdminPassword, writeBlocked, sp, reg, logger)
 		aln, err := net.Listen("tcp", cfg.AdminListen)
 		if err != nil {
 			return fmt.Errorf("admin HTTP 监听 %s: %w", cfg.AdminListen, err)

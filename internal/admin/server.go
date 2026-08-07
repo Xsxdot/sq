@@ -25,6 +25,7 @@ import (
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/metrics"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -37,6 +38,7 @@ type Server struct {
 	username     string
 	password     string
 	writeBlocked *atomic.Bool
+	sp           *metrics.Sampler // 时序采样器；admin_listen 关闭时 main 不装配，为 nil
 	logger       *slog.Logger
 
 	tokens sync.Map // token(string) → 过期时间(time.Time)
@@ -45,12 +47,13 @@ type Server struct {
 }
 
 // New 构造 Admin 服务并装配全部路由。username/password 均空 = 免登录。
+// sp 为 nil 时时序/总账端点返回 503（采样器未启用，不返回误导性的空数据）。
 func New(st *store.Store, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer,
-	username, password string, writeBlocked *atomic.Bool,
+	username, password string, writeBlocked *atomic.Bool, sp *metrics.Sampler,
 	reg *prometheus.Registry, logger *slog.Logger) *Server {
 	s := &Server{
 		st: st, mt: mt, pr: pr, dl: dl,
-		username: username, password: password, writeBlocked: writeBlocked,
+		username: username, password: password, writeBlocked: writeBlocked, sp: sp,
 		logger: logger.With("mod", "admin"),
 		mux:    http.NewServeMux(),
 	}
@@ -77,6 +80,8 @@ func (s *Server) routes(reg *prometheus.Registry) {
 	s.mux.HandleFunc("POST /admin/dlq/{group}/resend", s.protected(s.handleDLQResend))
 	s.mux.HandleFunc("GET /admin/delay", s.protected(s.handleDelayList))
 	s.mux.HandleFunc("GET /admin/overview", s.protected(s.handleOverview))
+	s.mux.HandleFunc("GET /admin/timeseries", s.protected(s.handleTimeseries))
+	s.mux.HandleFunc("GET /admin/ledger", s.protected(s.handleLedger))
 }
 
 // Handler 返回根 handler（测试注入用）。

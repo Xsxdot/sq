@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
@@ -19,7 +20,8 @@ import (
 )
 
 // newTestServer 构造 admin Server 与其依赖。user/pass 均空 = 免登录。
-func newTestServer(t *testing.T, user, pass string) (*Server, *store.Store, *meta.Meta, *produce.Producer, *deliver.Deliverer) {
+// 返回尾部多一个 *metrics.Sampler：时序/总账端点测试需要它（空环查询安全）。
+func newTestServer(t *testing.T, user, pass string) (*Server, *store.Store, *meta.Meta, *produce.Producer, *deliver.Deliverer, *metrics.Sampler) {
 	t.Helper()
 	st, err := store.Open(t.TempDir(), true, slog.Default())
 	if err != nil {
@@ -32,8 +34,28 @@ func newTestServer(t *testing.T, user, pass string) (*Server, *store.Store, *met
 	}
 	pr := produce.New(st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
-	s := New(st, mt, pr, dl, user, pass, &atomic.Bool{}, metrics.NewRegistry(st, mt, slog.Default()), slog.Default())
-	return s, st, mt, pr, dl
+	sp := metrics.NewSampler(st, mt, time.Hour, slog.Default())
+	s := New(st, mt, pr, dl, user, pass, &atomic.Bool{}, sp, metrics.NewRegistry(st, mt, slog.Default()), slog.Default())
+	return s, st, mt, pr, dl, sp
+}
+
+// newTestServerNoSampler 同 newTestServer，但向 Server 传 sp=nil（模拟
+// admin_listen 关闭时分支不装配采样器的生产形态）。查询安全、时序端点 503。
+func newTestServerNoSampler(t *testing.T, user, pass string) (*Server, *store.Store, *meta.Meta, *produce.Producer, *deliver.Deliverer, *metrics.Sampler) {
+	t.Helper()
+	st, err := store.Open(t.TempDir(), true, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { st.Close() })
+	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	pr := produce.New(st, mt, slog.Default())
+	dl := deliver.New(st, mt, pr, slog.Default())
+	s := New(st, mt, pr, dl, user, pass, &atomic.Bool{}, nil, metrics.NewRegistry(st, mt, slog.Default()), slog.Default())
+	return s, st, mt, pr, dl, nil
 }
 
 // doJSON 发 JSON 请求，返回响应记录器。token 非空时带 Bearer 头。
@@ -55,7 +77,7 @@ func doJSON(t *testing.T, h http.Handler, method, path, token string, body any) 
 }
 
 func TestLoginAndTokenGate(t *testing.T) {
-	s, _, _, _, _ := newTestServer(t, "root", "pw123")
+	s, _, _, _, _, _ := newTestServer(t, "root", "pw123")
 	h := s.Handler()
 	// 未带 token 访问受保护路由 → 401
 	if w := doJSON(t, h, "GET", "/admin/topics", "", nil); w.Code != http.StatusUnauthorized {
@@ -87,7 +109,7 @@ func TestLoginAndTokenGate(t *testing.T) {
 }
 
 func TestNoAuthConfiguredPassthrough(t *testing.T) {
-	s, _, _, _, _ := newTestServer(t, "", "")
+	s, _, _, _, _, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	if w := doJSON(t, h, "GET", "/admin/topics", "", nil); w.Code != http.StatusOK {
 		t.Fatalf("免登录模式应直通，得到 %d", w.Code)
@@ -99,7 +121,7 @@ func TestNoAuthConfiguredPassthrough(t *testing.T) {
 }
 
 func TestMetricsEndpointOpen(t *testing.T) {
-	s, _, _, _, _ := newTestServer(t, "root", "pw123")
+	s, _, _, _, _, _ := newTestServer(t, "root", "pw123")
 	// /metrics 不设防（Prometheus 抓取器无登录流程）
 	if w := doJSON(t, s.Handler(), "GET", "/metrics", "", nil); w.Code != http.StatusOK {
 		t.Fatalf("/metrics 应 200，得到 %d", w.Code)
