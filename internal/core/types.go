@@ -84,9 +84,13 @@ type Message struct {
 	// DeliverAtMs 延时消息的到期投递时间（UnixMilli）；0 = 普通消息。
 	// 移入 msg/ 后仍保留：投递时协议层据此回填 MessageType_DELAY 与
 	// DeliveryTimestamp，SDK 消费端才能读到自己当初设置的延时时间。
-	DeliverAtMs     int64  `json:"deliver_at_ms,omitempty"`
-	TraceContext    string `json:"trace_context,omitempty"`
-	DeliveryAttempt int32  `json:"-"`
+	DeliverAtMs  int64  `json:"deliver_at_ms,omitempty"`
+	TraceContext string `json:"trace_context,omitempty"`
+	// Transactional 事务消息路由标记（M6）：true 时 SendMessage 分流至
+	// txn.Stage 而非 produce.Append。不落盘——半消息的身份由所在 half/
+	// 前缀表达，提交移入 msg/ 后它就是普通消息。
+	Transactional   bool  `json:"-"`
+	DeliveryAttempt int32 `json:"-"`
 }
 
 // EncodeMessage 序列化消息用于落盘。
