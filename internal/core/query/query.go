@@ -51,3 +51,27 @@ func ByKey(st *store.Store, topic, key string, limit int) ([]*core.Message, erro
 	}
 	return out, nil
 }
+
+// Browse 按 (topic, queueID) 从 fromOffset 起顺序读取至多 limit 条消息
+// （<=0 用 defaultLimit）。控制台"按 topic 浏览"与 DLQ 查看共用此路径。
+// 越界/空队列返回空切片不报错——翻页到底是正常形态，不是错误。
+func Browse(st *store.Store, topic string, queueID uint32, fromOffset uint64, limit int) ([]*core.Message, error) {
+	if limit <= 0 {
+		limit = defaultLimit
+	}
+	lower := store.MsgKey(topic, queueID, fromOffset)
+	upper := store.PrefixUpperBound(store.MsgQueuePrefix(topic, queueID))
+	var out []*core.Message
+	err := st.Scan(lower, upper, limit, func(k, v []byte) (bool, error) {
+		m, derr := core.DecodeMessage(v)
+		if derr != nil {
+			return false, derr
+		}
+		out = append(out, m)
+		return true, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("浏览队列 (topic=%s q=%d from=%d): %w", topic, queueID, fromOffset, err)
+	}
+	return out, nil
+}

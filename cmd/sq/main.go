@@ -4,9 +4,12 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
+	"fmt"
 	"log/slog"
 	"net"
+	"net/http"
 	"os"
 	"os/signal"
 	"sync"
@@ -16,12 +19,16 @@ import (
 
 	"google.golang.org/grpc"
 
+	"github.com/prometheus/client_golang/prometheus"
+
+	"github.com/xushixin/sq/internal/admin"
 	"github.com/xushixin/sq/internal/config"
 	"github.com/xushixin/sq/internal/core/delay"
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
 	"github.com/xushixin/sq/internal/core/retention"
+	"github.com/xushixin/sq/internal/metrics"
 	"github.com/xushixin/sq/internal/rpc"
 	"github.com/xushixin/sq/internal/store"
 )
@@ -68,6 +75,16 @@ func run() error {
 	pr := produce.New(st, mt, logger)
 	dl := deliver.New(st, mt, pr, logger)
 
+	// metrics registry 必须先于任何后台 goroutine 装配：NewRegistry 会写包级
+	// 钩子 store.OnApplyObserve，其契约是「装配阶段设置一次、之后只读」——
+	// retention/delay 的 goroutine 启动即可能走 store.Apply 读这个钩子，
+	// 放到它们之后装配就是契约禁止的无同步并发读写。admin_listen 为空 =
+	// 不装配（钩子保持 nil，Apply 路径零开销）。
+	var reg *prometheus.Registry
+	if cfg.AdminListen != "" {
+		reg = metrics.NewRegistry(st, mt, logger)
+	}
+
 	// retention 后台清理。停机顺序关键：先取消并等待清理 goroutine 退出，
 	// 再让 defer 关闭 store——否则可能在 store 关闭后提交清理批次（panic）。
 	// defer 为 LIFO：本 defer 注册在 st.Close 的 defer 之后，故先执行。
@@ -89,6 +106,33 @@ func run() error {
 	dlyWG.Add(1)
 	go func() { defer dlyWG.Done(); ds.Run(dlyCtx) }()
 	defer func() { dlyCancel(); dlyWG.Wait() }()
+
+	// Admin HTTP（含 /metrics）。admin_listen 为空 = 关闭。停机顺序：本 defer
+	// 注册在 st.Close 的 defer 之后（LIFO 先执行），保证 handler 不会在 store
+	// 关闭后还在读写它。
+	if cfg.AdminListen != "" {
+		adm := admin.New(st, mt, pr, dl, cfg.AdminUsername, cfg.AdminPassword, writeBlocked, reg, logger)
+		aln, err := net.Listen("tcp", cfg.AdminListen)
+		if err != nil {
+			return fmt.Errorf("admin HTTP 监听 %s: %w", cfg.AdminListen, err)
+		}
+		go func() {
+			// 运行期 Serve 异常只记日志不退进程：admin 是辅助面，它挂掉不该
+			// 连累消息主链路；启动期端口占用则已在上面 fail-fast
+			if err := adm.Serve(aln); err != nil && !errors.Is(err, http.ErrServerClosed) {
+				logger.Error("admin HTTP 异常退出", "err", err)
+			}
+		}()
+		defer func() {
+			sctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			if err := adm.Shutdown(sctx); err != nil {
+				logger.Warn("admin HTTP 停机超时", "err", err)
+			}
+		}()
+		logger.Info("admin HTTP 已启动", "listen", cfg.AdminListen,
+			"login_required", cfg.AdminUsername != "")
+	}
 
 	lis, err := net.Listen("tcp", cfg.GRPCListen)
 	if err != nil {

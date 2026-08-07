@@ -16,9 +16,15 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 )
+
+// OnApplyObserve 若非 nil，每次 Apply 成功提交后以提交耗时（含 fsync）回调，
+// 供 metrics 装配 fsync 延迟直方图（spec §8）。契约：进程装配阶段设置一次，
+// 服务启动后只读——据此不加锁；运行期改写属数据竞态，禁止。
+var OnApplyObserve func(d time.Duration)
 
 // Store 封装单个 Pebble 实例。并发安全（Pebble 自身保证）。
 //
@@ -93,8 +99,14 @@ func (s *Store) Apply(b *pebble.Batch) error {
 	if s.sync {
 		opt = pebble.Sync
 	}
+	start := time.Now()
 	if err := b.Commit(opt); err != nil {
 		return fmt.Errorf("store Apply: %w", err)
+	}
+	if OnApplyObserve != nil {
+		// 只观测成功提交：失败路径由调用方带上下文记日志，混进直方图反而
+		// 会把错误重试的耗时污染进正常刷盘分布。
+		OnApplyObserve(time.Since(start))
 	}
 	// 提交成功，关闭批次以回收到 Pebble 的 sync.Pool（见 Pebble DB.Set 源码）。
 	// 这确保热路径不会持续分配新的批次结构。

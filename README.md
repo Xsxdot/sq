@@ -11,7 +11,7 @@ go build -o sq ./cmd/sq
 ```
 
 用官方 RocketMQ 5.x SDK（Java/Go/Python/C#/C++）直接连接 `127.0.0.1:8081` 收发。
-当前状态：M3（延时消息，任意秒级延时、重启不丢）。里程碑与设计见 docs/superpowers/specs/。
+当前状态：M5a（gRPC AK/SK 认证、Admin API、Prometheus /metrics）。里程碑与设计见 docs/superpowers/specs/。
 
 停机用 `SIGINT`/`SIGTERM` 即可：收到信号后先让协议层结束没有自然终点的长流
 （`Telemetry`），再等在途 RPC 处理完（gRPC `GracefulStop`），最后关闭底层存储，
@@ -41,6 +41,12 @@ go build -o sq ./cmd/sq
 - 消息 retention：按 topic 保留时长后台清理（默认 3 天），消息与 key 索引一并删除
 - 磁盘水位保护：磁盘使用率超过阈值（默认 85%）时拒写保读，低于阈值自动恢复
 - 延时消息：任意秒级延时（deliveryTimestamp），重启不丢，精度 ~100ms 调度间隔
+- 认证（M5a）：gRPC 静态 AK/SK 签名校验（默认关闭，`access_key`/`secret_key` 成对
+  配置启用）；Admin API 独立用户名密码登录（成对配置，均空 = 免登录）
+- Admin API（M5a）：topic/消费组管理、消息 Keys 查询与队列浏览、发送测试消息、
+  DLQ 重发、延时视图、总览（见「Admin API」）
+- Prometheus /metrics（M5a）：topic 写入计数、消费组堆积/inflight、延时深度、
+  store 提交耗时直方图（见「Admin API」）
 
 ## 消费失败链路
 
@@ -66,6 +72,12 @@ default_max_attempts: 16       # 新订阅组默认最大投递次数，超过�
 retention_check_interval: 5m   # 过期清理扫描间隔（Go duration 格式）
 disk_watermark_percent: 85     # 磁盘使用率超过即拒写保读；0=关闭
 log_level: info
+# —— M5a 认证与管理面 ——
+admin_listen: ":8082"          # Admin HTTP 监听地址；"" = 关闭管理面（含 /metrics）
+admin_username: ""             # 与 admin_password 成对设置；均空 = 免登录，只填一半启动报错
+admin_password: ""
+access_key: ""                 # 与 secret_key 成对设置；均空 = 不做 gRPC 鉴权（默认关闭）
+secret_key: ""
 ```
 
 通过 `-config` 指定配置文件路径，省略则使用以上默认值：
@@ -74,7 +86,59 @@ log_level: info
 ./sq -config sq.yaml
 ```
 
+## Admin API
+
+管理面与 `/metrics` 由 `admin_listen` 上的独立 HTTP 服务提供（默认 `:8082`，
+`admin_listen: ""` 可整个关闭）。配置了 `admin_username`/`admin_password` 后，
+除 `/admin/login` 与 `/metrics` 外的端点都要求 `Authorization: Bearer <token>`。
+
+登录拿 token：
+
+```bash
+TOKEN=$(curl -s -X POST localhost:8082/admin/login \
+  -d '{"username":"root","password":"pw"}' | jq -r .token)
+curl -H "Authorization: Bearer $TOKEN" localhost:8082/admin/topics
+```
+
+端点一览：
+
+| 方法 | 路径 | 用途 |
+| --- | --- | --- |
+| POST | `/admin/login` | 用户名密码登录，返回 token |
+| GET | `/admin/overview` | 总览计数（topic/组数、写入/堆积/inflight、延时深度） |
+| GET | `/admin/topics` | topic 列表 |
+| POST | `/admin/topics` | 建 topic（`{"name","queues","retention_ms"}`） |
+| GET | `/admin/topics/{name}` | topic 详情与每队列写入位置 |
+| PATCH | `/admin/topics/{name}` | 改 retention |
+| DELETE | `/admin/topics/{name}` | 删除 topic（先停流量，见下） |
+| GET | `/admin/groups` | 消费组列表 |
+| GET | `/admin/groups/{name}` | 组详情：逐 topic 堆积与 inflight |
+| POST | `/admin/groups/{name}/reset-cursor` | 位点重置（`{"topic","queue_id","offset"}`） |
+| DELETE | `/admin/groups/{name}` | 删除消费组（先停流量，见下） |
+| GET | `/admin/messages` | 消息查询：`key` 非空走 Keys 检索，否则按 `topic+queue_id` 顺序浏览 |
+| POST | `/admin/messages/send` | 发送测试消息（`{"topic","body","tag","keys"}`） |
+| POST | `/admin/dlq/{group}/resend` | 按 `queue_id+offset` 把死信重发回原 topic |
+| GET | `/admin/delay` | 延时暂存区视图（按到期时间升序） |
+| GET | `/metrics` | Prometheus 指标（免鉴权） |
+
+`/metrics` 暴露的业务指标（另有 `go_*`/`process_*` 标准采集器）：
+
+- `sq_topics`、`sq_groups`、`sq_delay_depth`
+- `sq_topic_messages_written_total{topic}`（收发 QPS 由 `rate()` 推导）
+- `sq_group_pending_messages{group,topic}`（堆积）
+- `sq_group_inflight_messages{group,topic}`
+- `sq_store_apply_duration_seconds`（store 批次提交含 fsync 耗时直方图）
+
+安全边界（刻意为之，部署前请知悉）：
+
+- AK/SK 签名**不含重放窗口**：服务端不做 nonce/时间戳校验，截获的签名可重放，
+  定位是可信内网，不要把 gRPC 端口对公网开放。
+- `/metrics` **不设防**：免鉴权暴露 topic/组名与流量计数，`admin_listen` 同样只应
+  绑定内网地址。
+- 删除类操作（topic/消费组）是即时物理删除，**先停对应流量再删**。
+- Admin token 只存于进程内存，**重启即全部失效**，需重新登录。
+
 ## 限制
 
 - 消息体上限 4MB（`produce.MaxBodySize`）；默认同步刷盘（`fsync: sync`）。
-- 未实现：顺序/事务消息、控制台、多 broker 集群。
+- 未实现：顺序/事务消息、Web 控制台（React UI）、多 broker 集群。
