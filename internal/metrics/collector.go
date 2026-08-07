@@ -88,7 +88,7 @@ func NewRegistry(st *store.Store, mt *meta.Meta, logger *slog.Logger) *prometheu
 	h := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: "sq_store_apply_duration_seconds",
 		Help: "store 批次提交耗时（含 fsync）",
-		// 0.1ms 起倍增 14 档（~1.6s 封顶）：同步刷盘常态在 0.5~10ms，
+		// 0.1ms 起倍增 14 档（~0.82s 封顶）：同步刷盘常态在 0.5~10ms，
 		// 尾部预算给磁盘抖动
 		Buckets: prometheus.ExponentialBuckets(0.0001, 2, 14),
 	})
