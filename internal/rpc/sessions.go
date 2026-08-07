@@ -12,7 +12,9 @@
 package rpc
 
 import (
+	"sort"
 	"sync"
+	"unsafe"
 
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
@@ -80,6 +82,10 @@ func (ss *sessions) updateTopics(se *session, fresh map[string]bool) {
 // TransactionChecker 做决断，发给没发布过该 topic 的进程，它的 checker 面对
 // 陌生事务多半回 ROLLBACK/UNKNOWN——等于让无关方替业务做了错误决定。
 // 找不到匹配会话时返回 nil，由调度器改期后下轮再试（producer 重连即恢复）。
+//
+// 轮转必须是「稳定顺序上的轮转」：matches 若按 map 随机迭代序收集，两次
+// 调用得到相同顺序的概率约 1/2，此时 next 游标前进也照样返回同一个会话，
+// 轮转形同虚设。按会话指针排序后再走游标，才保证相邻两次调用一定不同。
 func (ss *sessions) pickProducer(topic string) *session {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
@@ -92,6 +98,9 @@ func (ss *sessions) pickProducer(topic string) *session {
 	if len(matches) == 0 {
 		return nil
 	}
+	sort.Slice(matches, func(i, j int) bool {
+		return uintptr(unsafe.Pointer(matches[i])) < uintptr(unsafe.Pointer(matches[j]))
+	})
 	se := matches[ss.next%len(matches)]
 	ss.next++
 	return se
