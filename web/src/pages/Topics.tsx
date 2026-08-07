@@ -13,7 +13,7 @@
  *   - 死信 topic（%DLQ% 前缀）是系统自建的，不进管理列表：用户没建过它，也不能删它
  *   - 队列数与 retention 建好后不可随意改，表单里给出默认值提示
  */
-import { useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { usePoll } from '../hooks/usePoll'
@@ -94,6 +94,16 @@ export default function Topics() {
     setShowNew(true)
   }
 
+  // 新建 topic 用 modal 承载：焦点陷阱、Esc 关闭、背景 inert 交给原生 <dialog>，
+  // 与删除确认框（ConfirmDialog）保持一致，防止背景可点击造成误操作
+  const newDialogRef = useRef<HTMLDialogElement>(null)
+  useEffect(() => {
+    const d = newDialogRef.current
+    if (!d) return
+    if (showNew && !d.open) d.showModal()
+    if (!showNew && d.open) d.close()
+  }, [showNew])
+
   const loading = (list.loading && !list.data) || (led.loading && !led.data)
 
   return (
@@ -158,7 +168,7 @@ export default function Topics() {
       )}
 
       {/* 新建 topic：队列数与 retention 建好后不可随意改，表单里给出默认值提示 */}
-      <dialog open={showNew} onCancel={e => { e.preventDefault(); setShowNew(false) }}>
+      <dialog ref={newDialogRef} onCancel={e => { e.preventDefault(); setShowNew(false) }}>
         <h3>新建 Topic</h3>
         <form onSubmit={onCreate}>
           <div className="dialog-body">
