@@ -12,6 +12,7 @@
 package store
 
 import (
+	"fmt"
 	"log/slog"
 	"testing"
 )
@@ -65,5 +66,28 @@ func TestScanRangeAndLimit(t *testing.T) {
 	})
 	if err != nil || len(got) != 2 || got[0] != "a/1" || got[1] != "a/2" {
 		t.Fatalf("Scan: %v %v", got, err)
+	}
+}
+
+func TestScanNonPositiveLimitMeansUnlimited(t *testing.T) {
+	// limit<=0 == 不限量：该语义被 deliver 阶段 2 的跳过逻辑直接依赖（B5）
+	st := openTestStore(t, t.TempDir()) // 文件内既有 helper（store_test.go:19）
+	const n = 10
+	for i := 0; i < n; i++ {
+		b := st.NewBatch()
+		b.Set([]byte(fmt.Sprintf("scan-t/%03d", i)), []byte("v"), nil)
+		if err := st.Apply(b); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, limit := range []int{0, -1} {
+		got := 0
+		err := st.Scan([]byte("scan-t/"), []byte("scan-t0"), limit, func(k, v []byte) (bool, error) {
+			got++
+			return true, nil
+		})
+		if err != nil || got != n {
+			t.Fatalf("limit=%d: got=%d err=%v（期望全量 %d）", limit, got, err, n)
+		}
 	}
 }

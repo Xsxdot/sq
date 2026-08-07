@@ -13,6 +13,7 @@ package produce
 
 import (
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -155,6 +156,66 @@ func TestAppendWithExtraAtomic(t *testing.T) {
 	}
 	if _, ok, _ := st.Get(marker); !ok {
 		t.Fatal("extra 写操作未随消息落盘")
+	}
+}
+
+func TestAppendConcurrentNoDupNoHole(t *testing.T) {
+	// Producer 类型注释声称「并发安全」，此用例在 -race 下钉住它，并断言
+	// offset 分配无重复无空洞、alloc 计数器与消息数严格一致。
+	// Task 8 改队列粒度锁后本用例必须原样通过（等价重构的证明）。
+	p, st := newTestProducer(t, t.TempDir()) // 既有 fixture：sync store + autoCreate(4 队列)
+	const goroutines, perG = 8, 50
+	var wg sync.WaitGroup
+	errs := make(chan error, goroutines*perG)
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perG; i++ {
+				m := &core.Message{Topic: "t-conc", Body: []byte("x")}
+				if _, err := p.Append(m); err != nil {
+					errs <- err
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	// 逐队列扫描 msg/ 前缀：offset 必须恰为 0..count-1（无重复无空洞），
+	// 且 alloc 计数器 == count；四队列 count 总和 == goroutines*perG
+	total := 0
+	for q := uint32(0); q < 4; q++ {
+		count := 0
+		prev := int64(-1)
+		// 队列区间 = [MsgKey(t,q,0), MsgKey(t,q+1,0))：MsgKey 的 queueID/offset
+		// 均为定长大端编码，区间边界成立（执行时打开 keys.go:65 复核一眼）
+		err := st.Scan(store.MsgKey("t-conc", q, 0), store.MsgKey("t-conc", q+1, 0), 0,
+			func(k, v []byte) (bool, error) {
+				_, _, off, perr := store.ParseMsgKey(k)
+				if perr != nil {
+					return false, perr
+				}
+				if int64(off) != prev+1 {
+					t.Fatalf("q%d offset 不连续: prev=%d got=%d", q, prev, off)
+				}
+				prev = int64(off)
+				count++
+				return true, nil
+			})
+		if err != nil {
+			t.Fatal(err)
+		}
+		v, ok, _ := st.Get(store.AllocKey("t-conc", q))
+		if count > 0 && (!ok || store.GetU64(v) != uint64(count)) {
+			t.Fatalf("q%d alloc 计数器与消息数不一致", q)
+		}
+		total += count
+	}
+	if total != goroutines*perG {
+		t.Fatalf("总量 = %d, 期望 %d", total, goroutines*perG)
 	}
 }
 
