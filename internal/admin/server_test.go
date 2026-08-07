@@ -17,6 +17,7 @@ import (
 	"github.com/xushixin/sq/internal/core/produce"
 	"github.com/xushixin/sq/internal/metrics"
 	"github.com/xushixin/sq/internal/store"
+	"github.com/xushixin/sq/internal/sysinfo"
 )
 
 // newTestServer 构造 admin Server 与其依赖。user/pass 均空 = 免登录。
@@ -35,9 +36,10 @@ func newTestServer(t *testing.T, user, pass string) (*Server, *store.Store, *met
 	pr := produce.New(st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
 	sp := metrics.NewSampler(st, mt, time.Hour, slog.Default())
-	// sys 传 nil：admin 测试不抓取系统类指标（NewCollector 契约：sys 为 nil
-	// 时不出系统类指标）；Task 5 会换成共享的 sysinfo.Reporter。
-	s := New(st, mt, pr, dl, user, pass, &atomic.Bool{}, sp, metrics.NewRegistry(st, mt, nil, slog.Default()), slog.Default())
+	// sys 与 /metrics 的系统 Collector、/admin/system 共用同一个
+	// sysinfo.Reporter（数据目录用独立临时目录，不影响 store 所在目录）
+	sys := sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default())
+	s := New(st, mt, pr, dl, user, pass, sys, sp, metrics.NewRegistry(st, mt, sys, slog.Default()), slog.Default())
 	return s, st, mt, pr, dl, sp
 }
 
@@ -56,7 +58,8 @@ func newTestServerNoSampler(t *testing.T, user, pass string) (*Server, *store.St
 	}
 	pr := produce.New(st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
-	s := New(st, mt, pr, dl, user, pass, &atomic.Bool{}, nil, metrics.NewRegistry(st, mt, nil, slog.Default()), slog.Default())
+	sys := sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default())
+	s := New(st, mt, pr, dl, user, pass, sys, nil, metrics.NewRegistry(st, mt, sys, slog.Default()), slog.Default())
 	return s, st, mt, pr, dl, nil
 }
 

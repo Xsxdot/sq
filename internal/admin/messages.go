@@ -101,7 +101,7 @@ func (s *Server) handleMessagesQuery(w http.ResponseWriter, r *http.Request) {
 // handleMessageSend POST /admin/messages/send：控制台"发送测试消息"。
 // 与 gRPC 写路径同受磁盘水位拒写约束——管理面不该有绕过保护的后门。
 func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
-	if s.writeBlocked != nil && s.writeBlocked.Load() {
+	if s.blocked() {
 		s.httpError(w, http.StatusServiceUnavailable, "磁盘水位超限，写入已暂停")
 		return
 	}
@@ -162,7 +162,7 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 // 属性重新投回原 topic。死信条目保留（审计与再次重发），与 RocketMQ 控制台
 // 行为一致。
 func (s *Server) handleDLQResend(w http.ResponseWriter, r *http.Request) {
-	if s.writeBlocked != nil && s.writeBlocked.Load() {
+	if s.blocked() {
 		s.httpError(w, http.StatusServiceUnavailable, "磁盘水位超限，写入已暂停")
 		return
 	}

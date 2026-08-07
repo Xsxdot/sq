@@ -129,7 +129,7 @@ func run() error {
 	// 注册在 st.Close 的 defer 之后（LIFO 先执行），保证 handler 不会在 store
 	// 关闭后还在读写它。
 	if cfg.AdminListen != "" {
-		adm := admin.New(st, mt, pr, dl, cfg.AdminUsername, cfg.AdminPassword, writeBlocked, sp, reg, logger)
+		adm := admin.New(st, mt, pr, dl, cfg.AdminUsername, cfg.AdminPassword, sys, sp, reg, logger)
 		aln, err := net.Listen("tcp", cfg.AdminListen)
 		if err != nil {
 			return fmt.Errorf("admin HTTP 监听 %s: %w", cfg.AdminListen, err)
