@@ -11,7 +11,7 @@ go build -o sq ./cmd/sq
 ```
 
 用官方 RocketMQ 5.x SDK（Java/Go/Python/C#/C++）直接连接 `127.0.0.1:8081` 收发。
-开启鉴权（`access_key`/`secret_key`）后同样兼容这五种 SDK：官方实现之间的签名
+开启鉴权（配置 `credentials` 列表，见「配置」）后同样兼容这五种 SDK：官方实现之间的签名
 头差异（Credential 段带不带 `/{region}/{service}`、签名十六进制大小写）服务端
 都已容忍；其中 Go SDK 有真实 e2e 用例覆盖，其余按官方源码的头格式对齐。
 当前状态：M6（事务消息）。里程碑与设计见 docs/superpowers/specs/。
@@ -49,8 +49,8 @@ go build -o sq ./cmd/sq
   `EndTransaction` 提交/回滚后才可见；未决半消息服务端按 `txn_check_interval`
   （默认 30s）定期回查，超 `txn_max_checks`（默认 15）次仍无决断即丢弃并记日志；
   事务不可与延时/顺序组合（协议层显式拒绝），控制台发送页也不提供事务类型
-- 认证（M5a）：gRPC 静态 AK/SK 签名校验（默认关闭，`access_key`/`secret_key` 成对
-  配置启用）；Admin API 独立用户名密码登录（成对配置，均空 = 免登录）
+- 认证（M5a）：gRPC 静态 AK/SK 签名校验（默认关闭，配置 `credentials` 列表后启用——
+  每个接入方一对、可单独吊销）；Admin API 独立用户名密码登录（成对配置，均空 = 免登录）
 - Admin API（M5a）：topic/消费组管理、消息 Keys 查询与队列浏览、发送测试消息、
   DLQ 重发、延时与事务视图、总览（见「Admin API」）
 - Prometheus /metrics（M5a）：topic 写入计数、消费组堆积/inflight、延时深度、
@@ -87,8 +87,11 @@ log_level: info
 admin_listen: ":8082"          # Admin HTTP 监听地址；"" = 关闭管理面（含 /metrics）
 admin_username: ""             # 与 admin_password 成对设置；均空 = 免登录，只填一半启动报错
 admin_password: ""
-access_key: ""                 # 与 secret_key 成对设置；均空 = 不做 gRPC 鉴权（默认关闭）
-secret_key: ""
+credentials: []                # gRPC 静态鉴权凭据列表；空/缺省 = 不做鉴权（默认关闭）。
+                               # 每个接入方一对、可单独吊销（从列表移除即失效）：
+                               #   - name: 订单服务    # 可选，仅日志追溯用
+                               #     access_key: AK1
+                               #     secret_key: SK1
 # —— M5b 时序与 Web 控制台 ——
 metrics_retention_hours: 168   # 时序落库保留小时数；0 = 只留内存环的最近 1 小时
 # —— M6 事务消息 ——
@@ -101,6 +104,27 @@ txn_max_checks: 15             # 单条半消息最大回查次数，超限丢�
 ```bash
 ./sq -config sq.yaml
 ```
+
+## 升级注意
+
+- **receipt handle 本版本起带签名**：handle 由服务端 HMAC-SHA256 签名（密钥首次启动
+  生成并持久化，重启不换钥），伪造 handle 直接拒绝。升级重启后，升级前在途的旧 handle
+  （无签名）全部失效，对应消息会按不可见窗口到期重投——这是升级重启这一次的一次性
+  影响，此后新领取的 handle 均带签名。
+- **配置迁移：`access_key`/`secret_key` 标量改为 `credentials` 列表（破坏性变更）**：
+  旧标量写法不再生效（解析时被忽略、不报错），若沿用旧配置，鉴权会**静默回到关闭**，
+  请迁移为列表写法：
+
+  ```yaml
+  # 旧（已失效）
+  access_key: AK1
+  secret_key: SK1
+  # 新
+  credentials:
+    - name: 订单服务    # 可选，仅日志追溯用
+      access_key: AK1
+      secret_key: SK1
+  ```
 
 ## Admin API
 
@@ -168,9 +192,8 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8082/admin/topics
 - gRPC 签名**不绑请求内容**：官方 gRPC 协议本身只对 `x-mq-date-time` 做 HMAC
   （remoting 协议的 ACL 1.0 才对请求字段签名），因此签名可跨请求复用。这是协议
   性质而非本实现的取舍，抗重放只能靠 TLS 与网络隔离。
-- 只有**单组 AK/SK 且只认证不授权**：签名通过即全权限，没有 topic/消费组粒度、
-  没有 Pub/Sub 区分、没有 IP 白名单（RocketMQ ACL 2.0 有这些）。多组 AK/SK 排在
-  v1.0 之前，见里程碑。
+- 支持**多组 AK/SK，但只认证不授权**：签名通过即全权限，没有 topic/消费组粒度、
+  没有 Pub/Sub 区分、没有 IP 白名单（RocketMQ ACL 2.0 有这些）。
 
 ## Web 控制台
 
@@ -214,6 +237,13 @@ I/O 负担），因此这个数最多滞后一分钟。
 构建：`make build` 会先 `make web`（需要 Node）再编 Go；只改后端时用
 `make build-go` 跳过前端构建。未构建控制台时二进制照样能起，访问 `/` 会
 提示先执行 `make web`。
+
+## 开发与测试
+
+- 单元测试：`make test`（主模块 `go test ./...`，不含 e2e）
+- 端到端测试：`test/e2e` 是独立 Go module（自带 go.mod，把官方 SDK 及其约 20 个
+  间接依赖隔离出主模块依赖图）；全量跑 `make e2e`，或
+  `cd test/e2e && go test -tags e2e -count=1 ./...`
 
 ## 限制
 
