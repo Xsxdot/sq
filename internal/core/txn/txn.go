@@ -17,6 +17,7 @@
 package txn
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"log/slog"
@@ -176,3 +177,176 @@ func (t *Manager) ChecksTotal() uint64 { return t.checks.Load() }
 
 // DroppedTotal 返回累计超限丢弃条数。
 func (t *Manager) DroppedTotal() uint64 { return t.dropped.Load() }
+
+// scanInterval 回查扫描间隔。1s 对「几十秒级的回查间隔」精度绰绰有余。
+// var 而非 const：测试需注入小值。
+var scanInterval = time.Second
+
+// maxCheckPerPass 单趟最多处理条数（预算上界，理由同 delay.maxMovePerPass）。
+var maxCheckPerPass = 256
+
+// Notifier 回查命令下发通道。由协议适配层实现（经 Telemetry 流发
+// RecoverOrphanedTransactionCommand）；core 经本接口反向解耦，不感知 proto。
+// 返回 true 表示命令已写入某个 producer 流（不保证客户端处理成功——
+// 客户端的决断最终仍以 EndTransaction 到达）。
+type Notifier interface {
+	RecoverOrphan(m *core.Message, txID string) bool
+}
+
+// RunChecker 阻塞运行回查调度循环，结构与 delay.Scheduler.Run 同构：
+// 启动即跑一趟，此后每 scanInterval 一趟，单趟满额立即续趟。ctx 取消即返回。
+func (t *Manager) RunChecker(ctx context.Context, n Notifier) {
+	t.logger.Info("txn 回查调度器启动",
+		"scan_interval", scanInterval.String(),
+		"check_interval", t.checkInterval.String(), "max_checks", t.maxChecks)
+	tk := time.NewTicker(scanInterval)
+	defer tk.Stop()
+	for {
+		handled, err := t.Pass(n)
+		if err != nil {
+			// 单趟失败只记日志不退出：store 瞬时故障恢复后下一趟自然重试
+			t.logger.Error("txn 回查趟失败", "err", err)
+		} else if handled > 0 {
+			t.logger.Info("txn 回查趟完成", "handled", handled)
+		}
+		if err == nil && handled == maxCheckPerPass {
+			continue // 满额=可能还有到期积压，立即续趟
+		}
+		select {
+		case <-ctx.Done():
+			t.logger.Info("txn 回查调度器退出")
+			return
+		case <-tk.C:
+		}
+	}
+}
+
+// Pass 执行一趟到期回查，返回处理条数（下发+改期、或超限丢弃，均计入）。
+func (t *Manager) Pass(n Notifier) (int, error) {
+	now := time.Now().UnixMilli()
+	// 先收集后处理：Scan 回调里不能开写事务（迭代器与写入交错），拷贝出来
+	type dueEntry struct {
+		txID string
+		raw  []byte
+	}
+	var dues []dueEntry
+	err := t.st.Scan([]byte(store.HalfPrefix), store.HalfScanUpperBound(now), maxCheckPerPass,
+		func(k, v []byte) (bool, error) {
+			_, txID, perr := store.ParseHalfKey(k)
+			if perr != nil {
+				return false, perr
+			}
+			dues = append(dues, dueEntry{txID: txID, raw: append([]byte(nil), v...)})
+			return true, nil
+		})
+	if err != nil {
+		return 0, fmt.Errorf("扫描 half 暂存区: %w", err)
+	}
+	handled := 0
+	for _, d := range dues {
+		m, err := core.DecodeMessage(d.raw)
+		if err != nil {
+			// 坏条目永远无法决断，删除止损并 Error 留痕（同 delay 清坏条目）。
+			// 注意坏条目只能按 idx 定位删除——half key 需要 NextCheckMs，
+			// 而它在 idx 里，所以两键都从 idx 侧重建
+			t.logger.Error("half 条目解码失败，丢弃坏条目", "tx_id", d.txID, "err", err)
+			if err := t.dropLocked(d.txID); err != nil {
+				return handled, err
+			}
+			continue
+		}
+		send, err := t.checkOne(d.txID, m)
+		if err != nil {
+			// 失败即中断本趟：条目未动，下一趟重扫自然重试
+			return handled, err
+		}
+		handled++
+		if send {
+			// 下发放在改期之后、锁之外（见 checkOne 注释），这里只负责调用
+			if !n.RecoverOrphan(m, d.txID) {
+				t.logger.Warn("回查命令无处下发：没有发布该 topic 的在线 producer",
+					"tx_id", d.txID, "topic", m.Topic, "msg_id", m.ID)
+			}
+		}
+	}
+	return handled, nil
+}
+
+// checkOne 处理一条到期半消息：重验存在性→超限丢弃或改期。返回 send=true
+// 表示调用方应继续下发回查命令。
+//
+// 为什么改期在下发之前、且全程持 mu：客户端的 EndTransaction 随时可能并发
+// 到达。改期（搬 half 键）与 End（删 half 键）都以 halfidx 为准且都持 mu，
+// 因此任一方总能看到另一方的完整结果；若先下发后改期，客户端可能在两者的
+// 间隙完成 End，改期一方再按旧键重写就把已决断的事务复活成僵尸。
+// 下发本身是网络操作，放在锁外，避免一个慢客户端拖住全部事务状态迁移。
+func (t *Manager) checkOne(txID string, m *core.Message) (bool, error) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	refRaw, ok, err := t.st.Get(store.HalfIdxKey(txID))
+	if err != nil {
+		return false, fmt.Errorf("读取 halfidx (tx=%s): %w", txID, err)
+	}
+	if !ok {
+		// 扫描后、加锁前已被 End 决断——正常赛跑结果，静默跳过即可
+		return false, nil
+	}
+	ref := &HalfRef{}
+	if err := json.Unmarshal(refRaw, ref); err != nil {
+		return false, fmt.Errorf("解码 halfidx (tx=%s): %w", txID, err)
+	}
+	oldKey := store.HalfKey(ref.NextCheckMs, txID)
+	if ref.Checks >= t.maxChecks {
+		// spec §5：回查上限默认 15 次，超限丢弃并记日志。Error 级：这代表
+		// 一条业务消息被放弃，运维必须能从日志里找到它
+		b := t.st.NewBatch()
+		b.Delete(oldKey, nil)
+		b.Delete(store.HalfIdxKey(txID), nil)
+		if err := t.st.Apply(b); err != nil {
+			return false, fmt.Errorf("丢弃超限半消息 (tx=%s): %w", txID, err)
+		}
+		t.dropped.Add(1)
+		t.logger.Error("半消息回查超限，丢弃", "tx_id", txID, "msg_id", m.ID,
+			"topic", m.Topic, "checks", ref.Checks, "max_checks", t.maxChecks)
+		return false, nil
+	}
+	// 改期：half 键搬到新回查时间、checks+1，同批原子。无论下发是否成功都
+	// 计轮次——producer 永不回来时，半消息也要在 maxChecks 轮后被丢弃，
+	// 而不是永远滞留（每轮间隔 checkInterval，丢弃前给了它完整的重连窗口）
+	next := time.Now().Add(t.checkInterval).UnixMilli()
+	raw, ok, err := t.st.Get(oldKey)
+	if err != nil || !ok {
+		return false, fmt.Errorf("重读 half 条目失败 (tx=%s ok=%v): %w", txID, ok, err)
+	}
+	newRef, _ := json.Marshal(&HalfRef{NextCheckMs: next, Checks: ref.Checks + 1})
+	b := t.st.NewBatch()
+	b.Delete(oldKey, nil)
+	b.Set(store.HalfKey(next, txID), raw, nil)
+	b.Set(store.HalfIdxKey(txID), newRef, nil)
+	if err := t.st.Apply(b); err != nil {
+		return false, fmt.Errorf("半消息改期 (tx=%s): %w", txID, err)
+	}
+	t.checks.Add(1)
+	t.logger.Debug("半消息回查已排期", "tx_id", txID, "msg_id", m.ID,
+		"topic", m.Topic, "check_round", ref.Checks+1, "next_check_ms", next)
+	return true, nil
+}
+
+// dropLocked 按 txID 删除 half 两键（坏条目清理用）。自行加锁。
+func (t *Manager) dropLocked(txID string) error {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	refRaw, ok, err := t.st.Get(store.HalfIdxKey(txID))
+	if err != nil {
+		return fmt.Errorf("读取 halfidx (tx=%s): %w", txID, err)
+	}
+	b := t.st.NewBatch()
+	if ok {
+		ref := &HalfRef{}
+		if err := json.Unmarshal(refRaw, ref); err == nil {
+			b.Delete(store.HalfKey(ref.NextCheckMs, txID), nil)
+		}
+	}
+	b.Delete(store.HalfIdxKey(txID), nil)
+	return t.st.Apply(b)
+}
