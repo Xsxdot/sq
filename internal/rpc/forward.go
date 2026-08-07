@@ -18,7 +18,7 @@ import (
 // 成功返回 OK；handle 无法解析、目标不存在或已被重投覆盖（陈旧句柄）返回
 // INVALID_RECEIPT_HANDLE；存储故障返回 INTERNAL_SERVER_ERROR。
 func (s *Server) ForwardMessageToDeadLetterQueue(ctx context.Context, req *pb.ForwardMessageToDeadLetterQueueRequest) (*pb.ForwardMessageToDeadLetterQueueResponse, error) {
-	g, topic, q, off, attempt, err := receiptDecode(req.GetReceiptHandle())
+	g, topic, q, off, attempt, err := receiptDecode(s.handleSecret, req.GetReceiptHandle())
 	if err != nil {
 		s.logger.Warn("forward 句柄无法解析", "handle", req.GetReceiptHandle(), "msg_id", req.GetMessageId(), "err", err)
 		return &pb.ForwardMessageToDeadLetterQueueResponse{Status: errStatus(pb.Code_INVALID_RECEIPT_HANDLE, err.Error())}, nil

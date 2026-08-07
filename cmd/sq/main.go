@@ -89,10 +89,17 @@ func run() error {
 	// sysinfo 采集器：retention 的水位判定、/metrics 的 sq_disk_* 与控制台的
 	// /admin/system 三方共用它，保证看到的是同一份磁盘事实。
 	sys := sysinfo.New(cfg.DataDir, cfg.DiskWatermarkPercent, writeBlocked, logger)
+	// receipt handle 签名密钥：首次启动生成并持久化，此后原样加载（重启不换钥，
+	// 在途 handle 跨重启仍有效）。必须在 rpc.New 之前加载——Server 用它给
+	// 每个 handle 加签/验签，无密钥则全部 ack/改不可见时长请求会被拒。
+	handleSecret, err := rpc.LoadOrCreateHandleSecret(st, logger)
+	if err != nil {
+		return err
+	}
 	// rpc.Server 需在 metrics 块之前构造：metrics（/metrics 的
 	// sq_connections）与 admin 控制台都要拿 srv.ConnectionCount。rpc.New
 	// 无副作用，上移不改变任何行为。
-	srv := rpc.New(cfg, mt, pr, dl, tx, writeBlocked, logger)
+	srv := rpc.New(cfg, mt, pr, dl, tx, writeBlocked, handleSecret, logger)
 
 	// metrics registry 必须先于任何后台 goroutine 装配：NewRegistry 会写包级
 	// 钩子 store.OnApplyObserve，其契约是「装配阶段设置一次、之后只读」——

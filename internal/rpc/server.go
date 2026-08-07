@@ -42,6 +42,9 @@ type Server struct {
 	dl           *deliver.Deliverer
 	tx           *txn.Manager
 	writeBlocked *atomic.Bool
+	// handleSecret 是 receipt handle 的 HMAC-SHA256 签名密钥（见 handle_secret.go），
+	// 由 main 装配期经 LoadOrCreateHandleSecret 加载/生成后注入。
+	handleSecret []byte
 	logger       *slog.Logger
 
 	// sessions 维护已完成 Settings 协商的 Telemetry 流：事务回查的下发通道
@@ -61,11 +64,13 @@ type Server struct {
 // （ReceiveMessage/AckMessage/ChangeInvisibleDuration），tx 是事务管理器
 // （M6）：SendMessage 把 TRANSACTION 半消息交给它暂存，EndTransaction 由它
 // 决断；writeBlocked 是磁盘水位拒写开关（spec §7，由 retention 循环每趟更新），
-// 为 nil 时不拒写。sessions 是 Telemetry 会话注册表（M6 事务回查通道与连接数
-// 口径，本 task 自建，不依赖外部注入）。
-func New(cfg *config.Config, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, tx *txn.Manager, writeBlocked *atomic.Bool, logger *slog.Logger) *Server {
+// 为 nil 时不拒写；handleSecret 是 receipt handle 的 HMAC-SHA256 签名密钥
+// （LoadOrCreateHandleSecret 产物），nil 时 handle 加签/验签同样按 nil 密钥
+// 计算——校验必失败，正常装配不允许传入 nil。sessions 是 Telemetry 会话注册表
+// （M6 事务回查通道与连接数口径，本 task 自建，不依赖外部注入）。
+func New(cfg *config.Config, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, tx *txn.Manager, writeBlocked *atomic.Bool, handleSecret []byte, logger *slog.Logger) *Server {
 	return &Server{
-		cfg: cfg, mt: mt, pr: pr, dl: dl, tx: tx, writeBlocked: writeBlocked, logger: logger.With("mod", "rpc"),
+		cfg: cfg, mt: mt, pr: pr, dl: dl, tx: tx, writeBlocked: writeBlocked, handleSecret: handleSecret, logger: logger.With("mod", "rpc"),
 		done:     make(chan struct{}),
 		sessions: newSessions(),
 	}

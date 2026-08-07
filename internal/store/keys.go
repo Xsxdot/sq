@@ -260,6 +260,10 @@ func KeyIdxKeyPrefix(topic, key string) []byte {
 	return k[:len(k)-20]
 }
 
+// HandleSecretKey receipt handle 签名密钥：meta/handle_secret。
+// 首次启动生成、永不轮换——轮换会使全部在途 handle 失效，收益为零。
+func HandleSecretKey() []byte { return []byte("meta/handle_secret") }
+
 // KeyIdxTopicPrefix 某 topic 全部索引的扫描下界（retention 清理用）。
 func KeyIdxTopicPrefix(topic string) []byte {
 	return []byte(keyIdxPrefix + topic + "/")

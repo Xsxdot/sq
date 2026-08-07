@@ -252,12 +252,13 @@ func TestQueryAssignmentReturnsAllQueues(t *testing.T) {
 
 // TestReceiptRoundTrip 验证 receipt handle 编解码往返，含新增的 attempt 字段。
 func TestReceiptRoundTrip(t *testing.T) {
-	h := receiptEncode("g", "t", 3, 42, 7)
-	g, topic, q, off, attempt, err := receiptDecode(h)
+	secret := []byte("test-handle-secret")
+	h := receiptEncode(secret, "g", "t", 3, 42, 7)
+	g, topic, q, off, attempt, err := receiptDecode(secret, h)
 	if err != nil || g != "g" || topic != "t" || q != 3 || off != 42 || attempt != 7 {
 		t.Fatalf("receipt round trip: %v %v %v %v %v %v", g, topic, q, off, attempt, err)
 	}
-	if _, _, _, _, _, err := receiptDecode("garbage!!"); err == nil {
+	if _, _, _, _, _, err := receiptDecode(secret, "garbage!!"); err == nil {
 		t.Fatal("非法 handle 应报错")
 	}
 }

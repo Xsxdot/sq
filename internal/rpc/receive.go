@@ -201,7 +201,7 @@ func crc32Checksum(body []byte) string {
 // 透传之上有两条"缺失兜底"（只在生产者什么都没声明时生效，不覆盖已有值）：
 // digest 缺失补算 CRC32、encoding 未声明归一化 IDENTITY，理由见各自的行内注释。
 func (s *Server) toPBMessage(m *core.Message, group string, invisible time.Duration) *pb.Message {
-	handle := receiptEncode(group, m.Topic, m.QueueID, m.Offset, m.DeliveryAttempt)
+	handle := receiptEncode(s.handleSecret, group, m.Topic, m.QueueID, m.Offset, m.DeliveryAttempt)
 	attempt := m.DeliveryAttempt
 	offset := int64(m.Offset)
 	// 重投消息（attempt>=2）的实际不可见时长是 max(客户端要求, 退避下限)：
@@ -302,7 +302,7 @@ func (s *Server) toPBMessage(m *core.Message, group string, invisible time.Durat
 func (s *Server) AckMessage(ctx context.Context, req *pb.AckMessageRequest) (*pb.AckMessageResponse, error) {
 	entries := make([]*pb.AckMessageResultEntry, 0, len(req.GetEntries()))
 	for _, e := range req.GetEntries() {
-		g, topic, q, off, attempt, err := receiptDecode(e.GetReceiptHandle())
+		g, topic, q, off, attempt, err := receiptDecode(s.handleSecret, e.GetReceiptHandle())
 		if err != nil {
 			// 非法 handle 是客户端问题（篡改/损坏/过期协议版本），Warn 即可，
 			// 不是服务端故障。handle 是客户端可控的任意长度字符串，日志里只留
@@ -369,7 +369,7 @@ func ackAggregateStatus(entries []*pb.AckMessageResultEntry) *pb.Status {
 // （group/topic/queue/offset/attempt）在改不可见时长后不变（本操作只碰
 // InflightState.ExpireAtMs，不碰 Attempts），所以不需要重新编码。
 func (s *Server) ChangeInvisibleDuration(ctx context.Context, req *pb.ChangeInvisibleDurationRequest) (*pb.ChangeInvisibleDurationResponse, error) {
-	g, topic, q, off, attempt, err := receiptDecode(req.GetReceiptHandle())
+	g, topic, q, off, attempt, err := receiptDecode(s.handleSecret, req.GetReceiptHandle())
 	if err != nil {
 		s.logger.Warn("改不可见时长 handle 非法", "handle", truncateForLog(req.GetReceiptHandle()), "err", err)
 		return &pb.ChangeInvisibleDurationResponse{Status: errStatus(pb.Code_INVALID_RECEIPT_HANDLE, err.Error())}, nil

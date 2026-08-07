@@ -82,7 +82,7 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 	blocked := &atomic.Bool{}
 	// txn 管理器与生产装配同参数（30s 首查间隔、15 次上限，见 config 默认值）
 	tx := txn.New(st, pr, mt, 30*time.Second, 15, slog.Default())
-	srv := New(cfg, mt, pr, dl, tx, blocked, slog.Default())
+	srv := New(cfg, mt, pr, dl, tx, blocked, []byte("test-handle-secret"), slog.Default())
 
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer(opts...)
