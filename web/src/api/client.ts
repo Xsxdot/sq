@@ -4,6 +4,7 @@
  * 职责：
  *   - 统一 fetch 封装：注入 Bearer token、解析统一错误形状 {"error": "..."}
  *   - 401 时作废本地 token 并广播 UNAUTHORIZED_EVENT，由 Shell 负责跳登录
+ *     （登录端点除外：那里的 401 是凭据错误，只透出后端文案，不走失效拦截）
  *   - 提供 login / logout / probeAuth 三个认证相关动作
  *
  * 边界：
@@ -54,7 +55,11 @@ async function request<T>(path: string, init?: RequestInit): Promise<T> {
 
   const res = await fetch(path, { ...init, headers })
 
-  if (res.status === 401) {
+  // 登录端点的 401 是「用户名或密码错误」，不是会话失效：走失效拦截会把后端
+  // 那句错误文案换成自造的「登录已失效」，登录页头注释承诺的「错误文案统一为
+  // 后端返回的那一句」就兑现不了。登录请求的 401 直接落到下面的统一错误解析，
+  // 把 {"error": ...} 透给页面，也不清 token、不广播未授权事件
+  if (res.status === 401 && path !== '/admin/login') {
     // token 必须当场作废：留着它会让接下来每个请求都白跑一趟再 401
     clearToken()
     window.dispatchEvent(new CustomEvent(UNAUTHORIZED_EVENT))

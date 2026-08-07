@@ -13,7 +13,7 @@
  *   - 死信 topic（%DLQ% 前缀）是系统自建的，不进管理列表：用户没建过它，也不能删它
  *   - 队列数与 retention 建好后不可随意改，表单里给出默认值提示
  */
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { usePoll } from '../hooks/usePoll'
@@ -50,7 +50,7 @@ export default function Topics() {
   const [pending, setPending] = useState<Topic | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [delErr, setDelErr] = useState<string | null>(null)
-  const [delOk, setDelOk] = useState<string | null>(null)
+  const [delOk, setDelOk] = useState<ReactNode | null>(null)
 
   async function onCreate(e: FormEvent) {
     e.preventDefault()
@@ -79,7 +79,9 @@ export default function Topics() {
     setDelErr(null)
     try {
       await api.del(`/admin/topics/${encodeURIComponent(pending.name)}`)
-      setDelOk(`已删除 topic <b>${pending.name}</b>，其下所有消息数据一并清空`)
+      // 横幅是 JSX 不是字符串：Notice 只渲染纯文本 children，
+      // 拼 HTML 字符串会把 <b> 当字面文本显示出来
+      setDelOk(<>已删除 topic <b>{pending.name}</b>，其下所有消息数据一并清空</>)
       setPending(null)
       list.refresh()
     } catch (err) {

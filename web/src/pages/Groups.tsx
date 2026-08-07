@@ -14,7 +14,7 @@
  *   - 死信是组维度：同一组的各行显示同一个值，聚合时取任意一行即可
  *   - 消费组由消费者首次订阅时自动创建，本页只做查看与清理
  */
-import { useState } from 'react'
+import { useState, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { usePoll } from '../hooks/usePoll'
@@ -55,7 +55,7 @@ export default function Groups() {
   const [pending, setPending] = useState<Group | null>(null)
   const [deleting, setDeleting] = useState(false)
   const [delErr, setDelErr] = useState<string | null>(null)
-  const [delOk, setDelOk] = useState<string | null>(null)
+  const [delOk, setDelOk] = useState<ReactNode | null>(null)
 
   async function onDelete() {
     if (!pending) return
@@ -63,7 +63,9 @@ export default function Groups() {
     setDelErr(null)
     try {
       await api.del(`/admin/groups/${encodeURIComponent(pending.name)}`)
-      setDelOk(`已删除消费组 <b>${pending.name}</b>，其消费位点与在途记录一并清除`)
+      // 横幅是 JSX 不是字符串：Notice 只渲染纯文本 children，
+      // 拼 HTML 字符串会把 <b> 当字面文本显示出来
+      setDelOk(<>已删除消费组 <b>{pending.name}</b>，其消费位点与在途记录一并清除</>)
       setPending(null)
       // 列表与总账都要刷新：聚合读数来自总账，只刷列表会残留旧数字
       list.refresh()

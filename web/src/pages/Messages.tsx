@@ -80,8 +80,10 @@ export default function Messages() {
     setBusy(true)
     setErr(null)
     try {
-      // 两条路径与后端一致：填了 Keys 走 keyidx，否则 queue_id 必填走顺序浏览
-      setRows(keys.trim()
+      // 走哪个入口由当前 tab 决定，而不是由 Keys 输入框是否有内容决定：
+      // 否则在「按 Keys 检索」输过内容再切到「按队列浏览」查询，会实际按 Keys
+      // 查、结果标签却按队列模式显示——结果和标签双错
+      setRows(mode === 'keys'
         ? await api.messagesByKey(topic, keys.trim(), Math.max(1, Number(limit) || 32))
         : await api.messagesByQueue(topic, Number(queueId), Number(fromOffset) || 0,
             Math.max(1, Number(limit) || 32)))
