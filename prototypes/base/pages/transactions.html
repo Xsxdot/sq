@@ -1,0 +1,170 @@
+<!--
+  sq 控制台原型 · 事务（半消息）
+
+  职责：
+    - 列出尚未决断的待决事务：事务ID、消息ID、目标 topic、已回查次数、
+      下一次回查时间与暂存时刻，供排查「事务卡住 / 回查异常」时定位
+    - 按下次回查时间升序，最紧迫（最早要回查）的排在最前
+
+  对应 M6 Admin API：GET /admin/transactions
+
+  边界：
+    - 零依赖、纯 mock、file:// 直开；数据只取自 shared/mock.js，页面内不另造假数据
+    - 列表是「头部 limit 条」样例而不是全量：API 返回按 next_check 升序的前 limit 条，
+      总数不承诺，页面上如实标注（与真实页面一致）
+    - 只读不操作：提交/回滚由生产者 SDK 决断，回查由 broker 调度下发，本页不提供写入口
+    - 与真实页面的差异：仅 limit 默认值不同（原型 32、真实 64 与后端 queryUint(limit, 64)
+      一致），结构、交互、列定义逐项镜像 web/src/pages/Transactions.tsx
+-->
+<meta charset="utf-8">
+<title>sq 控制台 · 事务</title>
+<link rel="stylesheet" href="../shared/app.css">
+<script src="../shared/mock.js"></script>
+
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><b>sq</b><span>SIMPLE QUEUE</span></div>
+    <nav>
+      <a href="../index.html" class="nav-item">总览</a>
+      <div class="nav-group">资源</div>
+      <a href="topics.html" class="nav-item">Topic</a>
+      <a href="groups.html" class="nav-item">消费组</a>
+      <a href="delay.html" class="nav-item">延时队列</a>
+      <a href="transactions.html" class="nav-item active" aria-current="page">事务</a>
+      <div class="nav-group">排查</div>
+      <a href="messages.html" class="nav-item">消息查询</a>
+      <a href="dlq.html" class="nav-item">死信队列</a>
+      <a href="send.html" class="nav-item">发送测试消息</a>
+    </nav>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <span class="page-title">事务</span>
+      <span class="spacer"></span>
+      <span class="endpoint">127.0.0.1:8081</span>
+      <span class="live"><i class="dot"></i>5s 后刷新</span>
+      <button class="btn">立即刷新</button>
+      <a class="btn" href="login.html">退出登录</a>
+    </header>
+
+    <main class="content">
+      <div class="strip">
+        <div class="stat">
+          <div>
+            <div class="stat-label">待决事务</div>
+            <!-- 列表只是头部 limit 条样例，如实标注「上限」，不冒充全量总数 -->
+            <div class="stat-val" id="v-count"></div>
+            <small id="v-cap">上限 32 条</small>
+          </div>
+        </div>
+        <div class="stat">
+          <div>
+            <div class="stat-label">最近一次回查</div>
+            <div class="stat-val" id="v-next"></div>
+          </div>
+        </div>
+        <div class="stat">
+          <div>
+            <div class="stat-label">涉及 TOPIC</div>
+            <div class="stat-val" id="v-topics"></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="filters">
+        <label class="panel-note" for="limit">返回条数</label>
+        <select id="limit">
+          <option value="32" selected>32</option>
+          <option value="64">64</option>
+          <option value="128">128</option>
+        </select>
+        <span class="count" id="count"></span>
+      </div>
+
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-title">待决事务</span>
+          <span class="panel-note">按下次回查时间升序，最紧迫的排在最前</span>
+        </div>
+
+        <table>
+          <thead>
+            <tr>
+              <th style="width:220px">事务ID</th>
+              <th style="width:220px">MSGID</th>
+              <th style="width:132px">TOPIC</th>
+              <th class="r" style="width:88px">已回查</th>
+              <th class="r" style="width:158px">下次回查</th>
+              <th class="r" style="width:158px">暂存时刻</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+
+        <div class="empty" id="empty" hidden>
+          <p>暂无待决事务</p>
+          <div class="hint">半消息完成提交或回滚后即离开待决区；若预期有事务却看不到，去「消息查询」按 topic 找已决断的消息</div>
+        </div>
+
+        <div class="panel-body">
+          <div class="panel-note">
+            本页展示的是<b>尚未决断</b>的半消息：事务消息发送后先以半消息形式暂存，
+            待生产者提交或回滚（或回查后由 SDK 决断）才会写入目标 topic 的队列。
+            <br />
+            回查由 broker 按 next_check 时间调度，超过最大次数仍无决断的半消息将被丢弃；
+            topic 列可跳转查看该主题的队列情况，本页不提供任何写操作。
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<script>
+  const tbody = document.getElementById('tbody');
+  const emptyBox = document.getElementById('empty');
+  const limitSel = document.getElementById('limit');
+
+  // 事务ID/消息ID 都是长 ID，表格里截断展示，title 兜住全文（同真实页面）
+  const trunc = s => s.length > 24 ? `${s.slice(0, 24)}…` : s;
+
+  // 副本再排序，避免就地打乱 SQ.transactions 影响其它页面（同一份对象被多页共享）
+  const sorted = SQ.transactions.slice().sort((a, b) => a.nextCheckMs - b.nextCheckMs);
+
+  /* ---------- 顶部读数 ---------- */
+  document.getElementById('v-next').innerHTML = sorted.length
+    ? `${SQ.until(sorted[0].nextCheckMs)}<small>${SQ.time(sorted[0].nextCheckMs)}</small>`
+    : '<small>无</small>';
+  document.getElementById('v-topics').textContent = new Set(sorted.map(d => d.topic)).size;
+
+  /* ---------- 列表 ---------- */
+  function render() {
+    const limit = +limitSel.value;
+    const rows = sorted.slice(0, limit);
+    tbody.innerHTML = '';
+
+    rows.forEach(d => {
+      // 十分钟内就要回查的标黄：排查「为什么还没决断」时，这批是马上就要动的
+      const soon = d.nextCheckMs - SQ.NOW <= 600000;
+      const tr = document.createElement('tr');
+      tr.innerHTML = `
+        <td class="mono" title="${d.txId}">${trunc(d.txId)}</td>
+        <td class="mono" title="${d.msgId}">${trunc(d.msgId)}</td>
+        <td class="name"><a href="topic-detail.html?name=${d.topic}">${d.topic}</a></td>
+        <td class="num">${d.checks}</td>
+        <td class="num"><span class="badge ${soon ? 'warn' : ''}">${SQ.until(d.nextCheckMs)}</span>
+          <small class="muted" style="margin-left:4px">${SQ.time(d.nextCheckMs)}</small></td>
+        <td class="num muted">${SQ.time(d.bornMs)}</td>`;
+      tbody.appendChild(tr);
+    });
+
+    emptyBox.hidden = rows.length > 0;
+    document.getElementById('v-count').textContent = SQ.fmt(rows.length);
+    document.getElementById('v-cap').textContent = `上限 ${limit} 条`;
+    document.getElementById('count').textContent = `${rows.length} 条待决（上限 ${limit}）`;
+  }
+
+  limitSel.addEventListener('change', render);
+  render();
+</script>

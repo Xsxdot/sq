@@ -2,7 +2,7 @@
   sq 控制台原型 · 总览
 
   职责：
-    - 上半屏给整体信号：六项读数 + 写入/落后趋势图（1h/24h/7d）
+    - 上半屏给整体信号：七项业务读数（写入/总落后/在途/延时待投/死信/连接数/TOPIC·消费组）+ 写入/落后趋势图（1h/24h/7d）
     - 下半屏给全部消费关系总账，可逐行展开到队列级并就地发起操作
 
   边界：
@@ -23,6 +23,7 @@
       <a href="pages/topics.html" class="nav-item">Topic</a>
       <a href="pages/groups.html" class="nav-item">消费组</a>
       <a href="pages/delay.html" class="nav-item">延时队列</a>
+      <a href="pages/transactions.html" class="nav-item">事务</a>
       <div class="nav-group">排查</div>
       <a href="pages/messages.html" class="nav-item">消息查询</a>
       <a href="pages/dlq.html" class="nav-item">死信队列</a>
@@ -55,11 +56,14 @@
           <svg width="60" height="22" id="s-fly"></svg>
         </div>
         <div class="stat">
-          <div><div class="stat-label">延时待投</div><div class="stat-val" id="v-dly"></div></div>
+          <div><div class="stat-label">延时待投</div><div class="stat-val" id="v-dly"></div><small id="v-half"></small></div>
           <svg width="60" height="22" id="s-dly"></svg>
         </div>
         <div class="stat">
           <div><div class="stat-label">死信</div><div class="stat-val bad" id="v-dlq"></div></div>
+        </div>
+        <div class="stat">
+          <div><div class="stat-label">连接数</div><div class="stat-val" id="v-conn"></div><small>在线</small></div>
         </div>
         <div class="stat">
           <div><div class="stat-label">TOPIC / 消费组</div><div class="stat-val" id="v-res"></div></div>
@@ -138,7 +142,10 @@
   document.getElementById('v-lag').textContent = SQ.fmt(o.lag);
   document.getElementById('v-fly').textContent = SQ.fmt(o.inflight);
   document.getElementById('v-dly').textContent = SQ.fmt(o.delayDepth);
+  // 半消息是暂存区里的另一段生命周期，与延时同属「待处置」，并入同一深度卡区展示（同真实页面）
+  document.getElementById('v-half').textContent = `半消息 ${SQ.fmt(o.halfDepth)}`;
   document.getElementById('v-dlq').textContent = SQ.fmt(o.dlq);
+  document.getElementById('v-conn').textContent = SQ.fmt(o.connections);
   document.getElementById('v-res').textContent = `${o.topics} / ${o.groups}`;
 
   // 系统读数的样例值。磁盘故意取一个逼近水位但未触发的数：

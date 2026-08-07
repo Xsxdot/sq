@@ -2,11 +2,11 @@
  * sq 控制台原型 · 共享 mock 数据与渲染工具
  *
  * 职责：
- *   - 提供全站唯一一份假数据（topic / 消费组 / 消费关系 / 消息 / 死信 / 延时）
+ *   - 提供全站唯一一份假数据（topic / 消费组 / 消费关系 / 消息 / 死信 / 延时 / 事务）
  *   - 提供 offset 带、迷你折线、数字与时间格式化等跨页复用的渲染函数
  *
  * 边界：
- *   - 不发任何真实请求；字段名刻意对齐 M5a Admin API 的返回结构，
+ *   - 不发任何真实请求；字段名刻意对齐 Admin API 的返回结构，
  *     方便后续真实页面照着替换数据源而不用改渲染逻辑
  *   - 不做路由或状态管理，页面之间靠相对链接 + query 参数传递
  *   - 用固定基准时间而不是 Date.now()，保证每次打开页面数据一致、便于比对
@@ -72,7 +72,17 @@ window.SQ = (function () {
     { msgId: '01F8MECHZX3TBDSZ7XR8H8JHC6', topic: 'delay.remind', deliverAtMs: NOW + 3600000, keys: 'ORD-20260806-8840', body: '{"orderId":"ORD-20260806-8840","action":"unpaid_remind"}' },
   ];
 
-  const overview = { qps: 2847, qpsPeak1h: 4180, lag: 5965, inflight: 170, delayDepth: 1204, dlq: 39, topics: 5, groups: 3 };
+  // 待决事务（M6）：字段对齐 GET /admin/transactions 的返回结构
+  // （txId/msgId/nextCheckMs/bornMs 为 camelCase 对应 tx_id/msg_id/next_check_ms/born_ms）。
+  // 造数据时给一条回查次数较高的（check 11），让「已回查」列看得见数值
+  const transactions = [
+    { txId: '01F8MECHZX3TBDSZ7XR8H8JHC0', msgId: '01F8MECHZX3TBDSZ7XR8H8JHB1', topic: 'order.created', nextCheckMs: NOW + 30000, checks: 1, bornMs: NOW - 60000 },
+    { txId: '01F8MECHZX3TBDSZ7XR8H8JHC1', msgId: '01F8MECHZX3TBDSZ7XR8H8JHB2', topic: 'delay.remind', nextCheckMs: NOW + 600000, checks: 11, bornMs: NOW - 5400000 },
+    { txId: '01F8MECHZX3TBDSZ7XR8H8JHC2', msgId: '01F8MECHZX3TBDSZ7XR8H8JHB3', topic: 'sms.notify', nextCheckMs: NOW + 900000, checks: 0, bornMs: NOW - 4000 },
+    { txId: '01F8MECHZX3TBDSZ7XR8H8JHC3', msgId: '01F8MECHZX3TBDSZ7XR8H8JHB4', topic: 'order.created', nextCheckMs: NOW + 1800000, checks: 2, bornMs: NOW - 120000 },
+  ];
+
+  const overview = { qps: 2847, qpsPeak1h: 4180, lag: 5965, inflight: 170, delayDepth: 1204, halfDepth: 3, dlq: 39, connections: 12, topics: 5, groups: 3 };
 
   /* ---------------- 工具函数 ---------------- */
 
@@ -216,7 +226,7 @@ window.SQ = (function () {
     syncToggle();
   });
 
-  return { NOW, topics, groups, consumption, messages, dlq, delay, overview,
+  return { NOW, topics, groups, consumption, messages, dlq, delay, transactions, overview,
            fmt, ago, until, time, dur, wave, linePath, spark, ribbon, markOf,
            lagOf, maxLag, byGroup, byTopic, topic, group, notify, toggleTheme };
 })();

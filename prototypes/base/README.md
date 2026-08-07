@@ -1,6 +1,6 @@
 # sq 控制台原型站
 
-sq 内嵌 Web 控制台（里程碑 M5b）的**形态基准**。零依赖静态页，`file://` 双击 `index.html` 直接打开即可点击浏览。
+sq 内嵌 Web 控制台（里程碑 M5b 起建，M6 事务消息同步进本基准）的**形态基准**。零依赖静态页，`file://` 双击 `index.html` 直接打开即可点击浏览。
 
 ## 与常规原型站的一点不同
 
@@ -21,6 +21,7 @@ sq 内嵌 Web 控制台（里程碑 M5b）的**形态基准**。零依赖静态�
 | pages/messages.html | 消息查询（Keys / 按队列浏览） | `/messages` | `GET /admin/messages` | 已实现（M5b） | `web/src/pages/Messages.tsx` |
 | pages/dlq.html | 死信查看与单条重发 | `/dlq` | `GET /admin/messages`、`POST /admin/dlq/{group}/resend` | 已实现（M5b） | `web/src/pages/Dlq.tsx` |
 | pages/delay.html | 延时队列视图 | `/delay` | `GET /admin/delay` | 已实现（M5b） | `web/src/pages/Delay.tsx` |
+| pages/transactions.html | 事务（待决半消息）视图 | `/transactions` | `GET /admin/transactions` | 已实现（M6） | `web/src/pages/Transactions.tsx` |
 | pages/send.html | 发送测试消息 | `/send` | `POST /admin/messages/send` | 已实现（M5b） | `web/src/pages/Send.tsx` |
 | pages/login.html | 登录 | `/login` | `POST /admin/login` | 已实现（M5b） | `web/src/pages/Login.tsx` |
 
