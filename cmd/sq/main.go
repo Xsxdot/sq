@@ -28,6 +28,7 @@ import (
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
 	"github.com/xushixin/sq/internal/core/retention"
+	"github.com/xushixin/sq/internal/core/txn"
 	"github.com/xushixin/sq/internal/metrics"
 	"github.com/xushixin/sq/internal/rpc"
 	"github.com/xushixin/sq/internal/store"
@@ -76,6 +77,11 @@ func run() error {
 	pr := produce.New(st, mt, logger)
 	dl := deliver.New(st, mt, pr, logger)
 
+	// 事务管理器。构造顺序有讲究：rpc.Server 要拿它处理 Send/EndTransaction，
+	// 回查调度器又要拿 rpc.Server 当 Notifier（下发回查命令）——先建 Manager、
+	// 再建 Server、最后起调度 goroutine，依赖环在构造期就被拆开。
+	tx := txn.New(st, pr, mt, cfg.TxnInterval(), cfg.TxnMaxChecks, logger)
+
 	// writeBlocked 由 retention 每趟探测磁盘后更新，rpc.SendMessage 据此拒写。
 	// 必须先于 metrics registry 创建：registry 里的系统 Collector 要拿着
 	// sysinfo.Reporter，而 Reporter 持有的正是这个开关的指针。
@@ -83,6 +89,10 @@ func run() error {
 	// sysinfo 采集器：retention 的水位判定、/metrics 的 sq_disk_* 与控制台的
 	// /admin/system 三方共用它，保证看到的是同一份磁盘事实。
 	sys := sysinfo.New(cfg.DataDir, cfg.DiskWatermarkPercent, writeBlocked, logger)
+	// rpc.Server 需在 metrics 块之前构造：metrics（/metrics 的
+	// sq_connections）与 admin 控制台都要拿 srv.ConnectionCount。rpc.New
+	// 无副作用，上移不改变任何行为。
+	srv := rpc.New(cfg, mt, pr, dl, tx, writeBlocked, logger)
 
 	// metrics registry 必须先于任何后台 goroutine 装配：NewRegistry 会写包级
 	// 钩子 store.OnApplyObserve，其契约是「装配阶段设置一次、之后只读」——
@@ -124,6 +134,16 @@ func run() error {
 	dlyWG.Add(1)
 	go func() { defer dlyWG.Done(); ds.Run(dlyCtx) }()
 	defer func() { dlyCancel(); dlyWG.Wait() }()
+
+	// txn 回查调度器：到期未决半消息经 Telemetry 下发回查。停机顺序同
+	// retention/delay——defer LIFO 保证先取消并等待调度 goroutine 退出，
+	// 再轮到 st.Close。停机窗口内的回查下发会因流已收尾而写失败，
+	// RecoverOrphan 按 Warn 处理、条目已改期，重启后自然继续。
+	txnCtx, txnCancel := context.WithCancel(context.Background())
+	var txnWG sync.WaitGroup
+	txnWG.Add(1)
+	go func() { defer txnWG.Done(); tx.RunChecker(txnCtx, srv) }()
+	defer func() { txnCancel(); txnWG.Wait() }()
 
 	// Admin HTTP（含 /metrics）。admin_listen 为空 = 关闭。停机顺序：本 defer
 	// 注册在 st.Close 的 defer 之后（LIFO 先执行），保证 handler 不会在 store
@@ -174,7 +194,6 @@ func run() error {
 		logger.Info("gRPC AK/SK 认证已启用", "access_key", cfg.AccessKey)
 	}
 	gs := grpc.NewServer(gopts...)
-	srv := rpc.New(cfg, mt, pr, dl, writeBlocked, logger)
 	srv.Register(gs)
 
 	// signal.Notify 必须先于 gs.Serve 的 goroutine 注册：如果反过来，
@@ -188,7 +207,8 @@ func run() error {
 	errCh := make(chan error, 1)
 	go func() { errCh <- gs.Serve(lis) }()
 	logger.Info("sq 已启动", "grpc_listen", cfg.GRPCListen,
-		"advertise", cfg.AdvertiseHost, "data_dir", cfg.DataDir, "fsync", cfg.Fsync)
+		"advertise", cfg.AdvertiseHost, "data_dir", cfg.DataDir, "fsync", cfg.Fsync,
+		"txn_check_interval", cfg.TxnCheckInterval, "txn_max_checks", cfg.TxnMaxChecks)
 
 	select {
 	case sig := <-sigCh:
