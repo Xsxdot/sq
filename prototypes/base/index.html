@@ -66,6 +66,22 @@
         </div>
       </div>
 
+      <!-- 系统读数条：业务信号之下的第二梯队。四项都是「排查时才看、但看不到就抓瞎」的数 -->
+      <div class="strip">
+        <div class="stat">
+          <div><div class="stat-label">磁盘使用</div><div class="stat-val" id="v-disk"></div></div>
+        </div>
+        <div class="stat">
+          <div><div class="stat-label">数据目录</div><div class="stat-val" id="v-datadir"></div></div>
+        </div>
+        <div class="stat">
+          <div><div class="stat-label">GO 运行时内存</div><div class="stat-val" id="v-mem"></div></div>
+        </div>
+        <div class="stat">
+          <div><div class="stat-label">运行时长 / 协程</div><div class="stat-val" id="v-proc"></div></div>
+        </div>
+      </div>
+
       <section class="panel">
         <div class="panel-head">
           <span class="panel-title">写入速率与落后</span>
@@ -124,6 +140,14 @@
   document.getElementById('v-dly').textContent = SQ.fmt(o.delayDepth);
   document.getElementById('v-dlq').textContent = SQ.fmt(o.dlq);
   document.getElementById('v-res').textContent = `${o.topics} / ${o.groups}`;
+
+  // 系统读数的样例值。磁盘故意取一个逼近水位但未触发的数：
+  // 原型要能同时看清「正常态长什么样」和「离触发有多近」
+  document.getElementById('v-disk').innerHTML = '71.4<small>% / 水位 85%</small>';
+  document.getElementById('v-datadir').innerHTML = '2.4 GB<small>可用 128.6 GB</small>';
+  document.getElementById('v-mem').innerHTML = '86.2 MB<small>/ 申请 142.0 MB</small>';
+  document.getElementById('v-proc').innerHTML = '3d7h<small>/ 42</small>';
+
   SQ.spark(document.getElementById('s-qps'), SQ.wave(24, 2400, 1200, 1), 'var(--chart-1)');
   SQ.spark(document.getElementById('s-lag'), SQ.wave(24, 5000, 3000, 2), 'var(--chart-2)');
   SQ.spark(document.getElementById('s-fly'), SQ.wave(24, 160, 90, 3), 'var(--text-3)');

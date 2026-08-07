@@ -51,6 +51,12 @@
     </header>
 
     <main class="content">
+      <!-- 磁盘拒写横幅：仅当服务端 write_blocked=true 时渲染，其余时候整段不存在。
+           放在外壳而不是某个页面里，是因为「发不进去」可能在任何页面被察觉 —— 
+           尤其是发送测试消息页。复用 .notice.bad，不需要新 CSS -->
+      <div class="notice bad">
+        <span><b>磁盘水位已触发，服务当前拒写保读。</b>已用 86.3%，水位线 85%。生产端会收到写入失败，消费不受影响；清理磁盘或调高 disk_watermark_percent 后自动恢复。</span>
+      </div>
       <!-- 页面主体内容放这里 -->
     </main>
   </div>
