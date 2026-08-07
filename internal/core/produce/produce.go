@@ -9,6 +9,7 @@
 // 边界：
 //   - 延时判定入口在此（AppendDelay），到期搬运是 delay 包的事；事务（M6）仍在 Append 之前分流
 //   - 不做消费可见性判断（deliver 的事）
+//   - 锁结构：p.mu 护共享 map；每 (topic,queue) 一把锁护写入；delayMu 护延时暂存
 package produce
 
 import (
@@ -27,25 +28,41 @@ import (
 // MaxBodySize 消息体上限（spec §7）。
 const MaxBodySize = 4 * 1024 * 1024
 
+// queueState 单个 (topic, queue) 的写入状态。qs.mu 串行化同队列的
+// offset 分配与落盘；不同队列各持各锁，Apply 得以并发进入 Pebble，
+// group commit 才能把并发 fsync 合并（B1 的全部意义所在）。
+type queueState struct {
+	mu     sync.Mutex
+	next   uint64 // 下一 offset（懒加载自 alloc/ key）
+	loaded bool
+}
+
 // Producer 写入引擎。并发安全。
 type Producer struct {
 	st     *store.Store
 	mt     *meta.Meta
 	logger *slog.Logger
 
-	mu          sync.Mutex
-	next        map[string]uint64 // "topic/4Bqid" -> 下一 offset（内存缓存，与 alloc/ key 同步）
-	delayNext   uint64            // 下一延时 seq（内存缓存，与 delayalloc key 同步；delayLoaded 后有效）
+	// mu 只护共享 map（qstates/rr/wakers）——临界区内不再有任何 I/O。
+	// 旧实现的单一全局锁跨越 store.Apply（fsync 在内），使所有队列的写入
+	// 全局串行、group commit 失效，见 git 历史中原锁注释的完整推导。
+	mu      sync.Mutex
+	qstates map[string]*queueState
+	rr      map[string]uint32
+	wakers  map[string]chan struct{}
+
+	// delayMu 护延时暂存区的 seq 分配与落盘（单一全局计数器，天然串行；
+	// 独立成锁是为了不与普通写入互相阻塞）。
+	delayMu     sync.Mutex
+	delayNext   uint64
 	delayLoaded bool
-	rr          map[string]uint32        // topic -> 轮询游标
-	wakers      map[string]chan struct{} // topic -> 长轮询唤醒信号
 }
 
-// New 构造 Producer。next 缓存懒加载（首写某队列时读一次 alloc/ key）。
+// New 构造 Producer。offset 缓存懒加载（首写某队列时读一次 alloc/ key）。
 func New(st *store.Store, mt *meta.Meta, logger *slog.Logger) *Producer {
 	return &Producer{
 		st: st, mt: mt, logger: logger.With("mod", "produce"),
-		next: map[string]uint64{}, rr: map[string]uint32{}, wakers: map[string]chan struct{}{},
+		qstates: map[string]*queueState{}, rr: map[string]uint32{}, wakers: map[string]chan struct{}{},
 	}
 }
 
@@ -57,7 +74,7 @@ func qkey(topic string, q uint32) string { return fmt.Sprintf("%s/%d", topic, q)
 // 条目）等「消息写入必须与另一处状态变更同生共死」的场景。extra 可为 nil。
 //
 // 注意：extra 只应操作与本消息无键冲突的 key；extra 内不得再调用本 Producer
-// 的任何方法（p.mu 不可重入）。
+// 的任何方法（p.mu 与 queueState.mu 均不可重入）。
 func (p *Producer) AppendWith(m *core.Message, extra func(b *pebble.Batch)) (*core.Message, error) {
 	if len(m.Body) == 0 || len(m.Body) > MaxBodySize {
 		return nil, fmt.Errorf("消息体大小非法: %d（上限 %d）", len(m.Body), MaxBodySize)
@@ -74,24 +91,8 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *pebble.Batch)) (*co
 	}
 	m.StoreAtMs = time.Now().UnixMilli()
 
-	// 关于这把锁的范围——已知的吞吐瓶颈，先记在这里，不在 M1 动它：
-	//
-	// p.mu 是整个 Producer 唯一的一把锁，覆盖队列选择、offset 分配、store.Apply
-	// （fsync 就发生在里面）以及唤醒长轮询。也就是说所有 topic 的所有生产者都在
-	// 这一个临界区里排队，任意两次 Apply 永远不可能重叠。
-	//
-	// 由此产生的直接后果：Pebble 的 group commit 在 sq 上是失效的。它的原理是把
-	// 同一时刻并发到达的多个 commit 合并成一次 fsync 摊薄开销，而设计文档正是
-	// 以此为依据才敢把"默认同步刷盘"当成可以接受的默认值。既然并发不存在，
-	// 也就无从合并——持续写入时的实际形态是每条消息一次 fsync，且全局单线程。
-	//
-	// 为什么现在不改：正确的做法是把锁按队列拆开，或者在进入 Apply 之前就放锁
-	// （offset 一旦分配完，写入本身不需要互斥）。但两者都会改变"offset 分配与
-	// 落盘之间是否可能交错"的前提，而 M1 没有任何吞吐量基准，改完既无法证明变快，
-	// 也无法证明没有引入乱序。等到真正测吞吐时再连同基准一起做。
+	// 段 1（p.mu）：队列选择 + 取/建 queueState。纯内存，不含 I/O。
 	p.mu.Lock()
-	defer p.mu.Unlock()
-	// 队列选择：MessageGroup 定死队列（顺序语义的根基，M4 复用）；否则轮询
 	if m.MessageGroup != "" {
 		h := fnv.New32a()
 		h.Write([]byte(m.MessageGroup))
@@ -100,13 +101,26 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *pebble.Batch)) (*co
 		m.QueueID = p.rr[m.Topic] % tc.Queues
 		p.rr[m.Topic]++
 	}
-	off, err := p.nextOffsetLocked(m.Topic, m.QueueID)
+	k := qkey(m.Topic, m.QueueID)
+	qs, ok := p.qstates[k]
+	if !ok {
+		qs = &queueState{}
+		p.qstates[k] = qs
+	}
+	p.mu.Unlock()
+
+	// 段 2（qs.mu）：offset 分配 + 编码 + 落盘。同队列串行（offset 顺序 ==
+	// 落盘顺序，FIFO 根基），跨队列并行（group commit 合并 fsync）。
+	qs.mu.Lock()
+	off, err := qs.nextOffsetLocked(p.st, m.Topic, m.QueueID)
 	if err != nil {
+		qs.mu.Unlock()
 		return nil, err
 	}
 	m.Offset = off
 	raw, err := core.EncodeMessage(m)
 	if err != nil {
+		qs.mu.Unlock()
 		return nil, err
 	}
 	// 消息体与 offset 计数器同一 Batch 原子提交：Apply 要么两者都落盘要么都不落盘，
@@ -127,12 +141,19 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *pebble.Batch)) (*co
 		extra(b)
 	}
 	if err := p.st.Apply(b); err != nil {
+		qs.mu.Unlock()
 		return nil, fmt.Errorf("写入消息 %s (topic=%s q=%d off=%d): %w", m.ID, m.Topic, m.QueueID, m.Offset, err)
 	}
-	// 仅在 Apply 成功后才更新内存缓存：失败的写不能让内存计数器"抢跑"，
-	// 否则下次 Append 会因为缓存命中而跳过盘上校验，白白烧掉一个从未真正写出的 offset。
-	p.next[qkey(m.Topic, m.QueueID)] = off + 1
+	// Apply 成功才推进（失败的写不能烧 offset，原注释原样保留）
+	qs.next = off + 1
+	qs.loaded = true
+	qs.mu.Unlock()
+
+	// 段 3（p.mu）：唤醒长轮询。必须在落盘成功之后——被唤醒的订阅者读 store
+	// 必能看到这条消息。
+	p.mu.Lock()
 	p.wakeLocked(m.Topic)
+	p.mu.Unlock()
 	p.logger.Debug("消息已写入", "topic", m.Topic, "queue", m.QueueID, "offset", m.Offset, "msg_id", m.ID, "keys", len(m.Keys))
 	return m, nil
 }
@@ -175,8 +196,8 @@ func (p *Producer) AppendDelay(m *core.Message) (*core.Message, error) {
 	if err != nil {
 		return nil, err
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
+	p.delayMu.Lock()
+	defer p.delayMu.Unlock()
 	seq, err := p.nextDelaySeqLocked()
 	if err != nil {
 		return nil, err
@@ -196,7 +217,7 @@ func (p *Producer) AppendDelay(m *core.Message) (*core.Message, error) {
 }
 
 // nextDelaySeqLocked 取下一延时 seq。缓存未命中时读盘上 delayalloc 计数器，
-// 崩溃/重启后 O(1) 恢复。调用方必须持有 p.mu。
+// 崩溃/重启后 O(1) 恢复。调用方必须持有 p.delayMu。
 func (p *Producer) nextDelaySeqLocked() (uint64, error) {
 	if p.delayLoaded {
 		return p.delayNext, nil
@@ -214,16 +235,15 @@ func (p *Producer) nextDelaySeqLocked() (uint64, error) {
 // Append 写入一条普通消息（M1 签名保持不变）。
 func (p *Producer) Append(m *core.Message) (*core.Message, error) { return p.AppendWith(m, nil) }
 
-// nextOffsetLocked 取该队列下一 offset。缓存未命中时读盘上 alloc/ 计数器——
-// 崩溃后靠它 O(1) 恢复，且因与消息同 Batch 提交，绝不会分配已用过的 offset。
-func (p *Producer) nextOffsetLocked(topic string, q uint32) (uint64, error) {
-	k := qkey(topic, q)
-	if off, ok := p.next[k]; ok {
-		return off, nil
+// nextOffsetLocked 取该队列下一 offset，懒加载盘上 alloc/ 计数器。
+// 调用方必须持有 qs.mu。
+func (qs *queueState) nextOffsetLocked(st *store.Store, topic string, q uint32) (uint64, error) {
+	if qs.loaded {
+		return qs.next, nil
 	}
-	v, ok, err := p.st.Get(store.AllocKey(topic, q))
+	v, ok, err := st.Get(store.AllocKey(topic, q))
 	if err != nil {
-		return 0, fmt.Errorf("读取 offset 计数器 %s: %w", k, err)
+		return 0, fmt.Errorf("读取 offset 计数器 %s/%d: %w", topic, q, err)
 	}
 	if !ok {
 		return 0, nil
