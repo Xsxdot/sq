@@ -14,7 +14,7 @@
  */
 import type {
   Overview, TimeSeries, LedgerRow, Topic, TopicDetail,
-  Group, GroupDetail, Message, DelayEntry, SendResult,
+  Group, GroupDetail, Message, DelayEntry, SendResult, SystemInfo,
 } from './types'
 
 /** 本地 token 的存储键。与 index.html 里的主题键同一命名风格。 */
@@ -128,6 +128,8 @@ export const api = {
 
   /** 总览卡片数据。 */
   overview: () => request<Overview>('/admin/overview'),
+  /** 运行态系统读数（磁盘 / 数据目录 / Go 内存 / 拒写状态）。 */
+  system: () => request<SystemInfo>('/admin/system'),
   /** 时序曲线，range 决定跨度与粒度。 */
   timeseries: (range: '1h' | '24h' | '7d') => request<TimeSeries>(`/admin/timeseries?range=${range}`),
   /** 消费关系总账（组 × 主题 × 队列）。 */

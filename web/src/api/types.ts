@@ -23,6 +23,32 @@ export interface Overview {
   qps: number | null
 }
 
+/** 数据目录所在文件系统的容量读数。 */
+export interface DiskUsage {
+  total_bytes: number
+  free_bytes: number
+  /** 与 df 同口径的已用百分比 */
+  used_percent: number
+}
+
+/** 运行态系统读数（GET /admin/system）。 */
+export interface SystemInfo {
+  /** null = 探测失败或非 unix 平台，不是「磁盘为空」 */
+  disk: DiskUsage | null
+  /** 拒写水位线，0 = 水位保护关闭 */
+  watermark_percent: number
+  /** true = 当前拒写保读，生产端写入全部失败 */
+  write_blocked: boolean
+  /** null = 尚未成功统计过 */
+  data_dir_bytes: number | null
+  /** Go 运行时口径的堆占用，不是进程 RSS */
+  go_heap_inuse_bytes: number
+  /** Go 运行时向 OS 申请的总量 */
+  go_sys_bytes: number
+  goroutines: number
+  uptime_seconds: number
+}
+
 /** 时序曲线上的一个采样点 */
 export interface SeriesPoint {
   ts_ms: number

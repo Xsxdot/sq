@@ -51,3 +51,27 @@ export function decodeBody(b64: string): string {
     return b64
   }
 }
+
+/**
+ * 字节数。诊断读数看的是量级，两位有效数字足够，不需要精确到字节。
+ * 三位数以上丢掉小数位——「128.4 MB」比「128 MB」多出的那一位不改变任何判断。
+ */
+export function bytes(n: number): string {
+  if (n < 1024) return `${Math.round(n)} B`
+  const units = ['KB', 'MB', 'GB', 'TB', 'PB']
+  let v = n / 1024
+  let i = 0
+  while (v >= 1024 && i < units.length - 1) {
+    v /= 1024
+    i++
+  }
+  return `${v >= 100 ? Math.round(v) : v.toFixed(1)} ${units[i]}`
+}
+
+/** 运行时长。分钟以下说秒，一天以上说天时——「73 小时」不如「3d1h」好读。 */
+export function uptime(sec: number): string {
+  if (sec < 60) return `${Math.round(sec)}s`
+  if (sec < 3600) return `${Math.floor(sec / 60)}m`
+  if (sec < 86400) return `${Math.floor(sec / 3600)}h${Math.floor((sec % 3600) / 60)}m`
+  return `${Math.floor(sec / 86400)}d${Math.floor((sec % 86400) / 3600)}h`
+}
