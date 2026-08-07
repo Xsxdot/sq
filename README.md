@@ -11,7 +11,7 @@ go build -o sq ./cmd/sq
 ```
 
 用官方 RocketMQ 5.x SDK（Java/Go/Python/C#/C++）直接连接 `127.0.0.1:8081` 收发。
-当前状态：M5a（gRPC AK/SK 认证、Admin API、Prometheus /metrics）。里程碑与设计见 docs/superpowers/specs/。
+当前状态：M5b（内嵌 Web 控制台）。里程碑与设计见 docs/superpowers/specs/。
 
 停机用 `SIGINT`/`SIGTERM` 即可：收到信号后先让协议层结束没有自然终点的长流
 （`Telemetry`），再等在途 RPC 处理完（gRPC `GracefulStop`），最后关闭底层存储，
@@ -47,6 +47,8 @@ go build -o sq ./cmd/sq
   DLQ 重发、延时视图、总览（见「Admin API」）
 - Prometheus /metrics（M5a）：topic 写入计数、消费组堆积/inflight、延时深度、
   store 提交耗时直方图（见「Admin API」）
+- Web 控制台（M5b）：`go:embed` 进单二进制的静态站，10 个页面覆盖总览/时序/总账、
+  topic 与消费组管理、消息查询与发送、死信重发、延时视图（见「Web 控制台」）
 
 ## 消费失败链路
 
@@ -78,6 +80,8 @@ admin_username: ""             # 与 admin_password 成对设置；均空 = 免�
 admin_password: ""
 access_key: ""                 # 与 secret_key 成对设置；均空 = 不做 gRPC 鉴权（默认关闭）
 secret_key: ""
+# —— M5b 时序与 Web 控制台 ——
+metrics_retention_hours: 168   # 时序落库保留小时数；0 = 只留内存环的最近 1 小时
 ```
 
 通过 `-config` 指定配置文件路径，省略则使用以上默认值：
@@ -138,7 +142,38 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8082/admin/topics
 - 删除类操作（topic/消费组）是即时物理删除，**先停对应流量再删**。
 - Admin token 只存于进程内存，**重启即全部失效**，需重新登录。
 
+## Web 控制台
+
+启动后访问 `http://127.0.0.1:8082/`（端口即 `admin_listen`）。控制台是
+`go:embed` 进单二进制的静态站：不需要 Node、不需要单独部署前端，二进制在哪它就在哪。
+
+登录：`admin_username` / `admin_password` 两项都留空时免登录；配置了就要登录，
+token 有效期 24 小时、存在浏览器本地（localStorage），过期重新登录即可。
+
+十个页面，每个解决一个具体问题：
+
+| 页面 | 路径 | 解决什么 |
+| --- | --- | --- |
+| 总览 | `/` | 六项读数 + 1h/24h/7d 趋势图 + 消费关系总账，一眼看出哪个组落在后面 |
+| Topic | `/topics` | 建 topic、看队列数与写入位置、删 topic |
+| Topic 详情 | `/topics/:name` | 逐队列写入头、改 retention |
+| 消费组 | `/groups` | 组列表、删消费组 |
+| 组详情 | `/groups/:name` | 逐 topic 堆积与在途、重置位点 |
+| 消息查询 | `/messages` | 按 Keys 检索或按队列顺序浏览消息 |
+| 死信 | `/dlq` | 按组看死信、单条重发回原 topic |
+| 延时 | `/delay` | 延时暂存区视图（按到期时间升序） |
+| 发送 | `/send` | 发测试消息（普通/延时） |
+| 登录 | `/login` | 用户名密码登录拿 token |
+
+时序数据：内存环保留最近 1 小时（5 秒粒度）；`metrics_retention_hours` 控制
+落库保留时长（默认 168 小时 = 7 天，设 0 只保留内存环）。落库是 1 分钟粒度
+且**取该分钟的峰值**——分钟平均会把尖峰抹平，而排查时找的就是尖峰。
+
+构建：`make build` 会先 `make web`（需要 Node）再编 Go；只改后端时用
+`make build-go` 跳过前端构建。未构建控制台时二进制照样能起，访问 `/` 会
+提示先执行 `make web`。
+
 ## 限制
 
 - 消息体上限 4MB（`produce.MaxBodySize`）；默认同步刷盘（`fsync: sync`）。
-- 未实现：顺序/事务消息、Web 控制台（React UI）、多 broker 集群。
+- 未实现：顺序/事务消息、多 broker 集群。
