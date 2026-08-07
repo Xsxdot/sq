@@ -26,7 +26,7 @@ const (
 	inflightPrefix  = "inflight/"
 	keyIdxPrefix    = "keyidx/"
 	delayPrefix     = "delay/"
-	metricPrefix     = "metric/"
+	metricPrefix    = "metric/"
 	// DelayPrefix 延时暂存区扫描下界（导出供 delay 包使用）。
 	DelayPrefix = delayPrefix
 	// MetricPrefix 时序采样点扫描下界（导出供 metrics/admin 包使用）。
