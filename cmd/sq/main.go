@@ -3,20 +3,25 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"log/slog"
 	"net"
 	"os"
 	"os/signal"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"google.golang.org/grpc"
 
 	"github.com/xushixin/sq/internal/config"
+	"github.com/xushixin/sq/internal/core/delay"
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/core/retention"
 	"github.com/xushixin/sq/internal/rpc"
 	"github.com/xushixin/sq/internal/store"
 )
@@ -56,12 +61,34 @@ func run() error {
 		return err
 	}
 	defer st.Close()
-	mt, err := meta.New(st, cfg.AutoCreateTopic, cfg.DefaultQueueNums, logger)
+	mt, err := meta.New(st, cfg.AutoCreateTopic, cfg.DefaultQueueNums, cfg.DefaultMaxAttempts, logger)
 	if err != nil {
 		return err
 	}
 	pr := produce.New(st, mt, logger)
 	dl := deliver.New(st, mt, pr, logger)
+
+	// retention 后台清理。停机顺序关键：先取消并等待清理 goroutine 退出，
+	// 再让 defer 关闭 store——否则可能在 store 关闭后提交清理批次（panic）。
+	// defer 为 LIFO：本 defer 注册在 st.Close 的 defer 之后，故先执行。
+	// writeBlocked 由 retention 每趟探测磁盘后更新，rpc.SendMessage 据此拒写。
+	writeBlocked := &atomic.Bool{}
+	retCtx, retCancel := context.WithCancel(context.Background())
+	var retWG sync.WaitGroup
+	rm := retention.New(st, mt, cfg.RetentionInterval(), cfg.DataDir, cfg.DiskWatermarkPercent, writeBlocked, logger)
+	retWG.Add(1)
+	go func() { defer retWG.Done(); rm.Run(retCtx) }()
+	defer func() { retCancel(); retWG.Wait() }()
+
+	// delay 调度器：到期延时消息移入正常队列。停机顺序与 retention 同理——
+	// defer LIFO 保证先取消并等待调度 goroutine 退出，再轮到 st.Close 的 defer，
+	// 不会在 store 关闭后提交搬运批次。
+	dlyCtx, dlyCancel := context.WithCancel(context.Background())
+	var dlyWG sync.WaitGroup
+	ds := delay.New(st, pr, logger)
+	dlyWG.Add(1)
+	go func() { defer dlyWG.Done(); ds.Run(dlyCtx) }()
+	defer func() { dlyCancel(); dlyWG.Wait() }()
 
 	lis, err := net.Listen("tcp", cfg.GRPCListen)
 	if err != nil {
@@ -77,7 +104,7 @@ func run() error {
 		grpc.MaxRecvMsgSize(rpc.MaxGRPCMessageSize),
 		grpc.MaxSendMsgSize(rpc.MaxGRPCMessageSize),
 	)
-	srv := rpc.New(cfg, mt, pr, dl, logger)
+	srv := rpc.New(cfg, mt, pr, dl, writeBlocked, logger)
 	srv.Register(gs)
 
 	// signal.Notify 必须先于 gs.Serve 的 goroutine 注册：如果反过来，

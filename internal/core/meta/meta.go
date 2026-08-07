@@ -27,6 +27,18 @@ var ErrTopicNotFound = errors.New("topic 不存在")
 // ErrBadName 名字不符合 ^[A-Za-z0-9_%\-]{1,127}$。
 var ErrBadName = errors.New("名字含非法字符或长度超限")
 
+// DefaultMaxAttempts 订阅组默认最大投递次数（超过即转 DLQ），与 RocketMQ 默认一致。
+const DefaultMaxAttempts = 16
+
+// DefaultRetentionMs 默认消息保留时长：3 天（spec §5 流程 7）。
+const DefaultRetentionMs int64 = 3 * 24 * 60 * 60 * 1000
+
+const dlqPrefix = "%DLQ%"
+
+// DLQTopicName 消费组对应的死信 topic 名。'%' 在名字合法字符集内，
+// 死信 topic 是普通 topic（可用 SDK 直接消费、控制台可查可重发）。
+func DLQTopicName(group string) string { return dlqPrefix + group }
+
 var nameRe = regexp.MustCompile(`^[A-Za-z0-9_%\-]{1,127}$`)
 
 // ValidateName 校验 topic/group 名。合法字符不含 '/'，保证 key 编码分隔安全。
@@ -42,20 +54,39 @@ type TopicConfig struct {
 	Name        string `json:"name"`
 	Queues      uint32 `json:"queues"`
 	CreatedAtMs int64  `json:"created_at_ms"`
+	RetentionMs int64  `json:"retention_ms,omitempty"`
 }
 
-// GroupConfig 订阅组配置。M1 仅注册身份；maxAttempts 等属 M2。
+// EffectiveRetention 生效的消息保留时长。0 表示 M1 旧配置，回退包默认。
+func (t TopicConfig) EffectiveRetention() time.Duration {
+	if t.RetentionMs <= 0 {
+		return time.Duration(DefaultRetentionMs) * time.Millisecond
+	}
+	return time.Duration(t.RetentionMs) * time.Millisecond
+}
+
+// GroupConfig 订阅组配置。M1 仅注册身份；M2 增 maxAttempts（0 = M1 旧数据，回退包默认）。
 type GroupConfig struct {
 	Name        string `json:"name"`
 	CreatedAtMs int64  `json:"created_at_ms"`
+	MaxAttempts int32  `json:"max_attempts,omitempty"`
+}
+
+// EffectiveMaxAttempts 生效的最大投递次数。0 表示 M1 时期落盘的旧配置，回退包默认。
+func (g GroupConfig) EffectiveMaxAttempts() int32 {
+	if g.MaxAttempts <= 0 {
+		return DefaultMaxAttempts
+	}
+	return g.MaxAttempts
 }
 
 // Meta topic/group 注册表。读多写少，读走内存缓存，写穿透到 store。
 type Meta struct {
-	st            *store.Store
-	autoCreate    bool
-	defaultQueues uint32
-	logger        *slog.Logger
+	st                 *store.Store
+	autoCreate         bool
+	defaultQueues      uint32
+	defaultMaxAttempts int32
+	logger             *slog.Logger
 
 	mu     sync.RWMutex
 	topics map[string]TopicConfig
@@ -63,9 +94,13 @@ type Meta struct {
 }
 
 // New 构造并从 store 加载全部已有配置。
-func New(st *store.Store, autoCreate bool, defaultQueues uint32, logger *slog.Logger) (*Meta, error) {
+// defaultMaxAttempts<=0 时使用 DefaultMaxAttempts（防御配置层漏校验）。
+func New(st *store.Store, autoCreate bool, defaultQueues uint32, defaultMaxAttempts int32, logger *slog.Logger) (*Meta, error) {
+	if defaultMaxAttempts <= 0 {
+		defaultMaxAttempts = DefaultMaxAttempts
+	}
 	m := &Meta{
-		st: st, autoCreate: autoCreate, defaultQueues: defaultQueues,
+		st: st, autoCreate: autoCreate, defaultQueues: defaultQueues, defaultMaxAttempts: defaultMaxAttempts,
 		logger: logger.With("mod", "meta"),
 		topics: map[string]TopicConfig{}, groups: map[string]GroupConfig{},
 	}
@@ -133,7 +168,7 @@ func (m *Meta) CreateTopic(name string, queues uint32) (TopicConfig, error) {
 	if tc, ok := m.topics[name]; ok {
 		return tc, nil
 	}
-	tc := TopicConfig{Name: name, Queues: queues, CreatedAtMs: time.Now().UnixMilli()}
+	tc := TopicConfig{Name: name, Queues: queues, CreatedAtMs: time.Now().UnixMilli(), RetentionMs: DefaultRetentionMs}
 	raw, _ := json.Marshal(tc)
 	b := m.st.NewBatch()
 	b.Set(store.TopicMetaKey(name), raw, nil)
@@ -141,7 +176,7 @@ func (m *Meta) CreateTopic(name string, queues uint32) (TopicConfig, error) {
 		return TopicConfig{}, fmt.Errorf("持久化 topic %s: %w", name, err)
 	}
 	m.topics[name] = tc
-	m.logger.Info("topic 已创建", "topic", name, "queues", queues)
+	m.logger.Info("topic 已创建", "topic", name, "queues", queues, "retention_ms", tc.RetentionMs)
 	return tc, nil
 }
 
@@ -161,7 +196,7 @@ func (m *Meta) EnsureGroup(name string) (GroupConfig, error) {
 	if gc, ok := m.groups[name]; ok {
 		return gc, nil
 	}
-	gc = GroupConfig{Name: name, CreatedAtMs: time.Now().UnixMilli()}
+	gc = GroupConfig{Name: name, CreatedAtMs: time.Now().UnixMilli(), MaxAttempts: m.defaultMaxAttempts}
 	raw, _ := json.Marshal(gc)
 	b := m.st.NewBatch()
 	b.Set(store.GroupMetaKey(name), raw, nil)
@@ -169,6 +204,17 @@ func (m *Meta) EnsureGroup(name string) (GroupConfig, error) {
 		return GroupConfig{}, fmt.Errorf("持久化 group %s: %w", name, err)
 	}
 	m.groups[name] = gc
-	m.logger.Info("消费组已注册", "group", name)
+	m.logger.Info("消费组已注册", "group", name, "max_attempts", gc.MaxAttempts)
 	return gc, nil
+}
+
+// Topics 返回全部 topic 配置快照（retention 后台扫描用；乱序）。
+func (m *Meta) Topics() []TopicConfig {
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	out := make([]TopicConfig, 0, len(m.topics))
+	for _, tc := range m.topics {
+		out = append(out, tc)
+	}
+	return out
 }

@@ -28,8 +28,9 @@
 //
 // 边界：
 //   - 只验证普通消息链路；延时/顺序/事务的 e2e 属 M3/M4/M6
-//   - Tag 过滤只用 SUB_ALL（"*"），真实过滤属 M2
-//   - 不验证集群路由/多 broker：sq M1 是单机形态
+//   - 真实 Tag 过滤（TestOfficialGoSDKTagFilter）与 DLQ 全链路
+//     （TestOfficialGoSDKDLQ）自 M2 起覆盖；其余用例以 SUB_ALL 订阅
+//   - 不验证集群路由/多 broker：sq 是单机形态
 package e2e
 
 import (
@@ -195,13 +196,16 @@ type brokerHandle struct {
 
 // writeBrokerConfig 选端口、在独立临时目录写好 broker 配置。
 //
+// mutate 变参在配置写盘（yaml.Marshal）之前逐个应用，供用例覆盖
+// 特定配置项（如 DLQ 用例把 default_max_attempts 降到 2 以控制时长）。
+//
 // 返回：
 //   - cfgPath: 配置文件路径（数据目录与日志都放在它的同级目录下）
 //   - endpoint: "host:port" 接入点，直接喂给 rmq.Config.Endpoint
 //
 // 与 launchBroker 拆开是为了重启类用例：写一次配置、启动两次进程。
 // 常规用例不需要感知这层拆分，直接用 startBroker 即可。
-func writeBrokerConfig(t *testing.T) (cfgPath, endpoint string) {
+func writeBrokerConfig(t *testing.T, mutate ...func(*config.Config)) (cfgPath, endpoint string) {
 	t.Helper()
 	port := pickPort(t)
 	dir := t.TempDir()
@@ -209,19 +213,30 @@ func writeBrokerConfig(t *testing.T) (cfgPath, endpoint string) {
 	// QueryRoute 返回的 endpoints 就是 SDK 后续做 telemetry/send/receive 的目标，
 	// 对不上时表现为握手超时而不是「路由错」，很难定位。
 	cfg := &config.Config{
-		GRPCListen:       fmt.Sprintf("127.0.0.1:%d", port),
-		AdvertiseHost:    "127.0.0.1",
-		AdvertisePort:    port,
-		DataDir:          filepath.Join(dir, "data"),
-		Fsync:            "sync",
-		AutoCreateTopic:  true,
-		DefaultQueueNums: 4,
+		GRPCListen:         fmt.Sprintf("127.0.0.1:%d", port),
+		AdvertiseHost:      "127.0.0.1",
+		AdvertisePort:      port,
+		DataDir:            filepath.Join(dir, "data"),
+		Fsync:              "sync",
+		AutoCreateTopic:    true,
+		DefaultQueueNums:   4,
+		DefaultMaxAttempts: 16,
+		// 必须显式给非零值：yaml.Marshal 对空串照实序列化，而 broker 的 Load
+		// 会拒绝空 retention_check_interval，序列化出去反而起不来（与
+		// DefaultMaxAttempts 同款陷阱）。
+		RetentionCheckInterval: "5m",
+		// e2e 机器磁盘状况不可控，显式关闭水位以免误拒写；0 在校验范围
+		// [0,99] 内表示关闭（缺省是 85，e2e 里磁盘打满会莫名其妙拒写）。
+		DiskWatermarkPercent: 0,
 		// debug 级别：broker 侧的投递/确认日志是排查「消息没到」的唯一线索，
 		// 失败时由 dumpBrokerLog 打进测试输出。
 		LogLevel: "debug",
 	}
 	// 用 config.Config 结构体序列化而不是手写 YAML 文本：配置项改名时这里
 	// 会跟着变，不会悄悄写出一份 broker 读不懂（因而全部走默认值）的配置。
+	for _, f := range mutate {
+		f(cfg)
+	}
 	raw, err := yaml.Marshal(cfg)
 	if err != nil {
 		t.Fatalf("序列化 broker 配置失败: %v", err)
@@ -272,9 +287,11 @@ func (h *brokerHandle) stop(t *testing.T) {
 // 失败时展开日志），返回 SDK 用的接入点地址。适用于"一个用例一个 broker"的
 // 常规场景；需要亲手控制停起时机的用例（如重启恢复）改用
 // writeBrokerConfig + launchBroker 组合。
-func startBroker(t *testing.T) string {
+//
+// mutate 变参透传给 writeBrokerConfig，用于覆盖默认配置项。
+func startBroker(t *testing.T, mutate ...func(*config.Config)) string {
 	t.Helper()
-	cfgPath, endpoint := writeBrokerConfig(t)
+	cfgPath, endpoint := writeBrokerConfig(t, mutate...)
 	h := launchBroker(t, cfgPath, endpoint, filepath.Join(filepath.Dir(cfgPath), "broker.log"))
 	t.Cleanup(func() {
 		h.stop(t)
@@ -525,5 +542,256 @@ func TestOfficialGoSDKEmptyPollReportsMessageNotFound(t *testing.T) {
 	if st.GetCode() != int32(sdkpb.Code_MESSAGE_NOT_FOUND) {
 		t.Fatalf("空轮询状态码应为 MESSAGE_NOT_FOUND(%d)，实际 %d（message=%s）",
 			sdkpb.Code_MESSAGE_NOT_FOUND, st.GetCode(), st.GetMessage())
+	}
+}
+
+// TestOfficialGoSDKTagFilter 官方 SDK 按 tag 订阅：只收到匹配消息，不匹配的被
+// 服务端跳过且对本消费组永久越过（M2 出口标准之一）。
+//
+// 断言分两层：订 tagA 的消费者恰好收齐全部 4 条 A 且无一条 B；随后同组换
+// SUB_ALL 再收，必须颗粒无收——证明 B 是被位点永久跳过，不是暂时不可见。
+func TestOfficialGoSDKTagFilter(t *testing.T) {
+	endpoint := startBroker(t)
+	const (
+		topic = "e2e-tag"
+		group = "e2e-tag-g"
+	)
+	producer, err := rmq.NewProducer(&rmq.Config{
+		Endpoint:    endpoint,
+		Credentials: &credentials.SessionCredentials{},
+	}, rmq.WithTopics(topic))
+	if err != nil {
+		t.Fatalf("NewProducer: %v", err)
+	}
+	if err := producer.Start(); err != nil {
+		t.Fatalf("producer.Start: %v", err)
+	}
+	defer producer.GracefulStop()
+
+	for i := 0; i < 4; i++ {
+		for _, tag := range []string{"tagA", "tagB"} {
+			msg := &rmq.Message{Topic: topic, Body: []byte(fmt.Sprintf("%s-%d", tag, i))}
+			msg.SetTag(tag)
+			if _, err := producer.Send(context.Background(), msg); err != nil {
+				t.Fatalf("Send %s#%d: %v", tag, i, err)
+			}
+		}
+	}
+
+	consumer, err := rmq.NewSimpleConsumer(&rmq.Config{
+		Endpoint:      endpoint,
+		ConsumerGroup: group,
+		Credentials:   &credentials.SessionCredentials{},
+	},
+		rmq.WithSimpleAwaitDuration(3*time.Second),
+		rmq.WithSimpleSubscriptionExpressions(map[string]*rmq.FilterExpression{
+			topic: rmq.NewFilterExpression("tagA"),
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewSimpleConsumer: %v", err)
+	}
+	if err := consumer.Start(); err != nil {
+		t.Fatalf("consumer.Start: %v", err)
+	}
+	defer consumer.GracefulStop()
+
+	got := 0
+	deadline := time.Now().Add(60 * time.Second)
+	for got < 4 && time.Now().Before(deadline) {
+		mvs, err := consumer.Receive(context.Background(), 16, 30*time.Second)
+		if err != nil {
+			continue // 空轮询以 MESSAGE_NOT_FOUND 错误返回，属正常
+		}
+		for _, mv := range mvs {
+			if tag := mv.GetTag(); tag == nil || *tag != "tagA" {
+				t.Fatalf("收到非 tagA 消息: tag=%v body=%s", mv.GetTag(), mv.GetBody())
+			}
+			got++
+			if err := consumer.Ack(context.Background(), mv); err != nil {
+				t.Fatalf("Ack: %v", err)
+			}
+		}
+	}
+	if got != 4 {
+		t.Fatalf("tagA 消息应恰好 4 条，实际 %d", got)
+	}
+
+	// 收齐后继续把全部队列轮询到空：SimpleConsumer 每次只轮询一个队列，且
+	// 4 条 A 只分布在部分队列上，got==4 时 B 所在的队列可能还没被 tagA 过滤
+	// 位点扫过——那只是「还没被跳过」，不是「被永久越过」，直接换 SUB_ALL
+	// 会把它们泄出来。连续 4 轮空结果（= 队列数）才说明每条队列都已过滤到
+	// 位点尽头，SUB_ALL 阶段的「一无所获」断言才有意义。
+	swept := 0
+	for swept < 4 && time.Now().Before(deadline) {
+		mvs, err := consumer.Receive(context.Background(), 16, 30*time.Second)
+		if err != nil || len(mvs) == 0 {
+			swept++
+			continue
+		}
+		swept = 0
+		for _, mv := range mvs {
+			if tag := mv.GetTag(); tag == nil || *tag != "tagA" {
+				t.Fatalf("收到非 tagA 消息: tag=%v body=%s", mv.GetTag(), mv.GetBody())
+			}
+			if err := consumer.Ack(context.Background(), mv); err != nil {
+				t.Fatalf("Ack: %v", err)
+			}
+		}
+	}
+	if swept < 4 {
+		t.Fatalf("未能在截止时间前把全部队列过滤扫完: %d 轮空", swept)
+	}
+
+	// 同组换 SUB_ALL 再收：tagB 已被位点永久跳过，必须一无所获
+	allConsumer, err := rmq.NewSimpleConsumer(&rmq.Config{
+		Endpoint:      endpoint,
+		ConsumerGroup: group,
+		Credentials:   &credentials.SessionCredentials{},
+	},
+		rmq.WithSimpleAwaitDuration(2*time.Second),
+		rmq.WithSimpleSubscriptionExpressions(map[string]*rmq.FilterExpression{
+			topic: rmq.SUB_ALL,
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewSimpleConsumer(SUB_ALL): %v", err)
+	}
+	if err := allConsumer.Start(); err != nil {
+		t.Fatalf("allConsumer.Start: %v", err)
+	}
+	defer allConsumer.GracefulStop()
+	for i := 0; i < 4; i++ {
+		mvs, err := allConsumer.Receive(context.Background(), 16, 30*time.Second)
+		if err == nil && len(mvs) > 0 {
+			t.Fatalf("被过滤消息泄漏: %d 条（首条 body=%s）", len(mvs), mvs[0].GetBody())
+		}
+	}
+}
+
+// TestOfficialGoSDKDLQ 不 ack 直到投递超限（本用例 broker 配 default_max_attempts=2），
+// 死信作为普通 topic 从 %DLQ%{group} 被 SDK 消费到，且带 sq-origin-* 溯源属性
+// （M2 出口标准之一）。
+//
+// 时序说明：第 2 次投递的不可见窗口 = max(客户端 3s, 服务端退避下限 10s) = 10s；
+// 转入是惰性的（原队列下一次 Receive 触发），所以窗口过期后要继续戳原 topic。
+// DLQ topic 可能因 dlqConsumer 先 QueryRoute 而按默认 4 队列自动建出，
+// moveToDLQ 的 CreateTopic(1) 幂等返回既有配置——属预期，不影响断言。
+func TestOfficialGoSDKDLQ(t *testing.T) {
+	endpoint := startBroker(t, func(c *config.Config) {
+		c.DefaultMaxAttempts = 2 // 2 次投递即超限，控制用例时长
+	})
+	const (
+		topic = "e2e-dlq"
+		group = "e2e-dlq-g"
+		body  = "dlq-poison"
+	)
+	producer, err := rmq.NewProducer(&rmq.Config{
+		Endpoint:    endpoint,
+		Credentials: &credentials.SessionCredentials{},
+	}, rmq.WithTopics(topic))
+	if err != nil {
+		t.Fatalf("NewProducer: %v", err)
+	}
+	if err := producer.Start(); err != nil {
+		t.Fatalf("producer.Start: %v", err)
+	}
+	defer producer.GracefulStop()
+	if _, err := producer.Send(context.Background(), &rmq.Message{Topic: topic, Body: []byte(body)}); err != nil {
+		t.Fatalf("Send: %v", err)
+	}
+
+	consumer, err := rmq.NewSimpleConsumer(&rmq.Config{
+		Endpoint:      endpoint,
+		ConsumerGroup: group,
+		Credentials:   &credentials.SessionCredentials{},
+	},
+		rmq.WithSimpleAwaitDuration(3*time.Second),
+		rmq.WithSimpleSubscriptionExpressions(map[string]*rmq.FilterExpression{
+			topic: rmq.SUB_ALL,
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewSimpleConsumer: %v", err)
+	}
+	if err := consumer.Start(); err != nil {
+		t.Fatalf("consumer.Start: %v", err)
+	}
+	defer consumer.GracefulStop()
+
+	// 第 1、2 次投递均收到但不 ack（invisible 3s，任其过期）
+	seen := 0
+	deadline := time.Now().Add(90 * time.Second)
+	for seen < 2 && time.Now().Before(deadline) {
+		mvs, err := consumer.Receive(context.Background(), 16, 3*time.Second)
+		if err != nil {
+			continue
+		}
+		for _, mv := range mvs {
+			if string(mv.GetBody()) == body {
+				seen++
+				t.Logf("第 %d 次收到毒消息", seen)
+			}
+		}
+	}
+	if seen < 2 {
+		t.Fatalf("未完成 2 次投递: %d", seen)
+	}
+
+	// DLQ 消费者：%DLQ%{group} 是普通 topic，SDK 直接订阅
+	dlqTopic := "%DLQ%" + group
+	dlqConsumer, err := rmq.NewSimpleConsumer(&rmq.Config{
+		Endpoint:      endpoint,
+		ConsumerGroup: group + "-reader",
+		Credentials:   &credentials.SessionCredentials{},
+	},
+		rmq.WithSimpleAwaitDuration(3*time.Second),
+		rmq.WithSimpleSubscriptionExpressions(map[string]*rmq.FilterExpression{
+			dlqTopic: rmq.SUB_ALL,
+		}),
+	)
+	if err != nil {
+		t.Fatalf("NewSimpleConsumer(DLQ): %v", err)
+	}
+	if err := dlqConsumer.Start(); err != nil {
+		t.Fatalf("dlqConsumer.Start: %v", err)
+	}
+	defer dlqConsumer.GracefulStop()
+
+	// 循环：戳原 topic（等待退避窗口过期 + 触发惰性转入）→ 查 DLQ
+	var gotBody string
+	deadline = time.Now().Add(120 * time.Second)
+	for gotBody == "" && time.Now().Before(deadline) {
+		_, _ = consumer.Receive(context.Background(), 16, 3*time.Second) // 空轮询错误可忽略
+		mvs, err := dlqConsumer.Receive(context.Background(), 16, 30*time.Second)
+		if err != nil {
+			continue
+		}
+		for _, mv := range mvs {
+			gotBody = string(mv.GetBody())
+			props := mv.GetProperties()
+			if props["sq-origin-topic"] != topic {
+				t.Fatalf("死信缺少来源属性 sq-origin-topic: %v", props)
+			}
+			if err := dlqConsumer.Ack(context.Background(), mv); err != nil {
+				t.Fatalf("Ack 死信: %v", err)
+			}
+		}
+	}
+	if gotBody != body {
+		t.Fatalf("死信未到达或内容不符: %q", gotBody)
+	}
+
+	// 原 topic 不应再投出毒消息（inflight 已随转入原子删除）
+	for i := 0; i < 2; i++ {
+		mvs, err := consumer.Receive(context.Background(), 16, 3*time.Second)
+		if err != nil {
+			continue
+		}
+		for _, mv := range mvs {
+			if string(mv.GetBody()) == body {
+				t.Fatal("超限消息不应再从原 topic 投出")
+			}
+		}
 	}
 }

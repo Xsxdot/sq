@@ -1,5 +1,5 @@
 // SendMessage 相关：proto Message ↔ core.Message 的写方向翻译。
-// 边界：仅 NORMAL 类型（M3 延时 / M4 FIFO 属性 / M6 事务在各自里程碑打开）。
+// 边界：NORMAL、DELAY（M3）与 FIFO（M4）；M6 事务在其里程碑打开。
 package rpc
 
 import (
@@ -27,6 +27,12 @@ import (
 // "整批任一条失败即整体失败"这句话在字面上和效果上一致：失败就是真的什么
 // 都没写。
 func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*pb.SendMessageResponse, error) {
+	// 磁盘水位拒写保读（spec §7）：只拦生产者写入，消费链路（Receive/Ack）不受影响
+	if s.writeBlocked != nil && s.writeBlocked.Load() {
+		s.logger.Warn("磁盘水位超限，拒绝写入", "messages", len(req.GetMessages()))
+		return &pb.SendMessageResponse{Status: errStatus(pb.Code_FORBIDDEN,
+			"磁盘使用率超过水位线，暂时拒写（保读）")}, nil
+	}
 	// 第一遍：只翻译 + 校验，不做任何持久化。
 	msgs := make([]*core.Message, 0, len(req.GetMessages()))
 	for _, pm := range req.GetMessages() {
@@ -48,7 +54,15 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 	// 不额外引入多消息原子写入的复杂度。
 	entries := make([]*pb.SendResultEntry, 0, len(msgs))
 	for _, m := range msgs {
-		stored, err := s.pr.Append(m)
+		var stored *core.Message
+		var err error
+		if m.DeliverAtMs > 0 {
+			// 延时消息进暂存区（未分配 offset，entry 里 Offset 回 0——SDK 的
+			// SendReceipt 只消费 MessageId，offset 字段对延时场景无意义）
+			stored, err = s.pr.AppendDelay(m)
+		} else {
+			stored, err = s.pr.Append(m)
+		}
 		if err != nil {
 			// Append 内部会调用 meta.EnsureTopic，因此它的失败同样分"客户端输入
 			// 错误"与"服务端内部故障"两类，必须按 topicErrStatus 的规则分开
@@ -74,14 +88,52 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 // 此时不产生任何副作用（不触碰 store/meta）。
 func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 	sp := pm.GetSystemProperties()
+	var delayAt int64
 	switch sp.GetMessageType() {
 	case pb.MessageType_NORMAL:
+		// SDK 只要带 deliveryTimestamp 就自动标 DELAY 类型，标 NORMAL 却带
+		// 到期时间的只可能是行为异常的客户端。静默忽略该时间戳等于把"延时"
+		// 悄悄变成"立即投递"，必须显式拒绝。
+		if sp.GetDeliveryTimestamp() != nil {
+			return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,
+				"NORMAL 消息不应携带 delivery_timestamp")
+		}
+		// 同理（M4）：SDK 设了 messageGroup 就自动标 FIFO，标 NORMAL 却带组
+		// 意味着这条消息会在 deliver 侧获得顺序锁语义而发送端不自知——拒绝。
+		if sp.GetMessageGroup() != "" {
+			return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,
+				"NORMAL 消息不应携带 message_group")
+		}
 	case pb.MessageType_FIFO:
-		// FIFO 消息的写入路径与 NORMAL 相同（MessageGroup 定队列已在 produce 实现），
-		// 但消费端顺序锁是 M4——为避免"能发不能保序"的假象，M1 一并拒绝。
-		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "顺序消息将在 M4 支持")
+		// 顺序消息（M4）：MessageGroup 是顺序语义的全部依据（hash 定队列 +
+		// 消费端顺序锁），缺了它"顺序"无从谈起，用协议专用码报错。
+		if sp.GetMessageGroup() == "" {
+			return nil, errStatus(pb.Code_ILLEGAL_MESSAGE_GROUP, "FIFO 消息缺少 message_group")
+		}
+		if sp.GetDeliveryTimestamp() != nil {
+			return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,
+				"FIFO 消息不应携带 delivery_timestamp")
+		}
 	case pb.MessageType_DELAY:
-		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "延时消息将在 M3 支持")
+		if sp.GetDeliveryTimestamp() == nil {
+			return nil, errStatus(pb.Code_ILLEGAL_DELIVERY_TIME, "DELAY 消息缺少 delivery_timestamp")
+		}
+		// 延时与顺序不可组合（M4）：SDK 两者都设时按组判定标 FIFO（上面的
+		// 分支拒绝），裸客户端标 DELAY 带组同样拒绝——到期搬运经 AppendWith
+		// 重新入队，无法承诺组内相对顺序。
+		if sp.GetMessageGroup() != "" {
+			return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,
+				"DELAY 消息不应携带 message_group")
+		}
+		delayAt = sp.GetDeliveryTimestamp().AsTime().UnixMilli()
+		// 时间戳存在但落在非正区间（1970 epoch 或零值 time.Time）时不能静默
+		// 降级成 NORMAL：DeliverAtMs 停在 0 会让 SendMessage 的路由门
+		// m.DeliverAtMs>0 走不到 AppendDelay，消息被当普通消息落盘，类型与
+		// 时间戳回读双双丢失。钳到 1ms 保证路由进门，已过期由 AppendDelay
+		// 的直通逻辑立即投递，DELAY 语义原样保留。
+		if delayAt <= 0 {
+			delayAt = 1
+		}
 	case pb.MessageType_TRANSACTION:
 		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "事务消息将在 M6 支持")
 	default:
@@ -130,6 +182,9 @@ func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 		BodyDigest:   digestToCore(sp.GetBodyDigest()),
 		BornAtMs:     born,
 		BornHost:     sp.GetBornHost(),
+		// DELAY 消息才有值；任意未来时间都接受（spec：任意秒级延时，不设上限），
+		// 已过期的时间戳由 AppendDelay 直通立即投递
+		DeliverAtMs: delayAt,
 		// TraceContext 是 W3C traceparent 之类的链路上下文：不带回去，
 		// 分布式追踪就在 sq 这一跳断掉，且断得悄无声息。
 		TraceContext: sp.GetTraceContext(),

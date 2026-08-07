@@ -35,7 +35,10 @@ import (
 	"time"
 
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/xushixin/sq/internal/core"
+	"github.com/xushixin/sq/internal/core/deliver"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
@@ -377,6 +380,84 @@ func TestAckWithStaleAttemptTokenFailsAndMessageStaysRedeliverable(t *testing.T)
 	}
 }
 
+// TestToPBMessageSetsInvisibleDuration 下发消息须回填本次的不可见时长，
+// SDK 依此换算消息可见时间点展示/重试。
+func TestToPBMessageSetsInvisibleDuration(t *testing.T) {
+	s := &Server{}
+	msg := s.toPBMessage(&core.Message{ID: "A", Topic: "t", Body: []byte("x"), DeliveryAttempt: 1}, "g", 45*time.Second)
+	if got := msg.GetSystemProperties().GetInvisibleDuration().AsDuration(); got != 45*time.Second {
+		t.Fatalf("InvisibleDuration: 期望 45s，得到 %v", got)
+	}
+}
+
+// TestToPBMessageBackfillsRetryBackoffFloorOnRedelivery 重投消息（attempt>=2）下发
+// InvisibleDuration 必须反映实际过期语义 max(客户端要求, 退避下限)：
+// receiveOnce 里重投的过期时间是 exp=now+max(invisible,backoff)（deliver.go），
+// 若这里仍回填客户端原值，SDK 换算出的可见时间点会早于服务端实际，消费端
+// 展示/重试节奏与服务端不一致。首投（attempt=1）无退避概念，保持客户端值。
+func TestToPBMessageBackfillsRetryBackoffFloorOnRedelivery(t *testing.T) {
+	s := &Server{}
+	redelivered := s.toPBMessage(&core.Message{ID: "B", Topic: "t", Body: []byte("x"), DeliveryAttempt: 2}, "g", time.Second)
+	if got := redelivered.GetSystemProperties().GetInvisibleDuration().AsDuration(); got != 10*time.Second {
+		t.Fatalf("重投消息 InvisibleDuration 应回填退避下限 10s，实际 %v", got)
+	}
+	fresh := s.toPBMessage(&core.Message{ID: "C", Topic: "t", Body: []byte("x"), DeliveryAttempt: 1}, "g", 5*time.Second)
+	if got := fresh.GetSystemProperties().GetInvisibleDuration().AsDuration(); got != 5*time.Second {
+		t.Fatalf("首投消息 InvisibleDuration 应保持客户端值 5s，实际 %v", got)
+	}
+}
+
+// TestToPBMessageEchoesDelayTypeAndTimestamp 锁定投递方向的 DELAY 回填：
+// 盘上带 DeliverAtMs 的消息投递时，MessageType 必须如实回填为 DELAY、
+// DeliveryTimestamp 必须回填为到期时间；普通消息保持 NORMAL 且不带
+// DeliveryTimestamp。
+func TestToPBMessageEchoesDelayTypeAndTimestamp(t *testing.T) {
+	env := newTestEnv(t, true)
+	due := time.Now().Add(-time.Second).UnixMilli() // 已过期：发送即直通立即投递
+	m := &core.Message{ID: "d1", Topic: "t", Body: []byte("x"), DeliverAtMs: due, DeliveryAttempt: 1}
+	pm := env.srv.toPBMessage(m, "g", time.Minute)
+	if pm.GetSystemProperties().GetMessageType() != pb.MessageType_DELAY {
+		t.Fatalf("延时消息投递类型应为 DELAY，得到 %v", pm.GetSystemProperties().GetMessageType())
+	}
+	got := pm.GetSystemProperties().GetDeliveryTimestamp()
+	if got == nil || got.AsTime().UnixMilli() != due {
+		t.Fatalf("DeliveryTimestamp 未回填: %v", got)
+	}
+	// 普通消息不受影响
+	n := &core.Message{ID: "n1", Topic: "t", Body: []byte("y"), DeliveryAttempt: 1}
+	pn := env.srv.toPBMessage(n, "g", time.Minute)
+	if pn.GetSystemProperties().GetMessageType() != pb.MessageType_NORMAL ||
+		pn.GetSystemProperties().GetDeliveryTimestamp() != nil {
+		t.Fatal("普通消息不应带 DELAY 类型或 DeliveryTimestamp")
+	}
+}
+
+// 全链路：过期时间戳的 DELAY 消息发送后直通立即投递，消费端读回自己设置的时间
+func TestSendPastDueDelayDeliveredImmediatelyWithTimestampEcho(t *testing.T) {
+	env := newTestEnv(t, true)
+	due := time.Now().Add(-time.Second)
+	resp, err := env.client.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "dly2"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:       pb.MessageType_DELAY,
+				DeliveryTimestamp: timestamppb.New(due),
+			},
+			Body: []byte("imm"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("发送: %v %v", resp.GetStatus(), err)
+	}
+	pm := receiveOne(t, env.client, "g", "dly2", 0, time.Minute)
+	if pm.GetSystemProperties().GetMessageType() != pb.MessageType_DELAY {
+		t.Fatal("投递类型应为 DELAY")
+	}
+	if ts := pm.GetSystemProperties().GetDeliveryTimestamp(); ts == nil || ts.AsTime().UnixMilli() != due.UnixMilli() {
+		t.Fatalf("DeliveryTimestamp 回读不符: %v", ts)
+	}
+}
+
 // TestReceiveMessageRejectsIllegalConsumerGroup 验证消费组名字非法
 // （deliver.Receive 内部 EnsureGroup 报 meta.ErrBadName）时返回
 // Code_ILLEGAL_CONSUMER_GROUP——这是客户端可自行处理（改名字重试没用，
@@ -491,6 +572,100 @@ func TestAckMessageMalformedHandleEntryIncludesReceiptHandle(t *testing.T) {
 	}
 }
 
+// sendTagged 发送带 tag 的消息（Tag 是 *string，需取址）。
+func sendTagged(t *testing.T, c pb.MessagingServiceClient, topic, body, tag string) {
+	t.Helper()
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic:            &pb.Resource{Name: topic},
+			SystemProperties: &pb.SystemProperties{MessageType: pb.MessageType_NORMAL, Tag: &tag},
+			Body:             []byte(body),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("send: %v %v", resp.GetStatus(), err)
+	}
+}
+
+// receiveQueue 从指定队列收一次，返回消息（helper：给过滤用例复用）。
+// 3s deadline 让空队列长轮询快速返回（服务端 wait=deadline-1s≈2s），
+// 否则无 deadline 时默认长轮询 20s，空队列用例会拖慢整个测试。
+func receiveQueue(t *testing.T, c pb.MessagingServiceClient, group, topic string, q int32, expr string) []*pb.Message {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := c.ReceiveMessage(ctx, &pb.ReceiveMessageRequest{
+		Group:             &pb.Resource{Name: group},
+		MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: topic}, Id: q},
+		FilterExpression:  &pb.FilterExpression{Type: pb.FilterType_TAG, Expression: expr},
+		BatchSize:         16,
+		InvisibleDuration: durationpb.New(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ReceiveMessage: %v", err)
+	}
+	msgs, _ := recvAll(t, stream)
+	return msgs
+}
+
+// TestReceiveTagFilter 8 条消息 tagA/tagB 交替，按 tagA 过滤只收 4 条 A；
+// 被过滤的 B 已被位点跳过，事后用 "*" 也收不到。
+func TestReceiveTagFilter(t *testing.T) {
+	c := newTestClient(t)
+	for i := 0; i < 8; i++ {
+		tag, body := "tagA", "a"
+		if i%2 == 1 {
+			tag, body = "tagB", "b"
+		}
+		sendTagged(t, c, "tf", body, tag)
+	}
+	var got []string
+	for q := int32(0); q < 4; q++ {
+		for _, m := range receiveQueue(t, c, "g-tf", "tf", q, "tagA") {
+			got = append(got, string(m.GetBody()))
+		}
+	}
+	if len(got) != 4 {
+		t.Fatalf("tagA 消息数: %d (%v)", len(got), got)
+	}
+	for _, b := range got {
+		if b != "a" {
+			t.Fatalf("混入非 tagA 消息: %v", got)
+		}
+	}
+	for q := int32(0); q < 4; q++ {
+		if rest := receiveQueue(t, c, "g-tf", "tf", q, "*"); len(rest) != 0 {
+			t.Fatalf("被过滤消息不应可再收: %d", len(rest))
+		}
+	}
+}
+
+// TestReceiveRejectsUnsupportedFilter SQL92 与非法 TAG 表达式返回 ILLEGAL_FILTER_EXPRESSION。
+func TestReceiveRejectsUnsupportedFilter(t *testing.T) {
+	c := newTestClient(t)
+	sendOne(t, c, "tf-bad", "x")
+	cases := []*pb.FilterExpression{
+		{Type: pb.FilterType_SQL, Expression: "a > 1"},
+		{Type: pb.FilterType_TAG, Expression: "a ||"},
+	}
+	for _, fe := range cases {
+		stream, err := c.ReceiveMessage(context.Background(), &pb.ReceiveMessageRequest{
+			Group:             &pb.Resource{Name: "g-bad"},
+			MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: "tf-bad"}, Id: 0},
+			FilterExpression:  fe,
+			BatchSize:         1,
+			InvisibleDuration: durationpb.New(time.Minute),
+		})
+		if err != nil {
+			t.Fatalf("ReceiveMessage: %v", err)
+		}
+		msgs, st := recvAll(t, stream)
+		if len(msgs) != 0 || st.GetCode() != pb.Code_ILLEGAL_FILTER_EXPRESSION {
+			t.Fatalf("期望 ILLEGAL_FILTER_EXPRESSION，得到 %v (msgs=%d)", st, len(msgs))
+		}
+	}
+}
+
 // TestReceiveMessageEmptyPollReportsMessageNotFound 锁定长轮询空结果的协议表述：
 // 必须是一帧 MESSAGE_NOT_FOUND status，且不带任何消息帧。
 //
@@ -518,5 +693,72 @@ func TestReceiveMessageEmptyPollReportsMessageNotFound(t *testing.T) {
 	}
 	if st.GetCode() != pb.Code_MESSAGE_NOT_FOUND {
 		t.Fatalf("空轮询状态码应为 MESSAGE_NOT_FOUND，实际 %v", st)
+	}
+}
+
+// 投递方向 FIFO 回填：盘上带 MessageGroup 的消息类型必须回填 FIFO；
+// DeliverAtMs 优先（写方向已拒绝两者组合，读方向仍需确定性优先级）
+func TestToPBMessageEchoesFifoType(t *testing.T) {
+	env := newTestEnv(t, true)
+	m := &core.Message{ID: "f1", Topic: "t", Body: []byte("x"), MessageGroup: "grp", DeliveryAttempt: 1}
+	pm := env.srv.toPBMessage(m, "g", time.Minute)
+	sp := pm.GetSystemProperties()
+	if sp.GetMessageType() != pb.MessageType_FIFO || sp.GetMessageGroup() != "grp" {
+		t.Fatalf("FIFO 回填不符: type=%v group=%q", sp.GetMessageType(), sp.GetMessageGroup())
+	}
+	// 组合数据（理论上写方向已拒绝）按 DELAY 优先，保证确定性
+	both := &core.Message{ID: "f2", Topic: "t", Body: []byte("x"), MessageGroup: "grp",
+		DeliverAtMs: time.Now().UnixMilli(), DeliveryAttempt: 1}
+	if env.srv.toPBMessage(both, "g", time.Minute).GetSystemProperties().GetMessageType() != pb.MessageType_DELAY {
+		t.Fatal("DeliverAtMs 与 MessageGroup 并存时应按 DELAY 回填")
+	}
+}
+
+// 顺序消息重投的 InvisibleDuration 回填不套退避下限：deliver 侧对顺序消息
+// 不退避（Task 2），协议层若仍按退避公式回填，SDK 换算出的可见时间点会
+// 晚于服务端实际，消费端白等
+func TestToPBMessageOrderedRedeliveryNoBackoffEcho(t *testing.T) {
+	env := newTestEnv(t, true)
+	ord := &core.Message{ID: "o1", Topic: "t", Body: []byte("x"), MessageGroup: "grp", DeliveryAttempt: 3}
+	pm := env.srv.toPBMessage(ord, "g", time.Second)
+	if d := pm.GetSystemProperties().GetInvisibleDuration().AsDuration(); d != time.Second {
+		t.Fatalf("顺序重投回填应用客户端值 1s，得到 %v", d)
+	}
+	// 对照：非顺序重投仍套退避下限（既有行为不回归）
+	norm := &core.Message{ID: "n1", Topic: "t", Body: []byte("x"), DeliveryAttempt: 3}
+	pm2 := env.srv.toPBMessage(norm, "g", time.Second)
+	if d := pm2.GetSystemProperties().GetInvisibleDuration().AsDuration(); d != deliver.RetryBackoff(3) {
+		t.Fatalf("非顺序重投应回填退避下限 %v，得到 %v", deliver.RetryBackoff(3), d)
+	}
+}
+
+// 全链路：FIFO 发送 → 投递 → 消费端读回类型与组名
+func TestSendFifoDeliveredWithTypeEcho(t *testing.T) {
+	env := newTestEnv(t, true)
+	resp, err := env.client.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "fifo2"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:  pb.MessageType_FIFO,
+				MessageGroup: strPtr("grp-2"),
+			},
+			Body: []byte("hello"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("发送: %v %v", resp.GetStatus(), err)
+	}
+	// MessageGroup 经 hash 定队（produce.go），组名 "grp-2" 落哪条队列不固定，
+	// 逐队列收取（凑够即停），与包内其它全链路用例的取法一致。
+	var pm *pb.Message
+	for q := int32(0); q < 4 && pm == nil; q++ {
+		pm = receiveOne(t, env.client, "g", "fifo2", q, time.Minute)
+	}
+	if pm == nil {
+		t.Fatal("未收到 FIFO 消息")
+	}
+	sp := pm.GetSystemProperties()
+	if sp.GetMessageType() != pb.MessageType_FIFO || sp.GetMessageGroup() != "grp-2" {
+		t.Fatalf("投递回读不符: type=%v group=%q", sp.GetMessageType(), sp.GetMessageGroup())
 	}
 }

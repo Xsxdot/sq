@@ -24,9 +24,11 @@ import (
 	"time"
 
 	"google.golang.org/grpc"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/xushixin/sq/internal/core/produce"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
+	"github.com/xushixin/sq/internal/store"
 )
 
 // bigMsgSize 超限 body 测试专用的 gRPC server 端 MaxRecvMsgSize。
@@ -136,7 +138,7 @@ func TestSendMessageRejectsBatchAtomically(t *testing.T) {
 	}
 
 	// 直接从消费引擎取该 topic，证明"first-valid"没有被真正写入。
-	msgs, err := dl.Receive(context.Background(), "g-batch-check", topic, 0, 10, time.Second, 0)
+	msgs, err := dl.Receive(context.Background(), "g-batch-check", topic, 0, 10, time.Second, 0, nil)
 	if err != nil {
 		t.Fatalf("Receive: %v", err)
 	}
@@ -209,7 +211,7 @@ func TestSendMessageRejectsBatchWithOversizedBodyAtomically(t *testing.T) {
 		t.Fatalf("整批失败时不应返回任何 entry: %v", resp.GetEntries())
 	}
 
-	msgs, err := dl.Receive(context.Background(), "g-batch-oversized-check", topic, 0, 10, time.Second, 0)
+	msgs, err := dl.Receive(context.Background(), "g-batch-oversized-check", topic, 0, 10, time.Second, 0, nil)
 	if err != nil {
 		t.Fatalf("Receive: %v", err)
 	}
@@ -261,6 +263,268 @@ func TestSendMessageMalformedTopicReturnsIllegalTopic(t *testing.T) {
 	}
 	if resp.GetStatus().GetCode() != pb.Code_ILLEGAL_TOPIC {
 		t.Fatalf("status: 期望 ILLEGAL_TOPIC，得到 %v", resp.GetStatus())
+	}
+}
+
+// TestSendMessageRejectedWhenDiskBlocked 超水位拒写返回 FORBIDDEN（保读不保写）。
+func TestSendMessageRejectedWhenDiskBlocked(t *testing.T) {
+	env := newTestEnv(t, true) // server_test.go 既有 fixture，本 task 为其增 blocked 字段
+	c, blocked := env.client, env.blocked
+	blocked.Store(true)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic:            &pb.Resource{Name: "dw"},
+			SystemProperties: &pb.SystemProperties{MessageType: pb.MessageType_NORMAL},
+			Body:             []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_FORBIDDEN {
+		t.Fatalf("期望 FORBIDDEN，得到 %v %v", resp.GetStatus(), err)
+	}
+	blocked.Store(false)
+	sendOne(t, c, "dw", "x") // 恢复后可写
+}
+
+func TestSendDelayMessageGoesToDelayAreaNotDeliverable(t *testing.T) {
+	env := newTestEnv(t, true)
+	due := time.Now().Add(time.Hour)
+	resp, err := env.client.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "dly"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:       pb.MessageType_DELAY,
+				DeliveryTimestamp: timestamppb.New(due),
+			},
+			Body: []byte("later"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("延时发送应成功: %v %v", resp.GetStatus(), err)
+	}
+	// 未到期：正常消费链路取不到
+	msgs, err := env.dl.Receive(context.Background(), "g", "dly", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(msgs) != 0 {
+		t.Fatalf("未到期不应可消费: %d %v", len(msgs), err)
+	}
+	// 盘上 delay/ 恰有一条
+	pfx := []byte(store.DelayPrefix)
+	n := 0
+	env.st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) { n++; return true, nil })
+	if n != 1 {
+		t.Fatalf("delay 条目数 = %d，期望 1", n)
+	}
+}
+
+// TestSendDelayEpochTimestampNotDemotedToNormal 锁定 DELAY 消息携带非正到期
+// 时间戳（1970 epoch 或零值 time.Time）不被静默降级成 NORMAL：存在性校验只查
+// "带了没有"，不查正负；若这里不把 <=0 的到期时间钳到正数，DeliverAtMs 停在 0，
+// SendMessage 的路由门 m.DeliverAtMs>0 走不到 AppendDelay，消息就被当普通消息
+// 落盘——DELAY 类型与 DeliveryTimestamp 回读双双丢失（而且完全静默）。钳到
+// 1ms 后由 AppendDelay 的已过期直通逻辑立即投递，DeliverAtMs 原样保留：普通
+// 消息的 DeliverAtMs 恒为 0（types.go），取回的消息 >0 即证明仍是延时语义。
+func TestSendDelayEpochTimestampNotDemotedToNormal(t *testing.T) {
+	env := newTestEnv(t, true)
+	c, dl := env.client, env.dl
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "dly-epoch"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:       pb.MessageType_DELAY,
+				DeliveryTimestamp: timestamppb.New(time.UnixMilli(0)),
+			},
+			Body: []byte("epoch"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("DELAY+epoch 时间戳应被接受（直通立即投递）: %v %v", resp.GetStatus(), err)
+	}
+	msgs, err := dl.Receive(context.Background(), "g", "dly-epoch", 0, 10, time.Second, 5*time.Second, nil)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("直通投递应可取到 1 条: %d %v", len(msgs), err)
+	}
+	if msgs[0].DeliverAtMs <= 0 {
+		t.Fatalf("DeliverAtMs 应为正（DELAY 语义被保留），实际 %d——消息被降级成了 NORMAL", msgs[0].DeliverAtMs)
+	}
+}
+
+func TestSendDelayMissingTimestampRejected(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic:            &pb.Resource{Name: "dly"},
+			SystemProperties: &pb.SystemProperties{MessageType: pb.MessageType_DELAY},
+			Body:             []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_ILLEGAL_DELIVERY_TIME {
+		t.Fatalf("期望 ILLEGAL_DELIVERY_TIME，得到 %v %v", resp.GetStatus(), err)
+	}
+}
+
+func TestSendNormalWithDeliveryTimestampRejected(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "dly"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:       pb.MessageType_NORMAL,
+				DeliveryTimestamp: timestamppb.New(time.Now().Add(time.Hour)),
+			},
+			Body: []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE {
+		t.Fatalf("期望 MESSAGE_PROPERTY_CONFLICT_WITH_TYPE，得到 %v %v", resp.GetStatus(), err)
+	}
+}
+
+func TestQueryRouteAdvertisesDelayType(t *testing.T) {
+	// 守护 SDK 客户端侧校验：ValidateMessageType=true 时 SDK 发送前检查路由的
+	// AcceptMessageTypes，缺 DELAY 则延时消息在客户端本地就被拒（producer.go:191）
+	c := newTestClient(t)
+	resp, err := c.QueryRoute(context.Background(), &pb.QueryRouteRequest{Topic: &pb.Resource{Name: "dly"}})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("QueryRoute: %v %v", resp.GetStatus(), err)
+	}
+	for _, mq := range resp.GetMessageQueues() {
+		hasDelay := false
+		for _, mt := range mq.GetAcceptMessageTypes() {
+			if mt == pb.MessageType_DELAY {
+				hasDelay = true
+			}
+		}
+		if !hasDelay {
+			t.Fatalf("队列 %d 未通告 DELAY 类型", mq.GetId())
+		}
+	}
+}
+
+// FIFO 消息经全链路投递且遵守顺序锁：发 2 条同组，deliver 一次只吐 1 条
+func TestSendFifoMessageOrderedThroughStack(t *testing.T) {
+	env := newTestEnv(t, true)
+	for _, body := range []string{"f1", "f2"} {
+		resp, err := env.client.SendMessage(context.Background(), &pb.SendMessageRequest{
+			Messages: []*pb.Message{{
+				Topic: &pb.Resource{Name: "fifo"},
+				SystemProperties: &pb.SystemProperties{
+					MessageType:  pb.MessageType_FIFO,
+					MessageGroup: strPtr("grp-1"),
+				},
+				Body: []byte(body),
+			}},
+		})
+		if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+			t.Fatalf("FIFO 发送应成功: %v %v", resp.GetStatus(), err)
+		}
+	}
+	// 同组消息落同一队列；顺序锁下首轮只投 f1。队列号由 hash 决定，逐队列探测。
+	got := 0
+	for q := uint32(0); q < 4; q++ {
+		msgs, err := env.dl.Receive(context.Background(), "g", "fifo", q, 10, time.Minute, 0, nil)
+		if err != nil {
+			t.Fatalf("Receive q%d: %v", q, err)
+		}
+		got += len(msgs)
+		for _, m := range msgs {
+			if string(m.Body) != "f1" || m.MessageGroup != "grp-1" {
+				t.Fatalf("首轮只应投 f1 且组名保留: %+v", m)
+			}
+		}
+	}
+	if got != 1 {
+		t.Fatalf("顺序锁下首轮应恰投 1 条，实际 %d", got)
+	}
+}
+
+func TestSendFifoMissingGroupRejected(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic:            &pb.Resource{Name: "fifo"},
+			SystemProperties: &pb.SystemProperties{MessageType: pb.MessageType_FIFO},
+			Body:             []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_ILLEGAL_MESSAGE_GROUP {
+		t.Fatalf("期望 ILLEGAL_MESSAGE_GROUP，得到 %v %v", resp.GetStatus(), err)
+	}
+}
+
+func TestSendFifoWithDeliveryTimestampRejected(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "fifo"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:       pb.MessageType_FIFO,
+				MessageGroup:      strPtr("grp"),
+				DeliveryTimestamp: timestamppb.New(time.Now().Add(time.Hour)),
+			},
+			Body: []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE {
+		t.Fatalf("期望 MESSAGE_PROPERTY_CONFLICT_WITH_TYPE，得到 %v %v", resp.GetStatus(), err)
+	}
+}
+
+// NORMAL/DELAY 携带 message_group 被拒：SDK 只要设了组就自动标 FIFO，
+// 标其他类型却带组的只可能是行为异常的客户端；静默收下会让消息悄悄获得/
+// 失去顺序语义（与 M3 的 NORMAL+delivery_timestamp 拒绝完全同型）
+func TestSendNormalWithMessageGroupRejected(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "fifo"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:  pb.MessageType_NORMAL,
+				MessageGroup: strPtr("grp"),
+			},
+			Body: []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE {
+		t.Fatalf("期望 MESSAGE_PROPERTY_CONFLICT_WITH_TYPE，得到 %v %v", resp.GetStatus(), err)
+	}
+}
+
+func TestSendDelayWithMessageGroupRejected(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "fifo"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:       pb.MessageType_DELAY,
+				MessageGroup:      strPtr("grp"),
+				DeliveryTimestamp: timestamppb.New(time.Now().Add(time.Hour)),
+			},
+			Body: []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE {
+		t.Fatalf("期望 MESSAGE_PROPERTY_CONFLICT_WITH_TYPE，得到 %v %v", resp.GetStatus(), err)
+	}
+}
+
+// 守护 SDK 客户端侧校验（与 M3 的 DELAY 守护测试同型）：ValidateMessageType=true
+// 时 SDK 发送前检查路由的 AcceptMessageTypes，缺 FIFO 则顺序消息在客户端本地
+// 就被拒（producer.go:191）
+func TestQueryRouteAdvertisesFifoType(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.QueryRoute(context.Background(), &pb.QueryRouteRequest{Topic: &pb.Resource{Name: "fifo"}})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("QueryRoute: %v %v", resp.GetStatus(), err)
+	}
+	for _, mq := range resp.GetMessageQueues() {
+		hasFifo := false
+		for _, mt := range mq.GetAcceptMessageTypes() {
+			if mt == pb.MessageType_FIFO {
+				hasFifo = true
+			}
+		}
+		if !hasFifo {
+			t.Fatalf("队列 %d 未通告 FIFO 类型", mq.GetId())
+		}
 	}
 }
 

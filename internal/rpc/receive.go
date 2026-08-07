@@ -9,7 +9,7 @@
 //   - QueryAssignment：单机版路由查询，复用 QueryRoute 的 messageQueues
 //
 // 边界：
-//   - Tag 过滤 M1 仅接受 "*"（真实过滤属 M2），不实现投递次数上限/DLQ
+//   - Tag 过滤支持 "*" / 单 tag / "a || b"，SQL92 属性过滤计划 v1.1
 //   - 不直接操作 store/meta 以外的状态，翻译逻辑之外的业务规则全部在
 //     deliver 包（本包不重复实现 attempt 校验、inflight 生命周期等）
 package rpc
@@ -22,9 +22,11 @@ import (
 	"strings"
 	"time"
 
+	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/xushixin/sq/internal/core"
+	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
@@ -54,14 +56,23 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 	topic := mq.GetTopic().GetName()
 	queueID := uint32(mq.GetId())
 
-	if fe := req.GetFilterExpression(); fe != nil &&
-		!(fe.GetType() == pb.FilterType_TAG && fe.GetExpression() == "*") {
-		s.logger.Warn("ReceiveMessage 拒绝：不支持的过滤表达式",
-			"group", group, "topic", topic, "queue", queueID,
-			"filter_type", fe.GetType(), "filter_expr", fe.GetExpression())
-		return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
-			Status: errStatus(pb.Code_ILLEGAL_FILTER_EXPRESSION, "M1 仅支持 TAG 过滤表达式 *（M2 支持真实过滤）"),
-		}})
+	// TAG 表达式解析（M2）：支持 "*" / 单 tag / "a || b"。SQL92 → v1.1。
+	var filter *deliver.TagFilter
+	if fe := req.GetFilterExpression(); fe != nil {
+		if fe.GetType() != pb.FilterType_TAG {
+			s.logger.Warn("不支持的过滤类型", "group", group, "topic", topic, "type", fe.GetType())
+			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
+				Status: errStatus(pb.Code_ILLEGAL_FILTER_EXPRESSION, "仅支持 TAG 过滤（SQL92 计划 v1.1）"),
+			}})
+		}
+		f, err := deliver.ParseTagFilter(fe.GetExpression())
+		if err != nil {
+			s.logger.Warn("TAG 表达式非法", "group", group, "topic", topic, "expr", fe.GetExpression(), "err", err)
+			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
+				Status: errStatus(pb.Code_ILLEGAL_FILTER_EXPRESSION, err.Error()),
+			}})
+		}
+		filter = f
 	}
 	invisible := req.GetInvisibleDuration().AsDuration()
 	if invisible <= 0 {
@@ -73,7 +84,7 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 	}
 	wait := s.longPollWait(stream.Context())
 
-	msgs, err := s.dl.Receive(stream.Context(), group, topic, queueID, batch, invisible, wait)
+	msgs, err := s.dl.Receive(stream.Context(), group, topic, queueID, batch, invisible, wait, filter)
 	if err != nil {
 		// deliver.Receive 的错误不是铁板一块，必须按性质分类（同 QueryAssignment
 		// 对 EnsureTopic 错误的分类原则）：
@@ -125,7 +136,7 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 	}
 	for i, m := range msgs {
 		if err := stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Message{
-			Message: s.toPBMessage(m, group),
+			Message: s.toPBMessage(m, group, invisible),
 		}}); err != nil {
 			// 推送到一半流断了（客户端提前关闭/网络问题），前面已经发出的消息
 			// 已经生效（inflight 已写），只是本次响应没能完整送达。这条日志必须
@@ -185,13 +196,28 @@ func crc32Checksum(body []byte) string {
 // 本函数必须回填 toCoreMessage 收下的每一个透传字段：写方向存了、读方向不发，
 // 效果与压根没存一样，只是更难发现（盘上数据看着是对的）。改动其中一侧时
 // 请同时改另一侧，两者的类型映射集中在 sysprops.go。
+// DeliverAtMs 也在此回填（类型 + DeliveryTimestamp 两个字段）；MessageGroup 非空时类型回填 FIFO（M4）。
 //
 // 透传之上有两条"缺失兜底"（只在生产者什么都没声明时生效，不覆盖已有值）：
 // digest 缺失补算 CRC32、encoding 未声明归一化 IDENTITY，理由见各自的行内注释。
-func (s *Server) toPBMessage(m *core.Message, group string) *pb.Message {
+func (s *Server) toPBMessage(m *core.Message, group string, invisible time.Duration) *pb.Message {
 	handle := receiptEncode(group, m.Topic, m.QueueID, m.Offset, m.DeliveryAttempt)
 	attempt := m.DeliveryAttempt
 	offset := int64(m.Offset)
+	// 重投消息（attempt>=2）的实际不可见时长是 max(客户端要求, 退避下限)：
+	// receiveOnce 的过期语义是 exp=now+max(invisible,backoff)（deliver.go），
+	// 这里用同一公式（deliver.RetryBackoff）回填，否则 SDK 依 InvisibleDuration
+	// 换算出的可见时间点会早于服务端实际。首投无退避概念，保持客户端值。
+	eff := invisible
+	// 顺序消息除外（M4）：deliver 对顺序重投不设退避下限（卡队头要的是快速
+	// 原地重投，spec §5 流程 6 的退避仅限非顺序），这里的回填判据必须与
+	// deliver 侧（receiveOnce 的 !r.ordered）保持一致，否则 SDK 依
+	// InvisibleDuration 换算的可见时间点晚于服务端实际。
+	if m.DeliveryAttempt >= 2 && m.MessageGroup == "" {
+		if bo := deliver.RetryBackoff(m.DeliveryAttempt); bo > eff {
+			eff = bo
+		}
+	}
 	// 盘上的 token 只可能来自 bodyEncodingToCore，正常不会认不出来；真认不出来
 	// 说明数据被外部改写或两个方向被改得不再对称，宁可发一个"未声明"也要留日志。
 	enc, known := bodyEncodingToPB(m.BodyEncoding)
@@ -218,18 +244,30 @@ func (s *Server) toPBMessage(m *core.Message, group string) *pb.Message {
 	if digest == nil {
 		digest = &pb.Digest{Type: pb.DigestType_CRC32, Checksum: crc32Checksum(m.Body)}
 	}
+	// 投递时如实回填消息类型：延时看 DeliverAtMs、顺序看 MessageGroup。
+	// 写方向已拒绝两者组合，这里的优先级只为对脏数据保持确定性；
+	// DLQ 消息的 MessageGroup 在 moveToDLQ 时已清空，回 NORMAL，符合
+	// "死信不再参与顺序"的语义。
+	mtype := pb.MessageType_NORMAL
+	switch {
+	case m.DeliverAtMs > 0:
+		mtype = pb.MessageType_DELAY
+	case m.MessageGroup != "":
+		mtype = pb.MessageType_FIFO
+	}
 	sp := &pb.SystemProperties{
-		MessageId:       m.ID,
-		MessageType:     pb.MessageType_NORMAL,
-		Keys:            m.Keys,
-		BodyEncoding:    enc,
-		BodyDigest:      digest,
-		BornTimestamp:   timestamppb.New(time.UnixMilli(m.BornAtMs)),
-		BornHost:        m.BornHost,
-		StoreTimestamp:  timestamppb.New(time.UnixMilli(m.StoreAtMs)),
-		DeliveryAttempt: &attempt,
-		ReceiptHandle:   &handle,
-		QueueId:         int32(m.QueueID),
+		MessageId:         m.ID,
+		MessageType:       mtype,
+		Keys:              m.Keys,
+		BodyEncoding:      enc,
+		BodyDigest:        digest,
+		BornTimestamp:     timestamppb.New(time.UnixMilli(m.BornAtMs)),
+		BornHost:          m.BornHost,
+		StoreTimestamp:    timestamppb.New(time.UnixMilli(m.StoreAtMs)),
+		DeliveryAttempt:   &attempt,
+		ReceiptHandle:     &handle,
+		QueueId:           int32(m.QueueID),
+		InvisibleDuration: durationpb.New(eff),
 		// QueueOffset 在生成代码里是 *int64（不是 *int32，也不是值类型），
 		// 上面的 offset 局部变量就是为了取地址而存在的。
 		QueueOffset: &offset,
@@ -237,6 +275,9 @@ func (s *Server) toPBMessage(m *core.Message, group string) *pb.Message {
 	if m.Tag != "" {
 		tag := m.Tag
 		sp.Tag = &tag
+	}
+	if m.DeliverAtMs > 0 {
+		sp.DeliveryTimestamp = timestamppb.New(time.UnixMilli(m.DeliverAtMs))
 	}
 	if m.MessageGroup != "" {
 		mg := m.MessageGroup

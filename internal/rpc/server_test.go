@@ -19,6 +19,7 @@ import (
 	"log/slog"
 	"math"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -40,10 +41,13 @@ import (
 //   - client：绝大多数用例只需要它
 //   - srv：停机行为（Shutdown 让 Telemetry 长流收尾）只能从服务端这一侧触发
 //   - dl：需要绕开协议层、直接查"盘上到底有没有这条消息"时用
+//   - st：需要绕开协议层直接查盘上状态时用——延时用例查 delay/ 前缀
 type testEnv struct {
-	srv    *Server
-	client pb.MessagingServiceClient
-	dl     *deliver.Deliverer
+	srv     *Server
+	client  pb.MessagingServiceClient
+	dl      *deliver.Deliverer
+	blocked *atomic.Bool
+	st      *store.Store
 }
 
 // newTestEnv 起一套测试环境。autoCreate 决定未知 topic 是否自动创建；opts 追加
@@ -64,7 +68,7 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, autoCreate, 4, slog.Default())
+	mt, err := meta.New(st, autoCreate, 4, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("meta.New: %v", err)
 	}
@@ -74,7 +78,8 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
 	}
-	srv := New(cfg, mt, pr, dl, slog.Default())
+	blocked := &atomic.Bool{}
+	srv := New(cfg, mt, pr, dl, blocked, slog.Default())
 
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer(opts...)
@@ -93,7 +98,7 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 		t.Fatalf("dial: %v", err)
 	}
 	t.Cleanup(func() { conn.Close() })
-	return testEnv{srv: srv, client: pb.NewMessagingServiceClient(conn), dl: dl}
+	return testEnv{srv: srv, client: pb.NewMessagingServiceClient(conn), dl: dl, blocked: blocked, st: st}
 }
 
 // newTestClient 是 newTestEnv 最常用形态的简写：autoCreate=true、无额外
@@ -238,7 +243,7 @@ func TestTelemetrySubscriptionSettingsMatchClientType(t *testing.T) {
 		t.Fatal("fifo 必须显式下发（当前为 nil，客户端只能靠默认值猜）")
 	}
 	if *sub.Subscription.Fifo {
-		t.Fatal("M1 不支持顺序消费，fifo 必须显式下发 false")
+		t.Fatal("M4 起顺序由 broker 端强制（顺序锁），fifo 协商标志待 push 消费流程验证后（M5+）再翻转，当前保持 false")
 	}
 	if sub.Subscription.ReceiveBatchSize == nil {
 		t.Fatal("receive_batch_size 必须显式下发：漏填时 push 消费者拿到的批量大小是 0")

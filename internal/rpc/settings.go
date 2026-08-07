@@ -88,9 +88,9 @@ func (s *Server) negotiateSettings(client *pb.Settings) *pb.Settings {
 			// 日志/抓包里时能一眼看出这次协商对应哪个发布端。
 			Topics:      ps.Publishing.GetTopics(),
 			MaxBodySize: produce.MaxBodySize,
-			// 开启客户端侧消息类型校验：sq 的 QueryRoute 只通告
-			// AcceptMessageTypes=[NORMAL]，M1 也确实只接受普通消息。让客户端
-			// 在本地就拒掉延时/顺序/事务消息，比让它发出去再收一个
+			// 开启客户端侧消息类型校验：sq 的 QueryRoute 通告
+			// AcceptMessageTypes=[NORMAL, DELAY, FIFO]（M4 起），让客户端在本地就
+			// 拒掉事务消息，比让它发出去再收一个
 			// MESSAGE_PROPERTY_CONFLICT_WITH_TYPE 更早、更清楚。
 			ValidateMessageType: true,
 		}}
@@ -100,8 +100,9 @@ func (s *Server) negotiateSettings(client *pb.Settings) *pb.Settings {
 		out.PubSub = &pb.Settings_Subscription{Subscription: &pb.Subscription{
 			Group:         ps.Subscription.GetGroup(),
 			Subscriptions: ps.Subscription.GetSubscriptions(),
-			// M1 不支持顺序消费（属 M4），必须显式下发 false，
-			// 不能留空让客户端去猜。
+			// M4 起顺序由 broker 端强制（队列级顺序锁），消费端无需协商关闭；
+			// fifo 协商标志待 push 消费流程验证后（M5+）再翻转，
+			// 当前保持显式下发 false（不能留空让客户端去猜）。
 			Fifo:             &fifo,
 			ReceiveBatchSize: &batch,
 			// 下发服务端真实的长轮询上限，而不是回显客户端自报的值：

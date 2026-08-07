@@ -24,6 +24,13 @@ const (
 	allocPrefix     = "alloc/"
 	cursorPrefix    = "cursor/"
 	inflightPrefix  = "inflight/"
+	keyIdxPrefix    = "keyidx/"
+	delayPrefix     = "delay/"
+	// DelayPrefix 延时暂存区扫描下界（导出供 delay 包使用）。
+	DelayPrefix = delayPrefix
+	// delayAllocKey 全局单 key，与 alloc/{topic} 的按队列计数器不同：
+	// 延时条目移入前不属于任何队列，无法按队列维护计数器。
+	delayAllocKey = "delayalloc"
 )
 
 // PutU64 大端编码。
@@ -160,4 +167,88 @@ func PrefixUpperBound(prefix []byte) []byte {
 		}
 	}
 	return nil
+}
+
+// DelayKey 延时暂存条目：delay/{dueMs:8B}{seq:8B}，值为完整编码消息（spec §4）。
+// dueMs 是墙钟 UnixMilli 恒为正，按 uint64 大端编码后字节序即数值序；
+// seq 是全局分配的写入序号，仅用于同一毫秒内多条消息的 key 去重与稳定排序。
+func DelayKey(dueMs int64, seq uint64) []byte {
+	k := make([]byte, 0, len(delayPrefix)+16)
+	k = append(k, delayPrefix...)
+	k = append(k, PutU64(uint64(dueMs))...)
+	k = append(k, PutU64(seq)...)
+	return k
+}
+
+// DelayScanUpperBound 到期扫描 [DelayPrefix, 本上界) 的开区间上界：
+// 用 dueMs+1 的最小 key，恰好把 dueMs<=nowMs 的全部条目（含 nowMs 毫秒内
+// 任意 seq）纳入区间，且不含 nowMs+1 的任何条目。
+func DelayScanUpperBound(nowMs int64) []byte {
+	return DelayKey(nowMs+1, 0)
+}
+
+// ParseDelayKey 解析延时条目 key。前缀后必须恰好 16 字节定长二进制。
+func ParseDelayKey(k []byte) (int64, uint64, error) {
+	rest, ok := bytes.CutPrefix(k, []byte(delayPrefix))
+	if !ok || len(rest) != 16 {
+		return 0, 0, fmt.Errorf("非法 delay key: %q", k)
+	}
+	return int64(binary.BigEndian.Uint64(rest[:8])), binary.BigEndian.Uint64(rest[8:]), nil
+}
+
+// DelayAllocKey 延时 seq 全局计数器（值为下一可用 seq 的 8B 大端编码）。
+func DelayAllocKey() []byte { return []byte(delayAllocKey) }
+
+// KeyIdxKey Keys 业务索引：keyidx/{topic}/{key}/{storeMs:8B}{queueID:4B}{offset:8B}，值为空。
+//
+// 注意：key 是用户任意字符串（可含 '/'，与 topic/group 名不同），
+// 解析必须从尾部定长回推（见 ParseKeyIdxKey），不能按 '/' 分割。
+// storeMs 用消息 StoreAtMs：同一 key 多条消息按写入时间排序，retention 清理同用此值。
+func KeyIdxKey(topic, key string, storeMs int64, queueID uint32, offset uint64) []byte {
+	k := make([]byte, 0, len(keyIdxPrefix)+len(topic)+1+len(key)+1+20)
+	k = append(k, keyIdxPrefix...)
+	k = append(k, topic...)
+	k = append(k, '/')
+	k = append(k, key...)
+	k = append(k, '/')
+	k = append(k, PutU64(uint64(storeMs))...)
+	k = append(k, putU32(queueID)...)
+	k = append(k, PutU64(offset)...)
+	return k
+}
+
+// KeyIdxKeyPrefix 按 (topic, key) 精确查询的扫描下界（含末尾 '/'）。
+// 区间内可能混入「以本 key 为路径前缀」的其他 key（如查 "a" 命中 "a/b"），
+// 调用方须用 ParseKeyIdxKey 成功 + key 等值过滤（见 query.ByKey）。
+func KeyIdxKeyPrefix(topic, key string) []byte {
+	k := KeyIdxKey(topic, key, 0, 0, 0)
+	return k[:len(k)-20]
+}
+
+// KeyIdxTopicPrefix 某 topic 全部索引的扫描下界（retention 清理用）。
+func KeyIdxTopicPrefix(topic string) []byte {
+	return []byte(keyIdxPrefix + topic + "/")
+}
+
+// ParseKeyIdxKey 解析索引 key。key 段可能含 '/'，因此从尾部回推：
+// 末 20 字节为定长二进制（8B storeMs + 4B queueID + 8B offset），其前必须是 '/'；
+// topic 后第一个 '/' 与该分隔符之间的全部内容为 key。
+func ParseKeyIdxKey(k []byte) (topic, key string, storeMs int64, queueID uint32, offset uint64, err error) {
+	rest, ok := bytes.CutPrefix(k, []byte(keyIdxPrefix))
+	if !ok {
+		return "", "", 0, 0, 0, fmt.Errorf("非法 keyidx key: %q", k)
+	}
+	i := bytes.IndexByte(rest, '/')
+	if i < 0 {
+		return "", "", 0, 0, 0, fmt.Errorf("keyidx key 结构错误: %q", k)
+	}
+	topic = string(rest[:i])
+	rest = rest[i+1:]
+	if len(rest) < 1+20 || rest[len(rest)-21] != '/' {
+		return "", "", 0, 0, 0, fmt.Errorf("keyidx key 结构错误: %q", k)
+	}
+	key = string(rest[:len(rest)-21])
+	bin := rest[len(rest)-20:]
+	return topic, key, int64(binary.BigEndian.Uint64(bin[:8])),
+		binary.BigEndian.Uint32(bin[8:12]), binary.BigEndian.Uint64(bin[12:]), nil
 }

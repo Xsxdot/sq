@@ -4,6 +4,7 @@
 package core
 
 import (
+	"bytes"
 	"reflect"
 	"strings"
 	"testing"
@@ -71,6 +72,30 @@ func TestEncodeMessageOmitsUnsetPassthroughFields(t *testing.T) {
 	}
 }
 
+func TestMessageDeliverAtMsRoundTripAndCompat(t *testing.T) {
+	// 新字段往返
+	m := &Message{ID: "x", Topic: "t", Body: []byte("b"), DeliverAtMs: 12345}
+	raw, err := EncodeMessage(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := DecodeMessage(raw)
+	if err != nil || got.DeliverAtMs != 12345 {
+		t.Fatalf("DeliverAtMs 往返失败: %+v %v", got, err)
+	}
+	// 旧数据兼容：M2 及以前落盘的 JSON 没有 deliver_at_ms 键，解码得零值
+	old, err := DecodeMessage([]byte(`{"id":"y","topic":"t","body":"Yg=="}`))
+	if err != nil || old.DeliverAtMs != 0 {
+		t.Fatalf("旧数据兼容失败: %+v %v", old, err)
+	}
+	// 零值不产生新键：普通消息编码结果与升级前逐字节一致
+	m2 := &Message{ID: "z", Topic: "t", Body: []byte("b")}
+	raw2, _ := EncodeMessage(m2)
+	if bytes.Contains(raw2, []byte("deliver_at_ms")) {
+		t.Fatal("零值 DeliverAtMs 不应出现在 JSON 中")
+	}
+}
+
 func TestMessageIDShape(t *testing.T) {
 	id := NewMessageID()
 	if len(id) != 32 {
@@ -86,5 +111,23 @@ func TestInflightRoundTrip(t *testing.T) {
 	got, err := DecodeInflight(EncodeInflight(s))
 	if err != nil || !reflect.DeepEqual(s, got) {
 		t.Fatalf("round trip: %+v %v", got, err)
+	}
+}
+
+func TestInflightOrderedRoundTripAndCompat(t *testing.T) {
+	// 新字段往返
+	raw := EncodeInflight(&InflightState{ExpireAtMs: 100, Attempts: 2, Ordered: true})
+	got, err := DecodeInflight(raw)
+	if err != nil || !got.Ordered || got.ExpireAtMs != 100 || got.Attempts != 2 {
+		t.Fatalf("Ordered 往返失败: %+v %v", got, err)
+	}
+	// 旧数据兼容：M3 及以前落盘的 inflight JSON 没有 ordered 键，解码得 false
+	old, err := DecodeInflight([]byte(`{"expire_at_ms":100,"attempts":1}`))
+	if err != nil || old.Ordered {
+		t.Fatalf("旧数据兼容失败: %+v %v", old, err)
+	}
+	// 零值不产生新键：非顺序 inflight 编码结果与升级前逐字节一致
+	if bytes.Contains(EncodeInflight(&InflightState{ExpireAtMs: 1, Attempts: 1}), []byte("ordered")) {
+		t.Fatal("零值 Ordered 不应出现在 JSON 中")
 	}
 }

@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestLoadDefaults(t *testing.T) {
@@ -75,6 +76,19 @@ func TestLoadRejectsOutOfRangeQueueNums(t *testing.T) {
 	}
 }
 
+// TestLoadRejectsBadLogLevel 非法 log_level 必须在启动时报错：现状 SetupSlog
+// 静默降级为 info，一个拼写错误（如 verbose）会让 debug 日志无声消失，
+// 与同文件 fsync/default_queue_nums 的严格校验风格也不一致。
+func TestLoadRejectsBadLogLevel(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	if err := os.WriteFile(p, []byte("log_level: verbose\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil {
+		t.Fatal("期望拒绝非法 log_level")
+	}
+}
+
 // TestLoadAcceptsBoundaryQueueNums 与上一条互补：边界值本身必须放行，
 // 免得校验写成了排他区间。
 func TestLoadAcceptsBoundaryQueueNums(t *testing.T) {
@@ -90,5 +104,41 @@ func TestLoadAcceptsBoundaryQueueNums(t *testing.T) {
 		if cfg.DefaultQueueNums != n {
 			t.Fatalf("default_queue_nums=%d 未生效: %+v", n, cfg)
 		}
+	}
+}
+
+func TestDefaultMaxAttempts(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil || cfg.DefaultMaxAttempts != 16 {
+		t.Fatalf("默认 max attempts: %d %v", cfg.DefaultMaxAttempts, err)
+	}
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	os.WriteFile(p, []byte("default_max_attempts: 0\n"), 0o644)
+	if _, err := Load(p); err == nil {
+		t.Fatal("应拒绝 default_max_attempts=0")
+	}
+}
+
+func TestDiskWatermark(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil || cfg.DiskWatermarkPercent != 85 {
+		t.Fatalf("默认水位: %d %v", cfg.DiskWatermarkPercent, err)
+	}
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	os.WriteFile(p, []byte("disk_watermark_percent: 120\n"), 0o644)
+	if _, err := Load(p); err == nil {
+		t.Fatal("应拒绝 >99 的水位")
+	}
+}
+
+func TestRetentionInterval(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil || cfg.RetentionInterval() != 5*time.Minute {
+		t.Fatalf("默认 retention 间隔: %v %v", cfg.RetentionCheckInterval, err)
+	}
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	os.WriteFile(p, []byte("retention_check_interval: nonsense\n"), 0o644)
+	if _, err := Load(p); err == nil {
+		t.Fatal("应拒绝非法 interval")
 	}
 }
