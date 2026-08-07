@@ -2,10 +2,10 @@
 //
 // 职责：
 //   - 单趟扫描推导：topic 写入总量（alloc 计数器）、各组待拉取堆积
-//     （alloc-cursor 差值）、inflight 计数、延时队列深度
+//     （alloc-cursor 差值）、inflight 计数、延时队列深度、半消息暂存深度
 //
 // 边界：
-//   - 全量扫 cursor/inflight/delay 前缀，代价与这三类记录条数成线性——目标量级
+//   - 全量扫 cursor/inflight/delay/half 前缀，代价与这几类记录条数成线性——目标量级
 //     （单机、5k msg/s）毫秒级；不适合超大 inflight/延时积压场景的高频抓取
 //   - 没有 cursor 记录的 (group, topic) 不出现在 Pending 里：组从未拉取过就
 //     没有"它视角的堆积"可言（要看总量有 Written）
@@ -26,6 +26,7 @@ type Stats struct {
 	Topics     int
 	Groups     int
 	DelayDepth int
+	HalfDepth  int                   // 半消息暂存条数（扫 half/ 前缀，事务量级瞬时值）
 	Written    map[string]uint64     // topic → 累计写入条数
 	Pending    map[GroupTopic]uint64 // 已写入未拉取
 	Inflight   map[GroupTopic]int    // 已投递未确认
@@ -94,6 +95,16 @@ func Collect(st *store.Store, mt *meta.Meta) (*Stats, error) {
 	})
 	if err != nil {
 		return nil, fmt.Errorf("扫描 delay: %w", err)
+	}
+	// half 扫描与 delay 同款：前缀带 '/' 自定界（PrefixUpperBound 进位到
+	// "half0"），halfidx/ 索引天然落在区间外，不会混入深度计数
+	hp := []byte(store.HalfPrefix)
+	err = st.Scan(hp, store.PrefixUpperBound(hp), 0, func(k, v []byte) (bool, error) {
+		s.HalfDepth++
+		return true, nil
+	})
+	if err != nil {
+		return nil, fmt.Errorf("扫描 half: %w", err)
 	}
 	return s, nil
 }

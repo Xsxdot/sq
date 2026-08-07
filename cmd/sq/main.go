@@ -102,7 +102,7 @@ func run() error {
 	var reg *prometheus.Registry
 	var sp *metrics.Sampler
 	if cfg.AdminListen != "" {
-		reg = metrics.NewRegistry(st, mt, sys, logger)
+		reg = metrics.NewRegistry(st, mt, sys, tx, srv, logger)
 
 		// 时序采样器。停机顺序与 retention/delay 同理：本 defer 注册在
 		// st.Close 的 defer 之后（LIFO 先执行），保证不会在 store 关闭后落库。

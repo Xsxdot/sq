@@ -39,7 +39,7 @@ func newTestServer(t *testing.T, user, pass string) (*Server, *store.Store, *met
 	// sys 与 /metrics 的系统 Collector、/admin/system 共用同一个
 	// sysinfo.Reporter（数据目录用独立临时目录，不影响 store 所在目录）
 	sys := sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default())
-	s := New(st, mt, pr, dl, user, pass, sys, sp, metrics.NewRegistry(st, mt, sys, slog.Default()), slog.Default())
+	s := New(st, mt, pr, dl, user, pass, sys, sp, metrics.NewRegistry(st, mt, sys, nil, nil, slog.Default()), slog.Default())
 	return s, st, mt, pr, dl, sp
 }
 
@@ -59,7 +59,7 @@ func newTestServerNoSampler(t *testing.T, user, pass string) (*Server, *store.St
 	pr := produce.New(st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
 	sys := sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default())
-	s := New(st, mt, pr, dl, user, pass, sys, nil, metrics.NewRegistry(st, mt, sys, slog.Default()), slog.Default())
+	s := New(st, mt, pr, dl, user, pass, sys, nil, metrics.NewRegistry(st, mt, sys, nil, nil, slog.Default()), slog.Default())
 	return s, st, mt, pr, dl, nil
 }
 

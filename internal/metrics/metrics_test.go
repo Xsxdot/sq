@@ -77,7 +77,7 @@ func TestRegistryExposesMetrics(t *testing.T) {
 	if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
 		t.Fatal(err)
 	}
-	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()), slog.Default())
+	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()), nil, nil, slog.Default())
 	// Append 走过 store.Apply，直方图应已有样本；写入 counter 应为 1
 	got, err := testutil.GatherAndCount(reg, "sq_topic_messages_written_total", "sq_store_apply_duration_seconds")
 	if err != nil || got == 0 {
@@ -98,7 +98,7 @@ func TestRegistryExposesDiskAndWriteBlocked(t *testing.T) {
 	st, mt, _, _ := fixture(t)
 	blocked := &atomic.Bool{}
 	sys := sysinfo.New(t.TempDir(), 85, blocked, slog.Default())
-	reg := NewRegistry(st, mt, sys, slog.Default())
+	reg := NewRegistry(st, mt, sys, nil, nil, slog.Default())
 
 	names := gatherNames(t, reg)
 	for _, want := range []string{"sq_write_blocked", "sq_data_dir_bytes", "sq_disk_used_percent", "sq_disk_free_bytes"} {
@@ -168,7 +168,7 @@ func TestSystemMetricsSurviveStoreFailure(t *testing.T) {
 	blocked := &atomic.Bool{}
 	blocked.Store(true)
 	sys := sysinfo.New(t.TempDir(), 85, blocked, slog.Default())
-	reg := NewRegistry(st, mt, sys, slog.Default())
+	reg := NewRegistry(st, mt, sys, nil, nil, slog.Default())
 
 	// 关掉 store，让业务采集必然失败（Collect 里的 st.Get/Scan 会报 ErrClosed）
 	if err := st.Close(); err != nil {
@@ -198,5 +198,69 @@ func TestSystemMetricsSurviveStoreFailure(t *testing.T) {
 	}
 	if blockedVal != 1 {
 		t.Fatalf("拒写中应为 1，得到 %v", blockedVal)
+	}
+}
+
+// fakeTxnStats 测试替身：注入固定的事务回查计数。
+type fakeTxnStats struct{ checks, dropped uint64 }
+
+func (f *fakeTxnStats) ChecksTotal() uint64  { return f.checks }
+func (f *fakeTxnStats) DroppedTotal() uint64 { return f.dropped }
+
+// fakeConns 测试替身：注入固定的客户端连接数。
+type fakeConns struct{ n int }
+
+func (f *fakeConns) ConnectionCount() int { return f.n }
+
+// TestRegistryExportsTxnAndConnMetrics 钉住事务回查计数与连接数进入 /metrics。
+//
+// fixture 手法：直写两条 half/ 条目制造半消息暂存状态（走 store.Apply 绕过
+// txn 包），再补一条 halfidx/ 索引——halfidx 与 half 共享 "half" 前缀段，
+// 深度扫描必须把它排除（PrefixUpperBound 进位到 "half0"，halfidx 的 'i' > '0'
+// 天然落在区间外），用例把排除行为一起钉住。tx/conns 用假实现注入固定值。
+func TestRegistryExportsTxnAndConnMetrics(t *testing.T) {
+	st, mt, _, _ := fixture(t)
+	b := st.NewBatch()
+	b.Set(store.HalfKey(1723000000000, "TXN1"), []byte("raw1"), nil)
+	b.Set(store.HalfKey(1723000000001, "TXN2"), []byte("raw2"), nil)
+	b.Set(store.HalfIdxKey("TXN1"), []byte(`{}`), nil)
+	if err := st.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()),
+		&fakeTxnStats{checks: 7, dropped: 1}, &fakeConns{n: 3}, slog.Default())
+	if err := testutil.GatherAndCompare(reg, strings.NewReader(`
+# HELP sq_half_messages 半消息暂存区待回查条数
+# TYPE sq_half_messages gauge
+sq_half_messages 2
+# HELP sq_txn_checks_total 事务回查累计排期次数（含下发失败的轮次）
+# TYPE sq_txn_checks_total counter
+sq_txn_checks_total 7
+# HELP sq_txn_dropped_total 事务回查超限累计丢弃条数
+# TYPE sq_txn_dropped_total counter
+sq_txn_dropped_total 1
+# HELP sq_connections 已完成 Settings 协商的客户端连接数
+# TYPE sq_connections gauge
+sq_connections 3
+`), "sq_half_messages", "sq_txn_checks_total", "sq_txn_dropped_total", "sq_connections"); err != nil {
+		t.Fatalf("事务/连接指标输出不符: %v", err)
+	}
+}
+
+// TestRegistryTolerantToNilTxnAndConns 钉住降级场景：tx/conns 为 nil 时
+// NewRegistry 不 panic，且对应指标整体不出现（absent 而非 0——对告警更诚实）。
+func TestRegistryTolerantToNilTxnAndConns(t *testing.T) {
+	st, mt, _, _ := fixture(t)
+	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()),
+		nil, nil, slog.Default())
+	names := gatherNames(t, reg)
+	for _, absent := range []string{"sq_txn_checks_total", "sq_txn_dropped_total", "sq_connections"} {
+		if names[absent] {
+			t.Fatalf("tx/conns 为 nil 时 %s 不应产出，实际有 %v", absent, names)
+		}
+	}
+	// 业务指标不受影响仍正常产出——顺带确认 nil 分支没有打乱既有采集
+	if !names["sq_topics"] {
+		t.Fatalf("tx/conns 为 nil 不影响业务指标，实际有 %v", names)
 	}
 }
