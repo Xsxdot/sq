@@ -42,6 +42,10 @@ type Server struct {
 	writeBlocked *atomic.Bool
 	logger       *slog.Logger
 
+	// sessions 维护已完成 Settings 协商的 Telemetry 流：事务回查的下发通道
+	// （pickProducer）与连接数口径（ConnectionCount），详见 sessions.go。
+	sessions *sessions
+
 	// done 由 Shutdown 关闭，用于让没有自然终点的长流（Telemetry）主动收尾。
 	// 见 Shutdown 的注释：不给它们一个「该结束了」的信号，grpc.Server 的
 	// GracefulStop 会永远等下去。
@@ -54,10 +58,13 @@ type Server struct {
 // pr 是写路径（SendMessage），dl 是 POP 消费路径
 // （ReceiveMessage/AckMessage/ChangeInvisibleDuration）；writeBlocked 是
 // 磁盘水位拒写开关（spec §7，由 retention 循环每趟更新），为 nil 时不拒写。
+// sessions 是 Telemetry 会话注册表（M6 事务回查通道与连接数口径，本 task 自建，
+// 不依赖外部注入）。
 func New(cfg *config.Config, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, writeBlocked *atomic.Bool, logger *slog.Logger) *Server {
 	return &Server{
 		cfg: cfg, mt: mt, pr: pr, dl: dl, writeBlocked: writeBlocked, logger: logger.With("mod", "rpc"),
-		done: make(chan struct{}),
+		done:     make(chan struct{}),
+		sessions: newSessions(),
 	}
 }
 
@@ -207,6 +214,12 @@ func (s *Server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.H
 // ——客户端可以一直挂着不发也不关——于是停机时 GracefulStop 会永远等它。
 // 因此把 Recv 挪到一个独立 goroutine 里，主循环 select 读取结果与 s.done：
 // 收到停机信号就直接返回，由 gRPC 关闭流，读 goroutine 的 Recv 随之出错退出。
+//
+// topics 刷新的锁纪律（M6 回查引入的跨 goroutine 读写的根源）：
+// producer 会话的 topics 由本 handler goroutine 全量刷新（SDK 周期性重发
+// Settings，topic 列表会增长），而 pickProducer 在回查 checker goroutine 里
+// 读它——Go map 非原子，就算整体替换 map 引用也防不住读写并发。因此刷新必须
+// 经 s.sessions.updateTopics 持 sessions.mu 进行，与 pickProducer 同锁互斥。
 func (s *Server) Telemetry(stream pb.MessagingService_TelemetryServer) error {
 	// 缓冲 1 + readerDone：handler 先返回时，读 goroutine 手上可能正好有一条
 	// 没人接收的结果，靠缓冲位或 readerDone 分支退出，不会永久阻塞在发送上。
@@ -245,6 +258,16 @@ func (s *Server) Telemetry(stream pb.MessagingService_TelemetryServer) error {
 		}
 	}()
 
+	// 进入循环前声明会话并挂注销钩子：Settings 协商成功才注册（sess 非 nil），
+	// 流结束（含停机收尾）时经 defer 注销，保证注册表不留僵尸会话。
+	var sess *session
+	defer func() {
+		if sess != nil {
+			s.sessions.remove(sess)
+			s.logger.Debug("telemetry 会话注销", "connections", s.sessions.count())
+		}
+	}()
+
 	for {
 		select {
 		case <-s.done:
@@ -260,7 +283,24 @@ func (s *Server) Telemetry(stream pb.MessagingService_TelemetryServer) error {
 			switch c := r.cmd.GetCommand().(type) {
 			case *pb.TelemetryCommand_Settings:
 				settings := s.negotiateSettings(c.Settings)
-				if err := stream.Send(&pb.TelemetryCommand{
+				// 先注册会话再回包：回包经 sess.send 走同一把 sendMu，
+				// 从此本流上服务端的每一次写都被串行化（回查命令并发写安全）
+				if sess == nil {
+					sess = &session{stream: stream, clientType: c.Settings.GetClientType(), topics: map[string]bool{}}
+					s.sessions.add(sess)
+					s.logger.Debug("telemetry 会话注册",
+						"client_type", sess.clientType, "connections", s.sessions.count())
+				}
+				// SDK 周期性重发 Settings（topic 列表会增长），每次都全量刷新；
+				// 刷新经 updateTopics 持 sessions.mu 进行（topics 锁纪律见函数头注释）
+				if pubs := c.Settings.GetPublishing(); pubs != nil {
+					fresh := map[string]bool{}
+					for _, tp := range pubs.GetTopics() {
+						fresh[tp.GetName()] = true
+					}
+					s.sessions.updateTopics(sess, fresh)
+				}
+				if err := sess.send(&pb.TelemetryCommand{
 					Status:  okStatus(),
 					Command: &pb.TelemetryCommand_Settings{Settings: settings},
 				}); err != nil {
@@ -275,6 +315,10 @@ func (s *Server) Telemetry(stream pb.MessagingService_TelemetryServer) error {
 		}
 	}
 }
+
+// ConnectionCount 返回当前已完成 Settings 协商的客户端连接数
+// （/metrics 的 sq_connections 与控制台总览共用此口径，spec §9 递延自 M5）。
+func (s *Server) ConnectionCount() int { return s.sessions.count() }
 
 // NotifyClientTermination 客户端优雅下线通知。M1 无会话状态需要清理，确认即可。
 func (s *Server) NotifyClientTermination(ctx context.Context, req *pb.NotifyClientTerminationRequest) (*pb.NotifyClientTerminationResponse, error) {
