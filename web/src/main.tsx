@@ -7,7 +7,6 @@
  *
  * 边界：
  *   - 不含任何业务逻辑与数据获取；页面各自负责自己的数据
- *   - 未实现的页面先指向占位组件，每完成一个就换掉对应一行
  */
 import { StrictMode, useEffect, useState } from 'react'
 import { createRoot } from 'react-dom/client'
@@ -21,7 +20,8 @@ import Groups from './pages/Groups'
 import GroupDetail from './pages/GroupDetail'
 import Messages from './pages/Messages'
 import Send from './pages/Send'
-import { Dlq, Delay } from './pages/placeholder'
+import Dlq from './pages/Dlq'
+import Delay from './pages/Delay'
 import './styles/app.css'
 
 /** 启动时探一次是否需要登录：免登录的服务端上不该逼用户看登录页。 */

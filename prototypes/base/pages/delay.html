@@ -11,6 +11,10 @@
     - 零依赖、纯 mock、file:// 直开；数据只取自 shared/mock.js，页面内不另造假数据
     - 只呈现「未到期」这一段生命周期，不做投递/取消等写操作；
       已到期投递的消息已经变成对应 topic 的普通消息，要查它们得去 messages.html
+    - 与真实页面的差异：真实 GET /admin/delay 只返回 due_ms/msg_id/topic 三个字段，
+      没有 Keys 与消息体，真实页面因此去掉了本页的「查看消息体」弹窗，改为在
+      panel-note 里说明：延时消息尚在暂存区，要看内容需等它到期后去消息查询页
+      按 msgId 对照。本原型保留弹窗仅作视觉参考
 -->
 <meta charset="utf-8">
 <title>sq 控制台 · 延时队列</title>
