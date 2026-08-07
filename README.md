@@ -11,6 +11,9 @@ go build -o sq ./cmd/sq
 ```
 
 用官方 RocketMQ 5.x SDK（Java/Go/Python/C#/C++）直接连接 `127.0.0.1:8081` 收发。
+开启鉴权（`access_key`/`secret_key`）后同样兼容这五种 SDK：官方实现之间的签名
+头差异（Credential 段带不带 `/{region}/{service}`、签名十六进制大小写）服务端
+都已容忍；其中 Go SDK 有真实 e2e 用例覆盖，其余按官方源码的头格式对齐。
 当前状态：M5b（内嵌 Web 控制台）。里程碑与设计见 docs/superpowers/specs/。
 
 停机用 `SIGINT`/`SIGTERM` 即可：收到信号后先让协议层结束没有自然终点的长流
@@ -73,7 +76,8 @@ auto_create_topic: true
 default_queue_nums: 4
 default_max_attempts: 16       # 新订阅组默认最大投递次数，超过转入 %DLQ%{group}
 retention_check_interval: 5m   # 过期清理扫描间隔（Go duration 格式）
-disk_watermark_percent: 85     # 磁盘使用率超过即拒写保读；0=关闭
+disk_watermark_percent: 85     # 磁盘使用率超过即拒写保读；0=关闭。状态可在控制台
+                               # 总览页与 /metrics 的 sq_write_blocked 观察
 log_level: info
 # —— M5a 认证与管理面 ——
 admin_listen: ":8082"          # Admin HTTP 监听地址；"" = 关闭管理面（含 /metrics）
@@ -111,6 +115,7 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8082/admin/topics
 | --- | --- | --- |
 | POST | `/admin/login` | 用户名密码登录，返回 token |
 | GET | `/admin/overview` | 总览计数（topic/组数、写入/堆积/inflight、延时深度） |
+| GET | `/admin/system` | 运行态读数（磁盘用量与水位、数据目录占用、Go 运行时内存、协程数、运行时长、拒写状态） |
 | GET | `/admin/topics` | topic 列表 |
 | POST | `/admin/topics` | 建 topic（`{"name","queues","retention_ms"}`） |
 | GET | `/admin/topics/{name}` | topic 详情与每队列写入位置 |
@@ -133,6 +138,12 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8082/admin/topics
 - `sq_group_pending_messages{group,topic}`（堆积）
 - `sq_group_inflight_messages{group,topic}`
 - `sq_store_apply_duration_seconds`（store 批次提交含 fsync 耗时直方图）
+- `sq_disk_used_percent`、`sq_disk_free_bytes`（数据目录所在文件系统，与 `df` 同口径）
+- `sq_data_dir_bytes`（数据目录占用，60s TTL 缓存）
+- `sq_write_blocked`（磁盘水位拒写开关，1=拒写保读中）——**这一项适合直接配告警**：
+  它为 1 时生产端写入全部失败
+
+内存指标沿用 `go_memstats_*`（Go 采集器自带），不另开一套 `sq_` 前缀的口径。
 
 安全边界（刻意为之，部署前请知悉）：
 
@@ -142,6 +153,12 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8082/admin/topics
   绑定内网地址。
 - 删除类操作（topic/消费组）是即时物理删除，**先停对应流量再删**。
 - Admin token 只存于进程内存，**重启即全部失效**，需重新登录。
+- gRPC 签名**不绑请求内容**：官方 gRPC 协议本身只对 `x-mq-date-time` 做 HMAC
+  （remoting 协议的 ACL 1.0 才对请求字段签名），因此签名可跨请求复用。这是协议
+  性质而非本实现的取舍，抗重放只能靠 TLS 与网络隔离。
+- 只有**单组 AK/SK 且只认证不授权**：签名通过即全权限，没有 topic/消费组粒度、
+  没有 Pub/Sub 区分、没有 IP 白名单（RocketMQ ACL 2.0 有这些）。多组 AK/SK 排在
+  v1.0 之前，见里程碑。
 
 ## Web 控制台
 
@@ -165,6 +182,17 @@ token 有效期 24 小时、存在浏览器本地（localStorage），过期重�
 | 延时 | `/delay` | 延时暂存区视图（按到期时间升序） |
 | 发送 | `/send` | 发测试消息（普通/延时/顺序） |
 | 登录 | `/login` | 用户名密码登录拿 token |
+
+总览页第二条读数带给系统运行态：磁盘使用率与水位线、数据目录占用与可用空间、
+Go 运行时内存、运行时长与协程数。**磁盘水位触发拒写时，全站每个页面顶部都会
+挂一条红色横幅**——生产端「发不进去」的原因不该只存在于服务端日志里。
+
+内存那一格是 **Go 运行时口径**（堆占用 / 向 OS 申请量），不是进程 RSS：Go 归还
+内存有延迟，拿 RSS 读容易把正常的高位驻留误判成内存泄漏。Linux 上要看真实 RSS，
+用 `/metrics` 的 `process_resident_memory_bytes`。
+
+数据目录占用带 60 秒缓存（它只能靠递归遍历得到，每 5 秒算一遍是把诊断读数变成
+I/O 负担），因此这个数最多滞后一分钟。
 
 时序数据：内存环保留最近 1 小时（5 秒粒度）；`metrics_retention_hours` 控制
 落库保留时长（默认 168 小时 = 7 天，设 0 只保留内存环）。落库是 1 分钟粒度
