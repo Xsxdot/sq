@@ -25,6 +25,7 @@ const NAV = [
   { to: '/topics', label: 'Topic' },
   { to: '/groups', label: '消费组' },
   { to: '/delay', label: '延时队列' },
+  { to: '/transactions', label: '事务' },
   { group: '排查' },
   { to: '/messages', label: '消息查询' },
   { to: '/dlq', label: '死信队列' },

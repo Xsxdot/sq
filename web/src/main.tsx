@@ -22,6 +22,7 @@ import Messages from './pages/Messages'
 import Send from './pages/Send'
 import Dlq from './pages/Dlq'
 import Delay from './pages/Delay'
+import Transactions from './pages/Transactions'
 import './styles/app.css'
 
 /** 启动时探一次是否需要登录：免登录的服务端上不该逼用户看登录页。 */
@@ -48,6 +49,7 @@ function App() {
         <Route path="/messages" element={<Messages />} />
         <Route path="/dlq" element={<Dlq />} />
         <Route path="/delay" element={<Delay />} />
+        <Route path="/transactions" element={<Transactions />} />
         <Route path="/send" element={<Send />} />
       </Routes>
     </BrowserRouter>

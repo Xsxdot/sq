@@ -14,7 +14,7 @@
  */
 import type {
   Overview, TimeSeries, LedgerRow, Topic, TopicDetail,
-  Group, GroupDetail, Message, DelayEntry, SendResult, SystemInfo,
+  Group, GroupDetail, Message, DelayEntry, TxnEntry, SendResult, SystemInfo,
 } from './types'
 
 /** 本地 token 的存储键。与 index.html 里的主题键同一命名风格。 */
@@ -144,6 +144,8 @@ export const api = {
   group: (name: string) => request<GroupDetail>(`/admin/groups/${encodeURIComponent(name)}`),
   /** 延时队列到期条目，limit 限制条数。 */
   delay: (limit: number) => request<DelayEntry[]>(`/admin/delay?limit=${limit}`),
+  /** 待决事务半消息列表（按下次回查时间升序），limit 限制条数。 */
+  transactions: (limit: number) => request<TxnEntry[]>(`/admin/transactions?limit=${limit}`),
   /** 测试发送一条消息，body 为消息字段。 */
   send: (body: Record<string, unknown>) => request<SendResult>('/admin/messages/send', {
     method: 'POST', body: JSON.stringify(body),

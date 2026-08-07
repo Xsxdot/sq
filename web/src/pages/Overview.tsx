@@ -2,7 +2,7 @@
  * 总览页
  *
  * 职责：
- *   - 上半屏给整体信号：六项业务读数（写入/总落后/在途/延时待投/死信/TOPIC·消费组）
+ *   - 上半屏给整体信号：七项业务读数（写入/总落后/在途/延时待投/死信/连接数/TOPIC·消费组）
  *     + 四项系统读数（磁盘/数据目录/Go 内存/运行时长·协程）+ 写入与落后趋势图（1h/24h/7d）
  *   - 下半屏给全部消费关系总账：全表共用一把刻度画 offset 带，可逐行展开到队列级并就地发起操作
  *
@@ -116,7 +116,10 @@ export default function Overview() {
             <div className="stat">
               <div>
                 <div className="stat-label">延时待投</div>
+                {/* 半消息是暂存区里的另一段生命周期，与延时同属「待处置」，
+                    并入同一深度卡区展示，样式对齐延时深度 */}
                 <div className="stat-val">{fmt(ov.data?.delay_depth ?? 0)}</div>
+                <small>半消息 {fmt(ov.data?.half_depth ?? 0)}</small>
               </div>
               <Spark values={sparks.delay} color="var(--text-3)" />
             </div>
@@ -124,6 +127,15 @@ export default function Overview() {
               <div>
                 <div className="stat-label">死信</div>
                 <div className="stat-val bad">{fmt(ov.data?.total_dlq ?? 0)}</div>
+              </div>
+            </div>
+            <div className="stat">
+              <div>
+                <div className="stat-label">连接数</div>
+                {/* connections 来自 rpc 会话计数：同一连接复用长连接，
+                    它反映的是「在线客户端数」不是「请求并发数」 */}
+                <div className="stat-val">{fmt(ov.data?.connections ?? 0)}</div>
+                <small>在线</small>
               </div>
             </div>
             <div className="stat">

@@ -15,6 +15,10 @@ export interface Overview {
   topics: number
   groups: number
   delay_depth: number
+  /** 待决半消息数（事务消息尚未提交/回滚的暂存条数） */
+  half_depth: number
+  /** 在线连接数（rpc.Server 的会话计数；无连接时后端回 0） */
+  connections: number
   total_written: number
   total_pending: number
   total_inflight: number
@@ -149,6 +153,19 @@ export interface DelayEntry {
   due_ms: number
   msg_id: string
   topic: string
+}
+
+/** 事务半消息列表里的一条待决事务（按下次回查时间升序） */
+export interface TxnEntry {
+  tx_id: string
+  msg_id: string
+  topic: string
+  /** 下一次回查时间（毫秒时间戳） */
+  next_check_ms: number
+  /** 已经发起过的回查次数 */
+  checks: number
+  /** 半消息暂存时刻（毫秒时间戳） */
+  born_ms: number
 }
 
 /** 测试发送的返回：新消息落位信息 */
