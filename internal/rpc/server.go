@@ -24,6 +24,7 @@ import (
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/core/txn"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
@@ -39,6 +40,7 @@ type Server struct {
 	mt           *meta.Meta
 	pr           *produce.Producer
 	dl           *deliver.Deliverer
+	tx           *txn.Manager
 	writeBlocked *atomic.Bool
 	logger       *slog.Logger
 
@@ -53,16 +55,17 @@ type Server struct {
 	doneOnce sync.Once
 }
 
-// New 构造协议适配层。四个依赖各自服务于一组 RPC：cfg 提供对外通告地址与
+// New 构造协议适配层。五个依赖各自服务于一组 RPC：cfg 提供对外通告地址与
 // 协商参数，mt 管 topic/group 注册表（QueryRoute/Heartbeat/QueryAssignment），
 // pr 是写路径（SendMessage），dl 是 POP 消费路径
-// （ReceiveMessage/AckMessage/ChangeInvisibleDuration）；writeBlocked 是
-// 磁盘水位拒写开关（spec §7，由 retention 循环每趟更新），为 nil 时不拒写。
-// sessions 是 Telemetry 会话注册表（M6 事务回查通道与连接数口径，本 task 自建，
-// 不依赖外部注入）。
-func New(cfg *config.Config, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, writeBlocked *atomic.Bool, logger *slog.Logger) *Server {
+// （ReceiveMessage/AckMessage/ChangeInvisibleDuration），tx 是事务管理器
+// （M6）：SendMessage 把 TRANSACTION 半消息交给它暂存，EndTransaction 由它
+// 决断；writeBlocked 是磁盘水位拒写开关（spec §7，由 retention 循环每趟更新），
+// 为 nil 时不拒写。sessions 是 Telemetry 会话注册表（M6 事务回查通道与连接数
+// 口径，本 task 自建，不依赖外部注入）。
+func New(cfg *config.Config, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, tx *txn.Manager, writeBlocked *atomic.Bool, logger *slog.Logger) *Server {
 	return &Server{
-		cfg: cfg, mt: mt, pr: pr, dl: dl, writeBlocked: writeBlocked, logger: logger.With("mod", "rpc"),
+		cfg: cfg, mt: mt, pr: pr, dl: dl, tx: tx, writeBlocked: writeBlocked, logger: logger.With("mod", "rpc"),
 		done:     make(chan struct{}),
 		sessions: newSessions(),
 	}
@@ -161,6 +164,9 @@ func (s *Server) messageQueues(tc meta.TopicConfig, topic *pb.Resource) []*pb.Me
 				// M4 起接受顺序消息，理由同上（缺了 FIFO 顺序消息在客户端
 				// 本地就被拒；M6 时继续追加 TRANSACTION）
 				pb.MessageType_FIFO,
+				// M6 起接受事务消息，理由同上（SDK ValidateMessageType 在客户端
+				// 本地校验，缺了 TRANSACTION 事务消息根本发不出来）
+				pb.MessageType_TRANSACTION,
 			},
 		})
 	}

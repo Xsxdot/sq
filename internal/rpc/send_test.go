@@ -528,4 +528,98 @@ func TestQueryRouteAdvertisesFifoType(t *testing.T) {
 	}
 }
 
+// TestSendTransactionStagesHalfMessage 验证 TRANSACTION 消息经 SendMessage
+// 走暂存区（M6）：返回 OK、entry 回填 TransactionId（SDK 的 transactionImpl
+// 靠它发起 Commit/RollBack，漏了它整个事务 API 在客户端侧无法收尾）、
+// 半消息未提交前对消费不可见（deliver 只扫 msg/，half/ 数据取不到）。
+func TestSendTransactionStagesHalfMessage(t *testing.T) {
+	env := newTestEnv(t, true)
+	c, dl, st := env.client, env.dl, env.st
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "t-txn"},
+			SystemProperties: &pb.SystemProperties{
+				MessageId:   "M1",
+				MessageType: pb.MessageType_TRANSACTION,
+			},
+			Body: []byte("half"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("事务发送应成功: %v %v", resp.GetStatus(), err)
+	}
+	entry := resp.GetEntries()[0]
+	if entry.GetTransactionId() == "" {
+		t.Fatal("SendResultEntry 未回填 transaction_id——SDK 的 Commit/Rollback 全靠它")
+	}
+	// 未提交前不可消费（半消息不可见：deliver 只扫 msg/，half/ 数据取不到）
+	msgs, err := dl.Receive(context.Background(), "g", "t-txn", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(msgs) != 0 {
+		t.Fatalf("未提交的半消息不应可消费: %d %v", len(msgs), err)
+	}
+	// 盘上 half/ 恰有一条（与延时用例的 delay/ 断言同手法）
+	pfx := []byte(store.HalfPrefix)
+	n := 0
+	st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) { n++; return true, nil })
+	if n != 1 {
+		t.Fatalf("half 条目数 = %d，期望 1", n)
+	}
+}
+
+// TestSendTransactionRejectsConflicts 验证 TRANSACTION 与延时/顺序组合被拒
+// （RocketMQ 语义：事务不可与延时/顺序组合）：半消息的可见时机由
+// EndTransaction 决定，delivery_timestamp 无处安放；提交时经正常写入路径
+// 重新入队，无法承诺组内相对顺序。手法对齐既有 NORMAL/DELAY 冲突用例。
+func TestSendTransactionRejectsConflicts(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "t-txn"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:       pb.MessageType_TRANSACTION,
+				DeliveryTimestamp: timestamppb.New(time.Now().Add(time.Hour)),
+			},
+			Body: []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE {
+		t.Fatalf("TRANSACTION+delivery_timestamp 应被拒: %v %v", resp.GetStatus(), err)
+	}
+	resp, err = c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic: &pb.Resource{Name: "t-txn"},
+			SystemProperties: &pb.SystemProperties{
+				MessageType:  pb.MessageType_TRANSACTION,
+				MessageGroup: strPtr("grp"),
+			},
+			Body: []byte("x"),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE {
+		t.Fatalf("TRANSACTION+message_group 应被拒: %v %v", resp.GetStatus(), err)
+	}
+}
+
+// TestRouteAdvertisesTransaction 守护 SDK 客户端侧校验：ValidateMessageType=true
+// 时 SDK 发送前检查路由的 AcceptMessageTypes，缺 TRANSACTION 则事务消息在
+// 客户端本地就被拒（与 M3 的 DELAY / M4 的 FIFO 同教训）
+func TestRouteAdvertisesTransaction(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.QueryRoute(context.Background(), &pb.QueryRouteRequest{Topic: &pb.Resource{Name: "t-txn"}})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("QueryRoute: %v %v", resp.GetStatus(), err)
+	}
+	for _, mq := range resp.GetMessageQueues() {
+		hasTxn := false
+		for _, mt := range mq.GetAcceptMessageTypes() {
+			if mt == pb.MessageType_TRANSACTION {
+				hasTxn = true
+			}
+		}
+		if !hasTxn {
+			t.Fatalf("队列 %d 未通告 TRANSACTION 类型", mq.GetId())
+		}
+	}
+}
+
 func strPtr(s string) *string { return &s }

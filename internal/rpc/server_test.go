@@ -31,6 +31,7 @@ import (
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/core/txn"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 	"github.com/xushixin/sq/internal/store"
 )
@@ -79,7 +80,9 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 		t.Fatalf("config.Load: %v", err)
 	}
 	blocked := &atomic.Bool{}
-	srv := New(cfg, mt, pr, dl, blocked, slog.Default())
+	// txn 管理器与生产装配同参数（30s 首查间隔、15 次上限，见 config 默认值）
+	tx := txn.New(st, pr, mt, 30*time.Second, 15, slog.Default())
+	srv := New(cfg, mt, pr, dl, tx, blocked, slog.Default())
 
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer(opts...)

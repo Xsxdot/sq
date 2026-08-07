@@ -1,5 +1,5 @@
 // SendMessage 相关：proto Message ↔ core.Message 的写方向翻译。
-// 边界：NORMAL、DELAY（M3）与 FIFO（M4）；M6 事务在其里程碑打开。
+// 边界：NORMAL、DELAY（M3）、FIFO（M4）与 TRANSACTION（M6）。
 package rpc
 
 import (
@@ -55,12 +55,19 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 	entries := make([]*pb.SendResultEntry, 0, len(msgs))
 	for _, m := range msgs {
 		var stored *core.Message
+		var txID string
 		var err error
-		if m.DeliverAtMs > 0 {
+		switch {
+		case m.Transactional:
+			// 半消息进暂存区：无队列无 offset（entry.Offset 回 0），
+			// TransactionId 必须回填——SDK 的 transactionImpl 靠它发起
+			// Commit/RollBack，漏了它整个事务 API 在客户端侧无法收尾
+			stored, txID, err = s.tx.Stage(m)
+		case m.DeliverAtMs > 0:
 			// 延时消息进暂存区（未分配 offset，entry 里 Offset 回 0——SDK 的
 			// SendReceipt 只消费 MessageId，offset 字段对延时场景无意义）
 			stored, err = s.pr.AppendDelay(m)
-		} else {
+		default:
 			stored, err = s.pr.Append(m)
 		}
 		if err != nil {
@@ -76,9 +83,10 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 			}, nil
 		}
 		entries = append(entries, &pb.SendResultEntry{
-			Status:    okStatus(),
-			MessageId: stored.ID,
-			Offset:    int64(stored.Offset),
+			Status:        okStatus(),
+			MessageId:     stored.ID,
+			Offset:        int64(stored.Offset),
+			TransactionId: txID, // 非事务消息为空串，proto3 省略
 		})
 	}
 	return &pb.SendMessageResponse{Status: okStatus(), Entries: entries}, nil
@@ -89,6 +97,7 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 	sp := pm.GetSystemProperties()
 	var delayAt int64
+	var transactional bool
 	switch sp.GetMessageType() {
 	case pb.MessageType_NORMAL:
 		// SDK 只要带 deliveryTimestamp 就自动标 DELAY 类型，标 NORMAL 却带
@@ -135,7 +144,18 @@ func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 			delayAt = 1
 		}
 	case pb.MessageType_TRANSACTION:
-		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE, "事务消息将在 M6 支持")
+		// 事务不可与延时/顺序组合（RocketMQ 语义）：半消息的可见时机由
+		// EndTransaction 决定，delivery_timestamp 无处安放；提交时经正常
+		// 写入路径重新入队，无法承诺组内相对顺序
+		if sp.GetDeliveryTimestamp() != nil {
+			return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,
+				"TRANSACTION 消息不应携带 delivery_timestamp")
+		}
+		if sp.GetMessageGroup() != "" {
+			return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,
+				"TRANSACTION 消息不应携带 message_group")
+		}
+		transactional = true
 	default:
 		return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,
 			fmt.Sprintf("未知消息类型 %v", sp.GetMessageType()))
@@ -185,6 +205,9 @@ func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 		// DELAY 消息才有值；任意未来时间都接受（spec：任意秒级延时，不设上限），
 		// 已过期的时间戳由 AppendDelay 直通立即投递
 		DeliverAtMs: delayAt,
+		// TRANSACTION 消息才有值：SendMessage 据此分流到 txn.Stage 暂存
+		// （半消息不落 msg/，对消费者不可见，提交时才移入）
+		Transactional: transactional,
 		// TraceContext 是 W3C traceparent 之类的链路上下文：不带回去，
 		// 分布式追踪就在 sq 这一跳断掉，且断得悄无声息。
 		TraceContext: sp.GetTraceContext(),
