@@ -42,6 +42,12 @@ func TestSystemEndpointReportsSnapshot(t *testing.T) {
 	if got.WriteBlocked {
 		t.Fatal("测试环境不该处于拒写状态")
 	}
+	if got.Disk == nil {
+		t.Fatal("磁盘读数不该为 nil")
+	}
+	if got.DataDirBytes == nil {
+		t.Fatal("数据目录占用不该为 nil")
+	}
 }
 
 func TestSystemEndpointRequiresLogin(t *testing.T) {

@@ -101,7 +101,7 @@ func TestRegistryExposesDiskAndWriteBlocked(t *testing.T) {
 	reg := NewRegistry(st, mt, sys, slog.Default())
 
 	names := gatherNames(t, reg)
-	for _, want := range []string{"sq_write_blocked", "sq_data_dir_bytes"} {
+	for _, want := range []string{"sq_write_blocked", "sq_data_dir_bytes", "sq_disk_used_percent", "sq_disk_free_bytes"} {
 		if !names[want] {
 			t.Fatalf("/metrics 应包含 %s，实际有 %v", want, names)
 		}
