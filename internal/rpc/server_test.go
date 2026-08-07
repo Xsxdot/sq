@@ -79,6 +79,7 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
 	}
+	cfg.AutoCreateTopic = autoCreate // cfg 与 meta 的 autoCreate 必须一致，预检（send.go 第零遍）读的是 cfg
 	blocked := &atomic.Bool{}
 	// txn 管理器与生产装配同参数（30s 首查间隔、15 次上限，见 config 默认值）
 	tx := txn.New(st, pr, mt, 30*time.Second, 15, slog.Default())

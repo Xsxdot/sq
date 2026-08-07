@@ -8,15 +8,18 @@ import (
 	"time"
 
 	"github.com/xushixin/sq/internal/core"
+	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 // SendMessage 批量写入。
 //
-// 两遍处理，不能边校验边写：先把整批消息逐条翻译并校验（toCoreMessage），
-// 任一条不合法就直接返回该失败状态、不写入任何一条；只有整批全部通过校验，
-// 才进入第二遍逐条 Append。
+// 三遍处理（第零遍 + 两遍），不能边校验边写：先在"第零遍"做只读的 topic 级
+// 预检——批内 topic 必须一致、名字必须合法、未开自动创建时 topic 必须已存在，
+// 任何一条不满足整批直接拒、零落盘；再在"第一遍"把整批消息逐条翻译并校验
+// （toCoreMessage），任一条不合法就直接返回该失败状态、不写入任何一条；
+// 只有整批全部通过校验，才进入第二遍逐条 Append。
 //
 // 为什么不能像"翻译一条、校验一条、立刻 Append 一条"那样做：假设批内第 1 条
 // 合法、第 2 条不合法，若边验边写，第 1 条会在第 2 条校验失败之前就已经真正
@@ -32,6 +35,33 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 		s.logger.Warn("磁盘水位超限，拒绝写入", "messages", len(req.GetMessages()))
 		return &pb.SendMessageResponse{Status: errStatus(pb.Code_FORBIDDEN,
 			"磁盘使用率超过水位线，暂时拒写（保读）")}, nil
+	}
+	// 第零遍：topic 级只读预检（spec 鉴权收尾 §6 / backlog B6）。
+	// 必须完全无副作用——EnsureTopic（会创建 topic）绝不能出现在这里，
+	// 否则"整批任一条失败即什么都没发生"的承诺被打破。
+	if len(req.GetMessages()) > 0 {
+		topic := req.GetMessages()[0].GetTopic().GetName()
+		for _, pm := range req.GetMessages()[1:] {
+			if pm.GetTopic().GetName() != topic {
+				// 官方 Go/Java SDK 客户端侧即拒绝混 topic 批次（producer.go:276），
+				// 能到这里的只有手写客户端；若不拒绝，第二遍逐条 Append 会在部分
+				// 落盘后因 topic 错误返回不可重试错误，已落盘条目成为幽灵消息
+				s.logger.Warn("SendMessage 拒绝：批内 topic 不一致", "topic", topic, "other", pm.GetTopic().GetName())
+				return &pb.SendMessageResponse{Status: errStatus(pb.Code_BAD_REQUEST,
+					"批内所有消息的 topic 必须一致")}, nil
+			}
+		}
+		if err := meta.ValidateName(topic); err != nil {
+			s.logger.Warn("SendMessage 拒绝：topic 名字非法", "topic", topic, "err", err)
+			return &pb.SendMessageResponse{Status: errStatus(pb.Code_ILLEGAL_TOPIC, err.Error())}, nil
+		}
+		if !s.cfg.AutoCreateTopic {
+			if _, ok := s.mt.GetTopic(topic); !ok {
+				s.logger.Warn("SendMessage 拒绝：topic 不存在且未开启自动创建", "topic", topic)
+				return &pb.SendMessageResponse{Status: errStatus(pb.Code_TOPIC_NOT_FOUND,
+					fmt.Sprintf("topic %q 不存在（auto_create_topic 已关闭）", topic))}, nil
+			}
+		}
 	}
 	// 第一遍：只翻译 + 校验，不做任何持久化。
 	msgs := make([]*core.Message, 0, len(req.GetMessages()))

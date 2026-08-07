@@ -623,3 +623,68 @@ func TestRouteAdvertisesTransaction(t *testing.T) {
 }
 
 func strPtr(s string) *string { return &s }
+
+// sendReq 本文件小 helper：单/多条消息的 SendMessageRequest。
+func sendReq(topics ...string) *pb.SendMessageRequest {
+	req := &pb.SendMessageRequest{}
+	for _, tp := range topics {
+		req.Messages = append(req.Messages, &pb.Message{
+			Topic:            &pb.Resource{Name: tp},
+			SystemProperties: &pb.SystemProperties{MessageType: pb.MessageType_NORMAL},
+			Body:             []byte("x"),
+		})
+	}
+	return req
+}
+
+// countTopicMsgs 扫 [MsgKey(topic,0,0), MsgKey(topic,queues,0)) 计数（默认 4 队列）。
+func countTopicMsgs(t *testing.T, st *store.Store, topic string) int {
+	t.Helper()
+	n := 0
+	err := st.Scan(store.MsgKey(topic, 0, 0), store.MsgKey(topic, 4, 0), 0,
+		func(k, v []byte) (bool, error) { n++; return true, nil })
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestSendRejectsMixedTopicBatchWithoutPersisting(t *testing.T) {
+	env := newTestEnv(t, true)
+	resp, err := env.client.SendMessage(context.Background(), sendReq("t-mix-a", "t-mix-b"))
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if resp.GetStatus().GetCode() != pb.Code_BAD_REQUEST {
+		t.Fatalf("混 topic 批次应拒 BAD_REQUEST，实际 %v", resp.GetStatus())
+	}
+	// 关键断言：第一条也没落盘（B6 的幽灵消息就是这么产生的）
+	if n := countTopicMsgs(t, env.st, "t-mix-a") + countTopicMsgs(t, env.st, "t-mix-b"); n != 0 {
+		t.Fatalf("拒绝批次却落盘了 %d 条", n)
+	}
+}
+
+func TestSendRejectsUnknownTopicWhenAutoCreateOff(t *testing.T) {
+	env := newTestEnv(t, false)
+	resp, err := env.client.SendMessage(context.Background(), sendReq("t-nocreate"))
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if resp.GetStatus().GetCode() != pb.Code_TOPIC_NOT_FOUND {
+		t.Fatalf("未建 topic 应拒 TOPIC_NOT_FOUND，实际 %v", resp.GetStatus())
+	}
+	if n := countTopicMsgs(t, env.st, "t-nocreate"); n != 0 {
+		t.Fatalf("拒绝批次却落盘了 %d 条", n)
+	}
+}
+
+func TestSendRejectsIllegalTopicName(t *testing.T) {
+	env := newTestEnv(t, true)
+	resp, err := env.client.SendMessage(context.Background(), sendReq("bad/name"))
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if resp.GetStatus().GetCode() != pb.Code_ILLEGAL_TOPIC {
+		t.Fatalf("非法名应在预检即拒 ILLEGAL_TOPIC，实际 %v", resp.GetStatus())
+	}
+}
