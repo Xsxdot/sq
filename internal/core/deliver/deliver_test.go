@@ -501,4 +501,12 @@ func TestExhaustedAttemptsGoToDLQ(t *testing.T) {
 	if string(dlq[0].Body) != "poison" || dlq[0].Properties["sq-origin-topic"] != "t" {
 		t.Fatalf("死信内容/来源属性不符: %s %v", dlq[0].Body, dlq[0].Properties)
 	}
+	// 死信要回答的第一个问题是「试了几次、为什么进来的」：投递次数（maxAttempts=2，
+	// 第 2 次投递超限转入）与原因分类必须当场写进属性，而不是事后从日志里翻
+	if dlq[0].Properties["sq-dlq-attempts"] != "2" {
+		t.Fatalf("死信应带投递次数 2，得到 %q（props=%v）", dlq[0].Properties["sq-dlq-attempts"], dlq[0].Properties)
+	}
+	if dlq[0].Properties["sq-dlq-reason"] == "" {
+		t.Fatalf("死信应带转入原因，得到 %q（props=%v）", dlq[0].Properties["sq-dlq-reason"], dlq[0].Properties)
+	}
 }

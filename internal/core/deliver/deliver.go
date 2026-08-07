@@ -224,7 +224,7 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 		// 锁语义没有破坏：本方法已持队列锁，AppendWith 拿的是 produce 自己的锁，
 		// 两把锁全程单向（deliver → produce），无环即无死锁。
 		if r.attempts >= maxAttempts {
-			if err := d.moveToDLQ(group, topic, queueID, r.offset, m); err != nil {
+			if err := d.moveToDLQ(group, topic, queueID, r.offset, m, r.attempts, "投递次数耗尽（未在不可见期内 ack）"); err != nil {
 				b.Close()
 				return nil, err
 			}
@@ -424,21 +424,26 @@ func (d *Deliverer) ChangeInvisible(group, topic string, queueID uint32, offset 
 // moveToDLQ 将投递次数耗尽的消息复制入 %DLQ%{group} 并原子删除源 inflight。
 //
 // 死信保留原消息 ID/Body/Tag/Keys（ID 不变便于全链路追踪），来源坐标写入
-// Properties（sq-origin-topic/queue/offset，控制台溯源与重发用）；
-// MessageGroup 置空——死信不再参与顺序语义。
-func (d *Deliverer) moveToDLQ(group, topic string, queueID uint32, offset uint64, m *core.Message) error {
+// Properties（sq-origin-topic/queue/offset，控制台溯源与重发用），并附上
+// 投递次数与转入原因（sq-dlq-attempts/sq-dlq-reason）——控制台的死信列表
+// 要回答的第一个问题就是「试了几次、为什么进来的」，事后从日志里翻这两项
+// 成本远高于当场写进属性；MessageGroup 置空——死信不再参与顺序语义。
+func (d *Deliverer) moveToDLQ(group, topic string, queueID uint32, offset uint64,
+	m *core.Message, attempts int32, reason string) error {
 	dlqTopic := meta.DLQTopicName(group)
 	// 死信 topic 固定 1 队列：量小、顺序无关、控制台浏览简单。CreateTopic 幂等。
 	if _, err := d.mt.CreateTopic(dlqTopic, 1); err != nil {
 		return fmt.Errorf("创建 DLQ topic %s: %w", dlqTopic, err)
 	}
-	props := make(map[string]string, len(m.Properties)+3)
+	props := make(map[string]string, len(m.Properties)+5) // +3 来源坐标 +2 投递次数与原因
 	for k, v := range m.Properties {
 		props[k] = v
 	}
 	props["sq-origin-topic"] = topic
 	props["sq-origin-queue"] = strconv.FormatUint(uint64(queueID), 10)
 	props["sq-origin-offset"] = strconv.FormatUint(offset, 10)
+	props["sq-dlq-attempts"] = strconv.FormatInt(int64(attempts), 10)
+	props["sq-dlq-reason"] = reason
 	dlq := &core.Message{
 		ID: m.ID, Topic: dlqTopic, Tag: m.Tag, Keys: m.Keys,
 		Properties: props, Body: m.Body, BornAtMs: m.BornAtMs,
