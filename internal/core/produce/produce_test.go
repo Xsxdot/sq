@@ -164,6 +164,7 @@ func TestAppendConcurrentNoDupNoHole(t *testing.T) {
 	// offset 分配无重复无空洞、alloc 计数器与消息数严格一致。
 	// Task 8 改队列粒度锁后本用例必须原样通过（等价重构的证明）。
 	p, st := newTestProducer(t, t.TempDir()) // 既有 fixture：sync store + autoCreate(4 队列)
+	defer st.Close()
 	const goroutines, perG = 8, 50
 	var wg sync.WaitGroup
 	errs := make(chan error, goroutines*perG)

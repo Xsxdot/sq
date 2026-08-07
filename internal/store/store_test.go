@@ -72,6 +72,7 @@ func TestScanRangeAndLimit(t *testing.T) {
 func TestScanNonPositiveLimitMeansUnlimited(t *testing.T) {
 	// limit<=0 == 不限量：该语义被 deliver 阶段 2 的跳过逻辑直接依赖（B5）
 	st := openTestStore(t, t.TempDir()) // 文件内既有 helper（store_test.go:19）
+	defer st.Close()
 	const n = 10
 	for i := 0; i < n; i++ {
 		b := st.NewBatch()
