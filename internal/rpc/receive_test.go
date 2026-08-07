@@ -467,6 +467,11 @@ func TestSendPastDueDelayDeliveredImmediatelyWithTimestampEcho(t *testing.T) {
 // 在轮询频率下形成 Error 级别的日志洪水，而这个错误永远不会因为重试变好。
 func TestReceiveMessageRejectsIllegalConsumerGroup(t *testing.T) {
 	c := newTestClient(t)
+	// 先经 QueryRoute 建 topic：入口校验（Task 3）会以 TOPIC_NOT_FOUND 拒绝
+	// 不存在的 topic，本用例要测的是组名校验，topic 必须先存在
+	if _, err := c.QueryRoute(context.Background(), &pb.QueryRouteRequest{Topic: &pb.Resource{Name: "rt-illegal-group"}}); err != nil {
+		t.Fatalf("QueryRoute: %v", err)
+	}
 	stream, err := c.ReceiveMessage(context.Background(), &pb.ReceiveMessageRequest{
 		Group:             &pb.Resource{Name: "bad/group"},
 		MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: "rt-illegal-group"}, Id: 0},
@@ -676,6 +681,12 @@ func TestReceiveRejectsUnsupportedFilter(t *testing.T) {
 // 以及 test/e2e 里用真实 SDK 断言同一行为的用例。
 func TestReceiveMessageEmptyPollReportsMessageNotFound(t *testing.T) {
 	c := newTestClient(t)
+	// 先经 QueryRoute 建 topic："空轮询"的语义是 topic 存在但没有消息；
+	// 不存在的 topic 会被入口校验（Task 3）以 TOPIC_NOT_FOUND 拒绝，
+	// 那不是本用例要锁的协议形状
+	if _, err := c.QueryRoute(context.Background(), &pb.QueryRouteRequest{Topic: &pb.Resource{Name: "empty-topic"}}); err != nil {
+		t.Fatalf("QueryRoute: %v", err)
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 	stream, err := c.ReceiveMessage(ctx, &pb.ReceiveMessageRequest{
@@ -694,6 +705,53 @@ func TestReceiveMessageEmptyPollReportsMessageNotFound(t *testing.T) {
 	}
 	if st.GetCode() != pb.Code_MESSAGE_NOT_FOUND {
 		t.Fatalf("空轮询状态码应为 MESSAGE_NOT_FOUND，实际 %v", st)
+	}
+}
+
+func TestReceiveRejectsUnknownTopic(t *testing.T) {
+	// 从未被 QueryRoute/Send 创建过的 topic 直接 Receive → TOPIC_NOT_FOUND。
+	// 正常 SDK 到不了这个分支（它先 QueryRoute，autoCreate 时那里已建 topic），
+	// 挡的是绕过路由的手写客户端与已删除 topic
+	c := newTestClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stream, err := c.ReceiveMessage(ctx, &pb.ReceiveMessageRequest{
+		Group:             &pb.Resource{Name: "g-nt"},
+		MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: "never-created"}, Id: 0},
+		FilterExpression:  &pb.FilterExpression{Type: pb.FilterType_TAG, Expression: "*"},
+		BatchSize:         10,
+		InvisibleDuration: durationpb.New(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ReceiveMessage: %v", err)
+	}
+	_, st := recvAll(t, stream)
+	if st.GetCode() != pb.Code_TOPIC_NOT_FOUND {
+		t.Fatalf("状态码应为 TOPIC_NOT_FOUND，实际 %v", st)
+	}
+}
+
+func TestReceiveRejectsOutOfRangeQueue(t *testing.T) {
+	c := newTestClient(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	// 先经 QueryRoute 自动建 topic（默认 4 队列），再请求越界队列 99
+	if _, err := c.QueryRoute(ctx, &pb.QueryRouteRequest{Topic: &pb.Resource{Name: "t-oob"}}); err != nil {
+		t.Fatalf("QueryRoute: %v", err)
+	}
+	stream, err := c.ReceiveMessage(ctx, &pb.ReceiveMessageRequest{
+		Group:             &pb.Resource{Name: "g-oob"},
+		MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: "t-oob"}, Id: 99},
+		FilterExpression:  &pb.FilterExpression{Type: pb.FilterType_TAG, Expression: "*"},
+		BatchSize:         10,
+		InvisibleDuration: durationpb.New(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ReceiveMessage: %v", err)
+	}
+	_, st := recvAll(t, stream)
+	if st.GetCode() != pb.Code_BAD_REQUEST {
+		t.Fatalf("状态码应为 BAD_REQUEST，实际 %v", st)
 	}
 }
 

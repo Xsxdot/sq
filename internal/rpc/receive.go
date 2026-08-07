@@ -17,6 +17,7 @@ package rpc
 import (
 	"context"
 	"errors"
+	"fmt"
 	"hash/crc32"
 	"strconv"
 	"strings"
@@ -73,6 +74,24 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 			}})
 		}
 		filter = f
+	}
+	// topic 存在性与队列边界必须在进入 deliver 前挡住（spec 鉴权收尾 §5）。
+	// 用只读 GetTopic 而非 EnsureTopic：消费动作不应创建 topic。
+	// 为什么这里可以硬拒而不影响正常 SDK：SDK 总是先 QueryRoute（那里在
+	// auto_create 开启时会建 topic）再 Receive，走到这里 topic 必已存在；
+	// 能命中该分支的是绕过路由的手写客户端或已被删除的 topic。
+	tc, ok := s.mt.GetTopic(topic)
+	if !ok {
+		s.logger.Warn("ReceiveMessage 拒绝：topic 不存在", "group", group, "topic", topic, "queue", queueID)
+		return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
+			Status: errStatus(pb.Code_TOPIC_NOT_FOUND, fmt.Sprintf("topic %q 不存在", topic)),
+		}})
+	}
+	if queueID >= tc.Queues {
+		s.logger.Warn("ReceiveMessage 拒绝：queueID 越界", "group", group, "topic", topic, "queue", queueID, "queues", tc.Queues)
+		return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
+			Status: errStatus(pb.Code_BAD_REQUEST, fmt.Sprintf("queueID %d 越界（topic %q 共 %d 队列）", queueID, topic, tc.Queues)),
+		}})
 	}
 	invisible := req.GetInvisibleDuration().AsDuration()
 	if invisible <= 0 {
