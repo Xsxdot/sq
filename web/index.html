@@ -2,6 +2,9 @@
 <html lang="zh-CN">
   <head>
     <meta charset="utf-8" />
+    <!-- BrowserRouter 深层路由（如 /topics/order_created）硬刷新时，浏览器会按当前路径解析 ./assets/*.js，
+         拿到 SPA 回退 HTML 而不是真实 JS，导致空页面。base 指向根路径，让资源始终从根解析。 -->
+    <base href="/" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>sq 控制台</title>
     <script>
