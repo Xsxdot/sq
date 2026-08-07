@@ -14,8 +14,9 @@ import { createRoot } from 'react-dom/client'
 import { BrowserRouter, Routes, Route } from 'react-router-dom'
 import { api } from './api/client'
 import Login from './pages/Login'
+import Overview from './pages/Overview'
 import {
-  Overview, Topics, TopicDetail, Groups, GroupDetail,
+  Topics, TopicDetail, Groups, GroupDetail,
   Messages, Send, Dlq, Delay,
 } from './pages/placeholder'
 import './styles/app.css'

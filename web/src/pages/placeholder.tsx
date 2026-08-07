@@ -12,8 +12,6 @@ function Stub() {
   return <div className="empty"><p>页面待实现</p></div>
 }
 
-/** 总览页占位（Task 8 实现） */
-export const Overview = Stub
 /** Topic 列表页占位（Task 9 实现） */
 export const Topics = Stub
 /** 单个 Topic 详情页占位（Task 9 实现） */
