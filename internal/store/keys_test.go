@@ -164,3 +164,26 @@ func TestCursorKeyRoundTrip(t *testing.T) {
 		t.Fatal("InflightAllPrefix 应是 InflightKey 的前缀")
 	}
 }
+
+func TestMetricKeyRoundTrip(t *testing.T) {
+	for _, ts := range []int64{0, 1, 1754480400000, 1<<40 + 7} {
+		k := MetricKey(ts)
+		got, err := ParseMetricKey(k)
+		if err != nil {
+			t.Fatalf("ParseMetricKey(%d): %v", ts, err)
+		}
+		if got != ts {
+			t.Fatalf("往返不一致：写入 %d 读出 %d", ts, got)
+		}
+	}
+	// 字节序必须等于数值序，否则 Scan 出来的时序点不是按时间升序的
+	if bytes.Compare(MetricKey(1000), MetricKey(2000)) >= 0 {
+		t.Fatal("MetricKey 字节序应与时间序一致")
+	}
+	if _, err := ParseMetricKey([]byte("metric/short")); err == nil {
+		t.Fatal("长度不足的 key 应报错")
+	}
+	if _, err := ParseMetricKey([]byte("msg/xxxxxxxx")); err == nil {
+		t.Fatal("前缀不符的 key 应报错")
+	}
+}

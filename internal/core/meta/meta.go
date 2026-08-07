@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"log/slog"
 	"regexp"
+	"strings"
 	"sync"
 	"time"
 
@@ -37,6 +38,13 @@ const DefaultMaxAttempts = 16
 const DefaultRetentionMs int64 = 3 * 24 * 60 * 60 * 1000
 
 const dlqPrefix = "%DLQ%"
+
+// DLQPrefix 死信 topic 的名字前缀（导出：控制台与指标侧需要把死信 topic
+// 从业务 topic 里区分出来——死信不该混进「写入量」这类业务读数）。
+const DLQPrefix = dlqPrefix
+
+// IsDLQTopic 判断 topic 名是否为某消费组的死信队列。
+func IsDLQTopic(name string) bool { return strings.HasPrefix(name, dlqPrefix) }
 
 // DLQTopicName 消费组对应的死信 topic 名。'%' 在名字合法字符集内，
 // 死信 topic 是普通 topic（可用 SDK 直接消费、控制台可查可重发）。

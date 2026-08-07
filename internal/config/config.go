@@ -47,6 +47,10 @@ type Config struct {
 	AdminPassword string `yaml:"admin_password"` // Admin API 登录密码
 	AccessKey     string `yaml:"access_key"`     // gRPC 静态 AK（与 secret_key 成对，均空 = 不鉴权，spec §6 默认关闭）
 	SecretKey     string `yaml:"secret_key"`     // gRPC 静态 SK
+
+	// MetricsRetentionHours 时序采样点的落库保留时长（小时）。0 = 不落库，
+	// 只保留内存环的最近 1 小时（进程重启即丢）。默认 168（7 天）。
+	MetricsRetentionHours int `yaml:"metrics_retention_hours"`
 }
 
 // Load 加载配置。path 为空时返回纯默认值；文件存在则按字段覆盖。
@@ -58,6 +62,7 @@ func Load(path string) (*Config, error) {
 		RetentionCheckInterval: "5m",
 		DiskWatermarkPercent:   85,
 		AdminListen:            ":8082",
+		MetricsRetentionHours:  168,
 	}
 	if path == "" {
 		return cfg, nil
@@ -114,6 +119,12 @@ func Load(path string) (*Config, error) {
 	}
 	if (cfg.AdminUsername == "") != (cfg.AdminPassword == "") {
 		return nil, fmt.Errorf("配置 admin_username/admin_password 必须成对设置（或都留空以免登录）")
+	}
+	// 上界 8760（一年）：时序落库是每分钟一条定长记录，一年约 52 万条、
+	// 几十 MB，再往上就该接外部 TSDB 而不是塞进消息队列自己的 Pebble 了。
+	// 负数是笔误，启动时挡住比运行期静默按 0 处理更容易被发现。
+	if cfg.MetricsRetentionHours < 0 || cfg.MetricsRetentionHours > 8760 {
+		return nil, fmt.Errorf("配置 metrics_retention_hours 须在 [0,8760]（0=不落库），得到 %d", cfg.MetricsRetentionHours)
 	}
 	return cfg, nil
 }
