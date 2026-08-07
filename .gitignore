@@ -3,3 +3,6 @@
 *.log
 .gstack/
 web/node_modules/
+# 本机运行配置（含可能的密钥/路径）；示例见 sq.example.yaml
+/sq.yaml
+

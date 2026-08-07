@@ -18,6 +18,11 @@ export default defineConfig({
   base: './',
   build: { outDir: 'dist', emptyOutDir: true },
   server: {
+    // 固定端口：SuperDev 注册的 console 服务与 web.url 都按这个地址来。
+    // 不用默认 5173——本机 tk/admin 已占该口；不写死时 Vite 静默换口会让面板入口失效。
+    host: '127.0.0.1',
+    port: 5183,
+    strictPort: true,
     proxy: {
       '/admin': 'http://127.0.0.1:8082',
       '/metrics': 'http://127.0.0.1:8082',

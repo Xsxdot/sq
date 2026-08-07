@@ -1,0 +1,44 @@
+# sq 配置示例
+# 复制为 sq.yaml 后按需修改：cp sq.example.yaml sq.yaml
+# 启动：./sq -config sq.yaml
+# 说明：sq.yaml 已在 .gitignore，勿提交本机密钥与路径
+
+# gRPC 监听地址
+grpc_listen: ":8081"
+# 路由响应中的对外地址；容器 / 远程访问时必改
+advertise_host: "127.0.0.1"
+advertise_port: 8081
+
+# Pebble 数据目录（相对进程工作目录）
+data_dir: "./data"
+# 写盘策略：sync | async
+fsync: sync
+
+# 未知 topic 时自动创建
+auto_create_topic: true
+# 自动建 topic 的队列数（1..1024）
+default_queue_nums: 4
+# 新订阅组默认最大投递次数，超过转入 %DLQ%{group}
+default_max_attempts: 16
+
+# 过期清理扫描间隔（Go duration，如 5m、1h）
+retention_check_interval: 5m
+# 磁盘使用率超过即拒写保读；0 = 关闭；合法范围 [0,99]
+disk_watermark_percent: 85
+
+log_level: info # debug | info | warn | error
+
+# —— 管理面（Admin HTTP + /metrics + 控制台静态资源）——
+# "" = 关闭整个管理面
+admin_listen: ":8082"
+# 与 admin_password 成对；均空 = 免登录；只填一半启动报错
+admin_username: ""
+admin_password: ""
+
+# —— gRPC 静态鉴权 ——
+# 与 secret_key 成对；均空 = 不做 gRPC 鉴权；只填一半启动报错
+access_key: ""
+secret_key: ""
+
+# 时序采样落库保留小时数；0 = 只留内存环最近 1 小时；上限 8760
+metrics_retention_hours: 168
