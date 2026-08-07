@@ -26,7 +26,8 @@ func BenchmarkAppendParallel(b *testing.B) {
 	// store.Open(dir, true /*syncWrites——基准量的就是 fsync 合并*/, ...)、
 	// meta.New(st, true, 16 /*16 队列，给并发留出跨队列并行度*/, 16, ...)
 	p, _ := newBenchProducer(b, b.TempDir())
-	body := []byte("benchmark-payload-256B........................................")
+	// 固定 62B 载荷（命名如实标注），不随改锁调整，保证 Task 8 A/B 对比公平。
+	body := []byte("benchmark-payload-62B.........................................")
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
