@@ -82,6 +82,9 @@ func (s *Server) routes(reg *prometheus.Registry) {
 	s.mux.HandleFunc("GET /admin/overview", s.protected(s.handleOverview))
 	s.mux.HandleFunc("GET /admin/timeseries", s.protected(s.handleTimeseries))
 	s.mux.HandleFunc("GET /admin/ledger", s.protected(s.handleLedger))
+	// "/" 必须最后注册（可读性考虑，ServeMux 本身与注册顺序无关）：
+	// 它是兜底模式，上面每一条 /admin/... 都比它更具体，优先匹配
+	s.mux.HandleFunc("/", s.consoleHandler())
 }
 
 // Handler 返回根 handler（测试注入用）。

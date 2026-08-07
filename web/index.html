@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>sq 控制台</title>
+    <script>
+      // 主题在这里同步生效：等到 React 挂载再打标记会先白闪一下再变暗。
+      // file:// 之外 localStorage 也可能被策略拒绝，读失败退化为明色。
+      try {
+        var t = localStorage.getItem('sq-theme')
+        document.documentElement.dataset.theme = t === 'dark' ? 'dark' : 'light'
+      } catch (e) {
+        document.documentElement.dataset.theme = 'light'
+      }
+    </script>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>
