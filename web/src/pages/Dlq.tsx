@@ -14,7 +14,7 @@
  *   - 不提供删除/清空死信：死信是审计凭证，M5a 只允许读与重发
  *   - 重发后死信条目保留（可再次重发），确认框里写清这一点
  */
-import { useEffect, useRef, useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useSearchParams } from 'react-router-dom'
 import { api } from '../api/client'
 import { usePoll } from '../hooks/usePoll'
@@ -85,7 +85,7 @@ export default function Dlq() {
   const [pending, setPending] = useState<Message | null>(null)
   const [resending, setResending] = useState(false)
   const [resendErr, setResendErr] = useState<string | null>(null)
-  const [resendOk, setResendOk] = useState<string | null>(null)
+  const [resendOk, setResendOk] = useState<ReactNode | null>(null)
 
   async function onResend() {
     if (!pending) return
@@ -96,7 +96,11 @@ export default function Dlq() {
         queue_id: pending.queue_id,
         offset: pending.offset,
       })
-      setResendOk(`已提交重发 <b>${pending.id}</b> → ${propOf(pending, 'sq-origin-topic')}（死信条目保留）`)
+      // 横幅是 JSX 不是字符串：Notice 只渲染纯文本 children，
+      // 拼 HTML 字符串会把 <b> 当字面文本显示出来
+      setResendOk(
+        <>已提交重发 <b>{pending.id}</b> → {propOf(pending, 'sq-origin-topic')}（死信条目保留）</>,
+      )
       setPending(null)
       load(group)
     } catch (e) {

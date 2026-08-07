@@ -37,6 +37,21 @@ describe('api client', () => {
     await expect(api.post('/admin/topics', { name: 'order.x' })).rejects.toThrow('topic order.x 已存在')
   })
 
+  it('登录失败把后端错误文案透出，且不走失效拦截', async () => {
+    // 登录端点的 401 是「用户名或密码错误」，不是会话失效：不能清 token、
+    // 不能广播未授权事件，错误文案必须是后端那句（登录页头注释的承诺）
+    localStorage.setItem(TOKEN_KEY, 'stale')
+    const spy = vi.fn()
+    window.addEventListener(UNAUTHORIZED_EVENT, spy)
+    vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
+      new Response('{"error":"用户名或密码错误"}', { status: 401 }),
+    ))
+    await expect(api.login('root', 'bad')).rejects.toThrow('用户名或密码错误')
+    // 一次登录失败不该作废现有 token，也不该触发跳登录页
+    expect(localStorage.getItem(TOKEN_KEY)).toBe('stale')
+    expect(spy).not.toHaveBeenCalled()
+  })
+
   it('probeAuth 在免登录服务端上返回 false', async () => {
     vi.stubGlobal('fetch', vi.fn().mockResolvedValue(
       new Response('[]', { status: 200, headers: { 'content-type': 'application/json' } }),

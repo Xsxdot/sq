@@ -17,7 +17,7 @@
  *     或永久跳过，必须在确认框里写清后果
  *   - 创建/删除消费组不在此页，属于消费组列表页
  */
-import { useState } from 'react'
+import { useEffect, useRef, useState, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { api, ApiError } from '../api/client'
 import { usePoll } from '../hooks/usePoll'
@@ -32,6 +32,19 @@ export default function GroupDetail() {
   const { name = '' } = useParams()
   const detail = usePoll(() => api.group(name))
 
+  // 浏览器前进/后退在 /groups/:name 之间切换时组件不卸载：usePoll 的 interval
+  // 只在挂载时建立，fn 虽已换成新组，首次取数仍要等下一个 5s 周期——切换后
+  // 最多有 5 秒在拿旧组的数据冒充新组。与总览切档位同款：依赖变了立刻 refresh
+  const firstMount = useRef(true)
+  useEffect(() => {
+    if (firstMount.current) {
+      firstMount.current = false
+      return
+    }
+    detail.refresh()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [name])
+
   // —— 位点重置：危险且不可逆，必须二次确认，确认框写清 inflight 清空与重放影响 —— //
   const [pendingReset, setPendingReset] = useState<{
     topic: string
@@ -40,7 +53,7 @@ export default function GroupDetail() {
   const [offset, setOffset] = useState('')
   const [resetting, setResetting] = useState(false)
   const [resetErr, setResetErr] = useState<string | null>(null)
-  const [resetOk, setResetOk] = useState<string | null>(null)
+  const [resetOk, setResetOk] = useState<ReactNode | null>(null)
 
   function openReset(topic: string, q: QueueProgress) {
     setResetErr(null)
@@ -71,7 +84,12 @@ export default function GroupDetail() {
         queue_id: pendingReset.queue.queue_id,
         offset: target,
       })
-      setResetOk(`已重置 <b>${name}</b> / ${pendingReset.topic} / queue ${pendingReset.queue.queue_id} → offset <b>${fmt(target)}</b>`)
+      // 横幅是 JSX 不是字符串：Notice 只渲染纯文本 children，
+      // 拼 HTML 字符串会把 <b> 当字面文本显示出来
+      setResetOk(
+        <>已重置 <b>{name}</b> / {pendingReset.topic} / queue {pendingReset.queue.queue_id}
+          {' '}→ offset <b>{fmt(target)}</b></>,
+      )
       setPendingReset(null)
       detail.refresh()
     } catch (err) {

@@ -12,7 +12,7 @@
  *   - 队列数不可改（改了会打乱 hash 分区与既有位点），页面只读展示；retention 修改走 PATCH
  *   - 消费进度只做只读概览，重置位点等操作在消费组详情页做
  */
-import { useEffect, useRef, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent, type ReactNode } from 'react'
 import { Link, useParams } from 'react-router-dom'
 import { api, ApiError } from '../api/client'
 import { usePoll } from '../hooks/usePoll'
@@ -26,6 +26,22 @@ export default function TopicDetail() {
   const { name = '' } = useParams()
   const detail = usePoll(() => api.topic(name))
   const led = usePoll(() => api.ledger())
+
+  // 浏览器前进/后退在 /topics/:name 之间切换时组件不卸载：轮询不会立刻重拉，
+  // 且 retention 表单只在数据首达时填一次初值——不处理的话会持续显示上一个
+  // topic 的 retention，改完保存会打到新 topic 头上。与总览切档位同款：
+  // 切名时立刻 refresh，并把表单首达标记重置为 true，让新数据到达时重新填表
+  // （旧数据不触发填表，不会闪旧值）
+  const firstMount = useRef(true)
+  useEffect(() => {
+    if (firstMount.current) {
+      firstMount.current = false
+      return
+    }
+    detail.refresh()
+    first.current = true
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [name])
   const subs = (led.data ?? []).filter(r => r.topic === name)
   // 本表共用一把刻度：带子长短才能横向比较，取本页最大落后量
   const scale = maxLag(subs)
@@ -35,7 +51,7 @@ export default function TopicDetail() {
   const [retentionH, setRetentionH] = useState('')
   const [saving, setSaving] = useState(false)
   const [patchErr, setPatchErr] = useState<string | null>(null)
-  const [patchOk, setPatchOk] = useState<string | null>(null)
+  const [patchOk, setPatchOk] = useState<ReactNode | null>(null)
   // 表单初值只在数据首次到达时填一次；之后轮询刷新不覆盖手头正在改的输入
   const first = useRef(true)
   useEffect(() => {
@@ -56,7 +72,9 @@ export default function TopicDetail() {
       // 表单填的是小时，接口要毫秒
       await api.patch(`/admin/topics/${encodeURIComponent(name)}`, { retention_ms: h * 3600000 })
       setRetentionH(String(h))
-      setPatchOk(`已把 <b>${name}</b> 的 retention 改为 ${h} 小时，下一轮清理生效`)
+      // 横幅是 JSX 不是字符串：Notice 只渲染纯文本 children，
+      // 拼 HTML 字符串会把 <b> 当字面文本显示出来
+      setPatchOk(<>已把 <b>{name}</b> 的 retention 改为 {h} 小时，下一轮清理生效</>)
       detail.refresh()
     } catch (err) {
       setPatchErr(err instanceof Error ? err.message : '保存失败')
