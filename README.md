@@ -14,7 +14,7 @@ go build -o sq ./cmd/sq
 开启鉴权（`access_key`/`secret_key`）后同样兼容这五种 SDK：官方实现之间的签名
 头差异（Credential 段带不带 `/{region}/{service}`、签名十六进制大小写）服务端
 都已容忍；其中 Go SDK 有真实 e2e 用例覆盖，其余按官方源码的头格式对齐。
-当前状态：M5b（内嵌 Web 控制台）。里程碑与设计见 docs/superpowers/specs/。
+当前状态：M6（事务消息）。里程碑与设计见 docs/superpowers/specs/。
 
 停机用 `SIGINT`/`SIGTERM` 即可：收到信号后先让协议层结束没有自然终点的长流
 （`Telemetry`），再等在途 RPC 处理完（gRPC `GracefulStop`），最后关闭底层存储，
@@ -45,14 +45,18 @@ go build -o sq ./cmd/sq
 - 磁盘水位保护：磁盘使用率超过阈值（默认 85%）时拒写保读，低于阈值自动恢复
 - 延时消息：任意秒级延时（deliveryTimestamp），重启不丢，精度 ~100ms 调度间隔
 - 顺序消息：同 MessageGroup 严格按序（FIFO），失败卡队头重投、超限入 DLQ 后推进；建议顺序消息使用专用 topic（顺序锁按队列生效，与普通消息混发会队头阻塞）
+- 事务消息：SendMessage 带 TRANSACTION 类型时先以半消息暂存，由
+  `EndTransaction` 提交/回滚后才可见；未决半消息服务端按 `txn_check_interval`
+  （默认 30s）定期回查，超 `txn_max_checks`（默认 15）次仍无决断即丢弃并记日志；
+  事务不可与延时/顺序组合（协议层显式拒绝），控制台发送页也不提供事务类型
 - 认证（M5a）：gRPC 静态 AK/SK 签名校验（默认关闭，`access_key`/`secret_key` 成对
   配置启用）；Admin API 独立用户名密码登录（成对配置，均空 = 免登录）
 - Admin API（M5a）：topic/消费组管理、消息 Keys 查询与队列浏览、发送测试消息、
-  DLQ 重发、延时视图、总览（见「Admin API」）
+  DLQ 重发、延时与事务视图、总览（见「Admin API」）
 - Prometheus /metrics（M5a）：topic 写入计数、消费组堆积/inflight、延时深度、
-  store 提交耗时直方图（见「Admin API」）
-- Web 控制台（M5b）：`go:embed` 进单二进制的静态站，10 个页面覆盖总览/时序/总账、
-  topic 与消费组管理、消息查询与发送、死信重发、延时视图（见「Web 控制台」）
+  半消息深度与回查/丢弃计数、连接数、store 提交耗时直方图（见「Admin API」）
+- Web 控制台（M5b）：`go:embed` 进单二进制的静态站，11 个页面覆盖总览/时序/总账、
+  topic 与消费组管理、消息查询与发送、死信重发、延时与事务视图（见「Web 控制台」）
 
 ## 消费失败链路
 
@@ -87,6 +91,9 @@ access_key: ""                 # 与 secret_key 成对设置；均空 = 不做 g
 secret_key: ""
 # —— M5b 时序与 Web 控制台 ——
 metrics_retention_hours: 168   # 时序落库保留小时数；0 = 只留内存环的最近 1 小时
+# —— M6 事务消息 ——
+txn_check_interval: 30s        # 半消息回查间隔；未决半消息定期回查，等生产者决断
+txn_max_checks: 15             # 单条半消息最大回查次数，超限丢弃并记日志
 ```
 
 通过 `-config` 指定配置文件路径，省略则使用以上默认值：
@@ -114,7 +121,7 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8082/admin/topics
 | 方法 | 路径 | 用途 |
 | --- | --- | --- |
 | POST | `/admin/login` | 用户名密码登录，返回 token |
-| GET | `/admin/overview` | 总览计数（topic/组数、写入/堆积/inflight、延时深度） |
+| GET | `/admin/overview` | 总览计数（topic/组数、写入/堆积/inflight、延时深度、半消息深度、连接数） |
 | GET | `/admin/system` | 运行态读数（磁盘用量与水位、数据目录占用、Go 运行时内存、协程数、运行时长、拒写状态） |
 | GET | `/admin/topics` | topic 列表 |
 | POST | `/admin/topics` | 建 topic（`{"name","queues","retention_ms"}`） |
@@ -129,6 +136,7 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8082/admin/topics
 | POST | `/admin/messages/send` | 发送测试消息（`{"topic","body","tag","keys","delay_ms","message_group"}`；延时与顺序互斥） |
 | POST | `/admin/dlq/{group}/resend` | 按 `queue_id+offset` 把死信重发回原 topic |
 | GET | `/admin/delay` | 延时暂存区视图（按到期时间升序） |
+| GET | `/admin/transactions` | 待决事务视图（半消息按下次回查时间升序：tx_id/msg_id/topic/next_check_ms/checks/born_ms） |
 | GET | `/metrics` | Prometheus 指标（免鉴权） |
 
 `/metrics` 暴露的业务指标（另有 `go_*`/`process_*` 标准采集器）：
@@ -140,6 +148,10 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8082/admin/topics
 - `sq_store_apply_duration_seconds`（store 批次提交含 fsync 耗时直方图）
 - `sq_disk_used_percent`、`sq_disk_free_bytes`（数据目录所在文件系统，与 `df` 同口径）
 - `sq_data_dir_bytes`（数据目录占用，60s TTL 缓存）
+- `sq_half_messages`（半消息暂存区待回查条数，gauge）
+- `sq_txn_checks_total`（事务回查累计排期次数，含下发失败的轮次，counter）
+- `sq_txn_dropped_total`（事务回查超限累计丢弃条数，counter）
+- `sq_connections`（已完成 Settings 协商的客户端连接数，gauge；同一连接复用长连接，一条连接可带多条流）
 - `sq_write_blocked`（磁盘水位拒写开关，1=拒写保读中）——**这一项适合直接配告警**：
   它为 1 时生产端写入全部失败
 
@@ -168,11 +180,11 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8082/admin/topics
 登录：`admin_username` / `admin_password` 两项都留空时免登录；配置了就要登录，
 token 有效期 24 小时、存在浏览器本地（localStorage），过期重新登录即可。
 
-十个页面，每个解决一个具体问题：
+十一个页面，每个解决一个具体问题：
 
 | 页面 | 路径 | 解决什么 |
 | --- | --- | --- |
-| 总览 | `/` | 六项读数 + 1h/24h/7d 趋势图 + 消费关系总账，一眼看出哪个组落在后面 |
+| 总览 | `/` | 七项读数（写入/总落后/在途/延时待投/死信/连接数/TOPIC·消费组，半消息深度并入延时卡） + 1h/24h/7d 趋势图 + 消费关系总账，一眼看出哪个组落在后面 |
 | Topic | `/topics` | 建 topic、看队列数与写入位置、删 topic |
 | Topic 详情 | `/topics/:name` | 逐队列写入头、改 retention |
 | 消费组 | `/groups` | 组列表、删消费组 |
@@ -180,6 +192,7 @@ token 有效期 24 小时、存在浏览器本地（localStorage），过期重�
 | 消息查询 | `/messages` | 按 Keys 检索或按队列顺序浏览消息 |
 | 死信 | `/dlq` | 按组看死信、单条重发回原 topic |
 | 延时 | `/delay` | 延时暂存区视图（按到期时间升序） |
+| 事务 | `/transactions` | 待决事务视图：未决半消息的事务ID/消息ID/topic/回查次数/下次回查/暂存时刻，排查「事务卡住 / 回查异常」 |
 | 发送 | `/send` | 发测试消息（普通/延时/顺序） |
 | 登录 | `/login` | 用户名密码登录拿 token |
 
@@ -205,4 +218,4 @@ I/O 负担），因此这个数最多滞后一分钟。
 ## 限制
 
 - 消息体上限 4MB（`produce.MaxBodySize`）；默认同步刷盘（`fsync: sync`）。
-- 未实现：事务消息、多 broker 集群。
+- 未实现：多 broker 集群。
