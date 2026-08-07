@@ -252,3 +252,37 @@ func ParseKeyIdxKey(k []byte) (topic, key string, storeMs int64, queueID uint32,
 	return topic, key, int64(binary.BigEndian.Uint64(bin[:8])),
 		binary.BigEndian.Uint32(bin[8:12]), binary.BigEndian.Uint64(bin[12:]), nil
 }
+
+// CursorPrefix 全部消费位点的扫描下界（metrics/管理面全量遍历用）。
+func CursorPrefix() []byte { return []byte(cursorPrefix) }
+
+// CursorGroupPrefix 某消费组全部位点的扫描下界（含结尾 '/'，防 "g1" 误扫 "g10"）。
+func CursorGroupPrefix(group string) []byte { return []byte(cursorPrefix + group + "/") }
+
+// InflightAllPrefix 全部 inflight 记录的扫描下界（metrics 统计用）。
+func InflightAllPrefix() []byte { return []byte(inflightPrefix) }
+
+// InflightGroupPrefix 某消费组全部 inflight 的扫描下界（含结尾 '/'）。
+func InflightGroupPrefix(group string) []byte { return []byte(inflightPrefix + group + "/") }
+
+// ParseCursorKey 解析 cursor key：cursor/{group}/{topic}/{queueID:4B}。
+// 两段名字按 '/' 定位，尾部必须恰好 4 字节定长二进制（与 ParseInflightKey 同理，
+// 二进制段可能含 '/'，只能按位置解析）。
+func ParseCursorKey(k []byte) (group, topic string, queueID uint32, err error) {
+	rest, ok := bytes.CutPrefix(k, []byte(cursorPrefix))
+	if !ok {
+		return "", "", 0, fmt.Errorf("非法 cursor key: %q", k)
+	}
+	i := bytes.IndexByte(rest, '/')
+	if i < 0 {
+		return "", "", 0, fmt.Errorf("cursor key 结构错误: %q", k)
+	}
+	group = string(rest[:i])
+	rest = rest[i+1:]
+	j := bytes.IndexByte(rest, '/')
+	if j < 0 || len(rest)-j-1 != 4 {
+		return "", "", 0, fmt.Errorf("cursor key 结构错误: %q", k)
+	}
+	topic = string(rest[:j])
+	return group, topic, binary.BigEndian.Uint32(rest[j+1:]), nil
+}

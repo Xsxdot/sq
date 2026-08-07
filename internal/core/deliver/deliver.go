@@ -560,3 +560,26 @@ func (d *Deliverer) moveToDLQ(group, topic string, queueID uint32, offset uint64
 		"offset", offset, "msg_id", m.ID, "dlq_topic", dlqTopic)
 	return nil
 }
+
+// ResetCursor 重置某队列的消费位点并清空该队列全部 inflight（Admin API 位点
+// 重置）。offset 允许任意值：向后 = 重复消费（at-least-once 语义内），向前 =
+// 跳过消息。
+//
+// 必须持队列锁执行：绕开锁直接写 store 会与 receiveOnce/Ack 的读改写竞态，
+// 出现"重置后 cursor 又被并发投递推回去"的幽灵回退。清空 inflight 同样必须：
+// 残留的 inflight 记录会被阶段 1 当作过期重投候选、又会在 Ack 位点推进时
+// 参与空洞计算，与重置后的新 cursor 语义互相打架。
+func (d *Deliverer) ResetCursor(group, topic string, queueID uint32, offset uint64) error {
+	qmu := d.lockQueue(group, topic, queueID)
+	qmu.Lock()
+	defer qmu.Unlock()
+	b := d.st.NewBatch()
+	b.Set(store.CursorKey(group, topic, queueID), store.PutU64(offset), nil)
+	ip := store.InflightPrefix(group, topic, queueID)
+	b.DeleteRange(ip, store.PrefixUpperBound(ip), nil)
+	if err := d.st.Apply(b); err != nil {
+		return fmt.Errorf("重置位点 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+	}
+	d.logger.Info("消费位点已重置", "group", group, "topic", topic, "queue", queueID, "offset", offset)
+	return nil
+}

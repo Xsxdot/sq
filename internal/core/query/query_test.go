@@ -45,6 +45,27 @@ func TestByKeyFindsMessages(t *testing.T) {
 	}
 }
 
+// TestBrowse 按队列 offset 顺序浏览。
+func TestBrowse(t *testing.T) {
+	st, pr := newFixture(t)
+	for i := 0; i < 5; i++ {
+		if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte{byte('0' + i)}}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := Browse(st, "t1", 0, 2, 2)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("应返回 2 条: %d %v", len(got), err)
+	}
+	if got[0].Offset != 2 || got[1].Offset != 3 {
+		t.Fatalf("offset 应为 2,3: %d,%d", got[0].Offset, got[1].Offset)
+	}
+	// 越界起点：空结果不报错（控制台翻页到底的正常形态）
+	if got, err := Browse(st, "t1", 0, 99, 10); err != nil || len(got) != 0 {
+		t.Fatalf("越界应空: %d %v", len(got), err)
+	}
+}
+
 // TestByKeyNoPrefixCollision 查 "oid" 不得混入 "oid2" 与 "oid/x" 的消息。
 func TestByKeyNoPrefixCollision(t *testing.T) {
 	st, pr := newFixture(t)
