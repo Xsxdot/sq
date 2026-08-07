@@ -35,7 +35,9 @@ func newTestServer(t *testing.T, user, pass string) (*Server, *store.Store, *met
 	pr := produce.New(st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
 	sp := metrics.NewSampler(st, mt, time.Hour, slog.Default())
-	s := New(st, mt, pr, dl, user, pass, &atomic.Bool{}, sp, metrics.NewRegistry(st, mt, slog.Default()), slog.Default())
+	// sys 传 nil：admin 测试不抓取系统类指标（NewCollector 契约：sys 为 nil
+	// 时不出系统类指标）；Task 5 会换成共享的 sysinfo.Reporter。
+	s := New(st, mt, pr, dl, user, pass, &atomic.Bool{}, sp, metrics.NewRegistry(st, mt, nil, slog.Default()), slog.Default())
 	return s, st, mt, pr, dl, sp
 }
 
@@ -54,7 +56,7 @@ func newTestServerNoSampler(t *testing.T, user, pass string) (*Server, *store.St
 	}
 	pr := produce.New(st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
-	s := New(st, mt, pr, dl, user, pass, &atomic.Bool{}, nil, metrics.NewRegistry(st, mt, slog.Default()), slog.Default())
+	s := New(st, mt, pr, dl, user, pass, &atomic.Bool{}, nil, metrics.NewRegistry(st, mt, nil, slog.Default()), slog.Default())
 	return s, st, mt, pr, dl, nil
 }
 

@@ -9,9 +9,11 @@ import (
 	"context"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
 	"github.com/xushixin/sq/internal/core"
@@ -19,6 +21,7 @@ import (
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
 	"github.com/xushixin/sq/internal/store"
+	"github.com/xushixin/sq/internal/sysinfo"
 )
 
 func fixture(t *testing.T) (*store.Store, *meta.Meta, *produce.Producer, *deliver.Deliverer) {
@@ -74,7 +77,7 @@ func TestRegistryExposesMetrics(t *testing.T) {
 	if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
 		t.Fatal(err)
 	}
-	reg := NewRegistry(st, mt, slog.Default())
+	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()), slog.Default())
 	// Append 走过 store.Apply，直方图应已有样本；写入 counter 应为 1
 	got, err := testutil.GatherAndCount(reg, "sq_topic_messages_written_total", "sq_store_apply_duration_seconds")
 	if err != nil || got == 0 {
@@ -87,4 +90,57 @@ sq_topic_messages_written_total{topic="t1"} 1
 `), "sq_topic_messages_written_total"); err != nil {
 		t.Fatalf("written_total 输出不符: %v", err)
 	}
+}
+
+// TestRegistryExposesDiskAndWriteBlocked 钉住磁盘与拒写状态进入 /metrics。
+// 这是 M5 的欠账：拒写会让生产端全挂，却没有任何指标可供告警。
+func TestRegistryExposesDiskAndWriteBlocked(t *testing.T) {
+	st, mt, _, _ := fixture(t)
+	blocked := &atomic.Bool{}
+	sys := sysinfo.New(t.TempDir(), 85, blocked, slog.Default())
+	reg := NewRegistry(st, mt, sys, slog.Default())
+
+	names := gatherNames(t, reg)
+	for _, want := range []string{"sq_write_blocked", "sq_data_dir_bytes"} {
+		if !names[want] {
+			t.Fatalf("/metrics 应包含 %s，实际有 %v", want, names)
+		}
+	}
+	if v := gatherValue(t, reg, "sq_write_blocked"); v != 0 {
+		t.Fatalf("未拒写时 sq_write_blocked 应为 0，得到 %v", v)
+	}
+	blocked.Store(true)
+	if v := gatherValue(t, reg, "sq_write_blocked"); v != 1 {
+		t.Fatalf("拒写时 sq_write_blocked 应为 1，得到 %v", v)
+	}
+}
+
+// gatherNames 收集 registry 当前产出的全部指标名。
+func gatherNames(t *testing.T, reg *prometheus.Registry) map[string]bool {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather 失败: %v", err)
+	}
+	out := map[string]bool{}
+	for _, mf := range mfs {
+		out[mf.GetName()] = true
+	}
+	return out
+}
+
+// gatherValue 取一个无标签 gauge 的当前值。
+func gatherValue(t *testing.T, reg *prometheus.Registry, name string) float64 {
+	t.Helper()
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather 失败: %v", err)
+	}
+	for _, mf := range mfs {
+		if mf.GetName() == name {
+			return mf.GetMetric()[0].GetGauge().GetValue()
+		}
+	}
+	t.Fatalf("未找到指标 %s", name)
+	return 0
 }

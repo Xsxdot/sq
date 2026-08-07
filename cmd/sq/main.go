@@ -31,6 +31,7 @@ import (
 	"github.com/xushixin/sq/internal/metrics"
 	"github.com/xushixin/sq/internal/rpc"
 	"github.com/xushixin/sq/internal/store"
+	"github.com/xushixin/sq/internal/sysinfo"
 )
 
 func main() {
@@ -75,6 +76,14 @@ func run() error {
 	pr := produce.New(st, mt, logger)
 	dl := deliver.New(st, mt, pr, logger)
 
+	// writeBlocked 由 retention 每趟探测磁盘后更新，rpc.SendMessage 据此拒写。
+	// 必须先于 metrics registry 创建：registry 里的系统 Collector 要拿着
+	// sysinfo.Reporter，而 Reporter 持有的正是这个开关的指针。
+	writeBlocked := &atomic.Bool{}
+	// sysinfo 采集器：retention 的水位判定、/metrics 的 sq_disk_* 与控制台的
+	// /admin/system 三方共用它，保证看到的是同一份磁盘事实。
+	sys := sysinfo.New(cfg.DataDir, cfg.DiskWatermarkPercent, writeBlocked, logger)
+
 	// metrics registry 必须先于任何后台 goroutine 装配：NewRegistry 会写包级
 	// 钩子 store.OnApplyObserve，其契约是「装配阶段设置一次、之后只读」——
 	// retention/delay 的 goroutine 启动即可能走 store.Apply 读这个钩子，
@@ -83,7 +92,7 @@ func run() error {
 	var reg *prometheus.Registry
 	var sp *metrics.Sampler
 	if cfg.AdminListen != "" {
-		reg = metrics.NewRegistry(st, mt, logger)
+		reg = metrics.NewRegistry(st, mt, sys, logger)
 
 		// 时序采样器。停机顺序与 retention/delay 同理：本 defer 注册在
 		// st.Close 的 defer 之后（LIFO 先执行），保证不会在 store 关闭后落库。
@@ -99,8 +108,6 @@ func run() error {
 	// retention 后台清理。停机顺序关键：先取消并等待清理 goroutine 退出，
 	// 再让 defer 关闭 store——否则可能在 store 关闭后提交清理批次（panic）。
 	// defer 为 LIFO：本 defer 注册在 st.Close 的 defer 之后，故先执行。
-	// writeBlocked 由 retention 每趟探测磁盘后更新，rpc.SendMessage 据此拒写。
-	writeBlocked := &atomic.Bool{}
 	retCtx, retCancel := context.WithCancel(context.Background())
 	var retWG sync.WaitGroup
 	rm := retention.New(st, mt, cfg.RetentionInterval(), cfg.DataDir, cfg.DiskWatermarkPercent, writeBlocked, logger)
