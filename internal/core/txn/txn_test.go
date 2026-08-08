@@ -4,6 +4,7 @@ package txn
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -137,5 +138,36 @@ func TestEndTwiceSecondIsNoop(t *testing.T) {
 	got, _ := f.dl.Receive(context.Background(), "g", "t-txn", 0, 10, time.Minute, 0, nil)
 	if len(got) != 1 {
 		t.Fatalf("重复 End 导致消息条数 = %d", len(got))
+	}
+}
+
+// TestEndConcurrentDistinctTx 并发决断互不相同的 txID：分片锁下不同事务
+// 并行提交，全部 found=true 且 half 暂存区清零。若分片实现让同 txID 的
+// 互斥失效，现有 TestEndTwiceSecondIsNoop 等幂等测试会先暴露。
+func TestEndConcurrentDistinctTx(t *testing.T) {
+	f := newFixture(t, time.Minute, 15)
+	const n = 16
+	txIDs := make([]string, n)
+	for i := 0; i < n; i++ {
+		_, txID, err := f.mgr.Stage(&core.Message{Topic: "tx-cc", Body: []byte("x")})
+		if err != nil {
+			t.Fatalf("Stage: %v", err)
+		}
+		txIDs[i] = txID
+	}
+	var wg sync.WaitGroup
+	for _, id := range txIDs {
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			found, err := f.mgr.End(id, true)
+			if err != nil || !found {
+				t.Errorf("End(%s): found=%v err=%v", id, found, err)
+			}
+		}(id)
+	}
+	wg.Wait()
+	if got := f.halfCount(t); got != 0 {
+		t.Fatalf("并发提交后 half 暂存区残留 %d 条", got)
 	}
 }

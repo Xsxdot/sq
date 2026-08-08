@@ -402,6 +402,46 @@ func TestAppendBatchRejectsSpecialMessages(t *testing.T) {
 	}
 }
 
+// TestAppendDelayConcurrentSeqUnique 并发写延时消息，验证 seq 不重不漏：
+// delay 条目总数与 delayalloc 计数器严格一致。拆分提交若破坏 seq 分配的
+// 临界区（提前推进逻辑写错），本测试必挂。
+func TestAppendDelayConcurrentSeqUnique(t *testing.T) {
+	p, st := newTestProducer(t, t.TempDir())
+	defer st.Close()
+	due := time.Now().Add(time.Hour).UnixMilli()
+	const goroutines, perG = 8, 50
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perG; i++ {
+				if _, err := p.AppendDelay(&core.Message{Topic: "dly-cc", Body: []byte("x"), DeliverAtMs: due}); err != nil {
+					t.Errorf("AppendDelay: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	total := uint64(goroutines * perG)
+	n := 0
+	pfx := []byte(store.DelayPrefix)
+	if err := st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) {
+		n++
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if uint64(n) != total {
+		t.Fatalf("delay 条目 = %d, want %d（seq 撞号会覆盖变少）", n, total)
+	}
+	v, ok, err := st.Get(store.DelayAllocKey())
+	if err != nil || !ok || store.GetU64(v) != total {
+		t.Fatalf("delayalloc = %v ok=%v err=%v, want %d", v, ok, err, total)
+	}
+}
+
 // TestAppendBatchAtomicOnInvalidBody 验证整批原子性：批内任一条 body 非法时
 // 整批拒绝、零落盘（alloc 计数器不存在、无任何消息 key）。
 func TestAppendBatchAtomicOnInvalidBody(t *testing.T) {
