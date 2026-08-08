@@ -293,6 +293,94 @@ func TestClusterUncleanNodeRejoinsAsLearner(t *testing.T) {
 	tc.waitConverged(t, []string{"meta/topic/t0000", "meta/topic/t0099", "meta/topic/t0100", "meta/topic/t0199"}, 60*time.Second)
 }
 
+// TestClusterAutoRejoin 断电节点调用 cluster.Rejoin 一个入口完成全部编排：
+// 存活 leader 收 PrepareJoin 自动 Remove→AddLearner；节点 fresh 启动追平后
+// 由 AutoPromoteLearners 循环自动升 voter；最终三节点数据收敛且 victim 是
+// 全组 voter。原手工编排测试保留（行为规范不动）。
+func TestClusterAutoRejoin(t *testing.T) {
+	// AutoPromoteLearners 注入到全节点：升 voter 是 leader 侧循环的活
+	// （learner 不 lead 组），victim 自己的 Manager 也带上（无妨）
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{AutoPromoteLearners: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	lead := tc.leaderOf(t, MetaGroup)
+	writeN := func(from, n int) { // 经 meta 组写 n 键
+		for i := from; i < from+n; i++ {
+			b := tc.stores[tc.leaderOf(t, MetaGroup)].NewBatch()
+			_ = b.Set([]byte(fmt.Sprintf("meta/topic/t%04d", i)), []byte("v"))
+			if err := (clusterReplicator{tc.mgrs[tc.leaderOf(t, MetaGroup)]}).Apply(ctx, MetaGroup, b); err != nil {
+				t.Fatalf("写 %d: %v", i, err)
+			}
+		}
+	}
+	writeN(0, 100)
+	var victim uint64
+	for id := range tc.mgrs {
+		if id != lead {
+			victim = id
+			break
+		}
+	}
+	tc.kill(t, victim) // 不写标记 = 断电
+	writeN(100, 100)   // 2/3 照常
+
+	// Rejoin 前置（六步之 1）：调用方负责关旧 store——pebble 持有目录
+	// 句柄，不关闭 WipeForRejoin 清不掉（Rejoin 文档注释的调用方职责）
+	if err := tc.stores[victim].Close(); err != nil {
+		t.Fatalf("节点 %d 关闭旧 store: %v", victim, err)
+	}
+	m, err := Rejoin(ctx, Options{
+		NodeID:                 victim,
+		Peers:                  tc.peers,
+		DataGroups:             tc.dataGroups,
+		Mode:                   tc.mode,
+		Logger:                 testSlog(t),
+		LeaderBalancerInterval: tc.balancerInterval,
+		AutoPromoteLearners:    true,
+	}, tc.dirs[victim])
+	if err != nil {
+		t.Fatalf("Rejoin(%d): %v", victim, err)
+	}
+	tc.stores[victim] = m.st
+	tc.mgrs[victim] = m
+	tc.killed[victim] = false // 恢复存活：清理期按正常节点 StopClean
+	t.Logf("节点 %d 已经 Rejoin 自动编排恢复（dir=%s）", victim, tc.dirs[victim])
+
+	// 数据收敛：断电前后写入的 200 键全部存在且一致（盲 apply 的观测面）
+	tc.waitConverged(t, []string{"meta/topic/t0000", "meta/topic/t0099", "meta/topic/t0100", "meta/topic/t0199"}, 60*time.Second)
+
+	// 自动升 voter：AutoPromoteLearners 循环在追平后把 victim 升回
+	// 全组 voter——轮询 Status 断言 victim 在每组成员表的 voters 侧
+	for g := uint32(0); g <= tc.dataGroups; g++ {
+		tc.waitVoterInConfig(t, g, victim, 60*time.Second)
+	}
+}
+
+// waitVoterInConfig 轮询全部存活节点的 Status：组 g 的成员表把 nodeID
+// 列为 voter（Status.Config.Voters 即 ConfState 的运行时形态，[0] 为
+// incoming 侧）。超时 Fatal。
+func (tc *testCluster) waitVoterInConfig(t *testing.T, g uint32, nodeID uint64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for id, m := range tc.mgrs {
+			if tc.killed[id] {
+				continue
+			}
+			st, ok := m.Status(g)
+			if !ok {
+				continue
+			}
+			if _, ok := st.Config.Voters[0][nodeID]; ok {
+				t.Logf("组 %d: 节点 %d 已是 voter（节点 %d 的成员表）", g, nodeID, id)
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("组 %d: 节点 %d 未在 %v 内成为 voter", g, nodeID, timeout)
+}
+
 // TestControlRoundTrip 节点 A 经 Manager.Control 调 B 的控制通道：
 // B 的 ControlHandler 收到 op/payload 并应答，A 取回应答；handler
 // 报错时 A 收到带错误文本的 error；未知节点与超大 payload 在发送
@@ -671,6 +759,7 @@ func newTestClusterN(t *testing.T, mode AckMode, hookOpts Options, n uint64) *te
 			OnApplied:              onApplied,
 			ControlHandler:         hookOpts.ControlHandler,
 			LeaderBalancerInterval: hookOpts.LeaderBalancerInterval,
+			AutoPromoteLearners:    hookOpts.AutoPromoteLearners,
 		})
 		if err != nil {
 			t.Fatalf("节点 %d NewManager: %v", i, err)

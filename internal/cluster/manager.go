@@ -11,11 +11,14 @@
 //     最后写干净关机标记；Done 等完全退出
 //   - 重启恢复判定：干净关机标记决定 fresh / 原身份回归 / 拒绝裸恢复
 //     （ErrUncleanShutdown，须清空状态以 learner 重入）
+//   - learner 重入编排（batch③）：Rejoin 六步入口（关店清目录→
+//     PrepareJoin 全组→重建监听→fresh 启动→追平升 voter 交给 leader
+//     侧循环）；Manager 自装 PrepareJoin 控制协议 handler；开启
+//     AutoPromoteLearners 时自动把追平的 learner 升为 voter
 //
 // 边界：
-//   - 不自动编排 learner 重入——原语给全（WipeForRejoin、
-//     ProposeConfChange、TransferLeader、GroupForQueue），重入编排
-//     属 batch③
+//   - 不擅自清空数据目录——WipeForRejoin 是破坏性动作，调用方必须先
+//     打日志留痕再经 Rejoin/手动流程编排（启动自愈决策属 main）
 //   - 摊布只做「向 preferred 转移」的保守判定（本节点连续 lead ≥3 个
 //     周期、preferred 存活且为 voter 才动），不强制——节点挂掉时组
 //     停留在现任，恢复后自动回迁
@@ -34,6 +37,7 @@ import (
 	"os"
 	"sort"
 	"sync"
+	"syscall"
 	"time"
 
 	"go.etcd.io/raft/v3"
@@ -89,6 +93,19 @@ type Options struct {
 	// 节点转移领导权」的判定（策略见 StartLeaderBalancer 注释）。生产由
 	// main 注入；测试可注小间隔（cluster 测试 harness 注入 200ms）。
 	LeaderBalancerInterval time.Duration
+
+	// AutoPromoteLearners 控制追平后的自动升 voter（batch③，默认 false）：
+	// 开启时 Start 起一个与摊布循环共节拍的循环——对本节点 lead 的每个
+	// 组，把 Status(g).Progress 中「IsLearner 且 Match 已追平本组日志
+	// 末位（lastIndex）」的节点 ProposeConfChange(AddNode) 升为 voter。
+	// 「无新提案时位点即锚点」：Match 追上当下 lastIndex 即达标，不追求
+	// 绝对静止点，其后 leader 的新提案 learner 照常收。
+	// 与手工 ProposeConfChange 并存不冲突：raft 成员变更天然串行
+	// （pendingConfIndex 校验），并发提出时后者被静默替换成空条目、
+	// 等待超时——本循环下轮 tick 重判，手工调用方自行重试。
+	// 注意：升 voter 循环与摊布循环共节拍，依赖 LeaderBalancerInterval
+	// 注入（≤0 时两者都不启动）；重入编排主体是 Rejoin。
+	AutoPromoteLearners bool
 }
 
 // Manager 是多组装配体：持有全部 raft 组、传输层与恢复判定。
@@ -125,6 +142,14 @@ type Manager struct {
 	leaderBalancerInterval time.Duration
 	runCtx                 context.Context
 	balancerOnce           sync.Once
+
+	// 自动升 voter（batch③）：autoPromote 来自 Options.AutoPromoteLearners，
+	// 循环与摊布循环共节拍（见 promoteLearners 注释）。
+	autoPromote bool
+
+	// prepareJoinMu 串行化本节点的 PrepareJoin 处理（见
+	// handlePrepareJoin 注释：并发提成员变更会被 raft 静默替换）。
+	prepareJoinMu sync.Mutex
 }
 
 // NewManager 装配全部 raft 组并按磁盘状态判定恢复路径。
@@ -168,11 +193,26 @@ func NewManager(o Options) (*Manager, error) {
 		groups:                 make(map[uint32]*group, o.DataGroups+1),
 		onLeaderChange:         o.OnLeaderChange,
 		onApplied:              o.OnApplied,
-		controlHandler:         o.ControlHandler,
 		leaderBalancerInterval: o.LeaderBalancerInterval,
+		autoPromote:            o.AutoPromoteLearners,
 		doneCh:                 make(chan struct{}),
 	}
 	m.rs = newRaftStore(o.Store, lg)
+
+	// PrepareJoin handler 自装（batch③）：在任何注入的 ControlHandler
+	// 之前包一层——OpPrepareJoin 由 Manager 内部处理（重入编排协议面），
+	// 其余 op 转发给调用方注入的 handler；未注入时回「控制通道未装配」
+	// （保持 nil handler 的对端语义，probePeerAlive 依赖该错误形状）。
+	userHandler := o.ControlHandler
+	m.controlHandler = func(op byte, payload []byte) ([]byte, error) {
+		if op == OpPrepareJoin {
+			return m.handlePrepareJoin(payload)
+		}
+		if userHandler == nil {
+			return nil, errControlUnassembled
+		}
+		return userHandler(op, payload)
+	}
 
 	// 组数契约：首启持久化，此后不可变——组数变即存量数据错组
 	if err := m.rs.EnsureGroups(o.DataGroups); err != nil {
@@ -430,6 +470,13 @@ func (m *Manager) leaderBalancer(ctx context.Context, interval time.Duration) {
 			return
 		case <-ticker.C:
 			for g := uint32(0); g < m.Groups(); g++ {
+				// 自动升 voter 与摊布共节拍（AutoPromoteLearners）：
+				// 先升后摊——升完的 learner 成为 voter 后，摊布的
+				// preferred 转移判定才看得到它（balanceOnce 对 learner
+				// 不转移）；本节点不再 lead 的组自然跳过
+				if m.autoPromote {
+					m.promoteLearners(g)
+				}
 				m.balanceOnce(g, preferred[g], stableTicks)
 			}
 		}
@@ -510,6 +557,55 @@ func (m *Manager) probePeerAlive(nodeID uint64) bool {
 	// 只有拨号失败才算死亡——连接拒绝/超时都是 *net.OpError
 	var opErr *net.OpError
 	return !errors.As(err, &opErr)
+}
+
+// promoteLearners 对组 g 做一轮自动升 voter 判定（AutoPromoteLearners
+// 循环，与摊布循环共节拍，见 leaderBalancer）：本节点 lead 时，把
+// Status(g).Progress 中 IsLearner 且 Match 已追平本组日志末位
+// （storage.LastIndex）的节点 ProposeConfChange(AddNode) 升为 voter。
+//
+// 「无新提案时位点即锚点」（harness 步骤 5 语义）：Match 追上当下
+// lastIndex 即达标，不追求绝对静止点——其后 leader 的新提案 learner
+// 照常收，追平窗口不要求 quiescence。
+//
+// 与手工 ProposeConfChange 并存不冲突：raft 成员变更天然串行
+// （pendingConfIndex 校验），并发提出时后者被静默替换成空条目、
+// 等待超时——本循环下轮 tick 重判即可，升 voter 是幂等目标态，
+// 无需重试计数。
+//
+// 失败（超时/换 leader/提案丢弃）只记 Warn，下轮 tick 重新判定。
+func (m *Manager) promoteLearners(g uint32) {
+	gr, ok := m.groups[g]
+	if !ok {
+		return
+	}
+	// 先取 lastIndex 锚点再取 Status：Status 里的 Match 只会比锚点
+	// 更新——若反过来，锚点后移会让「已追上旧锚点」的 learner 被
+	// 误判为追平（少收一两条新条目），提前升 voter
+	lastIndex, err := gr.storage.LastIndex()
+	if err != nil {
+		// MemoryStorage 的 LastIndex 在正常路径不可达错误（无快照时
+		// 退化为 0），防御性跳过本轮
+		m.lg.Warn("自动升 voter 取日志末位失败，下轮重试", "g", g, "err", err)
+		return
+	}
+	st, ok := m.Status(g)
+	if !ok || !m.IsLeader(g) {
+		return // 非本节点 lead（含刚转移/失联）：learner 由新 leader 接管
+	}
+	for id, pr := range st.Progress {
+		if !pr.IsLearner || pr.Match < lastIndex {
+			continue // 未追平：下轮 tick 再判
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		err := m.ProposeConfChange(ctx, g, raftpb.ConfChangeAddNode, id)
+		cancel()
+		if err != nil {
+			m.lg.Warn("自动升 voter 失败，下轮重试", "g", g, "node", id, "match", pr.Match, "lastIndex", lastIndex, "err", err)
+			continue
+		}
+		m.lg.Info("自动升 voter", "g", g, "node", id, "match", pr.Match, "lastIndex", lastIndex)
+	}
 }
 
 // leaderStableTicks 是摊布转移前的稳定观察门槛：本节点必须连续 lead
@@ -667,7 +763,17 @@ func (m *Manager) Leader(g uint32) (nodeID uint64, ok bool) {
 //   - payload 过大（请求帧超过 16MiB 上限）时发送侧直接拒绝，不拨号
 //   - 对端 ControlHandler 为 nil 时返回「控制通道未装配」错误
 func (m *Manager) Control(ctx context.Context, nodeID uint64, op byte, payload []byte) ([]byte, error) {
-	addr, ok := m.peers[nodeID]
+	return controlCall(ctx, m.lg, m.peers, nodeID, op, payload)
+}
+
+// controlCall 向 nodeID 发起一次控制通道 RPC（短连接，一次往返）。
+//
+// 是 Manager.Control 与 Rejoin 编排（prepareJoinPoll）的公共实现——
+// 线协议唯一实现点，帧布局见 ControlGroup 注释。Manager.Control 的
+// 文档注释描述了完整契约；prepareJoinPoll 在节点尚无运行中 Manager
+// 时复用同一实现发 PrepareJoin。
+func controlCall(ctx context.Context, lg *slog.Logger, peers map[uint64]string, nodeID uint64, op byte, payload []byte) ([]byte, error) {
+	addr, ok := peers[nodeID]
 	if !ok {
 		return nil, fmt.Errorf("cluster: 未知节点 %d（Peers 表无此节点）", nodeID)
 	}
@@ -691,7 +797,7 @@ func (m *Manager) Control(ctx context.Context, nodeID uint64, op byte, payload [
 	if _, err := conn.Write(encodeFrame(nil, ControlGroup, ctrl)); err != nil {
 		return nil, fmt.Errorf("cluster: 控制请求写节点 %d: %w", nodeID, err)
 	}
-	m.lg.Debug("控制请求已发送", "peer", nodeID, "op", op, "len", len(payload))
+	lg.Debug("控制请求已发送", "peer", nodeID, "op", op, "len", len(payload))
 	// 响应帧同构：[4B 帧长][4B ControlGroup][1B op(响应位)][1B 状态][应答]
 	header := make([]byte, 4)
 	if _, err := io.ReadFull(conn, header); err != nil {
@@ -717,7 +823,7 @@ func (m *Manager) Control(ctx context.Context, nodeID uint64, op byte, payload [
 	}
 	status := body[5]
 	respPayload := body[6:]
-	m.lg.Debug("控制响应已收到", "peer", nodeID, "op", respOp&^0x80, "len", len(respPayload))
+	lg.Debug("控制响应已收到", "peer", nodeID, "op", respOp&^0x80, "len", len(respPayload))
 	switch status {
 	case 0:
 		return respPayload, nil
@@ -779,6 +885,99 @@ func (m *Manager) ProposeConfChange(ctx context.Context, g uint32, typ raftpb.Co
 	return nil
 }
 
+// handlePrepareJoin 处理 OpPrepareJoin 控制请求（Manager 自装，见
+// NewManager）：payload=[8B BE nodeID]，响应=本节点完成 Remove→
+// AddLearner 的组号列表 [4B BE n][n × 4B BE g]。
+//
+// 对**本节点当前 lead 的每个组**顺序执行 Remove→AddLearner（30s 时限，
+// 幂等报错忽略见 rejoinGroupPrep），非本节点 lead 的组不动——请求方
+// （Rejoin 编排）轮询全部对端收并集，天然免疫 leader 换手。
+//
+// 串行化：prepareJoinMu 保证同节点同时只有一个 PrepareJoin 在处理——
+// 请求方超时会开新连接重发，两个 handler 并发提成员变更会被 raft 的
+// pendingConfIndex 校验静默替换成空条目、等待超时，并集收敛被无谓拖慢。
+//
+// 注意：本 handler 在传输层读循环内同步执行、逐组阻塞至 apply——只
+// 阻塞本连接（控制通道短连接 RPC，一次往返），其余连接与各组 Ready
+// 循环不受影响；请求方断开时变更照常完成（幂等，下次轮询重发无害）。
+func (m *Manager) handlePrepareJoin(payload []byte) ([]byte, error) {
+	if len(payload) != 8 {
+		return nil, fmt.Errorf("cluster: PrepareJoin 载荷须为 8B BE nodeID，收到 %d B", len(payload))
+	}
+	nodeID := binary.BigEndian.Uint64(payload)
+	if nodeID == 0 {
+		return nil, errors.New("cluster: PrepareJoin 的 nodeID 不能为 0")
+	}
+	m.prepareJoinMu.Lock()
+	defer m.prepareJoinMu.Unlock()
+	m.lg.Info("PrepareJoin 请求到达：节点重入编排", "rejoin", nodeID)
+	done := make([]uint32, 0, m.Groups())
+	for g := uint32(0); g < m.Groups(); g++ {
+		if !m.IsLeader(g) {
+			continue // 非本节点 lead：请求方轮询其他对端补齐
+		}
+		if err := m.rejoinGroupPrep(g, nodeID); err != nil {
+			// 本轮不标记完成：请求方并集缺该组会重发，幂等补齐。
+			// 换 leader 时新 leader 会处理，无需本节点重试。
+			m.lg.Warn("PrepareJoin 组编排未完成，本轮不标记", "g", g, "rejoin", nodeID, "err", err)
+			continue
+		}
+		done = append(done, g)
+	}
+	// 响应布局：[4B BE n][n × 4B BE g]，组号升序（循环天然升序）
+	resp := make([]byte, 4+4*len(done))
+	binary.BigEndian.PutUint32(resp[:4], uint32(len(done)))
+	for i, g := range done {
+		binary.BigEndian.PutUint32(resp[4+4*i:], g)
+	}
+	m.lg.Info("PrepareJoin 编排完成", "rejoin", nodeID, "groups", done)
+	return resp, nil
+}
+
+// rejoinGroupPrep 对单个组执行 learner 重入的 Remove→AddLearner 两步
+// 成员变更（每步 5s 时限），两步都 apply 才算完成。
+//
+// 时限为什么取 5s 而非更宽松：提案已入日志但未 commit 时若 leader 换人
+// （摊布转移/选举），raft 静默截断该条目、waiter 永不通知——propose 只
+// 能等 ctx 超时收场（无 leader 变更的早醒机制）。超时太长会让一次换手
+// 撞车吃满整个 PrepareJoin 轮询预算（30s），而重入幂等决定了「快速
+// 失败 + 请求方重发」是更优的收敛路径：新 leader 收到重发后正常完成。
+func (m *Manager) rejoinGroupPrep(g uint32, nodeID uint64) error {
+	rmCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	err := m.ProposeConfChange(rmCtx, g, raftpb.ConfChangeRemoveNode, nodeID)
+	cancel()
+	if err != nil {
+		// 幂等重放：请求方轮询重发时，nodeID 可能已不在成员表（上一轮
+		// 已完成 Remove，或对端早先已处理过本组）——raft 对移除非成员
+		// 的变更静默 no-op，这里按成员表实况判定：不在表即幂等成功，
+		// 继续 AddLearner；在表却失败（超时/换 leader）是真错误，上报
+		if m.memberHas(g, nodeID) {
+			return fmt.Errorf("组 %d 移除节点 %d: %w", g, nodeID, err)
+		}
+		m.lg.Debug("PrepareJoin 移除幂等跳过", "g", g, "node", nodeID, "err", err)
+	}
+	addCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return m.ProposeConfChange(addCtx, g, raftpb.ConfChangeAddLearnerNode, nodeID)
+}
+
+// memberHas 判定 nodeID 是否在当前成员表（voter 或 learner，含 joint
+// 双侧）——幂等判定与成员实况校验共用。Status.Config 即 ConfState 的
+// 运行时形态，全节点填充（不只在 leader 上）。
+func (m *Manager) memberHas(g uint32, nodeID uint64) bool {
+	st, ok := m.Status(g)
+	if !ok {
+		return false
+	}
+	for _, half := range st.Config.Voters {
+		if _, ok := half[nodeID]; ok {
+			return true
+		}
+	}
+	_, ok = st.Config.Learners[nodeID]
+	return ok
+}
+
 // WipeForRejoin 清空整个数据目录，是 learner 重入的前置动作。
 //
 // 注意：
@@ -795,4 +994,185 @@ func WipeForRejoin(dataDir string) error {
 		return fmt.Errorf("cluster WipeForRejoin 重建 %s: %w", dataDir, err)
 	}
 	return nil
+}
+
+// Rejoin 把断电节点以 learner 身份自动接回集群——harness 六步编排
+// （cluster_test.go 的 rejoinAsLearner）的生产入口，编排语义与该行为
+// 规范对齐，不得私自偏离。
+//
+// 六步：
+//  1. 旧 store 已关闭——调用方职责（pebble 持有目录句柄，不关闭
+//     WipeForRejoin 清不掉；本函数不代关，签名约定即此）
+//  2. WipeForRejoin 清空数据目录（含旧 raft 日志——身份由存活
+//     leader 的 ConfChange 日志重赋）
+//  3. 轮询全部对端发 PrepareJoin：每端对**自己当前 lead** 的组做
+//     Remove→AddLearner 并返回完成组号，收齐 0..DataGroups 全组完成
+//     （30s 总时限；期间 leader 可能换手——重发即可，Remove/AddLearner
+//     幂等，见 handlePrepareJoin/rejoinGroupPrep）
+//  4. 重建本节点监听（EADDRINUSE 抢占，逻辑与注释同 harness）：kill
+//     后 Done 不保证旧传输层看门狗已关监听器，直接重绑同一地址可能
+//     撞 EADDRINUSE；先 net.Listen 抢到端口（拿到即旧监听器已关的
+//     确定性证明），再注入给 NewManager——中间无空窗
+//  5. store.Open + NewManager fresh 路径启动（Wipe 后仍报
+//     ErrUncleanShutdown 即判定错误，显式报错）+ Start
+//  6. 追平与升 voter 交给 leader 侧 AutoPromoteLearners 自动循环
+//     （本函数返回时节点尚是 learner，收敛由集群自动完成）
+//
+// 幂等性：任一步失败可整体重跑——Wipe 幂等（删了再建）、PrepareJoin
+// 幂等（已完成的组重发只是 Remove no-op + AddLearner 幂等）、fresh
+// 启动可重试（空目录永远 fresh 判定）。
+//
+// 注意：
+//   - Options.Store 与 Options.Listener 被忽略：本函数从 dataDir 重开
+//     store、从 Peers[NodeID] 重建监听，调用方不得传入复用实例
+//   - 升 voter 依赖 Options.AutoPromoteLearners + LeaderBalancerInterval
+//     （leader 侧注入，见 Options 字段注释）
+//   - 本节点自身不自动清目录——Wipe 是破坏性动作，main（Task 11）在
+//     检测到 ErrUncleanShutdown 后应先打日志留痕再调用本函数
+func Rejoin(ctx context.Context, o Options, dataDir string) (*Manager, error) {
+	if o.DataGroups == 0 {
+		o.DataGroups = 3 // 与 NewManager 同一默认
+	}
+	lg := o.Logger
+	if lg == nil {
+		lg = slog.Default()
+	}
+	start := time.Now()
+	// 第 1 步：旧 store 已关闭（调用方职责，见函数注释）
+	lg.Info("重入编排: 第 1 步 旧 store 已关闭", "node", o.NodeID, "dir", dataDir)
+
+	// 第 2 步：清空状态目录（幂等：整体重跑安全）
+	if err := WipeForRejoin(dataDir); err != nil {
+		return nil, err
+	}
+	lg.Info("重入编排: 第 2 步 状态目录已清空", "dir", dataDir, "duration", time.Since(start).Round(time.Millisecond))
+
+	// 第 3 步：PrepareJoin 全组编排（30s 总时限，leader 换手重发幂等）
+	if err := prepareJoinPoll(ctx, lg, o); err != nil {
+		return nil, fmt.Errorf("cluster: 重入编排第 3 步 PrepareJoin: %w", err)
+	}
+
+	// 第 4 步：重建本节点监听（EADDRINUSE 抢占，注释同 harness——
+	// kill 后旧传输层看门狗关监听器与 Done 不同步，直接重绑同地址
+	// 可能撞 EADDRINUSE；抢到端口=旧监听器已关的确定性证明）
+	addr := o.Peers[o.NodeID]
+	var ln net.Listener
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		l, err := net.Listen("tcp", addr)
+		if err == nil {
+			ln = l
+			break
+		}
+		if errors.Is(err, syscall.EADDRINUSE) {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		return nil, fmt.Errorf("cluster: 重入编排重建监听 %s: %w", addr, err)
+	}
+	if ln == nil {
+		return nil, fmt.Errorf("cluster: 重入编排旧监听器未在 10s 内关闭，无法重绑 %s", addr)
+	}
+	lg.Info("重入编排: 第 4 步 监听重建完成", "node", o.NodeID, "addr", addr, "duration", time.Since(start).Round(time.Millisecond))
+
+	// 第 5 步：新 store + NewManager fresh 路径启动 + Start
+	st, err := store.Open(dataDir, false, lg)
+	if err != nil {
+		ln.Close()
+		return nil, fmt.Errorf("cluster: 重入编排重开 store: %w", err)
+	}
+	o.Store = st
+	o.Listener = ln
+	m, err := NewManager(o)
+	if err != nil {
+		st.Close()
+		ln.Close()
+		if errors.Is(err, ErrUncleanShutdown) {
+			// Wipe 后仍判不干净 = fresh 判定被破坏，显式报错而非静默恢复
+			return nil, fmt.Errorf("cluster: 重入编排 WipeForRejoin 后仍报 ErrUncleanShutdown: %w", err)
+		}
+		return nil, err
+	}
+	m.Start(ctx)
+
+	// 第 6 步：追平与升 voter 交给 leader 侧 AutoPromoteLearners 循环
+	lg.Info("重入编排: 第 5/6 步 完成——fresh 启动，追平与升 voter 由 leader 侧自动循环接管",
+		"node", o.NodeID, "autoPromote", o.AutoPromoteLearners, "duration", time.Since(start).Round(time.Millisecond))
+	return m, nil
+}
+
+// prepareJoinPoll 是 Rejoin 的第 3 步：轮询全部对端发 OpPrepareJoin，
+// 收齐 0..DataGroups 全组完成的并集（30s 总时限）。
+//
+// 为什么轮询而非直连已知 leader：各组 leader 由摊布分布在多个节点上、
+// 且编排期间可能换手——轮询全部对端、每端只处理自己当前 lead 的组、
+// 请求方收并集，天然免疫换手；Remove/AddLearner 幂等使重发安全
+// （已完成的组重发只是 no-op）。
+//
+// 对端不可达（宕机/未起）只记 Warn 不失败：它 lead 的组会由其余对端
+// 处理，下轮重试补齐。
+func prepareJoinPoll(ctx context.Context, lg *slog.Logger, o Options) error {
+	// payload = [8B BE nodeID]
+	payload := make([]byte, 8)
+	binary.BigEndian.PutUint64(payload, o.NodeID)
+	need := make(map[uint32]bool, o.DataGroups+1)
+	for g := uint32(0); g <= o.DataGroups; g++ {
+		need[g] = true
+	}
+	pollCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	peerIDs := sortedPeerIDs(o.Peers)
+	start := time.Now()
+	for {
+		for _, peer := range peerIDs {
+			if peer == o.NodeID {
+				continue // 不轮询自己：本节点尚无运行中的 Manager
+			}
+			if len(need) == 0 {
+				break
+			}
+			callCtx, cancel := context.WithTimeout(pollCtx, 15*time.Second)
+			resp, err := controlCall(callCtx, lg, o.Peers, peer, OpPrepareJoin, payload)
+			cancel()
+			if err != nil {
+				lg.Warn("PrepareJoin 轮询失败，下轮重试", "peer", peer, "err", err)
+				continue
+			}
+			// 响应 = [4B BE n][n × 4B BE g]，长度校验防坏对端
+			if len(resp) < 4 || len(resp) != 4+int(binary.BigEndian.Uint32(resp[:4]))*4 {
+				lg.Warn("PrepareJoin 响应布局非法，忽略", "peer", peer, "len", len(resp))
+				continue
+			}
+			n := binary.BigEndian.Uint32(resp[:4])
+			var groups []uint32
+			for i := uint32(0); i < n; i++ {
+				g := binary.BigEndian.Uint32(resp[4+4*i:])
+				if g > o.DataGroups {
+					lg.Warn("PrepareJoin 响应组号越界，忽略", "peer", peer, "g", g)
+					continue
+				}
+				if need[g] {
+					delete(need, g)
+					groups = append(groups, g)
+				}
+			}
+			if len(groups) > 0 {
+				lg.Info("PrepareJoin 对端完成组", "peer", peer, "groups", groups, "remaining", len(need))
+			}
+		}
+		if len(need) == 0 {
+			lg.Info("PrepareJoin 全组就绪", "node", o.NodeID, "duration", time.Since(start).Round(time.Millisecond))
+			return nil
+		}
+		select {
+		case <-pollCtx.Done():
+			missing := make([]uint32, 0, len(need))
+			for g := range need {
+				missing = append(missing, g)
+			}
+			sort.Slice(missing, func(i, j int) bool { return missing[i] < missing[j] })
+			return fmt.Errorf("cluster: PrepareJoin 30s 超时，组 %v 仍未完成（对端已重试多轮）", missing)
+		case <-time.After(200 * time.Millisecond):
+		}
+	}
 }
