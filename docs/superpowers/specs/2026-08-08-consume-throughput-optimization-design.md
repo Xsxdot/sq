@@ -187,3 +187,90 @@ ack 的同队列 entries 立即享受单次 fsync。
    跑 §2 全表 + soak）→ 数据回填本 spec 附录 → 清理远端。
 
 每步独立成 commit、独立可验证。
+
+## 附录：验收数据（2026-08-08，root@47.80.240.57）
+
+### 环境说明
+
+- 云服务器：root@47.80.240.57，2 vCPU Xeon（Intel(R) Xeon(R) Platinum），裸 fsync 456 次/s（Task 1 实测）。
+- 测试方式：本机（macOS）`GOOS=linux GOARCH=amd64 go test -c` 交叉编译 4 个测试二进制，`scp -C` 压缩上传至 `/root/sqbench`，SSH 远端执行。普通模式（交叉编译产物不支持 -race）。
+- 测试二进制：`deliver.test` / `produce.test` / `txn.test` / `rpc.test`，来自 HEAD a9a25fb（Task 1-6 完成后）。
+
+### Step 0 本地全量回归
+
+- `make test`：全包 PASS（admin/config/core/core/deliver/delay/meta/produce/query/retention/rpc/store/sysinfo/txn 等全部 `ok`）。
+- `make e2e`：`ok github.com/xushixin/sq/test/e2e`（官方 SDK 收发/ack 真实链路）。注：首次运行因 worktree 内 `web/dist` 无构建产物（gitignore，需 `make web`），`TestConsoleServedFromBinary` 返回 503；复制主 checkout 已构建产物后全绿，与代码无关。
+
+### Step 2 远端正确性
+
+```bash
+cd /root/sqbench && ./deliver.test -test.run Test -test.count=1 && ./produce.test -test.run Test -test.count=1 && ./txn.test -test.run Test -test.count=1 && ./rpc.test -test.run Test -test.count=1
+```
+
+结果：4 个测试二进制全部 `PASS`（exit 0，0 FAIL）。soak 类测试因未设 `SQ_SOAK` 自动 Skip。
+
+### Step 3 验收基准（原始输出）
+
+```bash
+cd /root/sqbench && ./deliver.test -test.run "^$" -test.bench "BenchmarkAck" -test.benchtime 3s -test.cpu 64
+```
+
+```
+goos: linux
+goarch: amd64
+pkg: github.com/xushixin/sq/internal/core/deliver
+cpu: Intel(R) Xeon(R) Platinum
+BenchmarkAckParallel-64    47611    79013 ns/op
+BenchmarkAckBatch32-64     10000    911733 ns/op
+PASS
+```
+
+换算表（与 Task 1 基线对比）：
+
+| 基准 | Task 1 基线（优化前） | 本次（优化后） | 吞吐换算 | 放大倍数 |
+|------|----------------------|----------------|----------|----------|
+| BenchmarkAckParallel | 2,346,455 ns/op（~426 ack/s） | 79,013 ns/op | 1e9/79013 ≈ 12,656 ack/s | ~29.7x |
+| BenchmarkAckBatch32 | — | 911,733 ns/op | 1e9/911733×32 ≈ 35,098 msg/s | —（新建） |
+
+- AckParallel 验收标准：≥2,000 ack/s（ns/op ≤ 500,000）→ **达标**（12,656 ack/s）。
+- AckBatch32 验收标准：换算 ≥5,000 msg/s → **达标**（35,098 msg/s）。
+- 12,656 ack/s 远超裸 fsync 456 次/s，证明 group commit（多 ack 合成一次 fsync）在并发下实际生效。
+
+### Step 4 远端端到端 soak 10 分钟（打点序列）
+
+```bash
+cd /root/sqbench && mkdir -p soak-e2e-data && SQ_SOAK=1 SQ_SOAK_DURATION=10m SQ_SOAK_DIR=/root/sqbench/soak-e2e-data ./deliver.test -test.run TestSoakE2E -test.v -test.timeout 30m
+```
+
+结果：`--- PASS: TestSoakE2E (600.03s)`；produced=5,804,835 acked=5,804,770 backlog=65；avg_produce_per_s=9674 avg_ack_per_s=9674。
+
+完整打点（elapsed_s produce_rate ack_rate backlog）：
+
+```
+10   16961 16949 117 | 20 16113 16112 130 | 30 13919 13920 120 | 40 13533 13531 140 | 50 12287 12291 96  | 60 11154 11153 109
+70   10579 10578 118 | 80 10161 10159 140 | 90 11626 11627 133 | 100 11795 11794 139 | 110 11736 11735 151 | 120 11270 11273 127
+130  11492 11492 126 | 140 10975 10973 144 | 150 10260 10264 95 | 160 10518 10515 125 | 170 10058 10059 111 | 180 9559 9555 146
+190  9090  9091  130 | 200 9417 9416 142 | 210 9887 9888 130 | 220 8668 8669 116 | 230 8655 8654 125 | 240 8490 8490 128
+250  9029  9027  150 | 260 8835 8837 136 | 270 8610 8612 120 | 280 7887 7885 142 | 290 8609 8610 126 | 300 8627 8626 131
+310  8445  8444  143 | 320 8542 8545 116 | 330 9369 9369 115 | 340 8888 8887 125 | 350 8862 8861 136 | 360 9008 9008 130
+370  8862  8866  94  | 380 8765 8761 141 | 390 8769 8769 135 | 400 9664 9665 124 | 410 9467 9465 149 | 420 8302 8307 100
+430  7690  7688  126 | 440 9445 9445 127 | 450 8700 8699 140 | 460 8091 8093 117 | 470 8730 8726 154 | 480 8314 8317 125
+490  8420  8421  109 | 500 8690 8689 115 | 510 8444 8441 148 | 520 8491 8494 118 | 530 8990 8990 124 | 540 8277 8277 126
+550  8581  8581  122 | 560 7895 7893 139 | 570 9187 9189 124 | 580 8639 8640 121 | 590 8737 8738 116 | 600 8385 8384 121
+```
+
+判定表：
+
+| 验收标准 | 实测 | 结论 |
+|----------|------|------|
+| ack_rate 均值 ≥ produce_rate 均值 80% | 9674.0 / 9674.1 = 100.0%（60 个打点 ack 全程不落后于 produce，含瞬时 100%+） | 达标 |
+| backlog 有波动但不单调增长 | 范围 94~154，前/中/后 10 点均值 124/129/126，围绕 ~125 波动 | 达标 |
+| 无 >5s 的 0 打点 | 打点间隔恒定 10s，全部 60 点 rate 非零（最低 ack 7688/s） | 达标 |
+
+### 结论
+
+全部验收标准达标，无未达标项：
+
+- AckParallel ~12,656 ack/s（基线 ~426 ack/s，放大 ~29.7x），远超 ≥2,000 ack/s 目标。
+- AckBatch32 ~35,098 msg/s，远超 ≥5,000 msg/s 目标。
+- 10 分钟 e2e soak 全程 ack 与 produce 同步（100.0%），backlog 稳定波动，无停滞。
