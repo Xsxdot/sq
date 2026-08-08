@@ -29,6 +29,8 @@ package deliver
 import (
 	"context"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -796,5 +798,60 @@ func TestAckBatchAllInvalidNoWrite(t *testing.T) {
 	}
 	if _, ok, _ := f.st.Get(store.InflightKey("g", "ab2-t", 0, msgs[0].Offset)); !ok {
 		t.Fatal("inflight 不应被触碰")
+	}
+}
+
+// TestConcurrentReceiveAckNoRace 是拆分提交的核心回归：8 个 worker 并发
+// 取件+确认同一队列，验证 (1) 每条消息恰好被投递并确认一次（invisible 足够长，
+// 无重投）(2) 结束后 inflight 清零 (3) -race 干净。若拆锁破坏了
+// inflight/cursor 读-改-写的互斥（语义红线 2），本测试在 -race 下必然暴露。
+func TestConcurrentReceiveAckNoRace(t *testing.T) {
+	f := newFixture(t)
+	const total = 300
+	for i := 0; i < total; i++ {
+		f.send(t, "cc-t", "m")
+	}
+	var acked atomic.Int64
+	var wg sync.WaitGroup
+	for w := 0; w < 8; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for acked.Load() < total {
+				msgs, err := f.dl.Receive(context.Background(), "g", "cc-t", 0, 32, time.Minute, 0, nil)
+				if err != nil {
+					t.Errorf("Receive: %v", err)
+					return
+				}
+				for _, m := range msgs {
+					ok, err := f.dl.Ack("g", "cc-t", 0, m.Offset, m.DeliveryAttempt)
+					if err != nil {
+						t.Errorf("Ack off=%d: %v", m.Offset, err)
+						return
+					}
+					if ok {
+						acked.Add(1)
+					}
+				}
+				if len(msgs) == 0 {
+					time.Sleep(time.Millisecond)
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	if got := acked.Load(); got != total {
+		t.Fatalf("确认总数 = %d, want %d（invisible 1 分钟内不应有重投）", got, total)
+	}
+	pfx := store.InflightPrefix("g", "cc-t", 0)
+	n := 0
+	if err := f.st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) {
+		n++
+		return true, nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if n != 0 {
+		t.Fatalf("全部确认后残留 %d 条 inflight", n)
 	}
 }
