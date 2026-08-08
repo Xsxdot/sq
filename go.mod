@@ -5,6 +5,7 @@ go 1.26.1
 require (
 	github.com/cockroachdb/pebble/v2 v2.1.6
 	github.com/prometheus/client_golang v1.24.1
+	go.etcd.io/raft/v3 v3.7.0
 	google.golang.org/grpc v1.83.0
 	google.golang.org/protobuf v1.36.11
 	gopkg.in/yaml.v3 v3.0.1
