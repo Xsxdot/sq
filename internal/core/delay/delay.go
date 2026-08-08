@@ -19,6 +19,10 @@
 // 组归属（batch③）：delay/ 暂存区键族归元数据组（rt.MetaGroup()）——
 // 暂存条目未选队，无 GroupForQueue 映射；移入第一段（消息追加）归目标
 // 队列组，本节点非目标组 leader 时经 fwd 转发（见 Pass 内分支注释）。
+// 因此调度器是 leader-only 定时器（Task 8 门控）：只在 meta leader 上
+// 跑，非 leader 节点整趟跳过等待（leadership 可能随时轮到自己，不退出
+// 循环）；获得/失去 meta leadership 各打一条 Info，是「延时消息为什么
+// 不动了」的第一线索。
 package delay
 
 import (
@@ -72,11 +76,40 @@ func New(rep replication.Replicator, rt replication.Router, st *store.Store,
 // Run 阻塞运行调度循环：启动即跑一趟，此后每 scanInterval 一趟；单趟满额
 // （moved==maxMovePerPass）说明还有积压，立即续跑不等 tick。ctx 取消即返回。
 // 调用方（main）负责放入独立 goroutine 并在停机时先取消再关 store。
+//
+// leader-only 门控：每趟开头先查 meta 组 leadership——非 leader 只等
+// tick 不干活（delay/ 键族归 meta 组，非 leader 的写入会被拒），但
+// 绝不退出循环：leadership 可能随时轮到自己，退出即永久停摆。
 func (s *Scheduler) Run(ctx context.Context) {
 	s.logger.Info("delay 调度器启动", "interval", scanInterval.String())
 	t := time.NewTicker(scanInterval)
 	defer t.Stop()
+	// metaLeader 记录上一个 tick 的 meta 组 leadership：翻转即「开始/
+	// 停止承担调度」的判定面。单机档 IsLeader 恒真，只在启动时报一次
+	// 开始承担——这行 Info 是运维定位「延时消息为什么不动了」的第一
+	// 线索（集群档 leader 变更时它会先于症状出现）。
+	metaLeader := false
 	for {
+		isLeader := s.rt.IsLeader(s.rt.MetaGroup())
+		switch {
+		case isLeader && !metaLeader:
+			s.logger.Info("本节点开始承担 delay 调度")
+		case !isLeader && metaLeader:
+			s.logger.Info("本节点停止承担 delay 调度")
+		}
+		metaLeader = isLeader
+		if !isLeader {
+			// 门控跳过：每趟都会发生，Debug 级避免刷屏（Info 刷屏会
+			// 淹没真正的调度活动日志）
+			s.logger.Debug("非 meta leader，delay 本趟跳过")
+			select {
+			case <-ctx.Done():
+				s.logger.Info("delay 调度器退出")
+				return
+			case <-t.C:
+			}
+			continue
+		}
 		moved, err := s.Pass(ctx)
 		if err != nil {
 			// 单趟失败只记日志不退出：store 瞬时故障恢复后下一趟自然重试，
@@ -99,6 +132,14 @@ func (s *Scheduler) Run(ctx context.Context) {
 
 // Pass 执行一趟到期搬运，返回移入 msg/ 的条数（被清理的坏条目不计入）。
 func (s *Scheduler) Pass(ctx context.Context) (int, error) {
+	// leader-only 门控：delay/ 键族归 meta 组，只有 meta leader 才能
+	// 搬移（第一段写 msg/ 归队列组可经 fwd 转发，但第二段删 delay 条目
+	// 归 meta 组必须本节点提案——非 leader 直接跳过整趟）。Run 已按同
+	// 一条件跳过本趟，直接调用 Pass（测试/未来 Admin 触发）也须自守。
+	if !s.rt.IsLeader(s.rt.MetaGroup()) {
+		s.logger.Debug("非 meta leader，delay 趟跳过")
+		return 0, nil
+	}
 	now := time.Now().UnixMilli()
 	// 先收集后搬运：Scan 回调的 k/v 仅回调期间有效，且回调里不能再开写
 	// 事务（迭代器与写入交错），必须拷贝出来

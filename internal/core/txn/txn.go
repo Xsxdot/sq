@@ -20,7 +20,9 @@
 // 组归属（batch③）：half/ 与 halfidx/ 键族归元数据组（rt.MetaGroup()）——
 // 事务暂存区与队列无关，无 GroupForQueue 映射；提交段的两段分别归目标队列
 // 组（消息追加）与元数据组（删 half 两键）。EndTransaction 可能落在任意
-// 节点：非 leader 组经 fwd 转发，见 End 内分支注释。
+// 节点：非 leader 组经 fwd 转发，见 End 内分支注释。回查调度器因此是
+// leader-only 定时器（Task 8 门控）：只在 meta leader 上跑，非 leader
+// 节点整趟跳过等待；获得/失去 meta leadership 各打一条 Info。
 package txn
 
 import (
@@ -275,13 +277,39 @@ type Notifier interface {
 
 // RunChecker 阻塞运行回查调度循环，结构与 delay.Scheduler.Run 同构：
 // 启动即跑一趟，此后每 scanInterval 一趟，单趟满额立即续趟。ctx 取消即返回。
+//
+// leader-only 门控：每趟开头先查 meta 组 leadership——非 leader 只等
+// tick 不干活（half/ 键族归 meta 组，改期/丢弃都是 meta 组写入），但
+// 绝不退出循环：leadership 可能随时轮到自己，退出即永久停摆。
 func (t *Manager) RunChecker(ctx context.Context, n Notifier) {
 	t.logger.Info("txn 回查调度器启动",
 		"scan_interval", scanInterval.String(),
 		"check_interval", t.checkInterval.String(), "max_checks", t.maxChecks)
 	tk := time.NewTicker(scanInterval)
 	defer tk.Stop()
+	// metaLeader 记录上一个 tick 的 meta 组 leadership：翻转即「开始/
+	// 停止承担调度」的判定面（同 delay.Run 的门控日志约定）。
+	metaLeader := false
 	for {
+		isLeader := t.rt.IsLeader(t.rt.MetaGroup())
+		switch {
+		case isLeader && !metaLeader:
+			t.logger.Info("本节点开始承担 txn 回查调度")
+		case !isLeader && metaLeader:
+			t.logger.Info("本节点停止承担 txn 回查调度")
+		}
+		metaLeader = isLeader
+		if !isLeader {
+			// 门控跳过：每趟都会发生，Debug 级避免刷屏
+			t.logger.Debug("非 meta leader，txn 本趟跳过")
+			select {
+			case <-ctx.Done():
+				t.logger.Info("txn 回查调度器退出")
+				return
+			case <-tk.C:
+			}
+			continue
+		}
 		handled, err := t.Pass(ctx, n)
 		if err != nil {
 			// 单趟失败只记日志不退出：store 瞬时故障恢复后下一趟自然重试
@@ -303,6 +331,13 @@ func (t *Manager) RunChecker(ctx context.Context, n Notifier) {
 
 // Pass 执行一趟到期回查，返回处理条数（下发+改期、超限丢弃、坏条目清理，均计入）。
 func (t *Manager) Pass(ctx context.Context, n Notifier) (int, error) {
+	// leader-only 门控：half/ 键族归 meta 组，回查的改期/丢弃/坏条目
+	// 清理都是 meta 组写入——非 leader 直接跳过整趟（RunChecker 已按
+	// 同一条件跳过，直接调用 Pass 也须自守）。
+	if !t.rt.IsLeader(t.rt.MetaGroup()) {
+		t.logger.Debug("非 meta leader，txn 回查趟跳过")
+		return 0, nil
+	}
 	now := time.Now().UnixMilli()
 	// 先收集后处理：Scan 回调里不能开写事务（迭代器与写入交错会破坏迭代），
 	// 坏 key 也只能拷贝原始字节、扫描结束后统一批量删除（为什么见下方注释）

@@ -4,12 +4,22 @@ package txn
 import (
 	"context"
 	"encoding/json"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/xushixin/sq/internal/core"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
+
+// fixedLeaderRouter 可编程 Router：IsLeader 按字段返回（leader-only 门控单测用）。
+// 不实现 Forwarder——门控拦截后转发分支不可达，nil fwd 不会解引用。
+type fixedLeaderRouter struct{ leader bool }
+
+func (r fixedLeaderRouter) GroupForQueue(string, uint32) uint32 { return 0 }
+func (r fixedLeaderRouter) MetaGroup() uint32                   { return 0 }
+func (r fixedLeaderRouter) IsLeader(uint32) bool                { return r.leader }
 
 // fakeNotifier 记录收到的回查请求，可编程返回值。
 type fakeNotifier struct {
@@ -74,6 +84,37 @@ func mustUnmarshal(t *testing.T, raw []byte, v any) {
 	t.Helper()
 	if err := json.Unmarshal(raw, v); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestPassGatedByMetaLeadership 非 meta leader 时 Pass 有到期半消息也不
+// 回查（返回 0，条目原样保留，不下发）；恒 true 照常——half/ 键族归 meta
+// 组，回查的改期/丢弃都是 meta 组写入，必须 leader-only。
+func TestPassGatedByMetaLeadership(t *testing.T) {
+	f := newFixture(t, 30*time.Second, 15)
+	txID := stageOverdue(t, f, "t-gate")
+	rep := replication.NewStandalone(f.st)
+	n := &fakeNotifier{send: true}
+	// 恒 false：有到期半消息也不回查
+	mgr := New(rep, fixedLeaderRouter{leader: false}, f.st, f.pr, f.mt, 30*time.Second, 15, slog.Default())
+	sent, err := mgr.Pass(context.Background(), n)
+	if err != nil || sent != 0 {
+		t.Fatalf("非 leader Pass: sent=%d err=%v; want 0,nil", sent, err)
+	}
+	if len(n.got) != 0 {
+		t.Fatalf("非 leader 不应下发回查: %v", n.got)
+	}
+	if f.halfCount(t) != 1 {
+		t.Fatalf("非 leader 时到期半消息不应被处理: %d", f.halfCount(t))
+	}
+	// 恒 true：照常回查改期
+	mgr = New(rep, fixedLeaderRouter{leader: true}, f.st, f.pr, f.mt, 30*time.Second, 15, slog.Default())
+	sent, err = mgr.Pass(context.Background(), n)
+	if err != nil || sent != 1 {
+		t.Fatalf("leader Pass: sent=%d err=%v; want 1,nil", sent, err)
+	}
+	if len(n.got) != 1 || n.got[0] != txID {
+		t.Fatalf("leader 应下发回查: %v", n.got)
 	}
 }
 

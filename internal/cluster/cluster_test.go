@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -193,6 +194,70 @@ func TestOnLeaderChangeHookFiresOnFailover(t *testing.T) {
 	evt := tc.waitLeaderChangeIsSelf(t, 1, old, 60*time.Second)
 	if got := tc.leaderOfExcluding(t, 1, old); got != evt.leader {
 		t.Fatalf("回调报告的 leader=%d 与 leaderOfExcluding 报告的 %d 不一致", evt.leader, got)
+	}
+}
+
+// TestLeaderSpreadConverges 三节点四组，任由初始选举集中，摊布循环应在
+// 数个周期内把 leader 分布收敛到 preferred（组 g → sortedPeers[g % n]）。
+func TestLeaderSpreadConverges(t *testing.T) {
+	tc := newTestCluster(t, AckQuorumMem) // harness 注入 balancer 间隔 200ms
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if tc.leadersMatchPreferred(t) {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("leader 摊布未收敛到 preferred 分布")
+}
+
+// TestLeaderChangeFiresExactlyOncePerGroup 钩子时序断言：摊布收敛后每个
+// 组的现任 leader 恰好收到一次 isSelf=true（获得 leadership 时触发一次，
+// 不多不漏），其余节点至多一次（初始选举赢家若被摊布转走也触发过）。
+// 这是 Task 11 InvalidateCounters 接线（isSelf==true 时失效计数器）的
+// 时机前提：多次触发会让计数器被无谓失效。
+func TestLeaderChangeFiresExactlyOncePerGroup(t *testing.T) {
+	// 注入占位钩子启用收集器（newTestClusterOpts 见 harness 注释）
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{OnLeaderChange: func(g uint32, leader uint64, isSelf bool) {}})
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if tc.leadersMatchPreferred(t) {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	// 收敛后等最后的钩子事件入队：lead 原子先于钩子更新（handleReady
+	// 先 Store 再 notify），最后一场转移的当选事件可能晚于收敛观测
+	time.Sleep(time.Second)
+	drain := func(ch chan leaderEvt) map[uint32]int {
+		m := map[uint32]int{}
+		for {
+			select {
+			case evt := <-ch:
+				if evt.isSelf {
+					m[evt.g]++
+				}
+			default:
+				return m
+			}
+		}
+	}
+	counts := make(map[uint64]map[uint32]int, len(tc.mgrs)) // 节点 → 组 → isSelf=true 计数
+	for id, ch := range tc.leaderChs {
+		counts[id] = drain(ch)
+	}
+	for g := uint32(0); g <= tc.dataGroups; g++ {
+		pref := tc.preferredOf(g)
+		for id := range tc.mgrs {
+			got := counts[id][g]
+			if id == pref {
+				if got != 1 {
+					t.Fatalf("组 %d 的 preferred 节点 %d 收到 %d 次 isSelf=true; want 恰好 1", g, id, got)
+				}
+			} else if got > 1 {
+				t.Fatalf("组 %d 节点 %d 收到 %d 次 isSelf=true; want ≤1", g, id, got)
+			}
+		}
 	}
 }
 
@@ -494,6 +559,8 @@ type testCluster struct {
 	// 不带节点 id，harness 逐节点包裹闭包把事件分流进各节点 channel
 	appliedChs map[uint64]chan appliedEvt // 节点 → OnApplied 事件流
 	leaderChs  map[uint64]chan leaderEvt  // 节点 → OnLeaderChange 事件流
+
+	balancerInterval time.Duration // 摊布循环周期（harness 注入，见 newTestClusterN）
 }
 
 // newTestCluster 起三节点集群（真实 TCP），不带钩子注入。
@@ -525,6 +592,14 @@ func newTestClusterOpts(t *testing.T, mode AckMode, hookOpts Options) *testClust
 // 无需多数派语义的测试用双节点即可，避免三节点无谓的选举开销。
 func newTestClusterN(t *testing.T, mode AckMode, hookOpts Options, n uint64) *testCluster {
 	t.Helper()
+	// 摊布循环默认注入 200ms 周期（brief 约定「harness 注入 balancer
+	// 间隔 200ms」）：摊布只在「本节点连续 lead 某组 ≥3 个周期」后才
+	// 发起转移（见 StartLeaderBalancer 注释）——不会打断测试的读写
+	// 窗口，因此全量场景套件统一跑在摊布语义下，TestLeaderSpreadConverges
+	// 无需任何特殊装配。
+	if hookOpts.LeaderBalancerInterval <= 0 {
+		hookOpts.LeaderBalancerInterval = 200 * time.Millisecond
+	}
 	// 1. 先建 n 个监听器收集地址，再拼 Peers 表
 	lstns := make([]net.Listener, 0, n)
 	peers := make(map[uint64]string, n)
@@ -537,13 +612,14 @@ func newTestClusterN(t *testing.T, mode AckMode, hookOpts Options, n uint64) *te
 		peers[i] = ln.Addr().String()
 	}
 	tc := &testCluster{
-		dirs:       make(map[uint64]string, n),
-		stores:     make(map[uint64]*store.Store, n),
-		mgrs:       make(map[uint64]*Manager, n),
-		peers:      peers,
-		killed:     make(map[uint64]bool, n),
-		dataGroups: 3,
-		mode:       mode,
+		dirs:             make(map[uint64]string, n),
+		stores:           make(map[uint64]*store.Store, n),
+		mgrs:             make(map[uint64]*Manager, n),
+		peers:            peers,
+		killed:           make(map[uint64]bool, n),
+		dataGroups:       3,
+		mode:             mode,
+		balancerInterval: hookOpts.LeaderBalancerInterval,
 	}
 	if hookOpts.OnApplied != nil {
 		tc.appliedChs = make(map[uint64]chan appliedEvt, n)
@@ -584,16 +660,17 @@ func newTestClusterN(t *testing.T, mode AckMode, hookOpts Options, n uint64) *te
 			}
 		}
 		m, err := NewManager(Options{
-			NodeID:         i,
-			Peers:          peers,
-			Listener:       lstns[i-1], // 注入预建监听：Peers 地址与监听一一对应
-			DataGroups:     3,
-			Mode:           mode,
-			Store:          st,
-			Logger:         testSlog(t),
-			OnLeaderChange: onLC,
-			OnApplied:      onApplied,
-			ControlHandler: hookOpts.ControlHandler,
+			NodeID:                 i,
+			Peers:                  peers,
+			Listener:               lstns[i-1], // 注入预建监听：Peers 地址与监听一一对应
+			DataGroups:             3,
+			Mode:                   mode,
+			Store:                  st,
+			Logger:                 testSlog(t),
+			OnLeaderChange:         onLC,
+			OnApplied:              onApplied,
+			ControlHandler:         hookOpts.ControlHandler,
+			LeaderBalancerInterval: hookOpts.LeaderBalancerInterval,
 		})
 		if err != nil {
 			t.Fatalf("节点 %d NewManager: %v", i, err)
@@ -678,6 +755,29 @@ func (tc *testCluster) leaderOfExcluding(t *testing.T, g uint32, exclude uint64)
 	}
 	t.Fatalf("组 %d 在 90s 内未选出新 leader（排除 %d）", g, exclude)
 	return 0
+}
+
+// preferredOf 返回组 g 的 preferred leader 节点：sortedPeerIDs(peers)[g % n]。
+func (tc *testCluster) preferredOf(g uint32) uint64 {
+	ids := make([]uint64, 0, len(tc.mgrs))
+	for id := range tc.mgrs {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids[g%uint32(len(ids))]
+}
+
+// leadersMatchPreferred 判定全部组 leader 分布已收敛到 preferred：每组的
+// preferred 节点自报为该组 leader（摊布循环收敛的观测面）。
+func (tc *testCluster) leadersMatchPreferred(t *testing.T) bool {
+	t.Helper()
+	for g := uint32(0); g <= tc.dataGroups; g++ {
+		pref := tc.preferredOf(g)
+		if lead, ok := tc.mgrs[pref].Leader(g); !ok || lead != pref {
+			return false
+		}
+	}
+	return true
 }
 
 // waitAppliedEvt 轮询指定节点的 OnApplied 收集器，直到收到组 g 上
@@ -924,13 +1024,14 @@ func (tc *testCluster) rejoinAsLearner(t *testing.T, ctx context.Context, victim
 		t.Fatalf("节点 %d 重开 store: %v", victim, err)
 	}
 	m, err := NewManager(Options{
-		NodeID:     victim,
-		Peers:      tc.peers,
-		Listener:   ln,
-		DataGroups: tc.dataGroups,
-		Mode:       tc.mode,
-		Store:      st,
-		Logger:     testSlog(t),
+		NodeID:                 victim,
+		Peers:                  tc.peers,
+		Listener:               ln,
+		DataGroups:             tc.dataGroups,
+		Mode:                   tc.mode,
+		Store:                  st,
+		Logger:                 testSlog(t),
+		LeaderBalancerInterval: tc.balancerInterval,
 	})
 	if errors.Is(err, ErrUncleanShutdown) {
 		t.Fatalf("节点 %d WipeForRejoin 后仍报 ErrUncleanShutdown——fresh 路径判定错误", victim)

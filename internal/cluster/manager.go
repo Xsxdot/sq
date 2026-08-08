@@ -6,8 +6,9 @@
 //   - 组装配：全组创建——fresh 路径 StartNode 引导 / 干净关机路径
 //     RestartNode 原身份回归（磁盘日志回放进 MemoryStorage）
 //   - 组路由：队列→组映射（入盘契约，GroupForQueue）与传输消息按组投递
-//   - 生命周期：Start 起全部组 + 传输层 + mem 档后台批量刷盘；
-//     StopClean 停全部机件后最后写干净关机标记；Done 等完全退出
+//   - 生命周期：Start 起全部组 + 传输层 + mem 档后台批量刷盘 + leader
+//     摊布循环（Options 注入周期，≤0 不启动）；StopClean 停全部机件后
+//     最后写干净关机标记；Done 等完全退出
 //   - 重启恢复判定：干净关机标记决定 fresh / 原身份回归 / 拒绝裸恢复
 //     （ErrUncleanShutdown，须清空状态以 learner 重入）
 //
@@ -15,6 +16,9 @@
 //   - 不自动编排 learner 重入——原语给全（WipeForRejoin、
 //     ProposeConfChange、TransferLeader、GroupForQueue），重入编排
 //     属 batch③
+//   - 摊布只做「向 preferred 转移」的保守判定（本节点连续 lead ≥3 个
+//     周期、preferred 存活且为 voter 才动），不强制——节点挂掉时组
+//     停留在现任，恢复后自动回迁
 //   - 不接 core 写路径——本层只组装与管理集群机件，队列读写仍走原路径
 package cluster
 
@@ -79,6 +83,12 @@ type Options struct {
 	// 方）。nil 时对端收到「控制通道未装配」错误帧。
 	// 注意：处理在传输层读循环内同步执行，不得阻塞（重活自行 dispatch）。
 	ControlHandler func(op byte, payload []byte) ([]byte, error)
+
+	// LeaderBalancerInterval 是确定性 leader 摊布循环的周期（batch③，
+	// ≤0 表示不启动）：每周期对本节点 lead 的每个组做一次「向 preferred
+	// 节点转移领导权」的判定（策略见 StartLeaderBalancer 注释）。生产由
+	// main 注入；测试可注小间隔（cluster 测试 harness 注入 200ms）。
+	LeaderBalancerInterval time.Duration
 }
 
 // Manager 是多组装配体：持有全部 raft 组、传输层与恢复判定。
@@ -108,6 +118,13 @@ type Manager struct {
 	flusherStop    chan struct{}      // 仅 mem 档：通知后台刷盘 goroutine 退出
 	flusherDone    chan struct{}      // 仅 mem 档：刷盘 goroutine 退出后关闭
 	flusherStopOne sync.Once          // flusherStop 幂等关闭（kill 与 StopClean 都可能触发）
+
+	// 摊布循环（batch③）：leaderBalancerInterval 来自 Options（≤0 不
+	// 启动）；runCtx 是 Start 设置的运行上下文——循环随集群停机一并
+	// 退出；balancerOnce 保证重复启动只起一个循环。
+	leaderBalancerInterval time.Duration
+	runCtx                 context.Context
+	balancerOnce           sync.Once
 }
 
 // NewManager 装配全部 raft 组并按磁盘状态判定恢复路径。
@@ -142,17 +159,18 @@ func NewManager(o Options) (*Manager, error) {
 		lg = slog.Default()
 	}
 	m := &Manager{
-		nodeID:         o.NodeID,
-		peers:          o.Peers,
-		dataGroups:     o.DataGroups,
-		mode:           o.Mode,
-		st:             o.Store,
-		lg:             lg,
-		groups:         make(map[uint32]*group, o.DataGroups+1),
-		onLeaderChange: o.OnLeaderChange,
-		onApplied:      o.OnApplied,
-		controlHandler: o.ControlHandler,
-		doneCh:         make(chan struct{}),
+		nodeID:                 o.NodeID,
+		peers:                  o.Peers,
+		dataGroups:             o.DataGroups,
+		mode:                   o.Mode,
+		st:                     o.Store,
+		lg:                     lg,
+		groups:                 make(map[uint32]*group, o.DataGroups+1),
+		onLeaderChange:         o.OnLeaderChange,
+		onApplied:              o.OnApplied,
+		controlHandler:         o.ControlHandler,
+		leaderBalancerInterval: o.LeaderBalancerInterval,
+		doneCh:                 make(chan struct{}),
 	}
 	m.rs = newRaftStore(o.Store, lg)
 
@@ -335,6 +353,7 @@ func sortedPeerIDs(peers map[uint64]string) []uint64 {
 func (m *Manager) Start(ctx context.Context) {
 	rctx, cancel := context.WithCancel(ctx)
 	m.cancel = cancel
+	m.runCtx = rctx
 
 	// 传输层 peers 不含本节点（本节点消息由 send 短路，见 send 注释）；
 	// deliver 按信封组号路由到对应组的 step
@@ -355,6 +374,9 @@ func (m *Manager) Start(ctx context.Context) {
 		m.flusherDone = make(chan struct{})
 		go m.flusher()
 	}
+	// leader 摊布循环（Options 注入周期，≤0 不启动）：纯控制面，独立
+	// goroutine，不参与 Done 观察（停机时随 runCtx 取消退出，不阻塞）
+	m.StartLeaderBalancer(m.leaderBalancerInterval)
 	// Done 观察者：全部组退出且 flusher 停止后关闭 doneCh
 	go func() {
 		for _, gr := range m.groups {
@@ -366,6 +388,134 @@ func (m *Manager) Start(ctx context.Context) {
 		close(m.doneCh)
 	}()
 }
+
+// StartLeaderBalancer 启动确定性 leader 摊布循环：每 interval 对本节点
+// lead 的每个组做一次摊布判定（条件与策略见 leaderBalancer）。
+//
+// Start 内按 Options.LeaderBalancerInterval 自动调用；测试可经 Options
+// 注入小间隔。interval<=0 时是 no-op；重复调用只生效一次（sync.Once）。
+func (m *Manager) StartLeaderBalancer(interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	if m.runCtx == nil {
+		m.lg.Error("摊布循环要求先 Start 再启动", "interval", interval.String())
+		return
+	}
+	m.balancerOnce.Do(func() { go m.leaderBalancer(m.runCtx, interval) })
+}
+
+// leaderBalancer 是摊布循环本体：每 interval 对本节点 lead 的每个组做
+// 一次摊布判定（balanceOnce）。ctx 取消即退出。
+//
+// 摊布策略（确定性、无协调收敛）：组 g 的 preferred leader =
+// sortedPeerIDs(peers)[g % len(peers)]。全部节点跑同一公式、只看自己
+// lead 的组，不需要任何协调即可收敛到同一分布。
+func (m *Manager) leaderBalancer(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	// preferred 表一次算好：peers 全量静态（成员变更走 learner 重入
+	// 流程，本循环只认启动时的全量成员，不随 ConfChange 动态漂移）
+	ids := sortedPeerIDs(m.peers)
+	preferred := make(map[uint32]uint64, m.Groups())
+	for g := uint32(0); g < m.Groups(); g++ {
+		preferred[g] = ids[g%uint32(len(ids))]
+	}
+	// stableTicks 记录本节点连续 lead 各组的 tick 数（跨周期共享状态，
+	// 见 balanceOnce 注释的稳定观察说明）
+	stableTicks := make(map[uint32]int, m.Groups())
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for g := uint32(0); g < m.Groups(); g++ {
+				m.balanceOnce(g, preferred[g], stableTicks)
+			}
+		}
+	}
+}
+
+// balanceOnce 对单个组执行一轮摊布判定。preferred 为该组的目标 leader，
+// stableTicks 为稳定观察计数（跨周期共享状态）。
+//
+// 转移条件（全部满足才发起）：
+//   - 本节点是该组当前 leader——只有 leader 有权发起转移，多节点并发
+//     跑同一条循环也不会有冲突（follower 的判定天然空转）
+//   - 本节点已连续 lead 该组 ≥ leaderStableTicks 个周期：刚当选就转走
+//     会把 raft 的「转移期丢弃全部提案」（stepLeader 对 transfer 中的
+//     MsgProp 返回 ErrProposalDropped）叠在选举后的写入恢复窗口上，
+//     客户端在切换期重试的提案会再吃一次失败；稳定判定把转移推迟到
+//     写入静默期之后，也避免选举震荡期的反复转移
+//   - preferred 不是本节点（是则已收敛）
+//   - preferred 在当前成员表中且是 voter 且 RecentActive（Status(g)
+//     取）且经存活探测（probePeerAlive）：RecentActive 在本集群配置下
+//     不会随时间衰减（未开 CheckQuorum，raft 只在 CheckQuorum 消息里
+//     重置它），死节点会残留 true——必须再探一次存活，否则会把领导权
+//     转给已死节点（见 probePeerAlive 注释）
+func (m *Manager) balanceOnce(g uint32, preferred uint64, stableTicks map[uint32]int) {
+	if !m.IsLeader(g) {
+		stableTicks[g] = 0 // 重新当选后从头积累稳定观察
+		return
+	}
+	stableTicks[g]++
+	if stableTicks[g] < leaderStableTicks {
+		return // 稳定观察不足，本周期不动
+	}
+	if preferred == m.nodeID {
+		return // 本节点已是 preferred，无需转移
+	}
+	st, ok := m.Status(g)
+	if !ok {
+		return
+	}
+	pr, ok := st.Progress[preferred]
+	if !ok || pr.IsLearner || !pr.RecentActive {
+		// preferred 不在成员表/是 learner/不活跃：保持现任。向死节点
+		// 转移会一直挂到 raft 超时中止，白白制造提案丢弃窗口；preferred
+		// 恢复后自动回迁
+		return
+	}
+	if !m.probePeerAlive(preferred) {
+		m.lg.Debug("摊布：preferred 探测不可达，保持现任", "g", g, "preferred", preferred)
+		return
+	}
+	m.lg.Info("摊布：组领导权转移", "g", g, "from", m.nodeID, "to", preferred, "reason", "摊布")
+	m.TransferLeader(g, preferred)
+	// 转移后进入退避：raft 的转移中止时限是 1 个 electionTimeout
+	// （tickHeartbeat 里 abortLeaderTransfer），失败重试若按原节奏（每
+	// interval 一次）会让丢弃窗口连续重叠。退避到负值使下次尝试在
+	// 2×leaderStableTicks 个周期之后——长于中止时限，窗口不相交。
+	stableTicks[g] = -leaderStableTicks
+}
+
+// probePeerAlive 探测节点是否存活：控制通道短连接 RPC——拨号成功即
+// 视为存活（对端应答什么无关紧要：即使报「控制通道未装配」也证明它
+// 活着）；拨号失败（连接拒绝/超时）视为死亡。
+//
+// 为什么需要它：RecentActive 在本集群配置下不会衰减（raft 只在
+// CheckQuorum 消息里重置它，而 CheckQuorum 未开启），死节点的
+// RecentActive 残留 true 会骗过摊布判定——把领导权转给已死节点后，
+// raft 的转移挂起期内丢弃全部提案（见 balanceOnce 注释），窗口内所有
+// 写入/成员变更都会失败。探测在转移决策点做（每周期每组至多一次），
+// 代价可忽略。
+func (m *Manager) probePeerAlive(nodeID uint64) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
+	defer cancel()
+	_, err := m.Control(ctx, nodeID, 0, nil)
+	if err == nil {
+		return true
+	}
+	// 控制通道协议/装配错误（对端活着但应答失败）与拨号失败区分：
+	// 只有拨号失败才算死亡——连接拒绝/超时都是 *net.OpError
+	var opErr *net.OpError
+	return !errors.As(err, &opErr)
+}
+
+// leaderStableTicks 是摊布转移前的稳定观察门槛：本节点必须连续 lead
+// 该组 ≥3 个周期（2 个完整 interval 的稳定期）才发起转移。为什么需要
+// 稳定期见 balanceOnce 注释。
+const leaderStableTicks = 3
 
 // peerAddrs 返回传输层用的 peer 地址表：全量 Peers 减去本节点
 // （本节点消息短路，不配置也不会被 Send 命中）。

@@ -20,6 +20,7 @@ type fixture struct {
 	st  *store.Store
 	pr  *produce.Producer
 	dl  *deliver.Deliverer
+	mt  *meta.Meta
 	mgr *Manager
 }
 
@@ -38,7 +39,7 @@ func newFixture(t *testing.T, interval time.Duration, maxChecks int) *fixture {
 	rt := replication.StandaloneRouter{}
 	pr := produce.New(rep, rt, st, mt, slog.Default())
 	dl := deliver.New(rep, rt, st, mt, pr, slog.Default())
-	return &fixture{st: st, pr: pr, dl: dl, mgr: New(rep, rt, st, pr, mt, interval, maxChecks, slog.Default())}
+	return &fixture{st: st, pr: pr, dl: dl, mt: mt, mgr: New(rep, rt, st, pr, mt, interval, maxChecks, slog.Default())}
 }
 
 // msgCount 统计 msg/ 区消息条数（两段式重放用例断言目标队列条数用）。

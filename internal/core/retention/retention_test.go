@@ -57,6 +57,13 @@ func writeMsgAt(t *testing.T, st *store.Store, topic string, offset uint64, stor
 	}
 }
 
+// fixedLeaderRouter 可编程 Router：IsLeader 按字段返回（leader-only 门控单测用）。
+type fixedLeaderRouter struct{ leader bool }
+
+func (r fixedLeaderRouter) GroupForQueue(string, uint32) uint32 { return 0 }
+func (r fixedLeaderRouter) MetaGroup() uint32                   { return 0 }
+func (r fixedLeaderRouter) IsLeader(uint32) bool                { return r.leader }
+
 // TestPassPurgesExpired 过期消息与索引被清，未过期保留。
 func TestPassPurgesExpired(t *testing.T) {
 	st, mt, rep, rt := newFixtureRouted(t)
@@ -69,7 +76,7 @@ func TestPassPurgesExpired(t *testing.T) {
 	writeMsgAt(t, st, "t", 1, fresh, "k-new")
 
 	m := New(rep, rt, st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default())
-	n, err := m.Pass(context.Background())
+	n, _, err := m.Pass(context.Background())
 	if err != nil || n != 1 {
 		t.Fatalf("Pass: %d %v", n, err)
 	}
@@ -101,7 +108,7 @@ func TestPassIdempotentAndNoExpired(t *testing.T) {
 	writeMsgAt(t, st, "t", 0, time.Now().UnixMilli())
 	m := New(rep, rt, st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default())
 	for i := 0; i < 2; i++ {
-		if n, err := m.Pass(context.Background()); err != nil || n != 0 {
+		if n, _, err := m.Pass(context.Background()); err != nil || n != 0 {
 			t.Fatalf("第 %d 次 Pass: %d %v", i+1, n, err)
 		}
 	}
@@ -114,7 +121,7 @@ func TestConsumeAfterPurge(t *testing.T) {
 	old := time.Now().Add(-4 * 24 * time.Hour).UnixMilli()
 	writeMsgAt(t, st, "t", 0, old)
 	writeMsgAt(t, st, "t", 1, time.Now().UnixMilli())
-	if _, err := New(rep, rt, st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default()).Pass(context.Background()); err != nil {
+	if _, _, err := New(rep, rt, st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default()).Pass(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	pr := produce.New(rep, rt, st, mt, slog.Default())
@@ -122,6 +129,36 @@ func TestConsumeAfterPurge(t *testing.T) {
 	msgs, err := dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
 	if err != nil || len(msgs) != 1 || msgs[0].Offset != 1 {
 		t.Fatalf("清理后消费: %d %v", len(msgs), err)
+	}
+}
+
+// TestPassSkipsNonLedQueues 非 leader 组队列的过期消息不被清理（返回
+// 0 且 processable=0——Run 层「本趟 0 队列可处理」的判定依据）；leader
+// 时照常清理。
+func TestPassSkipsNonLedQueues(t *testing.T) {
+	st, mt, rep, _ := newFixtureRouted(t)
+	if _, err := mt.CreateTopic(context.Background(), "t", 1); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-4 * 24 * time.Hour).UnixMilli()
+	writeMsgAt(t, st, "t", 0, old)
+	// 非 leader 路由：队列组不 lead → 过期消息不清理
+	m := New(rep, fixedLeaderRouter{leader: false}, st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default())
+	n, proc, err := m.Pass(context.Background())
+	if err != nil || n != 0 || proc != 0 {
+		t.Fatalf("非 leader Pass: n=%d proc=%d err=%v; want 0,0,nil", n, proc, err)
+	}
+	if _, ok, _ := st.Get(store.MsgKey("t", 0, 0)); !ok {
+		t.Fatal("非 leader 队列的过期消息不应被清理")
+	}
+	// leader 路由：照常清理
+	m = New(rep, fixedLeaderRouter{leader: true}, st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default())
+	n, proc, err = m.Pass(context.Background())
+	if err != nil || n != 1 || proc != 1 {
+		t.Fatalf("leader Pass: n=%d proc=%d err=%v; want 1,1,nil", n, proc, err)
+	}
+	if _, ok, _ := st.Get(store.MsgKey("t", 0, 0)); ok {
+		t.Fatal("leader 队列的过期消息应被清理")
 	}
 }
 

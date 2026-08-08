@@ -6,6 +6,7 @@ package delay
 import (
 	"context"
 	"log/slog"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,21 @@ import (
 	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
+
+// fixedLeaderRouter 可编程 Router：IsLeader 按字段返回（leader-only 门控单测用）。
+// 不实现 Forwarder——门控拦截后转发分支不可达，nil fwd 不会解引用。
+type fixedLeaderRouter struct{ leader bool }
+
+func (r fixedLeaderRouter) GroupForQueue(string, uint32) uint32 { return 0 }
+func (r fixedLeaderRouter) MetaGroup() uint32                   { return 0 }
+func (r fixedLeaderRouter) IsLeader(uint32) bool                { return r.leader }
+
+// flipRouter 可在测试中翻转 IsLeader 的 Router（Run 门控测试用）。
+type flipRouter struct{ leader atomic.Bool }
+
+func (r *flipRouter) GroupForQueue(string, uint32) uint32 { return 0 }
+func (r *flipRouter) MetaGroup() uint32                   { return 0 }
+func (r *flipRouter) IsLeader(uint32) bool                { return r.leader.Load() }
 
 type fixture struct {
 	st *store.Store
@@ -205,6 +221,75 @@ func TestRunStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan struct{})
 	go func() { f.sc.Run(ctx); close(done) }()
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run 未在 ctx 取消后退出")
+	}
+}
+
+// TestPassGatedByMetaLeadership 非 meta leader 时 Pass 有到期条目也不搬
+// （返回 0，条目保留）；恒 true 照搬——delay/ 键族归 meta 组，搬移必须
+// leader-only（非 leader 的第二段删条目提案会被拒）。
+func TestPassGatedByMetaLeadership(t *testing.T) {
+	f := newFixture(t)
+	past := time.Now().Add(-time.Second).UnixMilli()
+	f.putDelay(t, 0, past, &core.Message{ID: "m1", Topic: "t", Body: []byte("x")})
+	rep := replication.NewStandalone(f.st)
+	// 恒 false：有到期条目也不搬
+	sc := New(rep, fixedLeaderRouter{leader: false}, f.st, f.pr, slog.Default())
+	moved, err := sc.Pass(context.Background())
+	if err != nil || moved != 0 {
+		t.Fatalf("非 leader Pass: moved=%d err=%v; want 0,nil", moved, err)
+	}
+	if n := f.delayCount(t); n != 1 {
+		t.Fatalf("非 leader 时到期条目不应被搬走: %d", n)
+	}
+	// 恒 true：照搬
+	sc = New(rep, fixedLeaderRouter{leader: true}, f.st, f.pr, slog.Default())
+	moved, err = sc.Pass(context.Background())
+	if err != nil || moved != 1 {
+		t.Fatalf("leader Pass: moved=%d err=%v; want 1,nil", moved, err)
+	}
+	if n := f.delayCount(t); n != 0 {
+		t.Fatalf("leader 时到期条目应被搬走: %d", n)
+	}
+}
+
+// TestRunGateSkipsWhileNotLeader Run 的门控是「跳趟等 tick」而非退出循环：
+// 非 leader 期间到期条目不动；拿到 meta leadership 后下趟即搬；失去后
+// 新到期条目又停下（leader 可能随时轮到自己，退出即永久停摆）。
+func TestRunGateSkipsWhileNotLeader(t *testing.T) {
+	f := newFixture(t)
+	past := time.Now().Add(-time.Second).UnixMilli()
+	f.putDelay(t, 0, past, &core.Message{ID: "m1", Topic: "t", Body: []byte("x")})
+	old := scanInterval
+	scanInterval = 30 * time.Millisecond
+	defer func() { scanInterval = old }()
+	rt := &flipRouter{} // 默认非 leader
+	sc := New(replication.NewStandalone(f.st), rt, f.st, f.pr, slog.Default())
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() { sc.Run(ctx); close(done) }()
+	time.Sleep(120 * time.Millisecond) // 4 个 tick：非 leader 期间不搬
+	if n := f.delayCount(t); n != 1 {
+		t.Fatalf("非 leader 期间条目不应被搬: %d", n)
+	}
+	rt.leader.Store(true) // 拿到 meta leadership → 下趟照搬
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) && f.delayCount(t) != 0 {
+		time.Sleep(30 * time.Millisecond)
+	}
+	if n := f.delayCount(t); n != 0 {
+		t.Fatal("成为 leader 后到期条目未被搬走")
+	}
+	rt.leader.Store(false) // 失去 leadership → 新到期条目不再被搬
+	f.putDelay(t, 1, past, &core.Message{ID: "m2", Topic: "t", Body: []byte("x")})
+	time.Sleep(120 * time.Millisecond)
+	if n := f.delayCount(t); n != 1 {
+		t.Fatalf("失去 leadership 后新到期条目不应被搬: %d", n)
+	}
 	cancel()
 	select {
 	case <-done:
