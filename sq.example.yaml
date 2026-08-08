@@ -17,7 +17,7 @@ fsync: sync
 # 未知 topic 时自动创建
 auto_create_topic: true
 # 自动建 topic 的队列数（1..1024）
-default_queue_nums: 4
+default_queue_nums: 16
 # 新订阅组默认最大投递次数，超过转入 %DLQ%{group}
 default_max_attempts: 16
 

@@ -166,7 +166,7 @@ func TestOfficialGoSDKAckTimeoutRedelivery(t *testing.T) {
 func TestOfficialGoSDKRestartRecovery(t *testing.T) {
 	const topic = "e2e-restart"
 	const group = "e2e-restart-g"
-	const total = 4 // 与 default_queue_nums 相同：轮询选队列会让每个队列各摊 1 条
+	const total = 4 // 4 条消息按轮询落在前 4 个队列（0-3），与总队列数无关；重启后按序恢复仍只依赖这 4 条
 
 	cfgPath, endpoint := writeBrokerConfig(t)
 	dir := filepath.Dir(cfgPath)
