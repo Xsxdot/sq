@@ -821,3 +821,92 @@ func TestSendFifoDeliveredWithTypeEcho(t *testing.T) {
 		t.Fatalf("投递回读不符: type=%v group=%q", sp.GetMessageType(), sp.GetMessageGroup())
 	}
 }
+
+// TestAckMessageBatchSameQueueSingleCommit 验证同队列多 entry 走批量路径：
+// 全部成功、响应与请求同序；再次整批 ack 全部落空（INVALID_RECEIPT_HANDLE），
+// 证明第一批真正生效且幂等语义不变。
+func TestAckMessageBatchSameQueueSingleCommit(t *testing.T) {
+	c := newTestClient(t)
+	const topic = "ack-batch-q"
+	const group = "g-ack-batch"
+	// 同一队列凑 3 条：12 条按轮询均匀落在 4 个队列（produce.go 的 rr 分配），
+	// 队列 0 恰好 3 条。必须用 receiveQueue 一次收整批而非 receiveOne 逐条收：
+	// 批量投递（BatchSize=10）会把队列 0 的 3 条一次全部投出（cursor 越过、
+	// 全部标记 inflight），receiveOne 只返回第一条，剩余 2 条在不可见期内
+	// 逐条轮询再也拿不到，循环必然以"收不满"失败。
+	for i := 0; i < 12; i++ {
+		sendOne(t, c, topic, "m")
+	}
+	msgs := receiveQueue(t, c, group, topic, 0, "*")
+	if len(msgs) < 3 {
+		t.Fatalf("队列 0 消息数 = %d, want >= 3", len(msgs))
+	}
+	var handles, ids []string
+	for _, m := range msgs[:3] {
+		handles = append(handles, m.GetSystemProperties().GetReceiptHandle())
+		ids = append(ids, m.GetSystemProperties().GetMessageId())
+	}
+	req := &pb.AckMessageRequest{Group: &pb.Resource{Name: group}, Topic: &pb.Resource{Name: topic}}
+	for i := range handles {
+		req.Entries = append(req.Entries, &pb.AckMessageEntry{ReceiptHandle: handles[i], MessageId: ids[i]})
+	}
+	resp, err := c.AckMessage(context.Background(), req)
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("批量 ack: %v %v", resp.GetStatus(), err)
+	}
+	if len(resp.GetEntries()) != 3 {
+		t.Fatalf("entries = %d, want 3", len(resp.GetEntries()))
+	}
+	for i, e := range resp.GetEntries() {
+		if e.GetStatus().GetCode() != pb.Code_OK || e.GetMessageId() != ids[i] {
+			t.Fatalf("entry %d 顺序或状态错误: %v", i, e)
+		}
+	}
+	// 重放同一批：全部应落空（幂等语义与逐条路径一致）
+	again, err := c.AckMessage(context.Background(), req)
+	if err != nil {
+		t.Fatalf("重放: %v", err)
+	}
+	for i, e := range again.GetEntries() {
+		if e.GetStatus().GetCode() != pb.Code_INVALID_RECEIPT_HANDLE {
+			t.Fatalf("重放 entry %d 应 INVALID_RECEIPT_HANDLE: %v", i, e)
+		}
+	}
+}
+
+// TestAckMessageMixedQueuesGrouped 验证跨队列 entries 正确分组：不同队列的
+// 消息在同一请求中确认，全部成功且响应保持请求顺序。
+func TestAckMessageMixedQueuesGrouped(t *testing.T) {
+	c := newTestClient(t)
+	const topic = "ack-mix-q"
+	const group = "g-ack-mix-q"
+	sendOne(t, c, topic, "a")
+	sendOne(t, c, topic, "b")
+	// 两条消息按轮询落在不同队列，逐队列收齐
+	var msgs []*pb.Message
+	for q := int32(0); q < 4 && len(msgs) < 2; q++ {
+		if m := receiveOne(t, c, group, topic, q, time.Minute); m != nil {
+			msgs = append(msgs, m)
+		}
+	}
+	if len(msgs) != 2 {
+		t.Fatalf("期望 2 条，实际 %d", len(msgs))
+	}
+	req := &pb.AckMessageRequest{Group: &pb.Resource{Name: group}, Topic: &pb.Resource{Name: topic}}
+	for _, m := range msgs {
+		req.Entries = append(req.Entries, &pb.AckMessageEntry{
+			ReceiptHandle: m.GetSystemProperties().GetReceiptHandle(),
+			MessageId:     m.GetSystemProperties().GetMessageId(),
+		})
+	}
+	resp, err := c.AckMessage(context.Background(), req)
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("跨队列批量 ack: %v %v", resp.GetStatus(), err)
+	}
+	for i, e := range resp.GetEntries() {
+		if e.GetStatus().GetCode() != pb.Code_OK ||
+			e.GetMessageId() != msgs[i].GetSystemProperties().GetMessageId() {
+			t.Fatalf("entry %d 顺序或状态错误: %v", i, e)
+		}
+	}
+}
