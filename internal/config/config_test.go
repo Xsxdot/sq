@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -295,6 +296,72 @@ func TestTxnConfigValidation(t *testing.T) {
 		}
 		if _, err := Load(p); err == nil {
 			t.Fatalf("%s 应在启动时报错", name)
+		}
+	}
+}
+
+// TestLoadRejectsLegacyScalarKeys 旧 access_key/secret_key 标量必须硬报错并带迁移
+// 提示——yaml 静默忽略会让升级的运维无声回到不鉴权（安全静默降级，v1.0 前必修）。
+func TestLoadRejectsLegacyScalarKeys(t *testing.T) {
+	cases := map[string]string{
+		"只有 access_key": "access_key: AK1\n",
+		"只有 secret_key": "secret_key: SK1\n",
+		"两个都有":          "access_key: AK1\nsecret_key: SK1\n",
+	}
+	for name, y := range cases {
+		t.Run(name, func(t *testing.T) {
+			p := filepath.Join(t.TempDir(), "sq.yaml")
+			if err := os.WriteFile(p, []byte(y), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			_, err := Load(p)
+			if err == nil {
+				t.Fatalf("%s: 应拒绝启动", name)
+			}
+			if !strings.Contains(err.Error(), "credentials") {
+				t.Fatalf("%s: 错误应带 credentials 迁移提示，得到 %v", name, err)
+			}
+		})
+	}
+}
+
+// TestLoadStrictRejectsTypoField 未知键名（笔误）必须被严格解析挡住。
+func TestLoadStrictRejectsTypoField(t *testing.T) {
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	if err := os.WriteFile(p, []byte("auto_crete_topic: true\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(p); err == nil {
+		t.Fatal("键名笔误应被严格解析拒绝")
+	}
+}
+
+// TestLoadStrictAcceptsExampleConfig 仓库自带的 sq.example.yaml 必须与严格 schema
+// 一致（它是用户照抄的模板，任何漂移都等于把错误教给用户）。
+func TestLoadStrictAcceptsExampleConfig(t *testing.T) {
+	cfg, err := Load("../../sq.example.yaml")
+	if err != nil {
+		t.Fatalf("sq.example.yaml 应通过严格解析: %v", err)
+	}
+	if len(cfg.Credentials) != 0 {
+		t.Fatalf("示例配置默认应空凭据（不鉴权）: %+v", cfg.Credentials)
+	}
+}
+
+// TestLoadEmptyOrCommentOnlyFile 空文件/纯注释文件仍按无配置处理（默认值），
+// yaml.Decoder 对空输入返回 io.EOF，必须显式放过，不能把合法的空配置当错误。
+func TestLoadEmptyOrCommentOnlyFile(t *testing.T) {
+	for _, body := range []string{"", "# 只有注释\n"} {
+		p := filepath.Join(t.TempDir(), "sq.yaml")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		cfg, err := Load(p)
+		if err != nil {
+			t.Fatalf("内容 %q 应视为空配置: %v", body, err)
+		}
+		if cfg.DataDir != "./data" {
+			t.Fatalf("空配置应保留默认值，得到 %q", cfg.DataDir)
 		}
 	}
 }

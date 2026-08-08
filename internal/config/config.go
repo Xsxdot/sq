@@ -10,9 +10,13 @@
 package config
 
 import (
+	"bytes"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"gopkg.in/yaml.v3"
@@ -87,7 +91,29 @@ func Load(path string) (*Config, error) {
 	if err != nil {
 		return nil, fmt.Errorf("读取配置文件 %s: %w", path, err)
 	}
-	if err := yaml.Unmarshal(raw, cfg); err != nil {
+	// 先扫一遍旧标量键：严格解析本身也会挡下它们（field not found），但那个报错
+	// 不含迁移指引，运维会以为是普通拼写错误。单独扫一遍是为了给出「已废弃、改
+	// credentials 列表」的明确提示——旧配置被静默忽略会让鉴权无声回到关闭，这是
+	// 安全静默降级，必须启动时硬报错（README「升级注意」有迁移示例）。
+	var probe map[string]any
+	if err := yaml.Unmarshal(raw, &probe); err == nil {
+		var legacy []string
+		if _, ok := probe["access_key"]; ok {
+			legacy = append(legacy, "access_key")
+		}
+		if _, ok := probe["secret_key"]; ok {
+			legacy = append(legacy, "secret_key")
+		}
+		if len(legacy) > 0 {
+			return nil, fmt.Errorf("配置使用了已废弃的 %s——自本版本起改为 credentials 列表（迁移示例见 README「升级注意」）；为防鉴权静默关闭，本配置拒绝启动",
+				strings.Join(legacy, "/"))
+		}
+	}
+	// 严格解析（KnownFields）：任何未知键名都拒绝——配置笔误要在启动时暴露，
+	// 而不是被 yaml 静默吞掉，运维带着"配置了却无效"的困惑上线。
+	dec := yaml.NewDecoder(bytes.NewReader(raw))
+	dec.KnownFields(true)
+	if err := dec.Decode(cfg); err != nil && !errors.Is(err, io.EOF) {
 		return nil, fmt.Errorf("解析配置文件 %s: %w", path, err)
 	}
 	if cfg.Fsync != "sync" && cfg.Fsync != "async" {
