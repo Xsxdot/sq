@@ -4,7 +4,7 @@
 //
 // 职责：raft 薄壳的可行性验证与参数标定。
 // 边界：不是生产代码——不做快照压缩、不做成员持久化、不接入 sq 主模块；
-//       独立 go module，依赖不进主模块图。
+// 独立 go module，依赖不进主模块图。
 package raftshell
 
 import (
@@ -45,7 +45,10 @@ type Node struct {
 	mode    AckMode
 	lg      *slog.Logger
 
-	inbox   chan raftpb.Message
+	// v3 的 raftpb.Message 是 protobuf-go v2 生成，内部嵌入互斥锁
+	// （protoimpl.MessageState）。消息全链路用指针传递，避免按值拷贝
+	// 触发 vet copylocks 检查，也省一次拷贝开销。
+	inbox   chan *raftpb.Message
 	applied atomic.Uint64
 	leader  atomic.Uint64
 
@@ -97,7 +100,7 @@ func NewNode(id uint64, peers []raft.Peer, dir string, mode AckMode, tr Transpor
 		tr:      tr,
 		mode:    mode,
 		lg:      lg,
-		inbox:   make(chan raftpb.Message, 1024),
+		inbox:   make(chan *raftpb.Message, 1024),
 		waiters: make(map[uint64]chan struct{}),
 		done:    make(chan struct{}),
 	}
@@ -127,7 +130,7 @@ func (n *Node) run(ctx context.Context) {
 		case <-ticker.C:
 			n.rn.Tick()
 		case m := <-n.inbox:
-			_ = n.rn.Step(ctx, &m)
+			_ = n.rn.Step(ctx, m)
 		case rd := <-n.rn.Ready():
 			n.handleReady(ctx, rd)
 		}
@@ -150,8 +153,9 @@ func (n *Node) handleReady(ctx context.Context, rd raft.Ready) {
 		_ = n.storage.SetHardState(rd.HardState)
 	}
 	_ = n.storage.Append(rd.Entries)
-	// raft v3 的 Messages 是指针切片，Transport 契约用值类型，转一层
-	n.tr.Send(n.id, derefMessages(rd.Messages))
+	// raft v3 的 Ready.Messages 本就是指针切片，Transport 契约同为指针，
+	// 直接透传，无拷贝
+	n.tr.Send(n.id, rd.Messages)
 	if rd.SoftState != nil {
 		n.leader.Store(rd.SoftState.Lead)
 		n.lg.Info("leader 变更", "id", n.id, "lead", rd.SoftState.Lead)
@@ -213,7 +217,11 @@ func (n *Node) Propose(ctx context.Context, payload []byte) error {
 }
 
 // Step 是 transport 的消息投递入口，投递给底层 raft 节点（异步入队）。
-func (n *Node) Step(m raftpb.Message) {
+//
+// 注意：m 必须为指针——v3 的 raftpb.Message 内嵌互斥锁
+// （protoimpl.MessageState），按值传递会触发 vet copylocks，
+// 且与 raft 库 rn.Step 的指针签名天然一致。
+func (n *Node) Step(m *raftpb.Message) {
 	n.inbox <- m
 }
 
@@ -256,15 +264,6 @@ func (n *Node) removeWaiter(id uint64) {
 	n.mu.Lock()
 	delete(n.waiters, id)
 	n.mu.Unlock()
-}
-
-// derefMessages 把 raft v3 的指针消息切片转成值切片（Transport 契约用值类型）。
-func derefMessages(ms []*raftpb.Message) []raftpb.Message {
-	out := make([]raftpb.Message, 0, len(ms))
-	for _, m := range ms {
-		out = append(out, *m)
-	}
-	return out
 }
 
 // String 返回 AckMode 的可读名称。

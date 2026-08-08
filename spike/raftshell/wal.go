@@ -1,3 +1,9 @@
+// wal.go 提供每节点独立的 pebble 持久化层，两档刷盘在此分流。
+//
+// 职责：raft 日志（HardState + Entries）的单批次持久化与截断回退覆盖；
+// AckQuorumMem 档的后台周期 fsync。
+// 边界：不做快照、不做成员表持久化、不做日志读取——spike 只写不读，
+// raft 库的读取视图由 Node.storage（MemoryStorage）承担。
 package raftshell
 
 import (
@@ -19,11 +25,12 @@ import (
 //
 // 职责：raft 日志（HardState + Entries）的持久化与截断回退。
 // 边界：不做快照、不做成员表持久化、不做日志读取（spike 只写不读，
-//       raft 库的读取视图由 Node.storage 承担）。
+//
+//	raft 库的读取视图由 Node.storage 承担）。
 type WAL struct {
-	db    *pebble.DB
-	mode  AckMode
-	lg    *slog.Logger
+	db   *pebble.DB
+	mode AckMode
+	lg   *slog.Logger
 
 	closeOnce sync.Once
 	stopCh    chan struct{} // 仅 AckQuorumMem 档使用：通知后台刷盘 goroutine 退出
