@@ -58,6 +58,19 @@ type Options struct {
 	Mode       AckMode
 	Store      *store.Store
 	Logger     *slog.Logger
+
+	// OnLeaderChange/OnApplied 是全组共享的装配钩子（batch③，均可为
+	// nil）：在组 Ready 循环内同步触发——钩子不得阻塞（阻塞即卡死该组
+	// 全部 tick/消息/apply 处理），重活自行 dispatch 到独立 goroutine；
+	// OnApplied 的 repr 参数不得保留引用（Ready 循环结束后缓冲可能被
+	// raft 复用），需保留须自行拷贝。钩子 panic 不恢复（注入方 bug）。
+	//
+	// OnLeaderChange: 组 leader 变更（当选/失联/换人）时触发，leader=0
+	// 表示当前无 leader；isSelf 表示本节点是否就是新 leader。
+	// OnApplied: 每条普通条目 apply 成功后触发，携带组号与原始批次 repr
+	// （空条目 repr 为 nil）。
+	OnLeaderChange func(g uint32, leader uint64, isSelf bool)
+	OnApplied      func(g uint32, repr []byte)
 }
 
 // Manager 是多组装配体：持有全部 raft 组、传输层与恢复判定。
@@ -72,6 +85,11 @@ type Manager struct {
 	groups     map[uint32]*group
 	ln         net.Listener // 本节点监听：NewManager 持有，Start 移交传输层
 	tr         *transport   // Start 时装配；send 回调运行时取值，必已就绪
+
+	// 装配钩子（Options 透传，nil 安全）：每个组共享同一份，契约见
+	// Options 字段注释（Ready 循环内同步触发，不得阻塞）
+	onLeaderChange func(g uint32, leader uint64, isSelf bool)
+	onApplied      func(g uint32, repr []byte)
 
 	cancel         context.CancelFunc // 运行 ctx 取消句柄（StopClean/kill 用）
 	doneCh         chan struct{}      // 全部组 + flusher 完全退出后关闭
@@ -112,14 +130,16 @@ func NewManager(o Options) (*Manager, error) {
 		lg = slog.Default()
 	}
 	m := &Manager{
-		nodeID:     o.NodeID,
-		peers:      o.Peers,
-		dataGroups: o.DataGroups,
-		mode:       o.Mode,
-		st:         o.Store,
-		lg:         lg,
-		groups:     make(map[uint32]*group, o.DataGroups+1),
-		doneCh:     make(chan struct{}),
+		nodeID:         o.NodeID,
+		peers:          o.Peers,
+		dataGroups:     o.DataGroups,
+		mode:           o.Mode,
+		st:             o.Store,
+		lg:             lg,
+		groups:         make(map[uint32]*group, o.DataGroups+1),
+		onLeaderChange: o.OnLeaderChange,
+		onApplied:      o.OnApplied,
+		doneCh:         make(chan struct{}),
 	}
 	m.rs = newRaftStore(o.Store, lg)
 
@@ -230,7 +250,7 @@ func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, e
 	} else {
 		rn = raft.StartNode(raftConfig(m.nodeID, storage), peers)
 	}
-	gr := newGroup(g, rn, storage, m.rs, m.st, m.send, m.mode, m.lg)
+	gr := newGroup(g, rn, storage, m.rs, m.st, m.send, m.mode, m.onLeaderChange, m.onApplied, m.lg)
 	// 重启重放跳过守卫：raft 从 applied+1 重投递，内存 applied 必须先
 	// 从磁盘位点填充，否则已 apply 的条目会被重放（Task 4 约定）；
 	// fresh 路径 applied=0，Store 无副作用
@@ -458,6 +478,17 @@ func (m *Manager) Leader(g uint32) (nodeID uint64, ok bool) {
 	}
 	id := gr.leader()
 	return id, id != 0
+}
+
+// Status 返回指定组的 raft 运行时状态（透传 rn.Status()）；组号非法
+// 时 ok=false。学习者进度监控（Task 10）经 Status.Progress[nodeID].
+// IsLearner 观测追平进度。
+func (m *Manager) Status(g uint32) (raft.Status, bool) {
+	gr, ok := m.groups[g]
+	if !ok {
+		return raft.Status{}, false
+	}
+	return gr.rn.Status(), true
 }
 
 // TransferLeader 请求把指定组的领导权转移给 to 节点。

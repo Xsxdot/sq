@@ -108,6 +108,68 @@ func TestClusterProposeOnFollowerFails(t *testing.T) {
 	}
 }
 
+// TestProposeOnFollowerReturnsErrNotLeader follower 上 Propose 必须报
+// ErrNotLeader（可被 errors.Is 识别）——协议面据此翻译可重试码。
+func TestProposeOnFollowerReturnsErrNotLeader(t *testing.T) {
+	tc := newTestCluster(t, AckQuorumMem)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	lead := tc.leaderOf(t, 1)
+	var follower uint64
+	for id := range tc.mgrs {
+		if id != lead {
+			follower = id
+			break
+		}
+	}
+	err := tc.mgrs[follower].Propose(ctx, 1, []byte("x"))
+	if !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("follower Propose 应返回 ErrNotLeader，得到: %v", err)
+	}
+}
+
+// TestOnAppliedHookFires 每个节点 apply 提案后钩子必须携带组号与原始
+// repr 触发：leader 写一条 meta 组提案，断言 3 个节点都收到
+// (g=0, repr 相同)。
+func TestOnAppliedHookFires(t *testing.T) {
+	// 注入 OnApplied 钩子启用收集器：harness 把钩子逐节点包裹进
+	// appliedChs（见 newTestClusterOpts 注释），raw 钩子为占位，断言走
+	// 收集器 channel
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{OnApplied: func(g uint32, repr []byte) {}})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	lead := tc.leaderOf(t, MetaGroup)
+	b := tc.stores[lead].NewBatch()
+	key := "meta/topic/hook-fires"
+	if err := b.Set([]byte(key), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	repr := append([]byte(nil), b.Repr()...)
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tc.mgrs[lead].Propose(ctx, MetaGroup, repr); err != nil {
+		t.Fatalf("meta 组提案: %v", err)
+	}
+	for id := range tc.mgrs {
+		tc.waitAppliedEvt(t, id, MetaGroup, repr, 30*time.Second)
+	}
+}
+
+// TestOnLeaderChangeHookFiresOnFailover kill leader 后，存活节点必须收到
+// isSelf=true 的 OnLeaderChange 回调：新 leader 在自己当选的 SoftState
+// 分支触发（leader 字段为新 leader 自身）。
+func TestOnLeaderChangeHookFiresOnFailover(t *testing.T) {
+	// 同 OnApplied 收集器用法：注入钩子启用 leaderChs，断言走 channel
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{OnLeaderChange: func(g uint32, leader uint64, isSelf bool) {}})
+	old := tc.leaderOf(t, 1)
+	tc.kill(t, old)
+	evt := tc.waitLeaderChangeIsSelf(t, 1, old, 60*time.Second)
+	if got := tc.leaderOfExcluding(t, 1, old); got != evt.leader {
+		t.Fatalf("回调报告的 leader=%d 与 leaderOfExcluding 报告的 %d 不一致", evt.leader, got)
+	}
+}
+
 // TestClusterUncleanNodeRejoinsAsLearner 断电节点经 WipeForRejoin +
 // harness 编排（存活 leader Remove→AddLearner→追平→AddNode）回归，
 // 已 commit 数据一条不丢——spike Task 5 流程在真实存储/传输上的复现。
@@ -140,6 +202,19 @@ func TestClusterUncleanNodeRejoinsAsLearner(t *testing.T) {
 	tc.waitConverged(t, []string{"meta/topic/t0000", "meta/topic/t0099", "meta/topic/t0100", "meta/topic/t0199"}, 60*time.Second)
 }
 
+// appliedEvt 是 OnApplied 钩子收集器的事件：组号 + 原始批次 repr。
+type appliedEvt struct {
+	g    uint32
+	repr []byte
+}
+
+// leaderEvt 是 OnLeaderChange 钩子收集器的事件：组号 + 新 leader + 是否自身。
+type leaderEvt struct {
+	g      uint32
+	leader uint64
+	isSelf bool
+}
+
 // testCluster 是三节点测试集群：每个节点一条独立数据目录、store 与
 // Manager，经 127.0.0.1 随机端口的真实 TCP 互联。
 //
@@ -153,9 +228,24 @@ type testCluster struct {
 	killed     map[uint64]bool         // 已 kill（模拟断电）的节点
 	dataGroups uint32
 	mode       AckMode
+
+	// 钩子收集器（newTestClusterOpts 注入对应钩子时才会创建）：钩子签名
+	// 不带节点 id，harness 逐节点包裹闭包把事件分流进各节点 channel
+	appliedChs map[uint64]chan appliedEvt // 节点 → OnApplied 事件流
+	leaderChs  map[uint64]chan leaderEvt  // 节点 → OnLeaderChange 事件流
 }
 
-// newTestCluster 起三节点集群（真实 TCP）。
+// newTestCluster 起三节点集群（真实 TCP），不带钩子注入。
+func newTestCluster(t *testing.T, mode AckMode) *testCluster {
+	return newTestClusterOpts(t, mode, Options{})
+}
+
+// newTestClusterOpts 起三节点集群（真实 TCP），并支持注入装配钩子。
+//
+// hookOpts 只消费 OnLeaderChange/OnApplied 两个字段：对应钩子非 nil 时，
+// harness 为每个节点挂上包裹闭包——把事件推进该节点的收集器 channel
+// （appliedChs/leaderChs），再转发给注入的 raw 钩子。钩子签名不带节点
+// id，逐节点 channel 分流是测试断言「三节点都收到」的观测面。
 //
 // 装配序：先 net.Listen ×3 收集地址再拼 Peers 表——解拨号先有鸡还是
 // 先有蛋（传输层按 Peers 拨号，必须拿到全部地址后才能建 Manager），
@@ -165,7 +255,7 @@ type testCluster struct {
 // 清理按逆序注册：StopClean 存活节点 → 等全部 Done → 关 store。
 // kill 过的节点跳过 StopClean（运行 ctx 已取消）；rejoin 过的节点
 // 已重置 killed 标记，按存活节点正常收尾（stores/mgrs 指向新实例）。
-func newTestCluster(t *testing.T, mode AckMode) *testCluster {
+func newTestClusterOpts(t *testing.T, mode AckMode, hookOpts Options) *testCluster {
 	t.Helper()
 	// 1. 先建三个监听器收集地址，再拼 Peers 表
 	lstns := make([]net.Listener, 0, 3)
@@ -187,6 +277,12 @@ func newTestCluster(t *testing.T, mode AckMode) *testCluster {
 		dataGroups: 3,
 		mode:       mode,
 	}
+	if hookOpts.OnApplied != nil {
+		tc.appliedChs = make(map[uint64]chan appliedEvt, 3)
+	}
+	if hookOpts.OnLeaderChange != nil {
+		tc.leaderChs = make(map[uint64]chan leaderEvt, 3)
+	}
 	// 2. 逐节点开 store + NewManager + Start（节点目录 = t.TempDir()/id，
 	//    WipeForRejoin 只需清节点目录，父目录保留）
 	for i := uint64(1); i <= 3; i++ {
@@ -195,14 +291,40 @@ func newTestCluster(t *testing.T, mode AckMode) *testCluster {
 		if err != nil {
 			t.Fatalf("节点 %d 开 store: %v", i, err)
 		}
+		// 逐节点钩子包裹闭包：事件推进收集器（缓冲 64——正常场景每节点
+		// 每次选举/每条提案各 1 条，远低于容量；测试不消费也不阻塞
+		// Ready 循环），再转发 raw 钩子
+		var onLC func(g uint32, leader uint64, isSelf bool)
+		if hookOpts.OnLeaderChange != nil {
+			raw := hookOpts.OnLeaderChange
+			tc.leaderChs[i] = make(chan leaderEvt, 64)
+			onLC = func(g uint32, leader uint64, isSelf bool) {
+				tc.leaderChs[i] <- leaderEvt{g: g, leader: leader, isSelf: isSelf}
+				raw(g, leader, isSelf)
+			}
+		}
+		var onApplied func(g uint32, repr []byte)
+		if hookOpts.OnApplied != nil {
+			raw := hookOpts.OnApplied
+			tc.appliedChs[i] = make(chan appliedEvt, 64)
+			onApplied = func(g uint32, repr []byte) {
+				// 拷贝：钩子契约禁止保留 repr（Ready 循环缓冲复用），
+				// 收集器跨协程持有必须深拷贝
+				repr = append([]byte(nil), repr...)
+				tc.appliedChs[i] <- appliedEvt{g: g, repr: repr}
+				raw(g, repr)
+			}
+		}
 		m, err := NewManager(Options{
-			NodeID:     i,
-			Peers:      peers,
-			Listener:   lstns[i-1], // 注入预建监听：Peers 地址与监听一一对应
-			DataGroups: 3,
-			Mode:       mode,
-			Store:      st,
-			Logger:     testSlog(t),
+			NodeID:         i,
+			Peers:          peers,
+			Listener:       lstns[i-1], // 注入预建监听：Peers 地址与监听一一对应
+			DataGroups:     3,
+			Mode:           mode,
+			Store:          st,
+			Logger:         testSlog(t),
+			OnLeaderChange: onLC,
+			OnApplied:      onApplied,
 		})
 		if err != nil {
 			t.Fatalf("节点 %d NewManager: %v", i, err)
@@ -287,6 +409,52 @@ func (tc *testCluster) leaderOfExcluding(t *testing.T, g uint32, exclude uint64)
 	}
 	t.Fatalf("组 %d 在 90s 内未选出新 leader（排除 %d）", g, exclude)
 	return 0
+}
+
+// waitAppliedEvt 轮询指定节点的 OnApplied 收集器，直到收到组 g 上
+// repr 匹配的事件（不匹配事件丢弃：startup 空条目等噪声），超时 Fatal。
+func (tc *testCluster) waitAppliedEvt(t *testing.T, id uint64, g uint32, repr []byte, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case evt := <-tc.appliedChs[id]:
+			if evt.g == g && bytes.Equal(evt.repr, repr) {
+				t.Logf("节点 %d 已收到组 %d 的 OnApplied 事件（repr %d B）", id, g, len(repr))
+				return
+			}
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	t.Fatalf("节点 %d 未在 %v 内收到组 %d 的 OnApplied 事件", id, timeout, g)
+}
+
+// waitLeaderChangeIsSelf 轮询全部存活节点的 OnLeaderChange 收集器，直到
+// 某节点收到组 g 上 isSelf=true 且 leader≠exclude 的事件（kill-leader 后
+// 新 leader 的当选回调），返回该事件。启动期旧 leader 的 isSelf 事件以
+// leader==exclude 过滤——回调是「新 leader 已产生」的确定性观测面。
+func (tc *testCluster) waitLeaderChangeIsSelf(t *testing.T, g uint32, exclude uint64, timeout time.Duration) leaderEvt {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for id, ch := range tc.leaderChs {
+			if tc.killed[id] {
+				continue
+			}
+			select {
+			case evt := <-ch:
+				if evt.g == g && evt.isSelf && evt.leader != exclude {
+					t.Logf("节点 %d 收到组 %d 当选回调: leader=%d isSelf=true", id, g, evt.leader)
+					return evt
+				}
+			default:
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("组 %d: 存活节点未在 %v 内收到 isSelf=true 的 leader 变更回调（排除旧 leader %d）", g, timeout, exclude)
+	return leaderEvt{}
 }
 
 // kill 模拟节点断电：测试后门 m.kill()（取消运行 ctx，不写干净关机

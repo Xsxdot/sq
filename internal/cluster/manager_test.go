@@ -15,8 +15,34 @@ import (
 	"testing"
 	"time"
 
+	"go.etcd.io/raft/v3"
+
 	"github.com/xushixin/sq/internal/store"
 )
+
+// TestManagerStatusExposesRaftState Status(g) 透传 rn.Status()：Task 10
+// 学习者进度监控依赖它读 Progress/IsLearner；此处锁死基本契约（组号
+// 非法 ok=false、单节点自选举后报告 leader）。
+func TestManagerStatusExposesRaftState(t *testing.T) {
+	dir := t.TempDir()
+	_, m := startSoloManager(t, dir, AckQuorumMem)
+	if _, ok := m.Status(99); ok {
+		t.Fatal("Status(99) 应 ok=false（组号越界）")
+	}
+	// 单节点自选举约 1s：轮询直到 Status 报告本节点为 leader
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		st, ok := m.Status(MetaGroup)
+		if !ok {
+			t.Fatal("Status(MetaGroup) 应 ok=true")
+		}
+		if st.RaftState == raft.StateLeader {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("单节点组未在 30s 内自选举为 leader")
+}
 
 // TestGroupForQueueStable 队列→组映射是入盘契约，黄金值锁死：任何改动
 // fnv 输入编码的重构都会在这里炸出来，而不是让存量数据错组。
