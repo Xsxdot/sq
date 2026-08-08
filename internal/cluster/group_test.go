@@ -8,6 +8,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/binary"
 	"testing"
 	"time"
 
@@ -118,5 +119,94 @@ func TestGroupProposeCtxTimeout(t *testing.T) {
 	gr.mu.Unlock()
 	if n != 0 {
 		t.Fatalf("超时后 propWaiters 残留 %d 个 waiter", n)
+	}
+}
+
+// TestProposalWaiterScopedToProposer 终审 R4：waiter id 是每节点独立
+// 计数器，跨节点可能撞车——条目头带提案者身份，只有本节点提案才
+// 唤醒 waiter（别节点条目 = 丢失提案的 id 恰好撞上，不得假成功）；
+// 且 nextID 以时间戳做种子（重启不回零，双保险）。
+func TestProposalWaiterScopedToProposer(t *testing.T) {
+	self := uint64(7)
+	other := uint64(9)
+	payload := []byte("payload")
+	mk := func(proposer, id uint64) []byte {
+		data := make([]byte, 16+len(payload))
+		binary.BigEndian.PutUint64(data[:8], proposer)
+		binary.BigEndian.PutUint64(data[8:16], id)
+		copy(data[16:], payload)
+		return data
+	}
+	if id, ok := proposalWaiter(mk(other, 42), self); ok {
+		t.Fatalf("别节点条目（proposer=%d）应 ok=false，得到 id=%d", other, id)
+	}
+	if id, ok := proposalWaiter(mk(self, 42), self); !ok || id != 42 {
+		t.Fatalf("本节点条目 = id %d, ok %v; want 42, true", id, ok)
+	}
+	if id, ok := proposalWaiter([]byte{0x01, 0x02}, self); ok {
+		t.Fatalf("不足 16B 的条目应 ok=false，得到 id=%d", id)
+	}
+	// nextID 时间戳种子：newGroup 后计数器必须远离 0（重启回零是
+	// 跨节点碰撞的第二条路径，由种子 + 提案者校验双保险覆盖）
+	storage := raft.NewMemoryStorage()
+	rn := raft.StartNode(raftConfig(1, storage), []raft.Peer{{ID: 1}})
+	gr := newGroup(0, rn, storage, nil, nil, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, testSlog(t))
+	if gr.nextID.Load() == 0 {
+		t.Fatal("nextID 应为时间戳种子（非零）——重启后计数器不得回零")
+	}
+}
+
+// TestCCWaiterInfoProposerScoped 终审 R4：成员变更的 waiter 通知同样
+// 按提案者作用域——Context 携带 [提案者][waiter id]，只有本节点发起的
+// ConfChange 才唤醒 ccWaiters（跨节点 id 碰撞不得假成功）。
+func TestCCWaiterInfoProposerScoped(t *testing.T) {
+	self := uint64(7)
+	other := uint64(9)
+	mk := func(proposer, id uint64) *raftpb.ConfChangeV2 {
+		ctx := make([]byte, 16)
+		binary.BigEndian.PutUint64(ctx[:8], proposer)
+		binary.BigEndian.PutUint64(ctx[8:16], id)
+		return &raftpb.ConfChangeV2{Context: ctx}
+	}
+	if id, ok := ccWaiterInfo(mk(other, 42), self); ok {
+		t.Fatalf("别节点 Context 应 ok=false，得到 id=%d", id)
+	}
+	if id, ok := ccWaiterInfo(mk(self, 42), self); !ok || id != 42 {
+		t.Fatalf("本节点 Context = id %d, ok %v; want 42, true", id, ok)
+	}
+	if id, ok := ccWaiterInfo(&raftpb.ConfChangeV2{}, self); ok {
+		t.Fatalf("nil Context 应 ok=false，得到 id=%d", id)
+	}
+}
+
+// TestGroupStepAfterDoneDoesNotBlock 终审 R4：组退出后 step 必须立即
+// 返回（丢弃消息）——传输读 goroutine 由整条连接共享，阻塞在某一组
+// 的 step 会拖死同连接上其余所有组的消息投递。
+func TestGroupStepAfterDoneDoesNotBlock(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	storage := raft.NewMemoryStorage()
+	rn := raft.StartNode(raftConfig(1, storage), []raft.Peer{{ID: 1}})
+	ctx, cancel := context.WithCancel(context.Background())
+	gr := newGroup(0, rn, storage, rs, st, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, testSlog(t))
+	go gr.run(ctx)
+	cancel()
+	select {
+	case <-gr.done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("组未在 5s 内退出")
+	}
+	from, to := uint64(1), uint64(1)
+	typ := raftpb.MsgHeartbeat
+	msg := &raftpb.Message{Type: &typ, From: &from, To: &to}
+	done := make(chan struct{})
+	go func() {
+		gr.step(msg) // 组已退出：必须立即返回，不阻塞传输读循环
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(1 * time.Second):
+		t.Fatal("step 在组退出后阻塞——违反不阻塞契约")
 	}
 }

@@ -7,7 +7,7 @@
 //     RestartNode 原身份回归（磁盘日志回放进 MemoryStorage）
 //   - 组路由：队列→组映射（入盘契约，GroupForQueue）与传输消息按组投递
 //   - 生命周期：Start 起全部组 + 传输层 + mem 档后台批量刷盘；
-//     StopClean 先写干净关机标记再停全部机件；Done 等完全退出
+//     StopClean 停全部机件后最后写干净关机标记；Done 等完全退出
 //   - 重启恢复判定：干净关机标记决定 fresh / 原身份回归 / 拒绝裸恢复
 //     （ErrUncleanShutdown，须清空状态以 learner 重入）
 //
@@ -199,10 +199,14 @@ func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, e
 			// 相遇；干净路径 leader 的 Progress 仍保留，追齐从不会回退到
 			// index-1 对账（若未来做快照压缩，需按真实 term 补快照，见 B8.2）
 			snapTerm := first.GetTerm()
+			cs, err := confStateFromEntries(ents, hs.GetCommit())
+			if err != nil {
+				return nil, fmt.Errorf("cluster: 组 %d 成员表合成: %w", g, err)
+			}
 			snap := &raftpb.Snapshot{Metadata: &raftpb.SnapshotMetadata{
 				Index:     &snapIndex,
 				Term:      &snapTerm,
-				ConfState: confStateFromEntries(ents, hs.GetCommit()),
+				ConfState: cs,
 			}}
 			if err := storage.ApplySnapshot(snap); err != nil {
 				return nil, fmt.Errorf("cluster: 组 %d 重放快照: %w", g, err)
@@ -364,8 +368,14 @@ func (m *Manager) flusher() {
 	}
 }
 
-// StopClean 干净关机：先写干净关机标记（Sync 落盘，先于任何关闭动作），
-// 再停全部组与后台刷盘 goroutine。
+// StopClean 干净关机：先停全部组与后台刷盘 goroutine，再以干净关机
+// 标记（Sync 落盘）收尾。
+//
+// 标记必须是关机的最后一次同步写：mem 档下组退出窗口内仍可能做
+// NoSync 持久化与提案确认。若像旧次序那样先写标记，「标记已落盘但
+// acked 尾部未刷」的窗口内断电，重启会误判为干净关机、把已确认却
+// 未持久化的数据当既有事实；反过来的新次序里，崩溃只可能发生在
+// 标记之前 = 标记缺失 = 走不干净路径（learner 重入），方向安全。
 //
 // 标记写入失败时记 Error 并按不干净关机处理（下次启动走 learner 重入），
 // 但关闭流程不阻塞、照常完成——spike 语义：关机是确定性动作，标记只是
@@ -373,13 +383,6 @@ func (m *Manager) flusher() {
 //
 // 返回：标记写入失败时返回该错误（关机本身已完成）；成功返回 nil。
 func (m *Manager) StopClean(ctx context.Context) error {
-	var markErr error
-	if err := m.rs.MarkCleanShutdown(); err != nil {
-		markErr = err
-		m.lg.Error("写入干净关机标记失败，本次关机按不干净处理", "err", err)
-	} else {
-		m.lg.Info("干净关机标记已写入")
-	}
 	m.cancel()
 	// 等全部组退出（run 循环结束）后再停 flusher：退出期的最后写入
 	// 仍被周期刷盘覆盖
@@ -389,6 +392,15 @@ func (m *Manager) StopClean(ctx context.Context) error {
 	if m.flusherStop != nil {
 		m.flusherStopOne.Do(func() { close(m.flusherStop) })
 		<-m.flusherDone
+	}
+	// 干净关机标记作为最后一次同步写（见方法注释：先写标记会让
+	// 「标记在、acked 尾部丢」的窗口被误判为干净关机）
+	var markErr error
+	if err := m.rs.MarkCleanShutdown(); err != nil {
+		markErr = err
+		m.lg.Error("写入干净关机标记失败，本次关机按不干净处理", "err", err)
+	} else {
+		m.lg.Info("干净关机标记已写入")
 	}
 	return markErr
 }

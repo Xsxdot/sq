@@ -269,9 +269,7 @@ func (t *transport) sendLoop(ctx context.Context, peerID uint64, addr string) {
 		writeErr := t.writeLoop(ctx, conn, q, peerID, drops, &lastDropLog)
 		// 写循环已返回（断线/取消）：连接退出看门狗集合再关闭。
 		// 与看门狗的双重 Close 安全（net.Conn Close 幂等）。
-		t.connsMu.Lock()
-		delete(t.conns, conn)
-		t.connsMu.Unlock()
+		t.unregisterConn(conn)
 		conn.Close()
 		if ctx.Err() != nil { // 正常关机路径的断开不打 Info（会误导成故障）
 			return
@@ -317,9 +315,13 @@ func (t *transport) writeLoop(ctx context.Context, conn net.Conn, q chan envelop
 //
 // 坏帧（帧长越界、反序列化失败）记 Warn 后退出循环（defer 关连接），
 // 等对端重拨——不能让一个坏字节流永久毒化读循环。
+//
+// 退出时把连接从看门狗集合摘除（终审 R4）：不摘除的话，抖动对端
+// （反复连接又断开）会让 conns 无界增长直到 ctx 取消。
 func (t *transport) readLoop(conn net.Conn) {
 	defer t.wg.Done()
 	defer conn.Close()
+	defer t.unregisterConn(conn) // delete-then-close，与 sendLoop 同风格
 	remote := conn.RemoteAddr().String()
 	header := make([]byte, 4)
 	for {
@@ -345,6 +347,15 @@ func (t *transport) readLoop(conn net.Conn) {
 		// 读端慢，写端自然阻塞，而非本地丢弃。
 		t.deliver(group, msg)
 	}
+}
+
+// unregisterConn 把连接从看门狗集合中摘除（读/写循环退出时调用）。
+// 摘除与关闭的次序按调用方风格（readLoop/sendLoop 都是 delete-then-close）；
+// 与看门狗的双重 Close 安全（net.Conn Close 幂等）。
+func (t *transport) unregisterConn(conn net.Conn) {
+	t.connsMu.Lock()
+	delete(t.conns, conn)
+	t.connsMu.Unlock()
 }
 
 // encodeFrame 组装一帧：[4B 帧长][4B 组号][payload]，帧长 = 4+len(payload)。

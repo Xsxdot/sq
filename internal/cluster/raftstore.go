@@ -202,7 +202,8 @@ func (r *raftStore) EnsureGroups(n uint32) error {
 }
 
 // MarkCleanShutdown 写入干净关机标记并 Sync 落盘。
-// 必须在节点退出之前调用，标记的持久化先于任何关闭操作。
+// 调用方保证它是节点退出前的最后一次同步写（StopClean 停完全部机件
+// 后再调用）——标记在全部写入之后落盘，「有标记即数据齐全」才成立。
 func (r *raftStore) MarkCleanShutdown() error {
 	b := r.st.NewBatch()
 	if err := b.Set([]byte(cleanShutdownKey), []byte{1}); err != nil {
@@ -251,39 +252,64 @@ func (r *raftStore) ConsumeCleanShutdown() (bool, error) {
 // 成员变更当成既定事实。
 //
 // 条目按 index 升序传入（Load 的返回契约），commit 裁剪直接 break。
-func confStateFromEntries(ents []*raftpb.Entry, commit uint64) *raftpb.ConfState {
+//
+// 损坏条目直接报错拒启（终审 R4 修正）：旧实现跳过损坏条目，但一条
+// 损坏的 RemoveNode 被跳过会让被移除的 voter 残留成员表——与注释宣称
+// 的「安全」恰好相反，且静默无日志无测试。拒启让损坏显式化：operator
+// 清空状态（WipeForRejoin）经存活 leader 以 learner 身份重入即可恢复，
+// 比静默残留一个已移除的 voter 安全得多。
+//
+// 同时支持 V1 与 V2 两种 ConfChange 条目格式（V2 是 R4 起的提案格式，
+// 旧日志可能遗留 V1）；任一格式的解码失败都拒启。
+func confStateFromEntries(ents []*raftpb.Entry, commit uint64) (*raftpb.ConfState, error) {
 	cs := &raftpb.ConfState{}
 	for _, ent := range ents {
 		if ent.GetIndex() > commit {
 			break // 条目升序，越过 commit 即全部未提交
 		}
-		if ent.GetType() != raftpb.EntryConfChange {
-			continue
+		var typ raftpb.ConfChangeType
+		var nodeID uint64
+		switch ent.GetType() {
+		case raftpb.EntryConfChange:
+			var cc raftpb.ConfChange
+			cc.Reset()
+			if err := proto.Unmarshal(ent.Data, &cc); err != nil {
+				return nil, fmt.Errorf("解码 ConfChange 条目 %d: %w", ent.GetIndex(), err)
+			}
+			typ = cc.GetType()
+			nodeID = cc.GetNodeId()
+		case raftpb.EntryConfChangeV2:
+			var v2 raftpb.ConfChangeV2
+			v2.Reset()
+			if err := proto.Unmarshal(ent.Data, &v2); err != nil {
+				return nil, fmt.Errorf("解码 ConfChangeV2 条目 %d: %w", ent.GetIndex(), err)
+			}
+			ch := v2.GetChanges()
+			if len(ch) == 0 {
+				// 空 Changes（leave-joint 类条目）：不改变单代成员表，
+				// 跳过——本批从不产生联合共识条目，此分支仅防御
+				continue
+			}
+			typ = ch[0].GetType()
+			nodeID = ch[0].GetNodeId()
+		default:
+			continue // 普通条目与选举空条目不参与成员表
 		}
-		var cc raftpb.ConfChange
-		cc.Reset()
-		if err := proto.Unmarshal(ent.Data, &cc); err != nil {
-			// 损坏的 ConfChange 条目：跳过成员表合成——缺一个成员会在
-			// 重启时响亮失败（成员缺失），而零值 cc（NodeId=0）拼进
-			// Voters 是静默的错误成员表，比跳过危险得多。
-			continue
-		}
-		id := cc.GetNodeId()
-		switch cc.GetType() {
+		switch typ {
 		case raftpb.ConfChangeAddNode:
-			removeUint64(&cs.Voters, id)
-			removeUint64(&cs.Learners, id)
-			cs.Voters = append(cs.Voters, id)
+			removeUint64(&cs.Voters, nodeID)
+			removeUint64(&cs.Learners, nodeID)
+			cs.Voters = append(cs.Voters, nodeID)
 		case raftpb.ConfChangeAddLearnerNode:
-			removeUint64(&cs.Voters, id)
-			removeUint64(&cs.Learners, id)
-			cs.Learners = append(cs.Learners, id)
+			removeUint64(&cs.Voters, nodeID)
+			removeUint64(&cs.Learners, nodeID)
+			cs.Learners = append(cs.Learners, nodeID)
 		case raftpb.ConfChangeRemoveNode:
-			removeUint64(&cs.Voters, id)
-			removeUint64(&cs.Learners, id)
+			removeUint64(&cs.Voters, nodeID)
+			removeUint64(&cs.Learners, nodeID)
 		}
 	}
-	return cs
+	return cs, nil
 }
 
 // removeUint64 从切片中移除第一个等于 v 的元素（不存在时静默）。

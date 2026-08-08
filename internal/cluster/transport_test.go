@@ -104,3 +104,51 @@ func TestTransportDropPeerDrainsQueue(t *testing.T) {
 		t.Fatalf("DropPeer 后丢弃计数 = %d; want 0", n)
 	}
 }
+
+// TestTransportUnregistersClosedConns 终审 R4：入站连接在 readLoop 退出
+// （对端断开等）时必须从看门狗集合摘除——不摘除的话，抖动对端反复
+// 连接又断开会让 conns 无界增长直到 ctx 取消。
+func TestTransportUnregistersClosedConns(t *testing.T) {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr := newTransport(1, ln, nil, func(uint32, *raftpb.Message) {}, testSlog(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr.Start(ctx)
+	// 直连监听器：不经拨号队列，入站连接走 accept→readLoop 注册
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	// 等到入站连接注册进看门狗集合
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		tr.connsMu.Lock()
+		n := len(tr.conns)
+		tr.connsMu.Unlock()
+		if n == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("入站连接未在 5s 内注册（conns=%d）", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	conn.Close()
+	// readLoop 读到 EOF 退出，必须把连接从集合摘除
+	for {
+		tr.connsMu.Lock()
+		n := len(tr.conns)
+		tr.connsMu.Unlock()
+		if n == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("连接关闭后未在 5s 内摘除（conns=%d）", n)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}

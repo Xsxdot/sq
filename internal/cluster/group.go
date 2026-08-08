@@ -77,6 +77,8 @@ type group struct {
 	// waiter 双命名空间（终审观察项①）：普通提案与成员变更的 id 共用
 	// 同一个 nextID 计数器，但 apply 时 EntryNormal 只通知 propWaiters、
 	// EntryConfChange 只通知 ccWaiters——id 相同也不会交叉误唤。
+	// 终审 R4：通知还带提案者作用域——条目头/Context 携带提案者身份，
+	// 只有本节点发起的条目才唤醒 waiter（跨节点 id 碰撞不得假成功）。
 	mu          sync.Mutex
 	propWaiters map[uint64]chan struct{}
 	ccWaiters   map[uint64]chan struct{}
@@ -101,7 +103,7 @@ func newGroup(g uint32, rn raft.Node, storage *raft.MemoryStorage, rs *raftStore
 	if lg == nil {
 		lg = slog.Default()
 	}
-	return &group{
+	gr := &group{
 		g:           g,
 		rn:          rn,
 		storage:     storage,
@@ -116,6 +118,12 @@ func newGroup(g uint32, rn raft.Node, storage *raft.MemoryStorage, rs *raftStore
 		ccWaiters:   make(map[uint64]chan struct{}),
 		doneCh:      make(chan struct{}),
 	}
+	// 提案 id 用时间戳做种子（终审 R4）：干净重启后计数器从远离旧值
+	// 的位置继续，配合条目头的提案者校验双保险——旧进程的等待者已随
+	// 进程消亡，新进程的 id 空间不得与旧进程重叠（否则重启回零是
+	// 跨节点 id 碰撞的第二条路径）。
+	gr.nextID.Store(uint64(time.Now().UnixNano()))
+	return gr
 }
 
 // raftConfig 构造共享的 raft 配置：tick 参数、单消息/在途日志上限、
@@ -177,10 +185,13 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	//    由确认档位逐轮判定；MemoryStorage 是 raft 库读取日志的视图，
 	//    必须与持久层同步推进（双记账）。
 	if err := gr.rs.Persist(gr.g, rd.HardState, rd.Entries, gr.syncPersist(rd.HardState, rd.Entries)); err != nil {
-		// 持久化失败：内存日志与磁盘分叉，崩溃后已确认的条目会消失，
-		// 继续跑没有任何可恢复路径，只能停摆等上层接管
+		// 持久化失败 = 内存日志与磁盘分叉：崩溃后本节点已确认的条目
+		// 会消失，与 applyEntry 的失败同属「日志/状态与多数派分叉」的
+		// 不可恢复类。统一走 panic——进程死亡由上层重启接管（走不干净
+		// 判定）；若记 Error 后停摆返回，run 循环只是安静退出，Manager
+		// 无从感知、组永久静默卡死，比 panic 更糟。
 		gr.lg.Error("日志持久化失败，组停摆", "err", err)
-		return
+		panic(err)
 	}
 	if !raft.IsEmptyHardState(rd.HardState) {
 		_ = gr.storage.SetHardState(rd.HardState)
@@ -195,7 +206,9 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 		gr.lg.Info("组 leader 变更", "lead", rd.SoftState.Lead, "term", rd.HardState.GetTerm())
 	}
 	// 3. CommittedEntries apply
-	appliedCC := make([]uint64, 0, 2) // 本轮回合的成员变更 id：Advance 后再通知
+	// 本轮回合的成员变更登记：Advance 后再通知（见循环外注释），
+	// notify=false 表示该变更非本节点发起，不通知（超时兜底）
+	appliedCC := make([]ccApplied, 0, 2)
 	for _, ent := range rd.CommittedEntries {
 		// 重启重放的幂等保证：raft 可能重发已 apply 过的条目
 		// （conflict 回退重写后），跳过即可——FSM 已是该 index 的状态
@@ -204,6 +217,11 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 		}
 		switch ent.GetType() {
 		case raftpb.EntryConfChange:
+			// 旧格式 V1 ConfChange（旧日志可能遗留）：照常 apply，但
+			// 永不通知 waiter——V1 条目没有提案者身份，通知有跨节点
+			// id 碰撞的假成功风险；且本进程只提议 V2，V1 条目在本
+			// 进程内不可能有对应 waiter（重启后 ccWaiters 为空）。
+			// 不通知 = 保守超时 = 安全方向。
 			var cc raftpb.ConfChange
 			cc.Reset()
 			// v3 的 raftpb 是 protobuf-go v2 生成：需要显式 Unmarshal
@@ -212,21 +230,36 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 				panic(err)
 			}
 			gr.rn.ApplyConfChange(&cc)
-			// 成员变更的 waiter 通知放到 Advance 之后（见循环外注释）：
-			// 这里只登记 id，不直接通知
-			appliedCC = append(appliedCC, cc.GetId())
 			gr.applied.Store(ent.GetIndex())
 			gr.lg.Debug("成员变更已 apply", "type", cc.GetType().String(), "node", cc.GetNodeId())
+		case raftpb.EntryConfChangeV2:
+			var v2 raftpb.ConfChangeV2
+			v2.Reset()
+			if err := proto.Unmarshal(ent.Data, &v2); err != nil {
+				gr.lg.Error("ConfChangeV2 解码失败，组停摆", "index", ent.GetIndex(), "err", err)
+				panic(err)
+			}
+			gr.rn.ApplyConfChange(&v2)
+			// 成员变更的 waiter 通知放到 Advance 之后（见循环外注释）：
+			// 这里只登记（id, 是否本节点发起），不直接通知
+			ccid, ours := ccWaiterInfo(&v2, gr.selfID)
+			appliedCC = append(appliedCC, ccApplied{id: ccid, notify: ours})
+			gr.applied.Store(ent.GetIndex())
+			if ch := v2.GetChanges(); len(ch) > 0 {
+				gr.lg.Debug("成员变更已 apply", "type", ch[0].GetType().String(), "node", ch[0].GetNodeId())
+			}
 		case raftpb.EntryNormal:
-			// 条目数据布局：[8B waiter id][batch repr]——apply 时
-			// 跳过前 8 字节取批次载荷
+			// 条目数据布局：[8B 提案者][8B waiter id][batch repr]——
+			// apply 时跳过 16 字节头取批次载荷；waiter 通知限定
+			// 本节点提案（proposalWaiter 的提案者校验，跨节点条目
+			// id 碰撞不得假成功）
 			var data []byte
-			if len(ent.Data) > 8 {
-				data = ent.Data[8:]
+			if len(ent.Data) > 16 {
+				data = ent.Data[16:]
 			}
 			gr.applyEntry(ent.GetIndex(), data)
-			if len(ent.Data) >= 8 {
-				gr.notifyWaiter(gr.propWaiters, binary.BigEndian.Uint64(ent.Data[:8]))
+			if id, ok := proposalWaiter(ent.Data, gr.selfID); ok {
+				gr.notifyWaiter(gr.propWaiters, id)
 			}
 		}
 	}
@@ -243,9 +276,19 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	// 的推进要等节点 goroutine 消费 advancec 后才发生，µs 级残余窗口内
 	// 背靠背的两条 ConfChange 仍可能被静默替换；proposeConfChange 对
 	// 空条目替换的检测与重试是 batch③ 的兜底缓解。
-	for _, id := range appliedCC {
-		gr.notifyWaiter(gr.ccWaiters, id)
+	for _, cc := range appliedCC {
+		if cc.notify {
+			gr.notifyWaiter(gr.ccWaiters, cc.id)
+		}
 	}
+}
+
+// ccApplied 记录本轮已 apply 的成员变更条目：id 用于 Advance 后唤醒
+// ccWaiters；notify 为 false（变更不是本节点发起）时不通知——跨节点
+// 条目 id 碰撞时通知会造成假成功（apply 的是别节点发起的变更）。
+type ccApplied struct {
+	id     uint64
+	notify bool
 }
 
 // syncPersist 判定本轮 Ready 持久化是否带 fsync。
@@ -301,8 +344,8 @@ func (gr *group) applyEntry(index uint64, data []byte) {
 // 自己写入的数据；commit 只代表多数派确认，本节点 FSM 可能尚未追上，
 // 只等 commit 会让「写入后立即可读」落空。
 //
-// 实现：分配自增提案 id → 注册 waiter（propWaiters）→ id（大端 8B）
-// 前置到批次字节前 → rn.Propose → 等 waiter 通知或 ctx 超时。
+// 实现：分配自增提案 id → 注册 waiter（propWaiters）→ 提案者与 id
+// 各 8B 大端前置到批次字节前 → rn.Propose → 等 waiter 通知或 ctx 超时。
 //
 // 参数：
 //   - ctx: 控制等待；超时/取消后 waiter 被移除（条目可能仍会被提交，
@@ -319,10 +362,14 @@ func (gr *group) propose(ctx context.Context, batchRepr []byte) error {
 	gr.propWaiters[id] = ch
 	gr.mu.Unlock()
 
-	// 提案 id 编码在载荷前 8 字节，apply 时据此回调对应 waiter
-	data := make([]byte, 8+len(batchRepr))
-	binary.BigEndian.PutUint64(data, id)
-	copy(data[8:], batchRepr)
+	// 提案头布局（终审 R4）：[8B 提案者 nodeID][8B waiter id]——apply
+	// 时据此回调对应 waiter，且只有提案者为本节点的条目才被唤醒
+	// （waiter id 是每节点独立计数器，跨节点可能撞车，裸 id 通知会
+	// 把别节点丢失的提案误判成自己的成功）
+	data := make([]byte, 16+len(batchRepr))
+	binary.BigEndian.PutUint64(data[:8], gr.selfID)
+	binary.BigEndian.PutUint64(data[8:16], id)
+	copy(data[16:], batchRepr)
 
 	if err := gr.rn.Propose(ctx, data); err != nil {
 		gr.removeWaiter(gr.propWaiters, id)
@@ -347,7 +394,9 @@ func (gr *group) propose(ctx context.Context, batchRepr []byte) error {
 // waiter 走独立命名空间（ccWaiters）：普通提案与成员变更的 id 共用
 // 同一个 nextID 计数器，但 apply 时 EntryNormal 只通知 propWaiters、
 // EntryConfChange 只通知 ccWaiters——id 相同也不会交叉误唤
-// （终审观察项①）。
+// （终审观察项①）。成员变更以 ConfChangeV2 提交，提案者与 waiter id
+// 放进 V2 的 Context 透传字段，apply 时只有本节点发起的变更才通知
+// （终审 R4：跨节点 id 碰撞不得假成功）。
 //
 // 参数：
 //   - ctx: 控制等待；超时/取消后 waiter 被移除（条目可能仍会被提交）
@@ -367,10 +416,19 @@ func (gr *group) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTyp
 	gr.ccWaiters[id] = ch
 	gr.mu.Unlock()
 
-	// ConfChange 的标量字段在 protobuf-go v2 开放结构下是指针，取址传参；
-	// ProposeConfChange 要求 ConfChangeI 接口（AsV1 为指针接收者），传指针
+	// 成员变更以 ConfChangeV2 提交（终审 R4）：v3.7 的 V2 格式没有
+	// Id 字段（Id 仅存于旧 V1 格式），waiter id 与提案者身份一并放进
+	// Context——raft 核心只校验 Changes（pendingConfIndex/联合共识），
+	// Context 是原样透传的私有字段（MarshalConfChange 把 V2 编码为
+	// EntryConfChangeV2 条目类型，raft.go:1305 的 V2 分支不触碰
+	// Context）。ConfChange 的标量字段在 protobuf-go v2 开放结构下是
+	// 指针，取址传参。
 	cc := raftpb.ConfChange{Type: typ.Enum(), NodeId: &nodeID, Id: &id}
-	if err := gr.rn.ProposeConfChange(ctx, &cc); err != nil {
+	v2 := cc.AsV2()
+	v2.Context = make([]byte, 16)
+	binary.BigEndian.PutUint64(v2.Context[:8], gr.selfID)
+	binary.BigEndian.PutUint64(v2.Context[8:16], id)
+	if err := gr.rn.ProposeConfChange(ctx, v2); err != nil {
 		gr.removeWaiter(gr.ccWaiters, id)
 		return err
 	}
@@ -394,11 +452,19 @@ func (gr *group) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTyp
 // 一次（出站 + 对端回包），raft 的 inflight 上限即入队总量上界；
 // 单节点组稳态不产自消息（自我投递仅出现在选举期）。
 //
+// 组已退出后（doneCh 关闭）丢弃消息而不阻塞（终审 R4）：传输读
+// goroutine 由整条连接共享，阻塞在某一组的 step 会拖死同连接上其余
+// 所有组的消息投递——raft 重试与上层编排是丢弃的兜底。
+//
 // 注意：m 必须为指针——v3 的 raftpb.Message 内嵌互斥锁
 // （protoimpl.MessageState），按值传递会触发 vet copylocks，
 // 且与 rn.Step 的指针签名天然一致。
 func (gr *group) step(m *raftpb.Message) {
-	gr.inbox <- m
+	select {
+	case gr.inbox <- m:
+	case <-gr.doneCh:
+		// 组已退出：丢弃（raft 重试/上层编排兜底），不阻塞传输读循环
+	}
 }
 
 // leader 返回当前 leader 的节点 ID（尚未选举完成时为 0）。
@@ -442,4 +508,41 @@ func (gr *group) removeWaiter(m map[uint64]chan struct{}, id uint64) {
 	gr.mu.Lock()
 	delete(m, id)
 	gr.mu.Unlock()
+}
+
+// proposalWaiter 解析普通提案条目的 16B 头部，返回 waiter id 与
+// 「是否本节点提案」。
+//
+// 布局：[8B 提案者 nodeID][8B waiter id]。ok=false 的两种情况：
+//   - 头部不足 16B（旧格式或选举空条目）：无提案者身份，保守不通知，
+//     提案方只能超时（安全方向，杜绝假成功）；
+//   - 提案者不是本节点：该 id 在本节点可能恰好与自己的计数器撞车
+//     （waiter id 是每节点独立自增），通知会把别节点丢失的提案误判
+//     成自己的成功——apply 的是别节点的消息，必须静默。
+func proposalWaiter(data []byte, selfID uint64) (id uint64, ok bool) {
+	if len(data) < 16 {
+		return 0, false
+	}
+	if binary.BigEndian.Uint64(data[:8]) != selfID {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(data[8:16]), true
+}
+
+// ccWaiterInfo 解析 ConfChangeV2 的 Context 头，返回成员变更的 waiter
+// id 与「是否本节点发起」。
+//
+// Context 是我们私有的 16B 头（[8B 提案者][8B waiter id]，见
+// proposeConfChange）：raft 核心只校验 Changes，不触碰 Context。
+// ok=false（长度不足或提案者不是本节点）时不得唤醒 ccWaiters——
+// 跨节点/无头条目的通知缺失只造成超时（安全方向），假成功才是灾难。
+func ccWaiterInfo(v2 *raftpb.ConfChangeV2, selfID uint64) (id uint64, ok bool) {
+	ctx := v2.GetContext()
+	if len(ctx) < 16 {
+		return 0, false
+	}
+	if binary.BigEndian.Uint64(ctx[:8]) != selfID {
+		return 0, false
+	}
+	return binary.BigEndian.Uint64(ctx[8:16]), true
 }

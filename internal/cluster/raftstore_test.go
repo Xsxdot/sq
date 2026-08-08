@@ -117,8 +117,26 @@ func TestConfStateClampsToCommit(t *testing.T) {
 		cc(2, raftpb.ConfChangeAddNode, 2),
 		cc(3, raftpb.ConfChangeAddNode, 3), // commit=2：这条是未提交尾巴
 	}
-	cs := confStateFromEntries(ents, 2)
+	cs, err := confStateFromEntries(ents, 2)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if len(cs.Voters) != 2 {
 		t.Fatalf("voters = %v; want [1 2]（index 3 未提交，不得纳入）", cs.Voters)
+	}
+}
+
+// TestConfStateRejectsCorruptEntry 终审 R4：损坏的 ConfChange 条目必须
+// 拒启报错，而不是静默跳过——跳过的 RemoveNode 会让被移除的 voter
+// 残留成员表，比拒启危险（拒启后 operator 走 WipeForRejoin + learner
+// 重入即可恢复）。
+func TestConfStateRejectsCorruptEntry(t *testing.T) {
+	idx := uint64(1)
+	etyp := raftpb.EntryConfChange
+	ents := []*raftpb.Entry{
+		{Index: &idx, Type: &etyp, Data: []byte{0xff, 0xff}},
+	}
+	if _, err := confStateFromEntries(ents, 1); err == nil {
+		t.Fatal("损坏的 ConfChange 条目应拒启报错，得到 nil")
 	}
 }
