@@ -107,15 +107,21 @@ txn_max_checks: 15             # 单条半消息最大回查次数，超限丢�
 
 ### 写吞吐与队列数
 
-写吞吐的第一决定因素是 topic 的队列数，不是磁盘速度：
-`吞吐 ≈ min(队列数, 客户端并发) × fsync速率 × group commit 合并系数`。
+fsync=sync 时，并发写入由 Pebble commit pipeline 合并 fsync（group commit，
+同队列的在途提交也参与合并）：`写吞吐 ≈ fsync速率 × 平均合并深度`，合并深度
+约等于在途并发数——**写吞吐由客户端并发和批量发送决定，与队列数基本无关**
+（实测 2 vCPU 云主机 64 并发下 1/4/16/64 队列吞吐收敛在同一量级）。
 
-- 默认 `default_queue_nums: 16` 适合大多数场景；高吞吐 topic 建议显式建
-  topic 并给更多队列（Admin API `queues` 参数，上限 1024）。
-- 单条 fsync 延迟决定单队列的串行下限；批量发送（SDK batch send）与更高
-  客户端并发都能进一步摊薄 fsync。
-- 参考实测（2 vCPU 云主机、fsync 456 次/s）：256 队列 + 256 并发可达
-  5 万+ msg/s，内存峰值 ~72MB（由 Pebble 配置决定，不随负载增长）。
+- 队列数决定的是**消费并行度**：一个消费组内每个队列同一时刻只被一个消费者
+  持有位点，16 队列即最多 16 路并行消费；FIFO 场景下队列越多，不同
+  MessageGroup 之间越少互相排队。默认 `default_queue_nums: 16` 适合大多数
+  场景；消费侧吞吐要求高的 topic 建议显式建 topic 并给更多队列（Admin API
+  `queues` 参数，上限 1024）。
+- 提升写吞吐的手段依次是：批量发送（SDK batch send，整批一次 fsync）、
+  提高客户端并发；两者都在摊薄单次 fsync 的成本。
+- 参考实测（2 vCPU 云主机、裸 fsync 456 次/s）：64 并发稳态 ~22,000 msg/s
+  （10 分钟 soak 无衰减）；批量 32 条/批 ~147,000 msg/s；内存峰值 ~72MB
+  （由 Pebble 配置决定，不随负载增长）。
 
 ## 升级注意
 
