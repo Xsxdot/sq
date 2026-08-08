@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -231,3 +232,78 @@ var _ Router = (*Cluster)(nil)
 var _ Forwarder = (*Cluster)(nil)
 var _ Pending = pending{}
 var _ Pending = (chanPending)(nil)
+
+// fakeLeaderRouter 可编程的 Router：IsLeader 按字段返回（转发分支测试用）。
+type fakeLeaderRouter struct{ leader bool }
+
+func (r fakeLeaderRouter) GroupForQueue(string, uint32) uint32 { return 7 }
+func (r fakeLeaderRouter) MetaGroup() uint32                   { return 0 }
+func (r fakeLeaderRouter) IsLeader(uint32) bool                { return r.leader }
+
+// fakeCaptureForwarder 捕获 ForwardApply 载荷的假转发器。
+type fakeCaptureForwarder struct {
+	g    uint32
+	repr []byte
+	err  error
+}
+
+func (f *fakeCaptureForwarder) ForwardAppend(context.Context, uint32, []byte) (uint32, uint64, error) {
+	return 0, 0, errors.New("未使用")
+}
+
+func (f *fakeCaptureForwarder) ForwardApply(_ context.Context, g uint32, repr []byte) error {
+	f.g = g
+	f.repr = append([]byte(nil), repr...)
+	return f.err
+}
+
+// TestApplyOrForwardLeaderBranch 本节点是 leader：直通 rep.Apply，批次落地。
+func TestApplyOrForwardLeaderBranch(t *testing.T) {
+	st := openReplTestStore(t)
+	b := st.NewBatch()
+	_ = b.Delete([]byte("half/1"))
+	if err := ApplyOrForward(context.Background(), NewStandalone(st),
+		StandaloneRouter{}, nil, 0, b, slog.Default()); err != nil {
+		t.Fatal(err)
+	}
+	// Standalone.Apply 直通 store：删除应已生效（键不存在）
+	if _, ok, _ := st.Get([]byte("half/1")); ok {
+		t.Fatal("本地分支删除未生效")
+	}
+}
+
+// TestApplyOrForwardForwardBranch 非 leader：批次字节（Repr 拷贝）转交给
+// fwd.ForwardApply，本节点不落盘——「转发路径内部完成 Repr 拷贝与 Close」的
+// 可观察契约：转发器收到完整载荷、本地无写入、失败原样上抛。
+func TestApplyOrForwardForwardBranch(t *testing.T) {
+	st := openReplTestStore(t)
+	fwd := &fakeCaptureForwarder{}
+	b := st.NewBatch()
+	_ = b.Set([]byte("cursor/g/t/q"), []byte("v"))
+	want := append([]byte(nil), b.Repr()...)
+	if err := ApplyOrForward(context.Background(), NewStandalone(st),
+		fakeLeaderRouter{leader: false}, fwd, 7, b, slog.Default()); err != nil {
+		t.Fatal(err)
+	}
+	if fwd.g != 7 || !bytes.Equal(fwd.repr, want) {
+		t.Fatalf("转发器收到 g=%d repr=%v; want g=7 repr=%v", fwd.g, fwd.repr, want)
+	}
+	// 转发分支本节点不落盘（follower 不 apply）
+	if _, ok, _ := st.Get([]byte("cursor/g/t/q")); ok {
+		t.Fatal("转发分支不应在本节点落盘")
+	}
+}
+
+// TestApplyOrForwardForwardBranchError 转发失败必须原样上抛（上层按协议语义
+// 重试），不能吞成成功。
+func TestApplyOrForwardForwardBranchError(t *testing.T) {
+	st := openReplTestStore(t)
+	fwd := &fakeCaptureForwarder{err: errors.New("leader 无响应")}
+	b := st.NewBatch()
+	_ = b.Delete([]byte("half/1"))
+	err := ApplyOrForward(context.Background(), NewStandalone(st),
+		fakeLeaderRouter{leader: false}, fwd, 7, b, slog.Default())
+	if err == nil || !strings.Contains(err.Error(), "leader 无响应") {
+		t.Fatalf("转发失败应原样上抛，得到 %v", err)
+	}
+}

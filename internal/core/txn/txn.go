@@ -235,10 +235,12 @@ func (t *Manager) End(ctx context.Context, txID string, commit bool) (bool, erro
 	// 全坐标，便于按 tx_id/msg_id 在 msg/ 与 half/ 两侧核对。
 	// 第二段归元数据组；本节点非 meta leader 时经 fwd.ForwardApply 转发——
 	// 批次是构造无关的两个绝对键 Delete，转发安全（跨节点重放无副作用）。
+	// 本地/转发分派与批次回收统一走 replication.ApplyOrForward（跨节点清理
+	// 类批次的唯一提交入口，见该函数注释）。
 	b := t.st.NewBatch()
 	b.Delete(halfKey)
 	b.Delete(idxKey)
-	if err := t.applyMetaOrForward(ctx, b); err != nil {
+	if err := replication.ApplyOrForward(ctx, t.rep, t.rt, t.fwd, t.rt.MetaGroup(), b, t.logger); err != nil {
 		t.logger.Error("半消息已提交入队但 half 键删除失败——重放将重复提交产生重复消息（at-least-once 允许）",
 			"tx_id", txID, "msg_id", stored.ID, "topic", stored.Topic,
 			"queue", stored.QueueID, "offset", stored.Offset, "err", err)
@@ -255,29 +257,6 @@ func (t *Manager) ChecksTotal() uint64 { return t.checks.Load() }
 
 // DroppedTotal 返回累计超限丢弃条数。
 func (t *Manager) DroppedTotal() uint64 { return t.dropped.Load() }
-
-// applyMetaOrForward 把构造无关批次提交到元数据组：本节点是 meta leader 时
-// rep.Apply 本地提案；否则经 fwd 转发给 meta leader（End 的第二段专用——
-// EndTransaction 可能落在任意节点，而 half 键族归元数据组）。批次归属：
-// 两条路径返回后调用方都不再持有（转发路径内部完成 Repr 拷贝与 Close）。
-func (t *Manager) applyMetaOrForward(ctx context.Context, b *store.Batch) error {
-	g := t.rt.MetaGroup()
-	if t.rt.IsLeader(g) {
-		return t.rep.Apply(ctx, g, b)
-	}
-	// 转发路径：Repr 字节归批次所有，先拷贝再 Close（同 replication.Cluster
-	// 的批次回收契约）；Close 失败仅 Warn——字节已取出，不阻断转发。
-	repr := append([]byte(nil), b.Repr()...)
-	if err := b.Close(); err != nil {
-		t.logger.Warn("转发前回收批次失败（字节已取出，不阻断转发）", "g", g, "err", err)
-	}
-	if err := t.fwd.ForwardApply(ctx, g, repr); err != nil {
-		t.logger.Warn("转发 half 键删除批次失败", "g", g, "bytes", len(repr), "err", err)
-		return err
-	}
-	t.logger.Info("事务决断键删除跨节点转发", "g", g, "bytes", len(repr))
-	return nil
-}
 
 // scanInterval 回查扫描间隔。1s 对「几十秒级的回查间隔」精度绰绰有余。
 // var 而非 const：测试需注入小值。

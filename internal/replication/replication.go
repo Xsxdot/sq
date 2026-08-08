@@ -30,7 +30,9 @@
 //     ApplyAsync 直通）维持零日志；Cluster 后端三处例外：b.Close() 失败
 //     记 Warn（字节已取出，不挡提案）、ForwardAppend/ForwardApply 跨
 //     节点转发成功记 Debug、失败记 Warn——转发走控制通道短连接 RPC，
-//     静默失败无从观测，必须可见
+//     静默失败无从观测，必须可见。第四处例外是包级函数 ApplyOrForward：
+//     它把「leader 判定 + 转发 + 批次回收」合成一个入口，转发分支成功
+//     记 Info、失败记 Warn（调用方要求的跨节点可见性，见该函数注释）。
 package replication
 
 import (
@@ -76,6 +78,42 @@ type Forwarder interface {
 	// ForwardApply 把构造无关批次（纯 Delete/DeleteRange/绝对值 Set，不含任何
 	// 计数器分配）的 repr 转发给 g 组 leader 提案。带构造状态的批次禁用本方法。
 	ForwardApply(ctx context.Context, g uint32, repr []byte) error
+}
+
+// ApplyOrForward 提交构造无关批次（纯 Delete/DeleteRange/绝对值 Set，不含
+// 任何计数器分配）到 g 组：本节点是该组 leader 时 rep.Apply 本地提案；否则
+// 经 fwd.ForwardApply 转发给 g 组 leader 提案。批次归属：两条路径返回后调用
+// 方都不再持有（转发路径内部完成 Repr 拷贝与 Close）。
+//
+// 为什么把「leader 判定 + 转发 + 批次回收」收在一个函数：转发路径的批次
+// 生命周期（Repr 字节归批次所有，先拷贝再 Close）与 leader 判定是同一个
+// 决策的两个半场，散落复制会在某一处被单独改错——本函数是跨节点清理类批次
+// （txn 决断键删除、adminops 成片清理）的唯一提交入口。
+//
+// fwd 为 nil（单机装配）时本函数只会命中本地分支——单机 Router 的 IsLeader
+// 恒真，转发分支不可达，nil 不会解引用。
+//
+// 注意：带构造状态的批次（含计数器分配）禁用本方法——跨节点重放计数器分配
+// 会让构造语义失效（见 Forwarder.ForwardApply 注释）。
+func ApplyOrForward(ctx context.Context, rep Replicator, rt Router, fwd Forwarder,
+	g uint32, b *store.Batch, logger *slog.Logger) error {
+	if rt.IsLeader(g) {
+		return rep.Apply(ctx, g, b)
+	}
+	// 转发路径：Repr 返回的字节归批次所有，必须拷贝后再 Close（回收内存池）。
+	// Close 失败仅记 Warn 不阻断——字节已取出，不阻断转发。
+	repr := append([]byte(nil), b.Repr()...)
+	if err := b.Close(); err != nil {
+		logger.Warn("转发前回收批次失败（字节已取出，不阻断转发）", "g", g, "err", err)
+	}
+	// 跨节点转发是罕见慢路径，成功/失败都必须可见（g + 字节数；leader 侧
+	// 坐标对清理类批次无意义，不随载荷返回）
+	if err := fwd.ForwardApply(ctx, g, repr); err != nil {
+		logger.Warn("转发批次失败", "g", g, "bytes", len(repr), "err", err)
+		return err
+	}
+	logger.Info("跨节点转发批次", "g", g, "bytes", len(repr))
+	return nil
 }
 
 // Standalone 单机后端：Apply/ApplyAsync 忽略 group，直通 store——今天
