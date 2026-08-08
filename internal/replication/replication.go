@@ -45,6 +45,12 @@ import (
 	"github.com/xushixin/sq/internal/store"
 )
 
+// ErrNotLeader 转发 cluster.ErrNotLeader：协议面（rpc）只依赖本包即可识别
+// 「本节点不是该组 leader」的 raft 语义错误，无需直接 import cluster——
+// 依赖方向 cluster → replication → rpc，协议层不耦合 raft 细节。
+// 错误本身由 cluster 定义与包装，本转发保证 errors.Is 穿透（值相等）。
+var ErrNotLeader = cluster.ErrNotLeader
+
 // Pending 一次已定序、待确认的复制提交；Wait 语义与 store.Pending 一致。
 type Pending interface{ Wait() error }
 

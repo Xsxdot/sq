@@ -10,13 +10,16 @@ package rpc
 
 import (
 	"context"
+	"errors"
 
+	"github.com/xushixin/sq/internal/replication"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 // ForwardMessageToDeadLetterQueue 按 receipt handle 将消息转入 %DLQ%{group}。
 // 成功返回 OK；handle 无法解析、目标不存在或已被重投覆盖（陈旧句柄）返回
-// INVALID_RECEIPT_HANDLE；存储故障返回 INTERNAL_SERVER_ERROR。
+// INVALID_RECEIPT_HANDLE；存储故障返回 INTERNAL_SERVER_ERROR；本节点非该
+// 队列 leader 返回 HA_NOT_AVAILABLE。
 func (s *Server) ForwardMessageToDeadLetterQueue(ctx context.Context, req *pb.ForwardMessageToDeadLetterQueueRequest) (*pb.ForwardMessageToDeadLetterQueueResponse, error) {
 	g, topic, q, off, attempt, err := receiptDecode(s.handleSecret, req.GetReceiptHandle())
 	if err != nil {
@@ -25,6 +28,12 @@ func (s *Server) ForwardMessageToDeadLetterQueue(ctx context.Context, req *pb.Fo
 	}
 	ok, err := s.dl.ForwardToDLQ(ctx, g, topic, q, off, attempt)
 	if err != nil {
+		// ErrNotLeader 与存储故障分性质映射，理由同 AckMessage 的批量失败分支
+		if errors.Is(err, replication.ErrNotLeader) {
+			s.logger.Debug("forward 转入死信失败：本节点非该组 leader", "group", g, "topic", topic,
+				"queue", q, "offset", off, "err", err)
+			return &pb.ForwardMessageToDeadLetterQueueResponse{Status: errStatus(pb.Code_HA_NOT_AVAILABLE, err.Error())}, nil
+		}
 		s.logger.Error("forward 转入死信失败", "group", g, "topic", topic, "queue", q, "offset", off, "err", err)
 		return &pb.ForwardMessageToDeadLetterQueueResponse{Status: errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error())}, nil
 	}

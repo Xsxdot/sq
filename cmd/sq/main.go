@@ -102,7 +102,8 @@ func run() error {
 	// rpc.Server 需在 metrics 块之前构造：metrics（/metrics 的
 	// sq_connections）与 admin 控制台都要拿 srv.ConnectionCount。rpc.New
 	// 无副作用，上移不改变任何行为。
-	srv := rpc.New(cfg, mt, pr, dl, tx, writeBlocked, handleSecret, logger)
+	// 路由视图：单机形态恒指向本节点（集群形态由 v2 装配在 main 侧注入）
+	srv := rpc.New(cfg, rpc.StaticRouteView(cfg), mt, pr, dl, tx, writeBlocked, handleSecret, logger)
 
 	// metrics registry 必须先于任何后台 goroutine 装配：NewRegistry 会写包级
 	// 钩子 store.OnApplyObserve，其契约是「装配阶段设置一次、之后只读」——

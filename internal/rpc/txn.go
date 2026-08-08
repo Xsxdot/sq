@@ -11,11 +11,13 @@ package rpc
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/xushixin/sq/internal/core"
+	"github.com/xushixin/sq/internal/replication"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
@@ -42,6 +44,14 @@ func (s *Server) EndTransaction(ctx context.Context, req *pb.EndTransactionReque
 	}
 	found, err := s.tx.End(ctx, txID, commit)
 	if err != nil {
+		// ErrNotLeader（本节点不再是元数据组 leader）与事务存储故障分性质
+		// 映射：前者是「问错节点」，SDK 据此换节点重试；后者才是真·服务端
+		// 故障（选码论证见 QueryRoute 分支注释）。
+		if errors.Is(err, replication.ErrNotLeader) {
+			s.logger.Debug("EndTransaction 失败：本节点非元数据组 leader", "tx_id", txID,
+				"msg_id", req.GetMessageId(), "topic", req.GetTopic().GetName(), "err", err)
+			return &pb.EndTransactionResponse{Status: errStatus(pb.Code_HA_NOT_AVAILABLE, err.Error())}, nil
+		}
 		s.logger.Error("EndTransaction 失败", "tx_id", txID,
 			"msg_id", req.GetMessageId(), "topic", req.GetTopic().GetName(),
 			"resolution", req.GetResolution(), "err", err)

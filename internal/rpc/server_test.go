@@ -52,7 +52,8 @@ type testEnv struct {
 	st      *store.Store
 }
 
-// newTestEnv 起一套测试环境。autoCreate 决定未知 topic 是否自动创建；opts 追加
+// newTestEnv 起一套测试环境（单机形态：staticRouteView + 真实 Standalone
+// 复制后端）。autoCreate 决定未知 topic 是否自动创建；opts 追加
 // 到 grpc.NewServer 上，供需要特定传输层配置的用例使用（如放宽 MaxRecvMsgSize
 // 好让超限请求真正到达应用层校验，或按生产装配的同款 Option 验证配置本身够用）。
 //
@@ -64,13 +65,22 @@ type testEnv struct {
 // ServerOption 与返回值上有差别，且各自都留了一段"为什么不复用另一份"的注释。
 // 到第三份时这个理由已经不成立——差异全部可以用参数表达。
 func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEnv {
+	return newTestEnvWith(t, autoCreate, nil, nil, opts...)
+}
+
+// newTestEnvWith 是 newTestEnv 的全参形态：rv 为 nil 时用 staticRouteView
+// （单机形态），rep 为 nil 时用真实 Standalone 复制后端。集群协议面用例
+// （路由指向 leader、follower 快速失败、ErrNotLeader 映射）注入两者。
+func newTestEnvWith(t *testing.T, autoCreate bool, rv RouteView, rep replication.Replicator, opts ...grpc.ServerOption) testEnv {
 	t.Helper()
 	st, err := store.Open(t.TempDir(), true, slog.Default())
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	rep := replication.NewStandalone(st)
+	if rep == nil {
+		rep = replication.NewStandalone(st)
+	}
 	rt := replication.StandaloneRouter{}
 	mt, err := meta.New(rep, rt, st, autoCreate, 4, 16, slog.Default())
 	if err != nil {
@@ -83,10 +93,13 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 		t.Fatalf("config.Load: %v", err)
 	}
 	cfg.AutoCreateTopic = autoCreate // cfg 与 meta 的 autoCreate 必须一致，预检（send.go 第零遍）读的是 cfg
+	if rv == nil {
+		rv = staticRouteView{cfg: cfg}
+	}
 	blocked := &atomic.Bool{}
 	// txn 管理器与生产装配同参数（30s 首查间隔、15 次上限，见 config 默认值）
 	tx := txn.New(rep, rt, st, pr, mt, 30*time.Second, 15, slog.Default())
-	srv := New(cfg, mt, pr, dl, tx, blocked, []byte("test-handle-secret"), slog.Default())
+	srv := New(cfg, rv, mt, pr, dl, tx, blocked, []byte("test-handle-secret"), slog.Default())
 
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer(opts...)

@@ -30,6 +30,23 @@ import (
 // "整批任一条失败即整体失败"这句话在字面上和效果上一致：失败就是真的什么
 // 都没写。
 func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*pb.SendMessageResponse, error) {
+	// 入口快速失败：本节点不是该 topic 队列所属组的 leader 时，整批消息的
+	// 提案都注定被拒（follower 上写路径经复制层报 ErrNotLeader）——与其等
+	// 批次构造 + 编解码完成后才在提案处失败，不如入口就拒，省一次批次构造。
+	//
+	// 用队列 0 作探针是协议层能力的边界：SendMessage 请求不带队列号，目标
+	// 队列由 produce 内部轮询选定，协议层无法预知；探针只负责识别「本节点
+	// 明确不是写主人」的情形（如整机处在选举窗口或分区），单队列误判由
+	// propose 的 ErrNotLeader 映射兜底（同样回 HA_NOT_AVAILABLE，见
+	// topicErrStatus）。事务消息暂存走元数据组（MetaIsLeader），但同样
+	// 有映射兜底，这里不额外分支。
+	if msgs := req.GetMessages(); len(msgs) > 0 {
+		if topic := msgs[0].GetTopic().GetName(); !s.rv.SelfIsLeader(topic, 0) {
+			s.logger.Debug("SendMessage 快速失败：本节点非该 topic 队列所属组 leader", "topic", topic)
+			return &pb.SendMessageResponse{Status: errStatus(pb.Code_HA_NOT_AVAILABLE,
+				"本节点不是该 topic 队列的当前 leader，请向 leader 节点重试")}, nil
+		}
+	}
 	// 磁盘水位拒写保读（spec §7）：只拦生产者写入，消费链路（Receive/Ack）不受影响
 	if s.writeBlocked != nil && s.writeBlocked.Load() {
 		s.logger.Warn("磁盘水位超限，拒绝写入", "messages", len(req.GetMessages()))
