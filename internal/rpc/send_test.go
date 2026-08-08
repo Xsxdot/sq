@@ -20,6 +20,7 @@ package rpc
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -686,5 +687,79 @@ func TestSendRejectsIllegalTopicName(t *testing.T) {
 	}
 	if resp.GetStatus().GetCode() != pb.Code_ILLEGAL_TOPIC {
 		t.Fatalf("非法名应在预检即拒 ILLEGAL_TOPIC，实际 %v", resp.GetStatus())
+	}
+}
+
+// TestSendMessageBatchFastPath 验证纯普通消息的多条请求走整批落盘：
+// 响应 Entries 与请求同序、offset 连续、全部同队列（整批一个 Pebble Batch
+// 一次 fsync 的外部可见特征）。
+func TestSendMessageBatchFastPath(t *testing.T) {
+	c := newTestClient(t)
+	req := &pb.SendMessageRequest{}
+	for i := 0; i < 3; i++ {
+		req.Messages = append(req.Messages, &pb.Message{
+			Topic: &pb.Resource{Name: "batch-t"},
+			SystemProperties: &pb.SystemProperties{
+				MessageId:   fmt.Sprintf("%032X", i+1),
+				MessageType: pb.MessageType_NORMAL,
+			},
+			Body: []byte("hello"),
+		})
+	}
+	resp, err := c.SendMessage(context.Background(), req)
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("status: %v", resp.GetStatus())
+	}
+	entries := resp.GetEntries()
+	if len(entries) != 3 {
+		t.Fatalf("entries = %d, want 3", len(entries))
+	}
+	for i, e := range entries {
+		if e.GetStatus().GetCode() != pb.Code_OK || e.GetMessageId() == "" {
+			t.Fatalf("entry %d: %v", i, e)
+		}
+		if i > 0 && e.GetOffset() != entries[0].GetOffset()+int64(i) {
+			t.Fatalf("entry %d offset %d 不连续（首条 %d）——整批应落同一队列连续 offset 段",
+				i, e.GetOffset(), entries[0].GetOffset())
+		}
+	}
+}
+
+// TestSendMessageBatchWithFifoFallsBack 验证含 FIFO 消息的多条请求回退逐条
+// 路径：行为与历史版本一致（各条独立成功），不因批量快路径引入而改变。
+func TestSendMessageBatchWithFifoFallsBack(t *testing.T) {
+	c := newTestClient(t)
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{
+			{
+				Topic: &pb.Resource{Name: "mix-t"},
+				SystemProperties: &pb.SystemProperties{
+					MessageId:   "000000000000000000000000000000A1",
+					MessageType: pb.MessageType_NORMAL,
+				},
+				Body: []byte("plain"),
+			},
+			{
+				Topic: &pb.Resource{Name: "mix-t"},
+				SystemProperties: &pb.SystemProperties{
+					MessageId:    "000000000000000000000000000000A2",
+					MessageType:  pb.MessageType_FIFO,
+					MessageGroup: strPtr("g1"),
+				},
+				Body: []byte("fifo"),
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("status: %v", resp.GetStatus())
+	}
+	if len(resp.GetEntries()) != 2 {
+		t.Fatalf("entries = %d, want 2", len(resp.GetEntries()))
 	}
 }

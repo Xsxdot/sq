@@ -76,11 +76,37 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 
 	// 第二遍：整批校验通过后才真正写入。
 	//
-	// 注意：这里仍可能在写到第 N 条时 Append 失败（store 内部故障），此时前面
-	// N-1 条已经真正落盘且无法撤回——没有跨消息的原子写入机制。但这与上面
-	// 两遍处理要解决的问题不同：这是运行时 I/O 故障，不是"客户端输入非法"，
-	// 属于 MQ 客户端本就要容忍的 at-least-once 场景（收到失败状态后重试，
-	// 服务端凭 msgId 或消费端幂等处理去重），因此仍然整批返回该错误，
+	// 快路径：多条且全部为普通消息 → AppendBatch 整批同队列、单 Pebble Batch、
+	// 一次 fsync、整批原子。官方 SDK 的 batch send 只会产生这种批（客户端侧
+	// 已禁止批内混入事务/延时/FIFO）；含特殊消息的多条请求走下方逐条回退
+	// 路径，行为与历史版本完全一致。
+	if batchable(msgs) {
+		stored, err := s.pr.AppendBatch(msgs)
+		if err != nil {
+			s.logger.Warn("SendMessage 批量写入失败", "topic", msgs[0].Topic, "count", len(msgs), "err", err)
+			return &pb.SendMessageResponse{
+				Status: s.topicErrStatus("SendMessage", msgs[0].Topic, err, "batch_count", len(msgs)),
+			}, nil
+		}
+		entries := make([]*pb.SendResultEntry, 0, len(stored))
+		for _, m := range stored {
+			entries = append(entries, &pb.SendResultEntry{
+				Status:    okStatus(),
+				MessageId: m.ID,
+				Offset:    int64(m.Offset),
+			})
+		}
+		s.logger.Debug("SendMessage 批量写入完成", "topic", msgs[0].Topic, "count", len(stored),
+			"queue", stored[0].QueueID, "first_offset", stored[0].Offset)
+		return &pb.SendMessageResponse{Status: okStatus(), Entries: entries}, nil
+	}
+	//
+	// 注意：以下 at-least-once 论证仅适用于逐条回退路径；批量快路径整批原子，
+	// 不存在部分落盘。这里仍可能在写到第 N 条时 Append 失败（store 内部故障），
+	// 此时前面 N-1 条已经真正落盘且无法撤回——没有跨消息的原子写入机制。但
+	// 这与上面两遍处理要解决的问题不同：这是运行时 I/O 故障，不是"客户端输入
+	// 非法"，属于 MQ 客户端本就要容忍的 at-least-once 场景（收到失败状态后
+	// 重试，服务端凭 msgId 或消费端幂等处理去重），因此仍然整批返回该错误，
 	// 不额外引入多消息原子写入的复杂度。
 	entries := make([]*pb.SendResultEntry, 0, len(msgs))
 	for _, m := range msgs {
@@ -242,4 +268,19 @@ func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 		// 分布式追踪就在 sq 这一跳断掉，且断得悄无声息。
 		TraceContext: sp.GetTraceContext(),
 	}, nil
+}
+
+// batchable 判断一批消息可否走 AppendBatch 快路径：多条、且全部为普通消息。
+// 事务/延时消息各有独立暂存路径；FIFO 消息的队列由 MessageGroup 哈希决定，
+// 与整批轮询选队冲突——三者任一出现即回退逐条处理，保证历史行为不变。
+func batchable(msgs []*core.Message) bool {
+	if len(msgs) < 2 {
+		return false
+	}
+	for _, m := range msgs {
+		if m.Transactional || m.DeliverAtMs > 0 || m.MessageGroup != "" {
+			return false
+		}
+	}
+	return true
 }
