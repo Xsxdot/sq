@@ -1,4 +1,4 @@
-.PHONY: build build-go web test test-web proto e2e
+.PHONY: build build-go web test test-web proto e2e soak
 
 # 默认构建包含控制台：单二进制「启动即见一切」是产品承诺的一半
 build: web build-go
@@ -25,3 +25,9 @@ proto:
 
 e2e:
 	cd test/e2e && go test -tags e2e -count=1 ./...
+
+# 写入 soak 长跑（默认 10 分钟，16 队列/64 并发/真实 fsync）。
+# SQ_SOAK_DURATION=2m 缩短；SQ_SOAK_DIR=/path 指定真实磁盘目录
+# （默认 TempDir 在部分机器上落 tmpfs，量不到真实 fsync）。
+soak:
+	SQ_SOAK=1 go test ./internal/core/produce/ -run TestSoak -v -timeout 30m

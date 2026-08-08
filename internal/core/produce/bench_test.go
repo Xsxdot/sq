@@ -2,6 +2,8 @@
 //
 // 职责（基准文件）：
 //   - BenchmarkAppendParallel 量化"全局锁跨 fsync 导致 group commit 失效"的写吞吐基线
+//   - BenchmarkAppendQueueSweep 复现吞吐随队列数近似线性放大（spec §1）
+//   - BenchmarkAppendBatch32 量化 AppendBatch 批量一次 fsync 的收益
 //
 // 边界：
 //   - 只跑基准，不包含断言测试
@@ -9,6 +11,7 @@
 package produce
 
 import (
+	"fmt"
 	"log/slog"
 	"testing"
 
@@ -53,4 +56,52 @@ func newBenchProducer(b *testing.B, dir string) (*Producer, *store.Store) {
 		b.Fatalf("meta: %v", err)
 	}
 	return New(st, mt, slog.Default()), st
+}
+
+// BenchmarkAppendQueueSweep 固定并发（由 -cpu/GOMAXPROCS 决定）只变队列数，
+// 复现「写吞吐随队列数近似线性放大」的结论（spec §1）。改锁前后各跑一轮
+// 即可量化 group commit 解锁对低队列数配置的收益。
+func BenchmarkAppendQueueSweep(b *testing.B) {
+	body := []byte("benchmark-payload-62B.........................................")
+	for _, queues := range []uint32{1, 4, 16, 64} {
+		b.Run(fmt.Sprintf("q%d", queues), func(b *testing.B) {
+			st, err := store.Open(b.TempDir(), true, slog.Default())
+			if err != nil {
+				b.Fatalf("store: %v", err)
+			}
+			b.Cleanup(func() { st.Close() })
+			mt, err := meta.New(st, true, queues, 16, slog.Default())
+			if err != nil {
+				b.Fatalf("meta: %v", err)
+			}
+			p := New(st, mt, slog.Default())
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					if _, err := p.Append(&core.Message{Topic: "t-sweep", Body: body}); err != nil {
+						b.Fatal(err)
+					}
+				}
+			})
+		})
+	}
+}
+
+// BenchmarkAppendBatch32 批量写入基准：每次迭代 = 一批 32 条一次 fsync。
+// 换算 msg/s 时乘 32（ns/op 是「每批」耗时，不是每条）。
+func BenchmarkAppendBatch32(b *testing.B) {
+	p, _ := newBenchProducer(b, b.TempDir())
+	body := []byte("benchmark-payload-62B.........................................")
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			msgs := make([]*core.Message, 32)
+			for i := range msgs {
+				msgs[i] = &core.Message{Topic: "t-batch", Body: body}
+			}
+			if _, err := p.AppendBatch(msgs); err != nil {
+				b.Fatal(err)
+			}
+		}
+	})
 }
