@@ -251,6 +251,112 @@ func (p *Producer) nextDelaySeqLocked() (uint64, error) {
 // Append 写入一条普通消息（M1 签名保持不变）。
 func (p *Producer) Append(m *core.Message) (*core.Message, error) { return p.AppendWith(m, nil) }
 
+// AppendBatch 将同一 topic 的一批普通消息整批落入同一队列：连续 offset 段
+// [off, off+N)、单个 Pebble Batch、一次 fsync，整批原子——要么全部落盘要么
+// 全部不落，比逐条 Append 的「第 N 条失败前 N-1 条无法撤回」语义更强。
+//
+// 参数：msgs 非空；全部同 topic、且均为普通消息（无事务、无延时、无
+// MessageGroup）。路由约束由 rpc 层保证，此处再做防御校验：FIFO 消息的
+// 队列由 MessageGroup 哈希决定，与整批轮询选队冲突；事务/延时各有独立
+// 暂存路径——三者一律报错，调用方应回退逐条处理。
+//
+// 返回：与入参同序的消息切片，QueueID/Offset/ID/时间戳已回填。
+//
+// 注意：整批绑定单一队列与 RocketMQ batch 绑定单 MessageQueue 的语义一致；
+// 批与批之间仍按轮询换队列，长期负载均衡不受影响。
+func (p *Producer) AppendBatch(msgs []*core.Message) ([]*core.Message, error) {
+	if len(msgs) == 0 {
+		return nil, fmt.Errorf("AppendBatch 要求至少一条消息")
+	}
+	topic := msgs[0].Topic
+	for _, m := range msgs {
+		if m.Topic != topic {
+			return nil, fmt.Errorf("AppendBatch 批内 topic 不一致: %q vs %q", topic, m.Topic)
+		}
+		if m.Transactional || m.DeliverAtMs > 0 || m.MessageGroup != "" {
+			return nil, fmt.Errorf("AppendBatch 仅接受普通消息（批内含事务/延时/FIFO 消息）")
+		}
+		if len(m.Body) == 0 || len(m.Body) > MaxBodySize {
+			return nil, fmt.Errorf("消息体大小非法: %d（上限 %d）", len(m.Body), MaxBodySize)
+		}
+	}
+	tc, err := p.mt.EnsureTopic(topic)
+	if err != nil {
+		return nil, err
+	}
+	now := time.Now().UnixMilli()
+	for _, m := range msgs {
+		if m.ID == "" {
+			m.ID = core.NewMessageID()
+		}
+		if m.BornAtMs == 0 {
+			m.BornAtMs = now
+		}
+		m.StoreAtMs = now
+	}
+
+	// 段 1（p.mu）：整批一次队列选择——批内同队列是一次 fsync 与整批原子的前提。
+	p.mu.Lock()
+	qid := p.rr[topic] % tc.Queues
+	p.rr[topic]++
+	k := qkey(topic, qid)
+	qs, ok := p.qstates[k]
+	if !ok {
+		qs = &queueState{}
+		p.qstates[k] = qs
+	}
+	p.mu.Unlock()
+
+	// 段 2（qs.mu）：连续 offset 段分配 + 编码 + 单批定序。
+	qs.mu.Lock()
+	off, err := qs.nextOffsetLocked(p.st, topic, qid)
+	if err != nil {
+		qs.mu.Unlock()
+		return nil, err
+	}
+	b := p.st.NewBatch()
+	for i, m := range msgs {
+		m.QueueID = qid
+		m.Offset = off + uint64(i)
+		raw, err := core.EncodeMessage(m)
+		if err != nil {
+			qs.mu.Unlock()
+			// 未提交而放弃的批次必须自行 Close 回收（store.NewBatch 契约路径 2）
+			b.Close()
+			return nil, fmt.Errorf("编码消息 %s (topic=%s): %w", m.ID, topic, err)
+		}
+		b.Set(store.MsgKey(topic, qid, m.Offset), raw, nil)
+		for _, key := range m.Keys {
+			if key == "" {
+				continue // 空 key 无检索意义（与 AppendWith 同款防御）
+			}
+			b.Set(store.KeyIdxKey(topic, key, m.StoreAtMs, qid, m.Offset), nil, nil)
+		}
+	}
+	// alloc 计数器一次写到 off+N，与全部消息同批原子（语义红线 3 的批量形态）
+	b.Set(store.AllocKey(topic, qid), store.PutU64(off+uint64(len(msgs))), nil)
+	pending, err := p.st.ApplyAsync(b)
+	if err != nil {
+		qs.mu.Unlock()
+		return nil, fmt.Errorf("批量写入 %d 条 (topic=%s q=%d off=%d): %w", len(msgs), topic, qid, off, err)
+	}
+	// 提前推进的理由与 AppendWith 完全相同（见其注释）
+	qs.next = off + uint64(len(msgs))
+	qs.loaded = true
+	qs.mu.Unlock()
+
+	// 锁外等待持久化：fsync 完成之前绝不返回、绝不唤醒（语义红线 1）
+	if err := pending.Wait(); err != nil {
+		return nil, fmt.Errorf("等待批量写入持久化 (topic=%s q=%d off=%d n=%d): %w", topic, qid, off, len(msgs), err)
+	}
+
+	p.mu.Lock()
+	p.wakeLocked(topic)
+	p.mu.Unlock()
+	p.logger.Debug("批量消息已写入", "topic", topic, "queue", qid, "first_offset", off, "count", len(msgs))
+	return msgs, nil
+}
+
 // nextOffsetLocked 取该队列下一 offset，懒加载盘上 alloc/ 计数器。
 // 调用方必须持有 qs.mu。
 func (qs *queueState) nextOffsetLocked(st *store.Store, topic string, q uint32) (uint64, error) {

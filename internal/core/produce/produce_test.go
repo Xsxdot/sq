@@ -345,3 +345,80 @@ func TestAppendConcurrentSameGroupOffsetsContiguous(t *testing.T) {
 		}
 	}
 }
+
+// TestAppendBatchContiguousSameQueue 验证批量写入核心不变式：整批同队列、
+// offset 连续段 [off, off+N)、alloc 计数器一次推进到 off+N、keys 索引齐全。
+func TestAppendBatchContiguousSameQueue(t *testing.T) {
+	p, st := newTestProducer(t, t.TempDir())
+	defer st.Close()
+	msgs := make([]*core.Message, 5)
+	for i := range msgs {
+		msgs[i] = &core.Message{Topic: "tb", Body: []byte("x"), Keys: []string{"k-idx"}}
+	}
+	stored, err := p.AppendBatch(msgs)
+	if err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	if len(stored) != 5 {
+		t.Fatalf("返回 %d 条, want 5", len(stored))
+	}
+	qid := stored[0].QueueID
+	for i, m := range stored {
+		if m.QueueID != qid {
+			t.Fatalf("第 %d 条队列 %d != 首条队列 %d（整批必须同队列）", i, m.QueueID, qid)
+		}
+		if m.Offset != stored[0].Offset+uint64(i) {
+			t.Fatalf("第 %d 条 offset %d 不连续（首条 %d）", i, m.Offset, stored[0].Offset)
+		}
+		if m.ID == "" {
+			t.Fatalf("第 %d 条未回填 ID", i)
+		}
+		if _, ok, err := st.Get(store.MsgKey("tb", qid, m.Offset)); err != nil || !ok {
+			t.Fatalf("offset %d 消息未落盘: ok=%v err=%v", m.Offset, ok, err)
+		}
+	}
+	v, ok, err := st.Get(store.AllocKey("tb", qid))
+	if err != nil || !ok || store.GetU64(v) != stored[4].Offset+1 {
+		t.Fatalf("alloc 计数器 = %v ok=%v err=%v, want %d", v, ok, err, stored[4].Offset+1)
+	}
+}
+
+// TestAppendBatchRejectsSpecialMessages 验证防御校验：事务/延时/FIFO 消息
+// 不允许进批量路径（路由约束在 rpc 层，此处防御手写调用方）。
+func TestAppendBatchRejectsSpecialMessages(t *testing.T) {
+	p, st := newTestProducer(t, t.TempDir())
+	defer st.Close()
+	cases := []*core.Message{
+		{Topic: "tb2", Body: []byte("x"), MessageGroup: "g"},
+		{Topic: "tb2", Body: []byte("x"), DeliverAtMs: time.Now().UnixMilli() + 60_000},
+		{Topic: "tb2", Body: []byte("x"), Transactional: true},
+	}
+	for i, special := range cases {
+		if _, err := p.AppendBatch([]*core.Message{{Topic: "tb2", Body: []byte("x")}, special}); err == nil {
+			t.Fatalf("case %d: 含特殊消息的批应报错", i)
+		}
+	}
+	if _, err := p.AppendBatch(nil); err == nil {
+		t.Fatal("空批应报错")
+	}
+}
+
+// TestAppendBatchAtomicOnInvalidBody 验证整批原子性：批内任一条 body 非法时
+// 整批拒绝、零落盘（alloc 计数器不存在、无任何消息 key）。
+func TestAppendBatchAtomicOnInvalidBody(t *testing.T) {
+	p, st := newTestProducer(t, t.TempDir())
+	defer st.Close()
+	msgs := []*core.Message{
+		{Topic: "tb3", Body: []byte("ok")},
+		{Topic: "tb3", Body: nil}, // 非法：空 body
+	}
+	if _, err := p.AppendBatch(msgs); err == nil {
+		t.Fatal("含空 body 的批应报错")
+	}
+	// 4 个队列全部确认零落盘
+	for q := uint32(0); q < 4; q++ {
+		if _, ok, _ := st.Get(store.AllocKey("tb3", q)); ok {
+			t.Fatalf("队列 %d 的 alloc 计数器不应存在（整批应零落盘）", q)
+		}
+	}
+}
