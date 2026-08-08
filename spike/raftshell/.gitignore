@@ -1,0 +1,4 @@
+# 交叉编译的 Linux 测试二进制（scp 到远程机用），不提交
+raftshell.test
+# 本地基准运行日志，不提交
+bench_stderr.log
