@@ -230,7 +230,19 @@ func run() error {
 		// 等 meta 组出 leader（60s 超时）：meta 组 leader 悬空时全部
 		// meta 写路径（建 topic/group、事务暂存、handle secret）都会
 		// 失败，半残启动比拒绝启动更糟——超时报错退出。
+		//
+		// 超时退出前必须显式 StopClean：StopClean 的 defer 注册在下面
+		// （早于任何定时器 defer，晚于本调用），这条错误路径不会经过它
+		// ——Manager 已在 Start 运行，裸 return 会留下「无干净关机标记」
+		// 的盘面，下次启动误判不干净、Wipe + 重入，把升级前的存量数据
+		// 清掉（单节点升级形态实测踩坑：首次集群启动慢 + 重启 = 数据
+		// 丢失）。StopClean 超时兜底，失败仅记日志（进程即将退出）。
 		if err := waitMetaLeader(m, logger, metaLeaderWaitTimeout); err != nil {
+			sctx, cancel := context.WithTimeout(context.Background(), stopCleanTimeout)
+			if cerr := m.StopClean(sctx); cerr != nil {
+				logger.Error("等 meta leader 超时退出前清理失败（下次启动将走 learner 重入）", "err", cerr)
+			}
+			cancel()
 			return err
 		}
 		// 集群后端三合一：*replication.Cluster 同时实现 Replicator、

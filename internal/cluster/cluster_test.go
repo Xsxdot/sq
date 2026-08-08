@@ -381,6 +381,75 @@ func (tc *testCluster) waitVoterInConfig(t *testing.T, g uint32, nodeID uint64, 
 	t.Fatalf("组 %d: 节点 %d 未在 %v 内成为 voter", g, nodeID, timeout)
 }
 
+// TestSingleNodeUncleanRestartRejoins 单节点集群（peers 只有自己）断电后
+// 调用 cluster.Rejoin 必须快速成功——评审 Critical 1 回归：prepareJoinPoll
+// 对唯一 peer 跳过轮询自己，need 集合永不消减，裸走 30s 超时失败，节点
+// 拒绝重启（单节点是受支持的形态：config 校验放行 peers:1，sq.example.yaml
+// 有文档；而 kill -9 正是 Rejoin 存在意义的场景）。修复后单节点跳过
+// PrepareJoin 编排（无对端可编排，Wipe + fresh 启动即完整恢复）。
+//
+// 断言：Rejoin 在远小于 30s 内成功（超时是修复前的失败形态），节点恢复
+// 后重新成为全部组 leader（fresh 启动 + 单节点立即当选）。
+func TestSingleNodeUncleanRestartRejoins(t *testing.T) {
+	tc := newTestClusterN(t, AckQuorumMem, Options{}, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	// 先写几键证明集群健康（断电前有数据）
+	for i := 0; i < 10; i++ {
+		b := tc.stores[1].NewBatch()
+		_ = b.Set([]byte(fmt.Sprintf("meta/topic/single%04d", i)), []byte("v"))
+		if err := (clusterReplicator{tc.mgrs[1]}).Apply(ctx, MetaGroup, b); err != nil {
+			t.Fatalf("写 %d: %v", i, err)
+		}
+	}
+	tc.kill(t, 1) // 不写标记 = 断电
+
+	// Rejoin 前置（六步之 1）：调用方负责关旧 store
+	if err := tc.stores[1].Close(); err != nil {
+		t.Fatalf("节点 1 关闭旧 store: %v", err)
+	}
+	start := time.Now()
+	m, err := Rejoin(ctx, Options{
+		NodeID:                 1,
+		Peers:                  tc.peers,
+		DataGroups:             tc.dataGroups,
+		Mode:                   tc.mode,
+		Logger:                 testSlog(t),
+		LeaderBalancerInterval: tc.balancerInterval,
+		AutoPromoteLearners:    true,
+	}, tc.dirs[1])
+	if err != nil {
+		t.Fatalf("Rejoin(单节点): %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Fatalf("单节点 Rejoin 耗时 %v，超过 15s——疑似走了 PrepareJoin 30s 超时路径", elapsed)
+	}
+	t.Logf("单节点 Rejoin 完成（%v，无 PrepareJoin 超时）", time.Since(start).Round(time.Millisecond))
+	tc.stores[1] = m.st
+	tc.mgrs[1] = m
+	tc.killed[1] = false // 恢复存活：清理期按正常节点 StopClean
+
+	// 恢复后重新成为全部组 leader（fresh 单节点即刻当选）
+	for g := uint32(0); g <= tc.dataGroups; g++ {
+		tc.waitLeader(t, g, 1, 30*time.Second)
+	}
+	t.Logf("单节点断电恢复完成：全组 leader 复归节点 1")
+}
+
+// waitLeader 轮询节点 id 的 Leader(g) 直到报告 lead==nodeID（或超时
+// Fatal）。单节点恢复场景用：节点必须重新成为各组 leader 才算恢复。
+func (tc *testCluster) waitLeader(t *testing.T, g uint32, nodeID uint64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if lead, ok := tc.mgrs[nodeID].Leader(g); ok && lead == nodeID {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("组 %d: 节点 %d 未在 %v 内成为 leader", g, nodeID, timeout)
+}
+
 // TestControlRoundTrip 节点 A 经 Manager.Control 调 B 的控制通道：
 // B 的 ControlHandler 收到 op/payload 并应答，A 取回应答；handler
 // 报错时 A 收到带错误文本的 error；未知节点与超大 payload 在发送

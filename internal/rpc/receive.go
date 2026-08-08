@@ -131,12 +131,22 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 		//     stream 的底层 ctx 已经失效，不再尝试 Send 一个 status 帧
 		//     （大概率也会失败），直接把 ctx 的错误原样返回给 gRPC 框架，
 		//     由它按标准方式结束这个流。
+		//   - replication.ErrNotLeader：长轮询期间领导权迁移（入口探针放行
+		//     后 leader 换手，EnsureGroup/receiveOnce 的提案被拒）——「问错
+		//     节点」不是服务端故障，映射 HA_NOT_AVAILABLE 让 SDK 换节点重试
+		//     （选码论证同 QueryRoute 分支注释）。Debug 级别：迁移窗口内
+		//     会被高频触发。
 		//   - 其余：真正的服务端内部故障，维持原有 INTERNAL_SERVER_ERROR + Error 日志。
 		switch {
 		case errors.Is(err, meta.ErrBadName):
 			s.logger.Warn("ReceiveMessage 拒绝：消费组名字非法", "group", group, "topic", topic, "queue", queueID, "err", err)
 			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
 				Status: errStatus(pb.Code_ILLEGAL_CONSUMER_GROUP, err.Error()),
+			}})
+		case errors.Is(err, replication.ErrNotLeader):
+			s.logger.Debug("ReceiveMessage 失败：本节点非该组 leader（长轮询期间领导权迁移）", "group", group, "topic", topic, "queue", queueID, "err", err)
+			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
+				Status: errStatus(pb.Code_HA_NOT_AVAILABLE, err.Error()),
 			}})
 		case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
 			s.logger.Debug("ReceiveMessage 结束：客户端取消或等待超时", "group", group, "topic", topic, "queue", queueID, "err", err)

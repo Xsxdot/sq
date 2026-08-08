@@ -1122,7 +1122,20 @@ func Rejoin(ctx context.Context, o Options, dataDir string) (*Manager, error) {
 //
 // 对端不可达（宕机/未起）只记 Warn 不失败：它 lead 的组会由其余对端
 // 处理，下轮重试补齐。
+//
+// 单节点集群（peers 只有自己）特判：没有任何对端可轮询，need 集合
+// 永远不会被消减，裸走循环必然 30s 超时失败。对单节点而言 PrepareJoin
+// 的 Remove→AddLearner 语义本就没有意义（成员表里只有自己，无从
+// 「移除再以 learner 加回」）——Wipe + fresh 启动就是完整的恢复路径，
+// 直接返回 nil 跳过编排（三节点 e2e 补的回归：单节点 kill -9 重启
+// 必须能自愈，见 manager_test.go）。
 func prepareJoinPoll(ctx context.Context, lg *slog.Logger, o Options) error {
+	peerIDs := sortedPeerIDs(o.Peers)
+	if len(peerIDs) == 1 && peerIDs[0] == o.NodeID {
+		lg.Info("PrepareJoin 跳过：单节点集群无对端可编排，Wipe + fresh 启动即完整恢复",
+			"node", o.NodeID)
+		return nil
+	}
 	// payload = [8B BE nodeID]
 	payload := make([]byte, 8)
 	binary.BigEndian.PutUint64(payload, o.NodeID)
@@ -1132,7 +1145,6 @@ func prepareJoinPoll(ctx context.Context, lg *slog.Logger, o Options) error {
 	}
 	pollCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	peerIDs := sortedPeerIDs(o.Peers)
 	start := time.Now()
 	for {
 		for _, peer := range peerIDs {

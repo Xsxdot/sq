@@ -26,7 +26,9 @@
 //     6 队列覆盖 3 组 3 节点），逐节点日志 grep 后断言两类转发各 ≥1 次
 //     ——两跳均有实测证据，转发代码是承重路径而非防御死代码
 //   - 消费吞吐只记粗略数字（plan 风险自记 ②：Receive 每次都过 raft
-//     提案，防止量级劣化无感），非 benchmark
+//     提案，防止量级劣化无感），非 benchmark；健康期消费者用 100ms 短
+//     轮询档测量（评审 Important 3：3s 长档下数字被 SDK 轮询节拍主导，
+//     不能代表 broker 吞吐）
 //   - 内存峰值：轮询 /proc/<pid>/status VmHWM（Linux；非 Linux 跳过）
 package e2e
 
@@ -76,6 +78,20 @@ const (
 	// ForwardApply）都至少命中一次——测试据此对 broker 日志做转发
 	// 证据断言（plan 风险自记① 的 keep-vs-delete 裁决）。
 	txnForwardProbeCount = 6
+
+	// clusterConsumerAwaitShort / clusterConsumerAwaitDefault 是集群用例
+	// 消费者的 SDK 轮询档位（见 newClusterConsumer 注释）。短档用于
+	// 吞吐测量路径（健康期消费）：100ms 让空轮询快速返回，测量值反映
+	// broker 投递能力而非轮询节拍。默认档（3s）用于其余消费者——长轮询
+	// 减少空轮询请求数，语义不变。
+	//
+	// clusterConsumerReqTimeout 是短档消费者配套的请求超时：SDK 的
+	// Receive 超时 = await + 请求超时（默认 3s），服务端长轮询按请求
+	// deadline 推导——只调 await 时空轮询仍等 ≈2.1s，测量仍被轮询节拍
+	// 主导（实测 13 msg/s）。压到 200ms 后空轮询 ≈ await 即返。
+	clusterConsumerAwaitShort   = 100 * time.Millisecond
+	clusterConsumerAwaitDefault = 3 * time.Second
+	clusterConsumerReqTimeout   = 200 * time.Millisecond
 )
 
 // pickPorts 选 n 个互不相同的空闲端口（与 pickPort 同款 bind-probe 语义，
@@ -432,7 +448,7 @@ func TestStandaloneToSingleNodeClusterUpgrade(t *testing.T) {
 	}
 
 	// 收到升级前的全部消息
-	consumer := newClusterConsumer(t, ep, "e2e-upgrade-g", "e2e-upgrade")
+	consumer := newClusterConsumer(t, ep, "e2e-upgrade-g", "e2e-upgrade", clusterConsumerAwaitDefault)
 	got := recvAll(t, consumer, len(sent), 60*time.Second, "升级前消息")
 	for id := range sent {
 		if !got[id] {
@@ -451,7 +467,7 @@ func TestStandaloneToSingleNodeClusterUpgrade(t *testing.T) {
 		sent[recs[0].MessageID] = true
 	}
 	producer2.GracefulStop()
-	consumer2 := newClusterConsumer(t, ep, "e2e-upgrade-g2", "e2e-upgrade")
+	consumer2 := newClusterConsumer(t, ep, "e2e-upgrade-g2", "e2e-upgrade", clusterConsumerAwaitDefault)
 	got2 := recvAll(t, consumer2, len(sent), 60*time.Second, "升级后全量")
 	for id := range sent {
 		if !got2[id] {
@@ -569,8 +585,16 @@ func TestThreeNodeClusterE2E(t *testing.T) {
 		}
 		t.Logf("节点 %d 的路由视角：%s", i+1, strings.Join(detail, " "))
 	}
+	// 等 leader 摊布收敛（60s）：三节点健康期是吞吐测量 + 事务转发证据
+	// 的窗口，摊布循环（5s 周期 + 3 周期稳定观察 ≈ 15s+）会把各组转移到
+	// preferred 节点——转移窗口内 SDK 路由缓存（30s 刷新）指向旧 leader，
+	// Receive 立即回 HA_NOT_AVAILABLE，消费侧对陈旧路由空转（实测 4661
+	// 次/s 热循环），吞吐数字被路由陈旧时间主导、事务转发证据偶发为 0
+	// （全组恰在同一节点）。等摊布落定后再进入测量窗口，数字才反映
+	// broker 真实投递能力。
+	waitRouteSpread(t, endpoints, topic, 60*time.Second)
 	producer := newClusterProducer(t, multi, topic)
-	consumer := newClusterConsumer(t, multi, group, topic)
+	consumer := newClusterConsumer(t, multi, group, topic, clusterConsumerAwaitShort) // 吞吐测量路径：短轮询档（见函数注释）
 
 	// ---- 健康期：发 200 → 全收全 ack（含粗略消费吞吐）----
 	sent := map[string]bool{}
@@ -591,8 +615,12 @@ func TestThreeNodeClusterE2E(t *testing.T) {
 	elapsed := time.Since(recvStart)
 	rate := float64(len(got)) / elapsed.Seconds()
 	// plan 风险自记 ②：Receive 每次都过 raft 提案，消费吞吐必须有粗略
-	// 数字防量级劣化无感（非 benchmark，不做抖动分析）
-	t.Logf("三节点消费吞吐（粗略，非 benchmark）：%.0f msg/s（%d 条 / %.1fs）", rate, len(got), elapsed.Seconds())
+	// 数字防量级劣化无感（非 benchmark，不做抖动分析）。消费者用短轮询
+	// 档（clusterConsumerAwaitShort=100ms）——长档 3s 下每次空轮询等满
+	// 3s，测出的是 SDK 轮询节拍不是 broker 吞吐（评审 Important 3）；
+	// 短档下空轮询 100ms 即返，数字反映 broker 实际投递能力。
+	t.Logf("三节点消费吞吐（短轮询档 100ms，粗略非 benchmark）：%.0f msg/s（%d 条 / %.1fs）",
+		rate, len(got), elapsed.Seconds())
 	for id := range sent {
 		if !got[id] {
 			t.Errorf("健康期消息 %s 未收到", id)
@@ -610,7 +638,7 @@ func TestThreeNodeClusterE2E(t *testing.T) {
 	// txnForwardProbeCount 条保证两类转发都至少命中一次；提交完成后
 	// 逐节点日志 grep 断言（转发节点 Info 日志，见下述两个计数）。
 	txnProducer := newClusterProducer(t, multi, "e2e-cluster-txn")
-	txnConsumer := newClusterConsumer(t, multi, "e2e-cluster-txn-g", "e2e-cluster-txn")
+	txnConsumer := newClusterConsumer(t, multi, "e2e-cluster-txn-g", "e2e-cluster-txn", clusterConsumerAwaitDefault)
 	txnSent := map[string]bool{}
 	for i := 0; i < txnForwardProbeCount; i++ {
 		tx := txnProducer.BeginTransaction()
@@ -741,7 +769,7 @@ func TestThreeNodeClusterE2E(t *testing.T) {
 	producer4.GracefulStop()
 	// 对账：新消费组从位点 0 重放全量历史——健康期 200 + kill 后 50 +
 	// 重入后 20 全部收齐，证明三阶段无一条丢失（新组重放 = 全历史断言）。
-	consumer4 := newClusterConsumer(t, multi, "e2e-cluster-g3", topic)
+	consumer4 := newClusterConsumer(t, multi, "e2e-cluster-g3", topic, clusterConsumerAwaitDefault)
 	got4 := recvAllAck(t, consumer4, len(sent)+len(postKill), 240*time.Second, "三节点对账消费")
 	for id := range sent {
 		if !got4[id] {
@@ -775,18 +803,33 @@ func newClusterProducer(t *testing.T, endpoint, topic string) rmq.Producer {
 }
 
 // newClusterConsumer 构造带集群凭据的 SimpleConsumer（SUB_ALL）。
-func newClusterConsumer(t *testing.T, endpoint, group, topic string) rmq.SimpleConsumer {
+//
+// await 是 SDK 的简单消费者轮询档位：Receive 对单个队列的长轮询上限
+// （官方 SDK 会把 awaitDuration 放进请求的 long-polling timeout）。
+// 吞吐测量路径必须用短档（clusterConsumerAwaitShort）——长档（3s）下
+// 每次空轮询都要等满 3s，测量结果是「轮询节拍」而不是 broker 吞吐
+// （8 msg/s ≈ 16 条/3s 周期的惨案，评审 Important 3）。
+//
+// 光调 await 还不够：SDK 的 Receive 超时 = awaitDuration + 客户端请求
+// 超时（默认 3s），服务端长轮询时长按请求 deadline 推导——只调 await
+// 时空轮询仍要等 ≈3s+100ms-1s 余量 ≈2.1s（实测 13 msg/s 仍被空轮询
+// 主导）。因此测量路径同时把请求超时压到 clusterConsumerReqTimeout，
+// 空轮询 ≈ await 即返，数字才反映 broker 实际投递能力。
+func newClusterConsumer(t *testing.T, endpoint, group, topic string, await time.Duration) rmq.SimpleConsumer {
 	t.Helper()
 	c, err := rmq.NewSimpleConsumer(&rmq.Config{
 		Endpoint:      endpoint,
 		ConsumerGroup: group,
 		Credentials:   &credentials.SessionCredentials{AccessKey: clusterAK, AccessSecret: clusterSK},
 	},
-		rmq.WithSimpleAwaitDuration(3*time.Second),
+		rmq.WithSimpleAwaitDuration(await),
 		rmq.WithSimpleSubscriptionExpressions(map[string]*rmq.FilterExpression{topic: rmq.SUB_ALL}),
 	)
 	if err != nil {
 		t.Fatalf("NewSimpleConsumer: %v", err)
+	}
+	if await == clusterConsumerAwaitShort {
+		c.SetRequestTimeout(clusterConsumerReqTimeout) // 吞吐测量路径：压短请求超时（见函数注释）
 	}
 	if err := c.Start(); err != nil {
 		t.Fatalf("consumer.Start: %v", err)
@@ -814,6 +857,32 @@ func countLogLines(t *testing.T, logPaths []string, needle string) int {
 	return total
 }
 
+// waitRouteSpread 轮询路由直到 topic 的队列摊布到全部节点（每节点至少
+// 领 1 条队列），超时 Fatal。
+//
+// 为什么需要等摊布收敛：leader 摊布循环把各组转移到 preferred 节点需要
+// 若干周期（5s 周期 × 3 稳定观察 ≈ 15s+），收敛前可能全部数据组集中
+// 在同一节点。健康期吞吐测量与事务转发证据断言都要求路由稳定且分散——
+// 转移窗口内 SDK 路由缓存指向旧 leader，Receive 立即回 HA_NOT_AVAILABLE，
+// 消费侧对陈旧路由空转（实测 4661 次/s 热循环），吞吐数字被路由陈旧
+// 时间主导而非 broker 能力；事务转发证据在「全组同节点」时天然为 0。
+func waitRouteSpread(t *testing.T, endpoints []string, topic string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		qs := queryRoute(t, endpoints[0], topic)
+		if len(routeEndpointCounts(qs)) == len(endpoints) {
+			t.Logf("leader 摊布已收敛：%d 条队列分布到 %d 个节点 %v",
+				len(qs), len(endpoints), routeEndpointCounts(qs))
+			return
+		}
+		time.Sleep(1 * time.Second)
+	}
+	qs := queryRoute(t, endpoints[0], topic)
+	t.Fatalf("leader 摊布 %v 内未收敛到 %d 个节点，当前分布 %v",
+		timeout, len(endpoints), routeEndpointCounts(qs))
+}
+
 // recvAll 轮询消费直到收齐 want 个不同 msgId 或超时，返回收到的 msgId
 // 集合。空轮询（MESSAGE_NOT_FOUND）与临时错误按正常路径继续。
 func recvAll(t *testing.T, consumer rmq.SimpleConsumer, want int, window time.Duration, phase string) map[string]bool {
@@ -825,7 +894,12 @@ func recvAll(t *testing.T, consumer rmq.SimpleConsumer, want int, window time.Du
 		rounds++
 		mvs, err := consumer.Receive(context.Background(), 16, 30*time.Second)
 		if err != nil {
-			continue // 空轮询以 MESSAGE_NOT_FOUND 错误返回，属正常
+			// 空轮询以 MESSAGE_NOT_FOUND 错误返回，属正常；HA_NOT_AVAILABLE
+			// 出现在 SDK 路由缓存过期（leader 摊布转移后 30s 刷新窗口内）——
+			// 必须退避再试，否则对陈旧路由的 Receive 会以 RPC 速率空转
+			// （三节点 e2e 实测 4661 次/s 的 CPU 热循环）
+			time.Sleep(50 * time.Millisecond)
+			continue
 		}
 		for _, mv := range mvs {
 			got[mv.GetMessageId()] = true
@@ -849,7 +923,12 @@ func recvAllAck(t *testing.T, consumer rmq.SimpleConsumer, want int, window time
 		rounds++
 		mvs, err := consumer.Receive(context.Background(), 16, 30*time.Second)
 		if err != nil {
-			continue // 空轮询以 MESSAGE_NOT_FOUND 错误返回，属正常
+			// 空轮询以 MESSAGE_NOT_FOUND 错误返回，属正常；HA_NOT_AVAILABLE
+			// 出现在 SDK 路由缓存过期（leader 摊布转移后 30s 刷新窗口内）——
+			// 必须退避再试，否则对陈旧路由的 Receive 会以 RPC 速率空转
+			// （三节点 e2e 实测 4661 次/s 的 CPU 热循环）
+			time.Sleep(50 * time.Millisecond)
+			continue
 		}
 		for _, mv := range mvs {
 			got[mv.GetMessageId()] = true

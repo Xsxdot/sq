@@ -23,6 +23,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 
 	"github.com/xushixin/sq/internal/config"
+	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/replication"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 	"github.com/xushixin/sq/internal/store"
@@ -60,6 +61,27 @@ func (f errInjectingReplicator) Apply(context.Context, uint32, *store.Batch) err
 
 func (f errInjectingReplicator) ApplyAsync(context.Context, uint32, *store.Batch) (replication.Pending, error) {
 	return nil, f.err
+}
+
+// asyncErrReplicator 测试用假 Replicator：Apply 成功（EnsureGroup 建组/
+// 建 topic 路径），ApplyAsync 注入错误（取件写入路径）——模拟「长轮询
+// 期间领导权迁移」：入口探针放行、EnsureGroup 成功，但取件批次提案
+// 撞上迁移窗口。
+//
+// st 在 newTestEnvWith 之后延迟绑定（env 内部才创建真实 store）；方法
+// 用指针接收者，env 持有的接口引用的同一实例才能看到绑定后的 st。
+type asyncErrReplicator struct {
+	st            *store.Store
+	applyAsyncErr error
+}
+
+func (f *asyncErrReplicator) Apply(ctx context.Context, _ uint32, b *store.Batch) error {
+	return f.st.Apply(b)
+}
+
+func (f *asyncErrReplicator) ApplyAsync(_ context.Context, _ uint32, b *store.Batch) (replication.Pending, error) {
+	b.Close()
+	return nil, f.applyAsyncErr
 }
 
 // TestQueryRoutePointsQueuesAtGroupLeaders 注入假 RouteView：队列 0→节点A、
@@ -256,6 +278,71 @@ func TestReceiveOnNonLeaderFailsFastWithoutLongPoll(t *testing.T) {
 	}
 	if elapsed >= time.Second {
 		t.Fatalf("follower 上 ReceiveMessage 应快速失败，耗时 %v（>=1s，疑似进入了长轮询）", elapsed)
+	}
+}
+
+// TestReceiveInLoopErrNotLeaderMapsHANotAvailable 长轮询期间领导权迁移：
+// 入口探针放行（发起时本节点是 leader），但 deliver.Receive 内的提案
+// （EnsureGroup/receiveOnce 的 ApplyAsync）报 ErrNotLeader——必须映射
+// HA_NOT_AVAILABLE 让 SDK 换节点重试，而不是 INTERNAL_SERVER_ERROR
+// （评审 Important 4：迁移窗口内的轮询失败被误标为服务端故障）。
+//
+// 注入拆分：Apply 保持真实落盘（EnsureGroup 建组/建 topic 走 Apply，
+// 必须先成功才能走到 receiveOnce），ApplyAsync 注入 ErrNotLeader
+// （取件写入是唯一一条可能撞上迁移窗口的路径）。
+func TestReceiveInLoopErrNotLeaderMapsHANotAvailable(t *testing.T) {
+	rv := fakeRouteView{selfLeader: true}
+	rep := &asyncErrReplicator{
+		applyAsyncErr: fmt.Errorf("%w: 模拟长轮询期间 leader 迁移", replication.ErrNotLeader),
+	}
+	env := newTestEnvWith(t, true, rv, rep)
+	rep.st = env.st // 延迟绑定 env 的真实 store（Apply 落盘用，见类型注释）
+	c := env.client
+	// 先 QueryRoute 把 topic 建出来（autoCreate=true；ReceiveMessage 对
+	// 未知 topic 硬拒 TOPIC_NOT_FOUND，先建 topic 才能走到 deliver 层）
+	if _, err := c.QueryRoute(context.Background(), &pb.QueryRouteRequest{
+		Topic: &pb.Resource{Name: "t-migrate"},
+	}); err != nil {
+		t.Fatalf("QueryRoute 建 topic: %v", err)
+	}
+	// 直接落盘一条消息：空队列的 receiveOnce 没有可写批次、不会走到
+	// ApplyAsync（注入点），必须让取件路径真实发起提案
+	raw, err := core.EncodeMessage(&core.Message{
+		ID: "m-migrate", Topic: "t-migrate", QueueID: 0, Offset: 0,
+		BornAtMs: time.Now().UnixMilli(), StoreAtMs: time.Now().UnixMilli(),
+		Body: []byte("x"),
+	})
+	if err != nil {
+		t.Fatalf("EncodeMessage: %v", err)
+	}
+	sb := env.st.NewBatch()
+	if err := sb.Set(store.MsgKey("t-migrate", 0, 0), raw); err != nil {
+		t.Fatalf("种消息: %v", err)
+	}
+	if err := env.st.Apply(sb); err != nil {
+		t.Fatalf("种消息落盘: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stream, err := c.ReceiveMessage(ctx, &pb.ReceiveMessageRequest{
+		Group: &pb.Resource{Name: "g-migrate"},
+		MessageQueue: &pb.MessageQueue{
+			Topic: &pb.Resource{Name: "t-migrate"},
+			Id:    0,
+		},
+		FilterExpression:  &pb.FilterExpression{Type: pb.FilterType_TAG, Expression: "*"},
+		BatchSize:         10,
+		InvisibleDuration: durationpb.New(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ReceiveMessage: %v", err)
+	}
+	msgs, st := recvAll(t, stream)
+	if len(msgs) != 0 {
+		t.Fatalf("迁移窗口内不应投递消息，得到 %d 条", len(msgs))
+	}
+	if st == nil || st.GetCode() != pb.Code_HA_NOT_AVAILABLE {
+		t.Fatalf("迁移窗口内 ReceiveMessage 应回 HA_NOT_AVAILABLE，得到 %v", st)
 	}
 }
 
