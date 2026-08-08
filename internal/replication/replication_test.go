@@ -1,18 +1,32 @@
-// 复制层测试：单机后端直通语义与编译期接口满足。
+// 复制层测试：单机后端直通语义、集群后端转发线路（solo Manager）与
+// 编译期接口满足。
 //
 // 职责：
-//   - 验证 Standalone.Apply 与 store.Apply 等价（apply 即可读，忽略 group）
-//   - 编译期断言两个后端都满足 Replicator 接口
+//   - 验证 Standalone.Apply/ApplyAsync 与 store 等价（apply 即可读，
+//     Wait 后可见，忽略 group）
+//   - 用单节点真实 Manager + 假 ControlHandler 验证 Cluster 转发原语的
+//     载荷编码与响应解析（线路层；真 produce 栈接线在 Task 11 e2e）
+//   - 编译期断言各后端/视图满足全部接口
 //
 // 边界：
-//   - 不测集群后端行为——三节点集成测试在 Task 7（单测起整套集群不划算）
+//   - 不测集群转发收敛——三节点集成测试在 cluster_test.go（本包反向
+//     import cluster 合法，但三节点 harness 的未导出原语过不来，
+//     收敛语义由那边经同语义 shim 覆盖）
 package replication
 
 import (
+	"bytes"
 	"context"
+	"encoding/binary"
+	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"testing"
+	"time"
 
+	"github.com/xushixin/sq/internal/cluster"
+	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -41,6 +55,179 @@ func TestStandaloneApplyPassthrough(t *testing.T) {
 	}
 }
 
-// 编译期接口满足：任一后端漏方法都会在此处报错。
+// TestStandaloneApplyAsync 单机档 ApplyAsync = store.ApplyAsync 直通
+// （group commit 合并 fsync 的既有机制）：Wait 后写入可见。
+func TestStandaloneApplyAsync(t *testing.T) {
+	st := openReplTestStore(t)
+	r := NewStandalone(st)
+	b := st.NewBatch()
+	_ = b.Set([]byte("meta/topic/x"), []byte("v"))
+	p, err := r.ApplyAsync(context.Background(), 0, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := st.Get([]byte("meta/topic/x")); !ok {
+		t.Fatal("写入不可见")
+	}
+}
+
+// TestClusterForwarderWire 用单节点真实 Manager + 假 ControlHandler 验证
+// Cluster 转发原语的线路层：ForwardAppend 的载荷编码（[4B BE g][msgRaw]）
+// 与响应解析（[4B BE queueID][8B BE offset]）、ForwardApply 的载荷编码
+// （[4B BE g][repr]）。真 produce 栈接线在 Task 11 e2e 覆盖；跨节点收敛
+// 语义由 cluster_test.go 的 ForwardApply 收敛测试承担。
+//
+// 单节点 Manager 自选举为全部组 leader，「自己就是 leader 属编程错误」
+// 的约束在此刻意绕过——转发目标即本节点，经 Control 自拨号回环到
+// 自己的 ControlHandler，线路真实性不受影响（Control 不走 raft 消息流，
+// 与对端是谁无关）。
+func TestClusterForwarderWire(t *testing.T) {
+	st, err := store.Open(t.TempDir(), false, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 假 produce 栈：收到请求即回坐标/确认。handler 契约要求并发安全
+	//（控制通道多连接并发调用）——通道缓冲足够且只被本测试驱动。
+	got := make(chan struct {
+		op      byte
+		payload []byte
+	}, 4)
+	handler := func(op byte, payload []byte) ([]byte, error) {
+		got <- struct {
+			op      byte
+			payload []byte
+		}{op, append([]byte(nil), payload...)}
+		switch op {
+		case cluster.OpForwardAppend:
+			if len(payload) < 4 {
+				return nil, fmt.Errorf("ForwardAppend 载荷过短: %d", len(payload))
+			}
+			resp := make([]byte, 12)
+			binary.BigEndian.PutUint32(resp[:4], 7)
+			binary.BigEndian.PutUint64(resp[4:], 42)
+			return resp, nil
+		case cluster.OpForwardApply:
+			return nil, nil
+		default:
+			return nil, fmt.Errorf("unexpected op %d", op)
+		}
+	}
+	m, err := cluster.NewManager(cluster.Options{
+		NodeID:         1,
+		Peers:          map[uint64]string{1: ln.Addr().String()}, // 真实地址：Control 自拨号按 Peers 寻址
+		Listener:       ln,
+		Mode:           cluster.AckQuorumMem,
+		Store:          st,
+		Logger:         slog.Default(),
+		ControlHandler: handler,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m.Start(context.Background())
+	t.Cleanup(func() {
+		if err := m.StopClean(context.Background()); err != nil {
+			t.Logf("清理: StopClean: %v", err)
+		}
+		select {
+		case <-m.Done():
+		case <-time.After(10 * time.Second):
+			t.Error("manager 未在 10s 内完全退出")
+		}
+	})
+	// 等自选举：Leader(1) 就绪（单节点约 1s）
+	deadline := time.Now().Add(30 * time.Second)
+	for {
+		if lead, ok := m.Leader(1); ok && lead == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("单节点组未在 30s 内自选举为 leader")
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	r := NewCluster(m)
+
+	// ForwardAppend：载荷 [4B BE g=1][EncodeMessage 字节]，响应坐标解析
+	raw, err := core.EncodeMessage(&core.Message{ID: "FWD1", Topic: "orders", Body: []byte("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	qid, off, err := r.ForwardAppend(ctx, 1, raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if qid != 7 || off != 42 {
+		t.Fatalf("坐标 qid=%d off=%d; want 7/42", qid, off)
+	}
+	evt := <-got
+	want := make([]byte, 4)
+	binary.BigEndian.PutUint32(want, 1)
+	want = append(want, raw...)
+	if evt.op != cluster.OpForwardAppend || !bytes.Equal(evt.payload, want) {
+		t.Fatalf("handler 收到 op=%d payload=%v; want op=%d payload=%v", evt.op, evt.payload, cluster.OpForwardAppend, want)
+	}
+
+	// ForwardApply：载荷 [4B BE g=1][repr]，响应空
+	repr := []byte("构造无关批次的 repr")
+	if err := r.ForwardApply(ctx, 1, repr); err != nil {
+		t.Fatal(err)
+	}
+	evt = <-got
+	want = append(want[:4], repr...)
+	if evt.op != cluster.OpForwardApply || !bytes.Equal(evt.payload, want) {
+		t.Fatalf("handler 收到 op=%d payload=%v; want op=%d payload=%v", evt.op, evt.payload, cluster.OpForwardApply, want)
+	}
+}
+
+// TestClusterForwardLeaderUnknownReturnsErrNotLeader 未启动的 Manager 无
+// 选举、Leader(g) 无结果：转发原语必须按 ErrNotLeader 报错（上层据此
+// 重试），而非返回零值静默假成功。
+func TestClusterForwardLeaderUnknownReturnsErrNotLeader(t *testing.T) {
+	st, err := store.Open(t.TempDir(), false, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	m, err := cluster.NewManager(cluster.Options{
+		NodeID:   1,
+		Peers:    map[uint64]string{1: ln.Addr().String()},
+		Listener: ln,
+		Store:    st,
+		Logger:   slog.Default(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 未 Start：无 run 循环、无选举，Leader(g) 恒无结果
+	if _, _, err := (NewCluster(m)).ForwardAppend(context.Background(), 1, nil); !errors.Is(err, cluster.ErrNotLeader) {
+		t.Fatalf("leader 未知的 ForwardAppend 应返回 ErrNotLeader，得到: %v", err)
+	}
+	if err := (NewCluster(m)).ForwardApply(context.Background(), 1, nil); !errors.Is(err, cluster.ErrNotLeader) {
+		t.Fatalf("leader 未知的 ForwardApply 应返回 ErrNotLeader，得到: %v", err)
+	}
+}
+
+// 编译期接口满足：任一实现漏方法都会在此处报错。
 var _ Replicator = (*Standalone)(nil)
 var _ Replicator = (*Cluster)(nil)
+var _ Router = (*StandaloneRouter)(nil)
+var _ Router = (*Cluster)(nil)
+var _ Forwarder = (*Cluster)(nil)
+var _ Pending = pending{}
+var _ Pending = (chanPending)(nil)

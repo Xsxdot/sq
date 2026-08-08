@@ -70,6 +70,29 @@ const (
 //	0=成功（余下为应答数据）、1=失败（余下为 UTF-8 错误文本）。
 const ControlGroup uint32 = 0xFFFFFFFF
 
+// 控制通道操作码注册表：op 是控制帧 payload 的首字节（Manager.Control
+// 与传输层 controlFrame 之间的协议面），取值即跨节点线协议——改动即
+// 不兼容（TestControlOpRegistry 锁死黄金值）。
+//
+//   - OpForwardAppend=1: payload=[4B BE 目标组][core.EncodeMessage 字节]，
+//     响应 payload=[4B BE queueID][8B BE offset]——跨节点消息追加，
+//     offset 分配发生在 leader 侧（replication.ForwardAppend 消费）
+//   - OpForwardApply=2: payload=[4B BE 目标组][store.Batch.Repr 字节]，
+//     响应空——构造无关批次的跨节点提案（replication.ForwardApply 消费）
+//   - OpPrepareJoin=3: payload=[8B BE nodeID]，响应=该节点完成
+//     Remove→AddLearner 的组号列表——learner 重入编排（Task 10
+//     PrepareJoin handler 消费）
+//
+// 定义在本包而非 replication：Task 10 的 PrepareJoin handler 在 cluster
+// 侧装配，而依赖方向是 replication→cluster——常量放集群侧才能被双方
+// 引用（plan 原稿放 replication 的决定经终审裁定迁移，见 progress 预检
+// 注记）。Task 11 的 ControlHandler 接线在 main 装配时引用本注册表。
+const (
+	OpForwardAppend byte = 1
+	OpForwardApply  byte = 2
+	OpPrepareJoin   byte = 3
+)
+
 // envelope 发送队列中的一条待发消息：组号 + 消息指针。
 //
 // msg 必须是指针——v3 的 raftpb.Message 内嵌互斥锁（protoimpl.MessageState），
