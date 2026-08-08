@@ -30,11 +30,11 @@ func PurgeTopicData(st *store.Store, tc meta.TopicConfig, logger *slog.Logger) e
 	b := st.NewBatch()
 	for q := uint32(0); q < tc.Queues; q++ {
 		mp := store.MsgQueuePrefix(tc.Name, q)
-		b.DeleteRange(mp, store.PrefixUpperBound(mp), nil)
-		b.Delete(store.AllocKey(tc.Name, q), nil)
+		b.DeleteRange(mp, store.PrefixUpperBound(mp))
+		b.Delete(store.AllocKey(tc.Name, q))
 	}
 	kp := store.KeyIdxTopicPrefix(tc.Name)
-	b.DeleteRange(kp, store.PrefixUpperBound(kp), nil)
+	b.DeleteRange(kp, store.PrefixUpperBound(kp))
 	if err := st.Apply(b); err != nil {
 		return fmt.Errorf("清理 topic %s 数据: %w", tc.Name, err)
 	}
@@ -49,9 +49,9 @@ func PurgeGroupData(st *store.Store, group string, logger *slog.Logger) error {
 	logger = logger.With("mod", "adminops")
 	b := st.NewBatch()
 	cp := store.CursorGroupPrefix(group)
-	b.DeleteRange(cp, store.PrefixUpperBound(cp), nil)
+	b.DeleteRange(cp, store.PrefixUpperBound(cp))
 	ip := store.InflightGroupPrefix(group)
-	b.DeleteRange(ip, store.PrefixUpperBound(ip), nil)
+	b.DeleteRange(ip, store.PrefixUpperBound(ip))
 	if err := st.Apply(b); err != nil {
 		return fmt.Errorf("清理 group %s 数据: %w", group, err)
 	}

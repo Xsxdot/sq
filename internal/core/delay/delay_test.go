@@ -48,7 +48,7 @@ func (f *fixture) putDelay(t *testing.T, seq uint64, dueMs int64, m *core.Messag
 		t.Fatal(err)
 	}
 	b := f.st.NewBatch()
-	b.Set(store.DelayKey(dueMs, seq), raw, nil)
+	b.Set(store.DelayKey(dueMs, seq), raw)
 	if err := f.st.Apply(b); err != nil {
 		t.Fatal(err)
 	}
@@ -110,7 +110,7 @@ func TestPassLeavesNotDueEntries(t *testing.T) {
 func TestPassDeletesCorruptEntryInsteadOfWedging(t *testing.T) {
 	f := newFixture(t)
 	b := f.st.NewBatch()
-	b.Set(store.DelayKey(time.Now().Add(-time.Second).UnixMilli(), 0), []byte("not-json"), nil)
+	b.Set(store.DelayKey(time.Now().Add(-time.Second).UnixMilli(), 0), []byte("not-json"))
 	if err := f.st.Apply(b); err != nil {
 		t.Fatal(err)
 	}

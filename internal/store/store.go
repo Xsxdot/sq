@@ -70,13 +70,30 @@ func (s *Store) Get(key []byte) ([]byte, bool, error) {
 	return out, true, nil
 }
 
-// NewBatch 创建写批次。批次有两条合法的终止路径，且仅能选一条：
-//  1. 组装后交给 Apply 提交——此后批次归 Apply 处置，调用方不再碰它
-//     （成功即回收，失败则弃给 GC，理由见 Apply 注释）
-//  2. 决定不提交，则必须自行调用 Close() 以回收内存
+// Batch 类型化写批次——「唯一写入口」的编译期强制（B2 / V2 spec §4）。
 //
-// 不可同时执行两条路径，也不可多次 Close。
-func (s *Store) NewBatch() *pebble.Batch { return s.db.NewBatch() }
+// 底层 *pebble.Batch 不导出：调用方只能通过本类型组装写入并交给
+// Apply/ApplyAsync 提交，无法绕过写入口直接 Commit。V2 集群模式将在
+// Apply/ApplyAsync 处拦截整个批次做 raft 复制，本类型是该拦截点成立的前提。
+//
+// 生命周期约定与旧 NewBatch 注释一致：组装后要么交给 Apply/ApplyAsync
+// （此后批次归提交方处置），要么自行 Close 回收，两条路径二选一。
+type Batch struct{ b *pebble.Batch }
+
+// NewBatch 创建类型化写批次（生命周期约定见 Batch 类型注释）。
+func (s *Store) NewBatch() *Batch { return &Batch{b: s.db.NewBatch()} }
+
+// Set 在批内写入一个键值对。
+func (b *Batch) Set(key, value []byte) error { return b.b.Set(key, value, nil) }
+
+// Delete 在批内删除一个键。
+func (b *Batch) Delete(key []byte) error { return b.b.Delete(key, nil) }
+
+// DeleteRange 在批内删除 [start, end) 区间的所有键。
+func (b *Batch) DeleteRange(start, end []byte) error { return b.b.DeleteRange(start, end, nil) }
+
+// Close 回收未提交的批次（决定不提交时的唯一合法出口）。
+func (b *Batch) Close() error { return b.b.Close() }
 
 // Apply 原子提交批次并按配置刷盘。这是唯一写入口（见类型注释）。
 //
@@ -94,13 +111,13 @@ func (s *Store) NewBatch() *pebble.Batch { return s.db.NewBatch() }
 //
 // 写下这段是为了防止有人"顺手修好"：本项目 6 个调用点全都在 Apply 出错后直接
 // 返回，这是刻意的，不是遗漏。
-func (s *Store) Apply(b *pebble.Batch) error {
+func (s *Store) Apply(b *Batch) error {
 	opt := pebble.NoSync
 	if s.sync {
 		opt = pebble.Sync
 	}
 	start := time.Now()
-	if err := b.Commit(opt); err != nil {
+	if err := b.b.Commit(opt); err != nil {
 		return fmt.Errorf("store Apply: %w", err)
 	}
 	if OnApplyObserve != nil {
@@ -110,7 +127,7 @@ func (s *Store) Apply(b *pebble.Batch) error {
 	}
 	// 提交成功，关闭批次以回收到 Pebble 的 sync.Pool（见 Pebble DB.Set 源码）。
 	// 这确保热路径不会持续分配新的批次结构。
-	return b.Close()
+	return b.b.Close()
 }
 
 // Pending 一次「已定序、待确认持久化」的提交。值类型，热路径零额外分配。
@@ -132,23 +149,23 @@ type Pending struct {
 // 返回的 Pending.Wait 退化为纯批次回收。
 //
 // 失败时批次按 Apply 同款约定丢给 GC，调用方不得再碰（理由见 Apply 注释）。
-func (s *Store) ApplyAsync(b *pebble.Batch) (Pending, error) {
+func (s *Store) ApplyAsync(b *Batch) (Pending, error) {
 	start := time.Now()
 	if !s.sync {
-		if err := b.Commit(pebble.NoSync); err != nil {
+		if err := b.b.Commit(pebble.NoSync); err != nil {
 			return Pending{}, fmt.Errorf("store ApplyAsync: %w", err)
 		}
 		if OnApplyObserve != nil {
 			OnApplyObserve(time.Since(start))
 		}
-		return Pending{b: b}, nil
+		return Pending{b: b.b}, nil
 	}
 	// ApplyNoSyncWait 要求 opts.Sync=true（Pebble 契约）：批次进入 commit
 	// pipeline 排队等待 WAL fsync，但本调用不阻塞等它完成。
-	if err := s.db.ApplyNoSyncWait(b, pebble.Sync); err != nil {
+	if err := s.db.ApplyNoSyncWait(b.b, pebble.Sync); err != nil {
 		return Pending{}, fmt.Errorf("store ApplyAsync: %w", err)
 	}
-	return Pending{b: b, start: start, needSync: true}, nil
+	return Pending{b: b.b, start: start, needSync: true}, nil
 }
 
 // Wait 等待批次持久化完成并回收批次。

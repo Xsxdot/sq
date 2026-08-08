@@ -18,7 +18,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/store"
@@ -151,7 +150,7 @@ func TestAppendWithExtraAtomic(t *testing.T) {
 	defer st.Close()
 	marker := []byte("test/marker")
 	_, err := pr.AppendWith(&core.Message{Topic: "t", Body: []byte("x")},
-		func(b *pebble.Batch) { b.Set(marker, []byte("1"), nil) })
+		func(b *store.Batch) { b.Set(marker, []byte("1")) })
 	if err != nil {
 		t.Fatalf("AppendWith: %v", err)
 	}

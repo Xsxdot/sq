@@ -21,8 +21,6 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
-
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/produce"
 	"github.com/xushixin/sq/internal/store"
@@ -103,7 +101,7 @@ func (s *Scheduler) Pass() (int, error) {
 			// ——与 deliver 清理孤儿 inflight 同理，删除止损并 Error 留痕
 			s.logger.Error("delay 条目解码失败，删除坏条目", "key", fmt.Sprintf("%q", d.key), "err", err)
 			b := s.st.NewBatch()
-			b.Delete(d.key, nil)
+			b.Delete(d.key)
 			if err := s.st.Apply(b); err != nil {
 				return moved, fmt.Errorf("删除坏 delay 条目: %w", err)
 			}
@@ -113,7 +111,7 @@ func (s *Scheduler) Pass() (int, error) {
 		// 写 msg/（正常分配队列与 offset、写 keyidx、唤醒长轮询）+ 删 delay
 		// 条目，同一 Batch 原子提交：崩溃窗口内要么都发生要么都不发生，
 		// 不存在丢失或重复投递
-		if _, err := s.pr.AppendWith(m, func(b *pebble.Batch) { b.Delete(key, nil) }); err != nil {
+		if _, err := s.pr.AppendWith(m, func(b *store.Batch) { b.Delete(key) }); err != nil {
 			// 失败即中断本趟：条目未删除，下一趟从头重扫自然重试
 			return moved, fmt.Errorf("延时消息移入 (msg_id=%s topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
 		}

@@ -83,7 +83,7 @@ func TestByKeySkipsPurgedMessage(t *testing.T) {
 	st, pr := newFixture(t)
 	m, _ := pr.Append(&core.Message{Topic: "t", Body: []byte("x"), Keys: []string{"k"}})
 	b := st.NewBatch()
-	b.Delete(store.MsgKey("t", m.QueueID, m.Offset), nil)
+	b.Delete(store.MsgKey("t", m.QueueID, m.Offset))
 	if err := st.Apply(b); err != nil {
 		t.Fatal(err)
 	}

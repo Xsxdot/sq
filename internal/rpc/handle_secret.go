@@ -32,7 +32,7 @@ func LoadOrCreateHandleSecret(st *store.Store, logger *slog.Logger) ([]byte, err
 		return nil, fmt.Errorf("生成 handle 签名密钥: %w", err)
 	}
 	b := st.NewBatch()
-	b.Set(store.HandleSecretKey(), key, nil)
+	b.Set(store.HandleSecretKey(), key)
 	if err := st.Apply(b); err != nil {
 		return nil, fmt.Errorf("持久化 handle 签名密钥: %w", err)
 	}

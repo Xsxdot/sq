@@ -162,9 +162,9 @@ func TestAdminTransactionsList(t *testing.T) {
 	}
 	ref, _ := json.Marshal(&txn.HalfRef{NextCheckMs: next, Checks: 3}) // 结构固定无失败路径
 	b := st.NewBatch()
-	b.Set(append([]byte(store.HalfPrefix), 0x00), []byte("whatever"), nil) // 坏 key 排在扫描头部
-	b.Set(store.HalfKey(next, "TX0001"), raw, nil)
-	b.Set(store.HalfIdxKey("TX0001"), ref, nil)
+	b.Set(append([]byte(store.HalfPrefix), 0x00), []byte("whatever")) // 坏 key 排在扫描头部
+	b.Set(store.HalfKey(next, "TX0001"), raw)
+	b.Set(store.HalfIdxKey("TX0001"), ref)
 	if err := st.Apply(b); err != nil {
 		t.Fatal(err)
 	}
@@ -203,8 +203,8 @@ func TestAdminOverviewHasHalfDepthAndConnections(t *testing.T) {
 	}
 	ref, _ := json.Marshal(&txn.HalfRef{NextCheckMs: next, Checks: 0})
 	b := st.NewBatch()
-	b.Set(store.HalfKey(next, "TX0002"), raw, nil)
-	b.Set(store.HalfIdxKey("TX0002"), ref, nil)
+	b.Set(store.HalfKey(next, "TX0002"), raw)
+	b.Set(store.HalfIdxKey("TX0002"), ref)
 	if err := st.Apply(b); err != nil {
 		t.Fatal(err)
 	}

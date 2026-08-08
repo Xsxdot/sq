@@ -31,7 +31,7 @@ func TestSetGetPersistence(t *testing.T) {
 	dir := t.TempDir()
 	s := openTestStore(t, dir)
 	b := s.NewBatch()
-	b.Set([]byte("k1"), []byte("v1"), nil)
+	b.Set([]byte("k1"), []byte("v1"))
 	if err := s.Apply(b); err != nil {
 		t.Fatalf("Apply: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestScanRangeAndLimit(t *testing.T) {
 	defer s.Close()
 	b := s.NewBatch()
 	for _, k := range []string{"a/1", "a/2", "a/3", "b/1"} {
-		b.Set([]byte(k), []byte("x"), nil)
+		b.Set([]byte(k), []byte("x"))
 	}
 	s.Apply(b)
 	var got []string
@@ -79,7 +79,7 @@ func TestApplyAsyncThenWaitPersists(t *testing.T) {
 	}
 	defer s.Close()
 	b := s.NewBatch()
-	b.Set([]byte("k1"), []byte("v1"), nil)
+	b.Set([]byte("k1"), []byte("v1"))
 	pending, err := s.ApplyAsync(b)
 	if err != nil {
 		t.Fatalf("ApplyAsync: %v", err)
@@ -102,7 +102,7 @@ func TestApplyAsyncNoSyncFallback(t *testing.T) {
 	}
 	defer s.Close()
 	b := s.NewBatch()
-	b.Set([]byte("k2"), []byte("v2"), nil)
+	b.Set([]byte("k2"), []byte("v2"))
 	pending, err := s.ApplyAsync(b)
 	if err != nil {
 		t.Fatalf("ApplyAsync: %v", err)
@@ -133,7 +133,7 @@ func TestApplyAsyncConcurrentAllDurable(t *testing.T) {
 			for i := 0; i < perG; i++ {
 				b := s.NewBatch()
 				key := fmt.Sprintf("cc/%d/%d", g, i)
-				b.Set([]byte(key), []byte("x"), nil)
+				b.Set([]byte(key), []byte("x"))
 				pending, err := s.ApplyAsync(b)
 				if err != nil {
 					t.Errorf("ApplyAsync %s: %v", key, err)
@@ -157,6 +157,48 @@ func TestApplyAsyncConcurrentAllDurable(t *testing.T) {
 	}
 }
 
+// TestTypedBatchRoundTrip 锁定类型化 Batch 的最小 API 面：
+// Set/Delete/DeleteRange 经 Apply 提交后语义与裸 pebble 批次一致。
+func TestTypedBatchRoundTrip(t *testing.T) {
+	st := openTestStore(t, t.TempDir())
+	defer st.Close()
+	b := st.NewBatch()
+	if err := b.Set([]byte("tb/k1"), []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Set([]byte("tb/k2"), []byte("v2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Delete([]byte("tb/k2")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	if v, ok, _ := st.Get([]byte("tb/k1")); !ok || string(v) != "v1" {
+		t.Fatalf("k1 = %q, ok=%v, want v1", v, ok)
+	}
+	if _, ok, _ := st.Get([]byte("tb/k2")); ok {
+		t.Fatal("k2 应已被批内 Delete 删除")
+	}
+
+	// DeleteRange 走 ApplyAsync+Wait 路径，顺带锁定拆分提交同样接受类型化批次
+	b2 := st.NewBatch()
+	if err := b2.DeleteRange([]byte("tb/"), []byte("tb0")); err != nil {
+		t.Fatal(err)
+	}
+	pending, err := st.ApplyAsync(b2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := pending.Wait(); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := st.Get([]byte("tb/k1")); ok {
+		t.Fatal("k1 应已被 DeleteRange 删除")
+	}
+}
+
 func TestScanNonPositiveLimitMeansUnlimited(t *testing.T) {
 	// limit<=0 == 不限量：该语义被 deliver 阶段 2 的跳过逻辑直接依赖（B5）
 	st := openTestStore(t, t.TempDir()) // 文件内既有 helper（store_test.go:19）
@@ -164,7 +206,7 @@ func TestScanNonPositiveLimitMeansUnlimited(t *testing.T) {
 	const n = 10
 	for i := 0; i < n; i++ {
 		b := st.NewBatch()
-		b.Set([]byte(fmt.Sprintf("scan-t/%03d", i)), []byte("v"), nil)
+		b.Set([]byte(fmt.Sprintf("scan-t/%03d", i)), []byte("v"))
 		if err := st.Apply(b); err != nil {
 			t.Fatal(err)
 		}

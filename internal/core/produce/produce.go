@@ -19,7 +19,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/store"
@@ -75,7 +74,7 @@ func qkey(topic string, q uint32) string { return fmt.Sprintf("%s/%d", topic, q)
 //
 // 注意：extra 只应操作与本消息无键冲突的 key；extra 内不得再调用本 Producer
 // 的任何方法（p.mu 与 queueState.mu 均不可重入）。
-func (p *Producer) AppendWith(m *core.Message, extra func(b *pebble.Batch)) (*core.Message, error) {
+func (p *Producer) AppendWith(m *core.Message, extra func(b *store.Batch)) (*core.Message, error) {
 	if len(m.Body) == 0 || len(m.Body) > MaxBodySize {
 		return nil, fmt.Errorf("消息体大小非法: %d（上限 %d）", len(m.Body), MaxBodySize)
 	}
@@ -128,14 +127,14 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *pebble.Batch)) (*co
 	// 绝不会出现"计数器已推进但消息未落盘"从而导致下次分配的 offset 覆盖旧消息，
 	// 也不会出现"消息已落盘但计数器未推进"从而导致 offset 被重复分配。
 	b := p.st.NewBatch()
-	b.Set(store.MsgKey(m.Topic, m.QueueID, m.Offset), raw, nil)
-	b.Set(store.AllocKey(m.Topic, m.QueueID), store.PutU64(off+1), nil)
+	b.Set(store.MsgKey(m.Topic, m.QueueID, m.Offset), raw)
+	b.Set(store.AllocKey(m.Topic, m.QueueID), store.PutU64(off+1))
 	// Keys 业务索引与消息同批写入（spec §5 流程 1）：崩溃时索引与消息要么都在要么都不在
 	for _, key := range m.Keys {
 		if key == "" {
 			continue // 空 key 无检索意义（SDK 不会生成，防御脏输入）
 		}
-		b.Set(store.KeyIdxKey(m.Topic, key, m.StoreAtMs, m.QueueID, m.Offset), nil, nil)
+		b.Set(store.KeyIdxKey(m.Topic, key, m.StoreAtMs, m.QueueID, m.Offset), nil)
 	}
 	if extra != nil {
 		extra(b)
@@ -219,8 +218,8 @@ func (p *Producer) AppendDelay(m *core.Message) (*core.Message, error) {
 		return nil, err
 	}
 	b := p.st.NewBatch()
-	b.Set(store.DelayKey(m.DeliverAtMs, seq), raw, nil)
-	b.Set(store.DelayAllocKey(), store.PutU64(seq+1), nil)
+	b.Set(store.DelayKey(m.DeliverAtMs, seq), raw)
+	b.Set(store.DelayAllocKey(), store.PutU64(seq+1))
 	if err := p.st.Apply(b); err != nil {
 		return nil, fmt.Errorf("写入延时消息 %s (topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
 	}
@@ -325,16 +324,16 @@ func (p *Producer) AppendBatch(msgs []*core.Message) ([]*core.Message, error) {
 			b.Close()
 			return nil, fmt.Errorf("编码消息 %s (topic=%s): %w", m.ID, topic, err)
 		}
-		b.Set(store.MsgKey(topic, qid, m.Offset), raw, nil)
+		b.Set(store.MsgKey(topic, qid, m.Offset), raw)
 		for _, key := range m.Keys {
 			if key == "" {
 				continue // 空 key 无检索意义（与 AppendWith 同款防御）
 			}
-			b.Set(store.KeyIdxKey(topic, key, m.StoreAtMs, qid, m.Offset), nil, nil)
+			b.Set(store.KeyIdxKey(topic, key, m.StoreAtMs, qid, m.Offset), nil)
 		}
 	}
 	// alloc 计数器一次写到 off+N，与全部消息同批原子（语义红线 3 的批量形态）
-	b.Set(store.AllocKey(topic, qid), store.PutU64(off+uint64(len(msgs))), nil)
+	b.Set(store.AllocKey(topic, qid), store.PutU64(off+uint64(len(msgs))))
 	pending, err := p.st.ApplyAsync(b)
 	if err != nil {
 		qs.mu.Unlock()

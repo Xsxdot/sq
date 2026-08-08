@@ -50,9 +50,9 @@ func rewriteNextCheck(t *testing.T, f *fixture, txID string, ms int64) {
 	old := store.HalfKey(ref.NextCheckMs, txID)
 	ref.NextCheckMs = ms
 	b := f.st.NewBatch()
-	b.Delete(old, nil)
-	b.Set(store.HalfKey(ms, txID), raw, nil)
-	b.Set(store.HalfIdxKey(txID), mustMarshal(t, ref), nil)
+	b.Delete(old)
+	b.Set(store.HalfKey(ms, txID), raw)
+	b.Set(store.HalfIdxKey(txID), mustMarshal(t, ref))
 	if err := f.st.Apply(b); err != nil {
 		t.Fatal(err)
 	}
@@ -171,7 +171,7 @@ func TestPassDeletesBadHalfKeyAndContinues(t *testing.T) {
 	// 复现"坏条目堵死其后全部条目"的形态
 	badKey := append([]byte(store.HalfPrefix), 0x00)
 	b := f.st.NewBatch()
-	b.Set(badKey, []byte("whatever"), nil)
+	b.Set(badKey, []byte("whatever"))
 	if err := f.st.Apply(b); err != nil {
 		t.Fatal(err)
 	}
@@ -206,7 +206,7 @@ func TestPassDeletesCorruptHalfIdxAndContinues(t *testing.T) {
 	f := newFixture(t, 30*time.Second, 15)
 	txID := stageOverdue(t, f, "t-badidx")
 	b := f.st.NewBatch()
-	b.Set(store.HalfIdxKey(txID), []byte("not-json"), nil)
+	b.Set(store.HalfIdxKey(txID), []byte("not-json"))
 	if err := f.st.Apply(b); err != nil {
 		t.Fatal(err)
 	}
@@ -245,8 +245,8 @@ func TestPassDeletesCorruptValueWithMissingIdx(t *testing.T) {
 	// 不可用」的损坏形态，也同时覆盖了旧实现 json.Unmarshal 失败即不删 half 键
 	// 的残留窗口（删 idx 只是它的退化子集）
 	b := f.st.NewBatch()
-	b.Set(halfKey, []byte("not-a-message"), nil)
-	b.Set(store.HalfIdxKey(txID), []byte("not-json"), nil)
+	b.Set(halfKey, []byte("not-a-message"))
+	b.Set(store.HalfIdxKey(txID), []byte("not-json"))
 	if err := f.st.Apply(b); err != nil {
 		t.Fatal(err)
 	}

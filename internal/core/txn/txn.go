@@ -25,8 +25,6 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
-
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
@@ -97,8 +95,8 @@ func (t *Manager) Stage(m *core.Message) (*core.Message, string, error) {
 	// half 条目与反查索引同批原子提交：崩溃后两键要么都在要么都不在，
 	// End 靠 halfidx 定位、调度器靠 half 扫描，任何一键单独存在都是孤儿
 	b := t.st.NewBatch()
-	b.Set(store.HalfKey(next, txID), raw, nil)
-	b.Set(store.HalfIdxKey(txID), ref, nil)
+	b.Set(store.HalfKey(next, txID), raw)
+	b.Set(store.HalfIdxKey(txID), ref)
 	if err := t.st.Apply(b); err != nil {
 		return nil, "", fmt.Errorf("写入半消息 %s (topic=%s tx=%s): %w", m.ID, m.Topic, txID, err)
 	}
@@ -137,7 +135,7 @@ func (t *Manager) End(txID string, commit bool) (bool, error) {
 		t.logger.Error("halfidx 存在但 half 条目缺失，删除孤儿索引",
 			"tx_id", txID, "next_check_ms", ref.NextCheckMs)
 		b := t.st.NewBatch()
-		b.Delete(store.HalfIdxKey(txID), nil)
+		b.Delete(store.HalfIdxKey(txID))
 		if aerr := t.st.Apply(b); aerr != nil {
 			return false, fmt.Errorf("删除孤儿 halfidx (tx=%s): %w", txID, aerr)
 		}
@@ -145,8 +143,8 @@ func (t *Manager) End(txID string, commit bool) (bool, error) {
 	}
 	if !commit {
 		b := t.st.NewBatch()
-		b.Delete(halfKey, nil)
-		b.Delete(store.HalfIdxKey(txID), nil)
+		b.Delete(halfKey)
+		b.Delete(store.HalfIdxKey(txID))
 		if err := t.st.Apply(b); err != nil {
 			return false, fmt.Errorf("回滚删除半消息 (tx=%s): %w", txID, err)
 		}
@@ -160,9 +158,9 @@ func (t *Manager) End(txID string, commit bool) (bool, error) {
 	// 写 msg/（正常分配队列与 offset、写 keyidx、唤醒长轮询）+ 删两个 half 键，
 	// 同一 Batch 原子提交：与 delay 到期搬运同构，不存在丢失或重复
 	idxKey := store.HalfIdxKey(txID)
-	stored, err := t.pr.AppendWith(m, func(b *pebble.Batch) {
-		b.Delete(halfKey, nil)
-		b.Delete(idxKey, nil)
+	stored, err := t.pr.AppendWith(m, func(b *store.Batch) {
+		b.Delete(halfKey)
+		b.Delete(idxKey)
 	})
 	if err != nil {
 		return false, fmt.Errorf("提交半消息 (tx=%s msg=%s topic=%s): %w", txID, m.ID, m.Topic, err)
@@ -257,7 +255,7 @@ func (t *Manager) Pass(n Notifier) (int, error) {
 	if len(badKeys) > 0 {
 		b := t.st.NewBatch()
 		for _, k := range badKeys {
-			b.Delete(k, nil)
+			b.Delete(k)
 		}
 		if err := t.st.Apply(b); err != nil {
 			return 0, fmt.Errorf("删除坏 half key: %w", err)
@@ -330,8 +328,8 @@ func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, 
 		t.logger.Error("halfidx 解码失败，删除坏条目", "tx_id", txID,
 			"key", fmt.Sprintf("%q", halfKey), "err", err)
 		b := t.st.NewBatch()
-		b.Delete(halfKey, nil)
-		b.Delete(store.HalfIdxKey(txID), nil)
+		b.Delete(halfKey)
+		b.Delete(store.HalfIdxKey(txID))
 		if aerr := t.st.Apply(b); aerr != nil {
 			return false, fmt.Errorf("删除坏 halfidx 条目 (tx=%s): %w", txID, aerr)
 		}
@@ -342,8 +340,8 @@ func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, 
 		// spec §5：回查上限默认 15 次，超限丢弃并记日志。Error 级：这代表
 		// 一条业务消息被放弃，运维必须能从日志里找到它
 		b := t.st.NewBatch()
-		b.Delete(oldKey, nil)
-		b.Delete(store.HalfIdxKey(txID), nil)
+		b.Delete(oldKey)
+		b.Delete(store.HalfIdxKey(txID))
 		if err := t.st.Apply(b); err != nil {
 			return false, fmt.Errorf("丢弃超限半消息 (tx=%s): %w", txID, err)
 		}
@@ -367,7 +365,7 @@ func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, 
 		t.logger.Error("halfidx 存在但 half 条目缺失，删除孤儿索引",
 			"tx_id", txID, "next_check_ms", ref.NextCheckMs)
 		b := t.st.NewBatch()
-		b.Delete(store.HalfIdxKey(txID), nil)
+		b.Delete(store.HalfIdxKey(txID))
 		if aerr := t.st.Apply(b); aerr != nil {
 			return false, fmt.Errorf("删除孤儿 halfidx (tx=%s): %w", txID, aerr)
 		}
@@ -375,9 +373,9 @@ func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, 
 	}
 	newRef, _ := json.Marshal(&HalfRef{NextCheckMs: next, Checks: ref.Checks + 1})
 	b := t.st.NewBatch()
-	b.Delete(oldKey, nil)
-	b.Set(store.HalfKey(next, txID), raw, nil)
-	b.Set(store.HalfIdxKey(txID), newRef, nil)
+	b.Delete(oldKey)
+	b.Set(store.HalfKey(next, txID), raw)
+	b.Set(store.HalfIdxKey(txID), newRef)
 	if err := t.st.Apply(b); err != nil {
 		return false, fmt.Errorf("半消息改期 (tx=%s): %w", txID, err)
 	}
@@ -395,7 +393,7 @@ func (t *Manager) dropLocked(txID string, halfKey []byte) error {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	b := t.st.NewBatch()
-	b.Delete(halfKey, nil)
-	b.Delete(store.HalfIdxKey(txID), nil)
+	b.Delete(halfKey)
+	b.Delete(store.HalfIdxKey(txID))
 	return t.st.Apply(b)
 }

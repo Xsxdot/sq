@@ -39,10 +39,10 @@ func writeMsgAt(t *testing.T, st *store.Store, topic string, offset uint64, stor
 		t.Fatal(err)
 	}
 	b := st.NewBatch()
-	b.Set(store.MsgKey(topic, 0, offset), raw, nil)
-	b.Set(store.AllocKey(topic, 0), store.PutU64(offset+1), nil)
+	b.Set(store.MsgKey(topic, 0, offset), raw)
+	b.Set(store.AllocKey(topic, 0), store.PutU64(offset+1))
 	for _, k := range keys {
-		b.Set(store.KeyIdxKey(topic, k, storeAt, 0, offset), nil, nil)
+		b.Set(store.KeyIdxKey(topic, k, storeAt, 0, offset), nil)
 	}
 	if err := st.Apply(b); err != nil {
 		t.Fatal(err)

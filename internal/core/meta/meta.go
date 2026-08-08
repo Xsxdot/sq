@@ -182,7 +182,7 @@ func (m *Meta) CreateTopic(name string, queues uint32) (TopicConfig, error) {
 	tc := TopicConfig{Name: name, Queues: queues, CreatedAtMs: time.Now().UnixMilli(), RetentionMs: DefaultRetentionMs}
 	raw, _ := json.Marshal(tc)
 	b := m.st.NewBatch()
-	b.Set(store.TopicMetaKey(name), raw, nil)
+	b.Set(store.TopicMetaKey(name), raw)
 	if err := m.st.Apply(b); err != nil {
 		return TopicConfig{}, fmt.Errorf("持久化 topic %s: %w", name, err)
 	}
@@ -210,7 +210,7 @@ func (m *Meta) EnsureGroup(name string) (GroupConfig, error) {
 	gc = GroupConfig{Name: name, CreatedAtMs: time.Now().UnixMilli(), MaxAttempts: m.defaultMaxAttempts}
 	raw, _ := json.Marshal(gc)
 	b := m.st.NewBatch()
-	b.Set(store.GroupMetaKey(name), raw, nil)
+	b.Set(store.GroupMetaKey(name), raw)
 	if err := m.st.Apply(b); err != nil {
 		return GroupConfig{}, fmt.Errorf("持久化 group %s: %w", name, err)
 	}
@@ -264,7 +264,7 @@ func (m *Meta) UpdateTopicRetention(name string, retentionMs int64) (TopicConfig
 	tc.RetentionMs = retentionMs
 	raw, _ := json.Marshal(tc)
 	b := m.st.NewBatch()
-	b.Set(store.TopicMetaKey(name), raw, nil)
+	b.Set(store.TopicMetaKey(name), raw)
 	if err := m.st.Apply(b); err != nil {
 		return TopicConfig{}, fmt.Errorf("持久化 topic %s: %w", name, err)
 	}
@@ -283,7 +283,7 @@ func (m *Meta) DeleteTopic(name string) error {
 		return fmt.Errorf("%w: %s", ErrTopicNotFound, name)
 	}
 	b := m.st.NewBatch()
-	b.Delete(store.TopicMetaKey(name), nil)
+	b.Delete(store.TopicMetaKey(name))
 	if err := m.st.Apply(b); err != nil {
 		return fmt.Errorf("删除 topic %s: %w", name, err)
 	}
@@ -300,7 +300,7 @@ func (m *Meta) DeleteGroup(name string) error {
 		return fmt.Errorf("%w: %s", ErrGroupNotFound, name)
 	}
 	b := m.st.NewBatch()
-	b.Delete(store.GroupMetaKey(name), nil)
+	b.Delete(store.GroupMetaKey(name))
 	if err := m.st.Apply(b); err != nil {
 		return fmt.Errorf("删除 group %s: %w", name, err)
 	}

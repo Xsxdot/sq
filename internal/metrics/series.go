@@ -358,7 +358,7 @@ func (s *Sampler) persist(mp MinutePoint) error {
 		return fmt.Errorf("编码时序点 %d: %w", mp.TsMs, err)
 	}
 	b := s.st.NewBatch()
-	b.Set(store.MetricKey(mp.TsMs), raw, nil)
+	b.Set(store.MetricKey(mp.TsMs), raw)
 	if err := s.st.Apply(b); err != nil {
 		return fmt.Errorf("提交时序点 %d: %w", mp.TsMs, err)
 	}
@@ -394,7 +394,7 @@ func (s *Sampler) History(fromMs int64) ([]Point, error) {
 // 一条区间墓碑顶掉逐条删除）。
 func (s *Sampler) expire(cutoffMs int64) error {
 	b := s.st.NewBatch()
-	b.DeleteRange(store.MetricKey(0), store.MetricKey(cutoffMs), nil)
+	b.DeleteRange(store.MetricKey(0), store.MetricKey(cutoffMs))
 	if err := s.st.Apply(b); err != nil {
 		return fmt.Errorf("提交时序过期删除 (cutoff=%d): %w", cutoffMs, err)
 	}

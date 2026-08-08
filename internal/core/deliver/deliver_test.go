@@ -242,7 +242,7 @@ func TestOrphanInflightCleanupPersistsAndDoesNotReportDelivery(t *testing.T) {
 
 	// 模拟消息已被清理：直接删掉消息本体，留下 inflight 记录，制造孤儿。
 	b := f.st.NewBatch()
-	b.Delete(store.MsgKey("t", 0, offset), nil)
+	b.Delete(store.MsgKey("t", 0, offset))
 	if err := f.st.Apply(b); err != nil {
 		t.Fatalf("模拟删除消息本体: %v", err)
 	}
@@ -591,7 +591,7 @@ func TestOrderedOrphanCleanupReleasesLock(t *testing.T) {
 	// 模拟 retention：消息记录已删，仅 inflight 残留（store 无单条 Delete，
 	// 与 TestOrphanInflightCleanupPersistsAndDoesNotReportDelivery 同用批次写法）
 	b := f.st.NewBatch()
-	b.Delete(store.MsgKey("t", 0, m[0].Offset), nil)
+	b.Delete(store.MsgKey("t", 0, m[0].Offset))
 	if err := f.st.Apply(b); err != nil {
 		t.Fatalf("Delete msg: %v", err)
 	}

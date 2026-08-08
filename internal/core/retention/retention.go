@@ -155,7 +155,7 @@ func (m *Manager) purgeQueue(topic string, q uint32, cutoff int64) (int, error) 
 	}
 	b := m.st.NewBatch()
 	// DeleteRange 从 offset 0 起：此前趟次已删的区间为空集，重复覆盖无害
-	b.DeleteRange(store.MsgKey(topic, q, 0), store.MsgKey(topic, q, boundary), nil)
+	b.DeleteRange(store.MsgKey(topic, q, 0), store.MsgKey(topic, q, boundary))
 	if err := m.st.Apply(b); err != nil {
 		return 0, fmt.Errorf("DeleteRange 提交: %w", err)
 	}
@@ -177,7 +177,7 @@ func (m *Manager) purgeKeyIdx(topic string, cutoff int64) error {
 			return false, perr
 		}
 		if ms < cutoff {
-			b.Delete(k, nil) // Batch 编码时即拷贝 key，回调切片可直接用
+			b.Delete(k) // Batch 编码时即拷贝 key，回调切片可直接用
 			n++
 		}
 		return n < maxPurgePerQueue, nil

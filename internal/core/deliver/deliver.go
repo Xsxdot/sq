@@ -31,8 +31,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/cockroachdb/pebble/v2"
-
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
@@ -221,7 +219,7 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 			// 记录永不消失，长轮询每 100ms 轮询一次就会反复扫描、反复打这条 Warn，
 			// 形成永久日志洪水。
 			d.logger.Warn("inflight 指向的消息不存在，清理孤儿记录", "group", group, "topic", topic, "queue", queueID, "offset", r.offset)
-			b.Delete(store.InflightKey(group, topic, queueID, r.offset), nil)
+			b.Delete(store.InflightKey(group, topic, queueID, r.offset))
 			staged = true
 			if r.ordered {
 				// 被清理的正是持有顺序锁的记录：锁随记录消失（不变式保证至多一条）
@@ -267,7 +265,7 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 		// 重投必须原样保留 Ordered 标记：丢了它，重投后的记录不再被视为
 		// 顺序锁占用，下一条顺序消息会与卡在队头的这条并发投递，顺序即破。
 		b.Set(store.InflightKey(group, topic, queueID, r.offset),
-			core.EncodeInflight(&core.InflightState{ExpireAtMs: exp, Attempts: m.DeliveryAttempt, Ordered: r.ordered}), nil)
+			core.EncodeInflight(&core.InflightState{ExpireAtMs: exp, Attempts: m.DeliveryAttempt, Ordered: r.ordered}))
 		out = append(out, m)
 		staged = true
 	}
@@ -325,7 +323,7 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 				orderedBusy = true
 			}
 			b.Set(store.InflightKey(group, topic, queueID, m.Offset),
-				core.EncodeInflight(&core.InflightState{ExpireAtMs: expireAt, Attempts: 1, Ordered: ordered}), nil)
+				core.EncodeInflight(&core.InflightState{ExpireAtMs: expireAt, Attempts: 1, Ordered: ordered}))
 			out = append(out, m)
 			return len(out) < maxMsgs, nil
 		})
@@ -356,7 +354,7 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 		return nil, nil
 	}
 	if newCursor > cursor {
-		b.Set(store.CursorKey(group, topic, queueID), store.PutU64(newCursor), nil)
+		b.Set(store.CursorKey(group, topic, queueID), store.PutU64(newCursor))
 	}
 	if err := d.st.Apply(b); err != nil {
 		return nil, fmt.Errorf("提交取件批次 (group=%s topic=%s q=%d): %w", group, topic, queueID, err)
@@ -416,7 +414,7 @@ func (d *Deliverer) Ack(group, topic string, queueID uint32, offset uint64, atte
 		return false, nil
 	}
 	b := d.st.NewBatch()
-	b.Delete(k, nil)
+	b.Delete(k)
 	if err := d.st.Apply(b); err != nil {
 		return false, fmt.Errorf("ack (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 	}
@@ -460,7 +458,7 @@ func (d *Deliverer) ChangeInvisible(group, topic string, queueID uint32, offset 
 	}
 	ist.ExpireAtMs = time.Now().Add(invisible).UnixMilli()
 	b := d.st.NewBatch()
-	b.Set(k, core.EncodeInflight(ist), nil)
+	b.Set(k, core.EncodeInflight(ist))
 	if err := d.st.Apply(b); err != nil {
 		return false, fmt.Errorf("改不可见时间 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 	}
@@ -512,7 +510,7 @@ func (d *Deliverer) ForwardToDLQ(group, topic string, queueID uint32, offset uin
 		// 消息已被 retention 清理但 inflight 残留：与 receiveOnce 的孤儿清理
 		// 同理删除止损。对调用方视为成功——"这条消息别再投了"已经成立。
 		b := d.st.NewBatch()
-		b.Delete(k, nil)
+		b.Delete(k)
 		if err := d.st.Apply(b); err != nil {
 			return false, fmt.Errorf("清理孤儿 inflight (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 		}
@@ -559,7 +557,7 @@ func (d *Deliverer) moveToDLQ(group, topic string, queueID uint32, offset uint64
 		Properties: props, Body: m.Body, BornAtMs: m.BornAtMs,
 	}
 	infKey := store.InflightKey(group, topic, queueID, offset)
-	if _, err := d.pr.AppendWith(dlq, func(b *pebble.Batch) { b.Delete(infKey, nil) }); err != nil {
+	if _, err := d.pr.AppendWith(dlq, func(b *store.Batch) { b.Delete(infKey) }); err != nil {
 		return fmt.Errorf("消息转入 DLQ (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 	}
 	d.logger.Info("消息投递超限转入死信", "group", group, "topic", topic, "queue", queueID,
@@ -580,9 +578,9 @@ func (d *Deliverer) ResetCursor(group, topic string, queueID uint32, offset uint
 	qmu.Lock()
 	defer qmu.Unlock()
 	b := d.st.NewBatch()
-	b.Set(store.CursorKey(group, topic, queueID), store.PutU64(offset), nil)
+	b.Set(store.CursorKey(group, topic, queueID), store.PutU64(offset))
 	ip := store.InflightPrefix(group, topic, queueID)
-	b.DeleteRange(ip, store.PrefixUpperBound(ip), nil)
+	b.DeleteRange(ip, store.PrefixUpperBound(ip))
 	if err := d.st.Apply(b); err != nil {
 		return fmt.Errorf("重置位点 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 	}

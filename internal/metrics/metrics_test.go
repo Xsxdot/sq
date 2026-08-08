@@ -221,9 +221,9 @@ func (f *fakeConns) ConnectionCount() int { return f.n }
 func TestRegistryExportsTxnAndConnMetrics(t *testing.T) {
 	st, mt, _, _ := fixture(t)
 	b := st.NewBatch()
-	b.Set(store.HalfKey(1723000000000, "TXN1"), []byte("raw1"), nil)
-	b.Set(store.HalfKey(1723000000001, "TXN2"), []byte("raw2"), nil)
-	b.Set(store.HalfIdxKey("TXN1"), []byte(`{}`), nil)
+	b.Set(store.HalfKey(1723000000000, "TXN1"), []byte("raw1"))
+	b.Set(store.HalfKey(1723000000001, "TXN2"), []byte("raw2"))
+	b.Set(store.HalfIdxKey("TXN1"), []byte(`{}`))
 	if err := st.Apply(b); err != nil {
 		t.Fatal(err)
 	}
