@@ -49,6 +49,29 @@
 
 单机时代吞吐定律：`吞吐 ≈ min(队列数, 并发)/2 × fsync 速率`（根源：每队列各自成批 fsync）。上 raft 后每组一条日志流，组内所有队列的写汇入，leader 按批追加——**一次 fsync 摊掉全部并发提案，合并度随并发涨、与队列数解耦**。粗估：批量 50 × 456 fsync/s × 3 数据组 ≈ 6.8 万 msg/s（同步刷盘档）；异步档更高。spike 实测标定（§8）。
 
+**spike 实测（08-08 回填，三节点固定成员、100B payload、量 propose→commit，来源 Task 3/4/5 实际输出）**：
+
+| 平台 | 确认档 | 并发（-cpu） | msg/s | 内存峰值 |
+|---|---|---|---|---|
+| 本机 M1 Pro（darwin/arm64, APFS） | Fsync | 1 / 16 / 64 / 256 | 32.02 / 251.0 / 835.9 / 1,302 | — |
+| 本机 M1 Pro（复跑 ±30% 抖动） | Mem | 1 / 16 / 64 / 256 | 3,091 / 37,401 / 77,298 / 69,385 | — |
+| 本机 M1 Pro | 对照：pebble 单流 Commit(Sync) | — | 225/s（4.45ms/次） | — |
+| Linux 47.80.240.57（2 vCPU Xeon Platinum, amd64, ext4）· 整矩阵干净运行 | Fsync | 64 / 256 | 1,961 / 5,239 | 整进程 508MB（含泄漏集群） |
+| Linux 47.80.240.57 · 整矩阵干净运行 | Mem | 64 / 256 | 36,100 / 41,491 | 同上 |
+| Linux 47.80.240.57 · 单档位隔离进程 | Fsync-64 | 64 | 2,090 | 50MB |
+| Linux 47.80.240.57 · 单档位隔离进程 | Fsync-256 | 256 | 5,623 | 104MB |
+| Linux 47.80.240.57 · 单档位隔离进程 | Mem-64 | 64 | 38,594 | 196MB |
+| Linux 47.80.240.57 · 单档位隔离进程 | Mem-256 | 256 | 46,940 | 224MB |
+
+learner 追齐实测（§2.2 安全配套）：2000 条已 commit 全量重放 ≈283ms（两轮 283ms/150ms，取保守值）。
+
+Caveat（必须与上述数字同读）：
+
+1. **pebble v2.1.6 上游已知竞态 #5601**（db.go:2835 `rotateWAL`，2025-11 上报；修复 PR #5619 仅把 panic 改善为 Fatalf 提升可调试性、未修根因，且不在 v2.1.6——当前最新 tag）：Linux Mem-256 约 30-50% 概率 panic（benchmark 进程 teardown 时 tempdir 移除与泄漏集群的 flush 竞争触发）；Linux 侧数字均来自重试后的干净运行。
+2. **Linux Fsync-256 云盘波动大**（多次整矩阵运行区间 3,045→5,623 msg/s）：表内取整矩阵干净运行值 5,239。
+3. **整矩阵 RSS 508MB 含泄漏集群**（基准进程从不 Shutdown，前序档位集群累积）：内存峰值以单档位隔离进程值为准。
+4. **Fsync@1=32 msg/s vs 单流 225/s**：propose→commit 往返关键路径 ≥3 次串行 fsync（leader 追加 → quorum follower 追加 → leader commit-advance 持久化），32 ≈ 225/7，属架构性除效应而非缺陷；并发上涨后合并效应把单流拉回 1,302（40x），合并机制健康。
+
 ## 3. 总体架构
 
 ```
@@ -90,7 +113,7 @@
 
 - 客户端 endpoints 填 3 节点地址（官方 SDK 原生支持分号分隔多地址）。
 - 任意节点应答 `QueryRoute`；每个队列的路由地址指向其组当前 leader。发到旧 leader → 可重试错误码，SDK 自动重试 + 刷路由。
-- 切换窗口 = 选举时间（秒级）+ 客户端路由刷新周期（默认 30s，出错即刷可提前）。目标与实测值由 spike 标定。
+- 切换窗口 = 选举时间（重选实测 1.47~1.53s，ElectionTick=10/100ms tick 配置下，spike Task 3）+ 客户端路由刷新周期（默认 30s，出错即刷可提前）。目标与实测值由 spike 标定。
 - 语义保持 at-least-once：inflight 状态在组内复制，切换后 ack 照常生效；切换期间可能重复投递（协议本就允许）。
 
 ## 7. 单机模式与升级路径
@@ -101,7 +124,11 @@
 
 ## 8. 验证策略
 
-1. **前置 spike**（进 plan 的第一批任务）：etcd/raft 薄壳搭最小三节点原型，实测——切换时间、同步/异步刷盘两档吞吐、learner 追齐耗时。数据回填本 spec §2.3。
+1. **前置 spike**（进 plan 的第一批任务）：etcd/raft 薄壳搭最小三节点原型，实测——切换时间、同步/异步刷盘两档吞吐、learner 追齐耗时。数据回填本 spec §2.3/§6。08-08 完成（spike/raftshell，独立 module）：
+   - [x] 最小薄壳三节点原型：`TestSingleNodeProposeApply`（单节点 propose→apply）、`TestThreeNodeReplicate`（三节点 1000 条复制收敛）；
+   - [x] 切换时间：`TestKillLeaderFailover`（实测 1.47~1.53s，见 §6）；
+   - [x] 同步/异步两档吞吐：`BenchmarkProposeQuorumFsync` / `BenchmarkProposeQuorumMem`（实测矩阵与内存峰值见 §2.3）；
+   - [x] learner 追齐耗时：`TestUncleanRestartRejoinsAsLearner`（断电重入追齐 ≈283ms）、`TestCleanRestartResumes`（干净重启 applied 恢复）。
 2. **场景测试**：补上场景测试框架预留的集群节点实现，新增四类场景，不变量对账器原样复用：
    - kill leader（含 `kill -9`）；
    - 网络分区（少数派不可写、愈合后追齐）；
