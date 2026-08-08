@@ -3,9 +3,11 @@
 // 职责：固定 3 节点（id 1/2/3）的创建与启动、leader 收敛等待、
 // 节点摘除（kill-leader 实验）、整体关闭，以及节点重启恢复
 // （Restart：干净/不干净两条路径，见 Restart 注释）与 FSM 收敛等待。
-// 边界：不处理成员变更与扩容（spike 固定成员表）；不支持重启 leader；
-// 不并发安全——WaitLeader/Kill/Leader/Restart 由同一测试 goroutine
-// 顺序调用。
+// 边界：不处理成员变更与扩容（spike 固定成员表）；learner 重入要求
+// 重启时集群内已有非本节点的存活 leader——被摘除（Kill）的 leader 由
+// 幸存者选出新 leader 后同样可回归，仅「待重启节点仍是唯一 leader」
+// 被拒绝；不并发安全——WaitLeader/Kill/Leader/Restart 由同一测试
+// goroutine 顺序调用。
 package raftshell
 
 import (
@@ -210,7 +212,11 @@ func (c *Cluster) Shutdown() error {
 //
 // 注意：
 //   - 必须先 Kill（或 StopClean）待重启节点并等其完全退出
-//   - 不支持重启 leader 节点（spike 固定成员表，无 leader 转移场景）
+//   - learner 重入的「leader 检查」只拒绝一种情形：待重启节点此刻
+//     仍是集群唯一 leader（没有存活节点能选出新 leader，重入无从
+//     谈起）。被 Kill 的 leader 不在此列——幸存者会先选出新 leader，
+//     随后正常走 learner 回归；被 StopClean 的 leader 走干净路径，
+//     根本不进 learner 分支
 //   - 边界：追齐走全量日志重放，spike 不做日志压缩（无 Compact）；
 //     快照流式追齐是 B8.2 的范围
 func (c *Cluster) Restart(id uint64) error {
@@ -252,6 +258,11 @@ func (c *Cluster) restartClean(id uint64, wal *WAL) error {
 	if len(ents) > 0 {
 		first := ents[0]
 		snapIndex := first.GetIndex() - 1
+		// snapTerm 用首条条目的 term 近似「缺失条目 index-1 的 term」：
+		// raft 只在任期比较时用到它，而两条路径都不会触发该比较——
+		// 不干净路径空存储启动（snapTerm=0）只与新鲜 leader 的 term(0)
+		// 相遇；干净路径 leader 的 Progress 仍保留，追齐从不会回退到
+		// index-1 对账（若未来做快照压缩，需按真实 term 补快照，见 B8.2）
 		snapTerm := first.GetTerm()
 		snap := &raftpb.Snapshot{Metadata: &raftpb.SnapshotMetadata{
 			Index:     &snapIndex,
@@ -285,10 +296,30 @@ func (c *Cluster) restartClean(id uint64, wal *WAL) error {
 	return nil
 }
 
-// restartAsLearner 不干净路径：清空状态目录，leader 走
-// Remove → AddLearner → 追平 → AddNode 的完整成员变更往返。
+// restartAsLearner 不干净路径：leader 走 Remove → AddLearner → 追平 →
+// AddNode 的完整成员变更往返，被重启节点以空存储重入。
+// 注意：任何破坏性操作（关 WAL、清状态目录）都排在 leader 检查之后，
+// 确保失败路径上该节点唯一的 WAL 副本原样保留（终审 R2 修复了原实现
+// 先清目录后查 leader 的顺序缺陷）。
 func (c *Cluster) restartAsLearner(id uint64, wal *WAL, dir string) error {
 	c.lg.Info(uncleanRestartLogMsg, "id", id, "dir", dir)
+	// 先确认 leader 可用，再动状态目录：waitLeader 失败或待重启节点
+	// 仍是唯一 leader 时直接返回，目录原封未动
+	lead, err := c.WaitLeader(5 * time.Second)
+	if err != nil {
+		_ = wal.Close()
+		c.lg.Error("等待 leader 失败", "id", id, "err", err)
+		return fmt.Errorf("Restart(%d): 等待 leader 失败: %w", id, err)
+	}
+	// 拒绝条件收窄为「待重启节点仍是当前 leader」：此时没有存活节点
+	// 能选出新 leader，learner 重入无从谈起。被 Kill 的 leader 由
+	// 幸存者选出新 leader 后走正常 learner 回归（见 Restart 注释）
+	if lead == id {
+		_ = wal.Close()
+		err := fmt.Errorf("Restart(%d): 待重启节点仍是唯一 leader（lead=%d）", id, lead)
+		c.lg.Error("待重启节点仍是唯一 leader，拒绝 learner 重入", "id", id, "lead", lead)
+		return err
+	}
 	// 先关掉刚打开的 WAL 再清目录：pebble 持有目录文件句柄，
 	// 不关闭直接 RemoveAll 会失败
 	if err := wal.Close(); err != nil {
@@ -300,18 +331,6 @@ func (c *Cluster) restartAsLearner(id uint64, wal *WAL, dir string) error {
 		return fmt.Errorf("Restart(%d): 清空状态目录 %s 失败: %w", id, dir, err)
 	}
 	c.lg.Info("状态目录已清空", "id", id, "dir", dir)
-	// leader 不能是重启节点自身：spike 固定成员表，没有 leader 转移
-	// 场景，此处显式拒绝
-	lead, err := c.WaitLeader(5 * time.Second)
-	if err != nil {
-		c.lg.Error("等待 leader 失败", "id", id, "err", err)
-		return fmt.Errorf("Restart(%d): 等待 leader 失败: %w", id, err)
-	}
-	if lead == id {
-		err := fmt.Errorf("Restart(%d): 不支持重启 leader 节点（lead=%d）", id, lead)
-		c.lg.Error("不支持重启 leader 节点", "id", id, "lead", lead)
-		return err
-	}
 	leader := c.Nodes[lead]
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -393,18 +412,21 @@ func (c *Cluster) waitCaughtUp(learner, leader *Node, timeout time.Duration) err
 //   - nil：已收敛
 //   - error：超时，错误信息附各节点当前计数（排障上下文）
 //
-// 注意：存活节点数 ≤1 时视为已收敛（无对账对象）；
+// 注意：存活节点数为 0 时直接报错——空集上「全部相等」是假收敛
+// （终审 R2 修复）；存活节点数为 1 时视为已收敛（无对账对象）；
 // 摘除节点不参与对账——其计数停在摘除前。
 func (c *Cluster) WaitConverged(timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
 		var target uint64
 		converged := true
+		alive := 0
 		first := true
 		for id, n := range c.Nodes {
 			if c.killed[id] {
 				continue
 			}
+			alive++
 			app := n.AppliedCount()
 			if first {
 				target = app
@@ -415,6 +437,9 @@ func (c *Cluster) WaitConverged(timeout time.Duration) error {
 				converged = false
 				break
 			}
+		}
+		if alive == 0 {
+			return fmt.Errorf("WaitConverged：无存活节点（timeout %v），无法判定收敛", timeout)
 		}
 		if converged {
 			c.lg.Info("集群 FSM 已收敛", "applied", target)

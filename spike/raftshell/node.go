@@ -271,6 +271,9 @@ func (n *Node) Propose(ctx context.Context, payload []byte) error {
 //   - nil：成员变更已 apply
 //   - error：ProposeConfChange 失败或 ctx 超时/取消
 func (n *Node) ProposeConfChange(ctx context.Context, ccType raftpb.ConfChangeType, nodeID uint64) error {
+	// 提案 id 与 ConfChange.Id 共用同一个 nextID 计数器和 waiters 表：
+	// 单节点内原子自增不可能碰撞；follower 从不持有 waiter（Propose/
+	// ProposeConfChange 只在 leader 上有意义），同表 key 也不会交叉误唤
 	id := n.nextID.Add(1)
 	ch := make(chan struct{})
 	n.mu.Lock()

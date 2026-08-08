@@ -192,6 +192,15 @@ func (w *WAL) Load() (*raftpb.HardState, []*raftpb.Entry, error) {
 // MemoryStorage 的快照元数据），不会自己回放 ConfChange 条目重建成员表；
 // 而 spike 不做快照，因此必须由调用方重放。条目中的 ConfChange 序列
 // 与节点运行期 apply 的顺序一致，重放结果即关机时刻的成员表。
+//
+// 注意（B8.2 观察项）：这里重放了全部 ConfChange 条目，包括 commit
+// 之外可能存在的未提交尾部；正确做法应只回放到 HardState.Commit
+// （调用方手里有 HardState 却未传入）。当前 spike 不可能出现未提交的
+// ConfChange 尾部：ConfChange 只由 restartAsLearner 中存活的 leader
+// 提出，且 ProposeConfChange 等待 apply 返回后才继续，重启节点自身
+// 从不当 leader，因此重放序列必然全部已提交。若未来允许 leader 带着
+// 未提交 ConfChange 崩溃、或引入日志截断，此处必须先按 commit 裁剪
+// 再合成成员表，纳入 B8.2 快照/压缩观察项。
 func confStateFromEntries(ents []*raftpb.Entry) *raftpb.ConfState {
 	cs := &raftpb.ConfState{}
 	for _, ent := range ents {
