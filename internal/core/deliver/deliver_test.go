@@ -746,3 +746,55 @@ func TestForwardToDLQStaleHandle(t *testing.T) {
 		t.Fatalf("原记录应完好: %v %v", ok, err)
 	}
 }
+
+// TestAckBatchMixedEntries 验证批量确认的 per-entry 语义（语义红线 4）：
+// 有效、陈旧 attempt、不存在的 offset 混在一批——逐条独立判定，
+// 只有有效条目被删除，落空条目不影响其它条目也不报错。
+func TestAckBatchMixedEntries(t *testing.T) {
+	f := newFixture(t)
+	f.send(t, "ab-t", "m0")
+	f.send(t, "ab-t", "m1")
+	msgs, err := f.dl.Receive(context.Background(), "g", "ab-t", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(msgs) != 2 {
+		t.Fatalf("receive: %v msgs=%d", err, len(msgs))
+	}
+	results, err := f.dl.AckBatch("g", "ab-t", 0, []AckEntry{
+		{Offset: msgs[0].Offset, Attempt: msgs[0].DeliveryAttempt}, // 有效
+		{Offset: msgs[1].Offset, Attempt: 99},                      // 陈旧 attempt
+		{Offset: 9999, Attempt: 1},                                 // 不存在
+	})
+	if err != nil {
+		t.Fatalf("AckBatch: %v", err)
+	}
+	if len(results) != 3 || !results[0].OK || results[1].OK || results[2].OK {
+		t.Fatalf("per-entry 结果错误: %+v", results)
+	}
+	// 有效条目的 inflight 已删；陈旧条目的 inflight 必须原样保留
+	if _, ok, _ := f.st.Get(store.InflightKey("g", "ab-t", 0, msgs[0].Offset)); ok {
+		t.Fatal("已确认消息的 inflight 未删除")
+	}
+	if _, ok, _ := f.st.Get(store.InflightKey("g", "ab-t", 0, msgs[1].Offset)); !ok {
+		t.Fatal("陈旧句柄不应误删他人 inflight")
+	}
+}
+
+// TestAckBatchAllInvalidNoWrite 验证全部落空时不产生任何写入（批次走
+// 自行 Close 回收路径），且不报错。
+func TestAckBatchAllInvalidNoWrite(t *testing.T) {
+	f := newFixture(t)
+	f.send(t, "ab2-t", "m")
+	msgs, err := f.dl.Receive(context.Background(), "g", "ab2-t", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("receive: %v", err)
+	}
+	results, err := f.dl.AckBatch("g", "ab2-t", 0, []AckEntry{
+		{Offset: msgs[0].Offset, Attempt: 42}, // 陈旧
+		{Offset: 8888, Attempt: 1},            // 不存在
+	})
+	if err != nil || results[0].OK || results[1].OK {
+		t.Fatalf("全落空批应无错且全 false: %v %+v", err, results)
+	}
+	if _, ok, _ := f.st.Get(store.InflightKey("g", "ab2-t", 0, msgs[0].Offset)); !ok {
+		t.Fatal("inflight 不应被触碰")
+	}
+}

@@ -75,3 +75,29 @@ func BenchmarkAckParallel(b *testing.B) {
 		}
 	})
 }
+
+// BenchmarkAckBatch32 批量确认基准：每次迭代 = 一批 32 条一次 fsync。
+// 换算 msg/s 时乘 32（ns/op 是「每批」耗时，不是每条）。
+func BenchmarkAckBatch32(b *testing.B) {
+	d := newBenchDeliverer(b, b.N*32)
+	var next atomic.Uint64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			base := (next.Add(1) - 1) * 32
+			entries := make([]AckEntry, 32)
+			for i := range entries {
+				entries[i] = AckEntry{Offset: base + uint64(i), Attempt: 1}
+			}
+			results, err := d.AckBatch("g-bench", "t-ack", 0, entries)
+			if err != nil {
+				b.Fatalf("AckBatch: %v", err)
+			}
+			for _, r := range results {
+				if !r.OK {
+					b.Fatalf("entry off=%d 落空", r.Offset)
+				}
+			}
+		}
+	})
+}
