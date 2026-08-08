@@ -6,6 +6,8 @@
 //   - 确保配置加载不产生预期外的错误
 //   - 验证 default_queue_nums 的上下界校验：配置笔误必须在启动时挡住，
 //     不能等到运行时伪装成 broker 故障或负数队列 id
+//   - 验证 cluster 段的解析与校验：node_id 归属、peer 唯一性、ack 档位、
+//     单机回退（Cluster==nil）
 //
 // 边界：
 //   - 不测试业务语义校验（如端口合法性）
@@ -363,5 +365,101 @@ func TestLoadEmptyOrCommentOnlyFile(t *testing.T) {
 		if cfg.DataDir != "./data" {
 			t.Fatalf("空配置应保留默认值，得到 %q", cfg.DataDir)
 		}
+	}
+}
+
+// TestClusterConfigParsing 集群段的全量解析与校验：
+// 合法配置解析出 node_id/peers/默认档；四类笔误（node_id 不在成员表、
+// peer id 重复、ack 非法、空 peers）启动即拒；不带 cluster 段 = 单机模式。
+func TestClusterConfigParsing(t *testing.T) {
+	dir := t.TempDir()
+	write := func(body string) string {
+		p := filepath.Join(dir, "sq.yaml")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	base := `
+cluster:
+  node_id: 2
+  raft_listen: ":9081"
+  peers:
+    - id: 1
+      raft_addr: "10.0.0.1:9081"
+      advertise_host: "10.0.0.1"
+      advertise_port: 8081
+    - id: 2
+      raft_addr: "10.0.0.2:9081"
+      advertise_host: "10.0.0.2"
+      advertise_port: 8081
+    - id: 3
+      raft_addr: "10.0.0.3:9081"
+      advertise_host: "10.0.0.3"
+      advertise_port: 8081
+`
+	cfg, err := Load(write(base))
+	if err != nil {
+		t.Fatalf("合法集群配置被拒: %v", err)
+	}
+	if !cfg.ClusterEnabled() || cfg.Cluster.NodeID != 2 {
+		t.Fatalf("集群段解析错误: %+v", cfg.Cluster)
+	}
+	if cfg.Cluster.DataGroups != 3 || cfg.Cluster.Ack != "quorum-mem" {
+		t.Fatalf("默认值错误: groups=%d ack=%q", cfg.Cluster.DataGroups, cfg.Cluster.Ack)
+	}
+	// 拒绝路径：node_id 不在 peers 里 / peers id 重复 / ack 非法 / 单机配置 Cluster==nil
+	for name, body := range map[string]string{
+		"node_id 不在 peers": strings.Replace(base, "node_id: 2", "node_id: 9", 1),
+		"peers id 重复":      strings.Replace(base, "- id: 3", "- id: 1", 1),
+		"ack 非法":           base + "  ack: fsync-everything\n",
+		"peers 少于 1":       "cluster:\n  node_id: 1\n  raft_listen: \":9081\"\n  peers: []\n",
+	} {
+		if _, err := Load(write(body)); err == nil {
+			t.Errorf("%s: 应拒绝，实际通过", name)
+		}
+	}
+	cfg2, err := Load("")
+	if err != nil || cfg2.ClusterEnabled() {
+		t.Fatalf("空配置应为单机: err=%v cluster=%v", err, cfg2.Cluster)
+	}
+}
+
+// TestClusterHelpers 成员表辅助方法：PeerRaftAddrs 展开 id→raft 地址映射，
+// AdvertiseOf 查成员对外广告地址（id 不在表内 = ok=false）。
+// Task 9/11 装配 raft 组配置与路由广播依赖这两个方法的语义。
+func TestClusterHelpers(t *testing.T) {
+	y := `
+cluster:
+  node_id: 1
+  raft_listen: ":9081"
+  data_groups: 8
+  peers:
+    - id: 1
+      raft_addr: "10.0.0.1:9081"
+      advertise_host: "10.0.0.1"
+      advertise_port: 8081
+    - id: 2
+      raft_addr: "10.0.0.2:9081"
+      advertise_host: "10.0.0.2"
+      advertise_port: 8081
+`
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	if err := os.WriteFile(p, []byte(y), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	addrs := cfg.Cluster.PeerRaftAddrs()
+	if len(addrs) != 2 || addrs[1] != "10.0.0.1:9081" || addrs[2] != "10.0.0.2:9081" {
+		t.Fatalf("PeerRaftAddrs 展开错误: %v", addrs)
+	}
+	if host, port, ok := cfg.Cluster.AdvertiseOf(2); !ok || host != "10.0.0.2" || port != 8081 {
+		t.Fatalf("AdvertiseOf(2) 错误: %q:%d ok=%v", host, port, ok)
+	}
+	if _, _, ok := cfg.Cluster.AdvertiseOf(99); ok {
+		t.Fatal("AdvertiseOf(99) 应返回 ok=false")
 	}
 }

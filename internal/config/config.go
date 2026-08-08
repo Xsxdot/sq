@@ -69,6 +69,26 @@ type Config struct {
 	TxnCheckInterval string `yaml:"txn_check_interval"`
 	// TxnMaxChecks 单条半消息最大回查次数，超限即丢弃并记日志（spec §5 流程 5）。
 	TxnMaxChecks int `yaml:"txn_max_checks"`
+	// Cluster 集群模式配置段。nil = 单机模式；段一旦出现即集群模式。
+	Cluster *ClusterConfig `yaml:"cluster"`
+}
+
+// ClusterConfig 集群模式配置段；nil = 单机模式。段一旦出现即集群模式，
+// 全部字段按集群语义严格校验（见 Load 末尾校验链）。
+type ClusterConfig struct {
+	NodeID     uint64        `yaml:"node_id"`     // 本节点在成员表中的唯一 id，必须出现在 peers 中
+	RaftListen string        `yaml:"raft_listen"` // 本节点 raft 组间复制流量的监听地址（如 ":9081"）
+	DataGroups uint32        `yaml:"data_groups"` // 数据组数；首启持久化后不可变，改配置不改盘上事实（cluster.EnsureGroups 拒启）
+	Ack        string        `yaml:"ack"`         // 确认档位：quorum-mem|quorum-fsync；缺省 quorum-mem（spec §2.2 复制确认+异步刷盘）
+	Peers      []ClusterPeer `yaml:"peers"`       // 成员表（含本节点）；1 个 = 单机→单节点集群升级形态
+}
+
+// ClusterPeer 成员表里一个节点的描述。
+type ClusterPeer struct {
+	ID            uint64 `yaml:"id"`             // 成员 id，全表唯一且非零
+	RaftAddr      string `yaml:"raft_addr"`      // 该节点的 raft 监听地址（组间复制流量）
+	AdvertiseHost string `yaml:"advertise_host"` // 对外广告地址（路由/协议面广播给客户端）
+	AdvertisePort int    `yaml:"advertise_port"` // 对外广告端口
 }
 
 // Load 加载配置。path 为空时返回纯默认值；文件存在则按字段覆盖。
@@ -186,6 +206,73 @@ func Load(path string) (*Config, error) {
 	if cfg.TxnMaxChecks < 1 || cfg.TxnMaxChecks > 1000 {
 		return nil, fmt.Errorf("配置 txn_max_checks 须在 [1,1000]，得到 %d", cfg.TxnMaxChecks)
 	}
+	// —— 集群段（cluster）校验 ——
+	// 段缺省 = 单机模式（Cluster 保持 nil，ClusterEnabled()==false）；段一旦出现，
+	// 每个字段都按集群语义严格校验——半配的集群段比没有更危险，启动时挡住。
+	if cfg.Cluster != nil {
+		cc := cfg.Cluster
+		// DataGroups/Ack 的缺省档只在段存在时生效：yaml 标量无法区分
+		// 「显式 0/空串」与「未填」，一律按未填给默认值，再做范围校验。
+		if cc.DataGroups == 0 {
+			cc.DataGroups = 3
+		}
+		if cc.Ack == "" {
+			cc.Ack = "quorum-mem"
+		}
+		if cc.RaftListen == "" {
+			return nil, fmt.Errorf("配置 cluster.raft_listen 不能为空（集群模式必须声明 raft 监听地址）")
+		}
+		// 组数范围 [1,64]：组数在首启时持久化进盘、之后不可变（cluster.EnsureGroups
+		// 拒启），这里只防笔误——64 组 × 每组长轮询心跳已是极宽余量。
+		if cc.DataGroups < 1 || cc.DataGroups > 64 {
+			return nil, fmt.Errorf("配置 cluster.data_groups 须在 [1,64]，得到 %d", cc.DataGroups)
+		}
+		// 档位白名单：其他值（如 "async"）会在复制层静默按默认档执行，
+		// 运维以为开了严格档实际没有——启动时挡下。
+		switch cc.Ack {
+		case "quorum-mem", "quorum-fsync":
+		default:
+			return nil, fmt.Errorf("配置 cluster.ack 只接受 quorum-mem|quorum-fsync，得到 %q", cc.Ack)
+		}
+		// peers 至少 1：0 个 peer 的集群段是半配（node_id 必然找不到归属）；
+		// 1 个 peer 合法——单机→单节点集群的升级形态。
+		if len(cc.Peers) < 1 {
+			return nil, fmt.Errorf("配置 cluster.peers 至少 1 个，得到 %d 个", len(cc.Peers))
+		}
+		seen := make(map[uint64]int, len(cc.Peers))
+		seenNode := false
+		for i, p := range cc.Peers {
+			if p.ID == 0 {
+				return nil, fmt.Errorf("配置 cluster.peers[%d] 的 id 必须 >0，得到 %d", i, p.ID)
+			}
+			if j, dup := seen[p.ID]; dup {
+				return nil, fmt.Errorf("配置 cluster.peers[%d] 与 peers[%d] 的 id 重复: %d", i, j, p.ID)
+			}
+			seen[p.ID] = i
+			if p.ID == cc.NodeID {
+				seenNode = true
+			}
+			if p.RaftAddr == "" {
+				return nil, fmt.Errorf("配置 cluster.peers[%d] 的 raft_addr 不能为空", i)
+			}
+			if p.AdvertiseHost == "" {
+				return nil, fmt.Errorf("配置 cluster.peers[%d] 的 advertise_host 不能为空", i)
+			}
+			if p.AdvertisePort < 1 || p.AdvertisePort > 65535 {
+				return nil, fmt.Errorf("配置 cluster.peers[%d] 的 advertise_port 须在 [1,65535]，得到 %d", i, p.AdvertisePort)
+			}
+		}
+		// node_id 必须落在成员表里：不在 = 笔误，启动即挡（raft 需要成员表自洽，
+		// 缺本的节点无从开始）。
+		if !seenNode {
+			return nil, fmt.Errorf("配置 cluster.node_id %d 必须出现在 peers 的 id 中", cc.NodeID)
+		}
+		// 校验全部通过后才提示：偶数节点数无容错价值（2 节点任一挂即失 quorum），
+		// raft 容忍但不拒——留给运维判断。
+		if len(cc.Peers) > 1 && len(cc.Peers)%2 == 0 {
+			slog.Default().Warn("集群节点数为偶数，无容错价值，建议奇数", "nodes", len(cc.Peers))
+		}
+	}
 	return cfg, nil
 }
 
@@ -199,6 +286,36 @@ func (c *Config) RetentionInterval() time.Duration {
 func (c *Config) TxnInterval() time.Duration {
 	d, _ := time.ParseDuration(c.TxnCheckInterval)
 	return d
+}
+
+// ClusterEnabled 是否集群模式：Cluster 段存在即集群，nil 即单机。
+func (c *Config) ClusterEnabled() bool {
+	return c.Cluster != nil
+}
+
+// PeerRaftAddrs 返回成员表 id → raft 监听地址 的映射。
+//
+// Task 9/11 装配 raft 组配置时用：组启动把本节点与各 peer 的地址
+// 展开进 raft 节点列表，避免调用方各自重复遍历。
+func (cc *ClusterConfig) PeerRaftAddrs() map[uint64]string {
+	m := make(map[uint64]string, len(cc.Peers))
+	for _, p := range cc.Peers {
+		m[p.ID] = p.RaftAddr
+	}
+	return m
+}
+
+// AdvertiseOf 返回指定成员 id 的对外广告地址（host, port）。
+//
+// 协议/路由面需要把集群成员的对地址广播给客户端时用；
+// id 不在成员表返回 ok=false，调用方按缺失处理。
+func (cc *ClusterConfig) AdvertiseOf(id uint64) (host string, port int, ok bool) {
+	for _, p := range cc.Peers {
+		if p.ID == id {
+			return p.AdvertiseHost, p.AdvertisePort, true
+		}
+	}
+	return "", 0, false
 }
 
 // SetupSlog 按配置初始化全局 slog（JSON 输出到 stdout）。
