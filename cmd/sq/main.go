@@ -30,6 +30,7 @@ import (
 	"github.com/xushixin/sq/internal/core/retention"
 	"github.com/xushixin/sq/internal/core/txn"
 	"github.com/xushixin/sq/internal/metrics"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/rpc"
 	"github.com/xushixin/sq/internal/store"
 	"github.com/xushixin/sq/internal/sysinfo"
@@ -70,11 +71,11 @@ func run() error {
 		return err
 	}
 	defer st.Close()
-	mt, err := meta.New(st, cfg.AutoCreateTopic, cfg.DefaultQueueNums, cfg.DefaultMaxAttempts, logger)
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, cfg.AutoCreateTopic, cfg.DefaultQueueNums, cfg.DefaultMaxAttempts, logger)
 	if err != nil {
 		return err
 	}
-	pr := produce.New(st, mt, logger)
+	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, logger)
 	dl := deliver.New(st, mt, pr, logger)
 
 	// 事务管理器。构造顺序有讲究：rpc.Server 要拿它处理 Send/EndTransaction，

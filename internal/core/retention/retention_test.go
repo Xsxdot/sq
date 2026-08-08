@@ -12,6 +12,7 @@ import (
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -22,7 +23,7 @@ func newFixture(t *testing.T) (*store.Store, *meta.Meta) {
 		t.Fatalf("store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 1, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
@@ -52,7 +53,7 @@ func writeMsgAt(t *testing.T, st *store.Store, topic string, offset uint64, stor
 // TestPassPurgesExpired 过期消息与索引被清，未过期保留。
 func TestPassPurgesExpired(t *testing.T) {
 	st, mt := newFixture(t)
-	if _, err := mt.CreateTopic("t", 1); err != nil {
+	if _, err := mt.CreateTopic(context.Background(), "t", 1); err != nil {
 		t.Fatal(err)
 	}
 	old := time.Now().Add(-4 * 24 * time.Hour).UnixMilli() // 超过默认 3 天
@@ -89,7 +90,7 @@ func TestPassPurgesExpired(t *testing.T) {
 // TestPassIdempotentAndNoExpired 无过期数据时 Pass 是无害空转。
 func TestPassIdempotentAndNoExpired(t *testing.T) {
 	st, mt := newFixture(t)
-	mt.CreateTopic("t", 1)
+	mt.CreateTopic(context.Background(), "t", 1)
 	writeMsgAt(t, st, "t", 0, time.Now().UnixMilli())
 	m := New(st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default())
 	for i := 0; i < 2; i++ {
@@ -102,14 +103,14 @@ func TestPassIdempotentAndNoExpired(t *testing.T) {
 // TestConsumeAfterPurge 清理后消费从位点扫描自然越过已删区间（cursor 无需修正）。
 func TestConsumeAfterPurge(t *testing.T) {
 	st, mt := newFixture(t)
-	mt.CreateTopic("t", 1)
+	mt.CreateTopic(context.Background(), "t", 1)
 	old := time.Now().Add(-4 * 24 * time.Hour).UnixMilli()
 	writeMsgAt(t, st, "t", 0, old)
 	writeMsgAt(t, st, "t", 1, time.Now().UnixMilli())
 	if _, err := New(st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default()).Pass(); err != nil {
 		t.Fatal(err)
 	}
-	pr := produce.New(st, mt, slog.Default())
+	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
 	msgs, err := dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
 	if err != nil || len(msgs) != 1 || msgs[0].Offset != 1 {

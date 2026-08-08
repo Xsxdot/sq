@@ -70,7 +70,7 @@ func TestDLQResend(t *testing.T) {
 	// 构造一条死信：与 moveToDLQ 的写入形状一致（origin 坐标在 Properties）。
 	// 不驱动真实重试超限（那是 deliver 测试的职责），这里只验证重发路径。
 	dlqTopic := meta.DLQTopicName("g1")
-	if _, err := pr.Append(&core.Message{
+	if _, err := pr.Append(context.Background(), &core.Message{
 		ID: "dead-1", Topic: dlqTopic, Body: []byte("dead"),
 		Properties: map[string]string{
 			"sq-origin-topic": "t-orig", "sq-origin-queue": "0", "sq-origin-offset": "5",
@@ -101,10 +101,10 @@ func TestDelayViewAndOverview(t *testing.T) {
 	s, _, _, pr, _, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	due := time.Now().Add(time.Hour).UnixMilli()
-	if _, err := pr.AppendDelay(&core.Message{Topic: "t1", Body: []byte("later"), DeliverAtMs: due}); err != nil {
+	if _, err := pr.AppendDelay(context.Background(), &core.Message{Topic: "t1", Body: []byte("later"), DeliverAtMs: due}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("now")}); err != nil {
+	if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("now")}); err != nil {
 		t.Fatal(err)
 	}
 	w := doJSON(t, h, "GET", "/admin/delay?limit=10", "", nil)
@@ -263,12 +263,12 @@ func TestOverviewCarriesQPSAndDLQ(t *testing.T) {
 
 	// 业务 topic 写入 2 条；死信 topic 写入 3 条（pr.Append 内部 EnsureTopic 自动建 topic）
 	for i := 0; i < 2; i++ {
-		if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+		if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
 			t.Fatal(err)
 		}
 	}
 	for i := 0; i < 3; i++ {
-		if _, err := pr.Append(&core.Message{Topic: meta.DLQTopicName("notify-svc"), Body: []byte("dead")}); err != nil {
+		if _, err := pr.Append(context.Background(), &core.Message{Topic: meta.DLQTopicName("notify-svc"), Body: []byte("dead")}); err != nil {
 			t.Fatal(err)
 		}
 	}

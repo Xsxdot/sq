@@ -2,6 +2,7 @@
 package txn
 
 import (
+	"context"
 	"encoding/json"
 	"testing"
 	"time"
@@ -25,7 +26,7 @@ func (f *fakeNotifier) RecoverOrphan(m *core.Message, txID string) bool {
 // 正常 Stage 首查在 30s 后，测试等不起，手法同 delay_test 直写暂存区）。
 func stageOverdue(t *testing.T, f *fixture, topic string) string {
 	t.Helper()
-	m, txID, err := f.mgr.Stage(msg(topic))
+	m, txID, err := f.mgr.Stage(context.Background(), msg(topic))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -150,7 +151,7 @@ func TestPassSkipsEntryEndedInBetween(t *testing.T) {
 	// 不能凭已收集的旧键复活已决断的事务
 	f := newFixture(t, 30*time.Second, 15)
 	txID := stageOverdue(t, f, "t-race")
-	if found, _ := f.mgr.End(txID, true); !found {
+	if found, _ := f.mgr.End(context.Background(), txID, true); !found {
 		t.Fatal("End 失败")
 	}
 	n := &fakeNotifier{send: true}

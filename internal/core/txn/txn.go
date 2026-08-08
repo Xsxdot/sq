@@ -89,13 +89,13 @@ func New(st *store.Store, pr *produce.Producer, mt *meta.Meta,
 // 因此对消费者天然不可见——deliver 只扫 msg/。
 // 首次回查排在 now+checkInterval：客户端正常几毫秒内就会 EndTransaction，
 // 只有本地事务悬而未决（进程崩溃、网络分区）的孤儿才会活到第一次回查。
-func (t *Manager) Stage(m *core.Message) (*core.Message, string, error) {
+func (t *Manager) Stage(ctx context.Context, m *core.Message) (*core.Message, string, error) {
 	if len(m.Body) == 0 || len(m.Body) > produce.MaxBodySize {
 		return nil, "", fmt.Errorf("消息体大小非法: %d（上限 %d）", len(m.Body), produce.MaxBodySize)
 	}
 	// 与 AppendDelay 同理：错误要在发送端立刻暴露，不能等到提交时才发现
 	// topic 不存在、消息无处可去
-	if _, err := t.mt.EnsureTopic(m.Topic); err != nil {
+	if _, err := t.mt.EnsureTopic(ctx, m.Topic); err != nil {
 		return nil, "", err
 	}
 	if m.ID == "" {
@@ -130,7 +130,7 @@ func (t *Manager) Stage(m *core.Message) (*core.Message, string, error) {
 // 返回 found=false 表示 txID 当前不存在半消息——三种正常来源：客户端网络
 // 重试（第一次已生效）、回查决断与客户端决断赛跑输的一方、超限已丢弃。
 // 三者都不是错误，调用方按幂等成功处理（记 Warn 即可）。
-func (t *Manager) End(txID string, commit bool) (bool, error) {
+func (t *Manager) End(ctx context.Context, txID string, commit bool) (bool, error) {
 	mu := t.lockFor(txID)
 	mu.Lock()
 	defer mu.Unlock()
@@ -183,7 +183,7 @@ func (t *Manager) End(txID string, commit bool) (bool, error) {
 	// 一切再次 EndTransaction 均为幂等 no-op；窗口内重试则重复提交一次，
 	// 仅此而已——重复有界、不丢失。
 	idxKey := store.HalfIdxKey(txID)
-	stored, err := t.pr.Append(m)
+	stored, err := t.pr.Append(ctx, m)
 	if err != nil {
 		return false, fmt.Errorf("提交半消息 (tx=%s msg=%s topic=%s): %w", txID, m.ID, m.Topic, err)
 	}

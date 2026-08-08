@@ -2,6 +2,7 @@
 package admin
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"testing"
@@ -30,7 +31,7 @@ func TestTopicCRUD(t *testing.T) {
 		t.Fatalf("queues=0 应 400，得到 %d", w.Code)
 	}
 	// 详情含每队列 next_offset
-	if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+	if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
 		t.Fatal(err)
 	}
 	w = doJSON(t, h, "GET", "/admin/topics/t1", "", nil)

@@ -7,9 +7,13 @@
 // 边界：
 //   - 不管队列内容与位点（produce/deliver 的事）
 //   - M1 无删除与配置修改（M5 Admin API 再加）
+//   - 缓存一致性契约：写路径经 Replicator 提交，leader 节点写穿透即时可见；
+//     follower 节点的盲 apply 不碰内存缓存，靠 OnApplied 钩子触发 Reload
+//     全量重读（钩子接线在 main 装配，本包只提供 Reload 方法）
 package meta
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -19,6 +23,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -94,6 +99,8 @@ func (g GroupConfig) EffectiveMaxAttempts() int32 {
 // Meta topic/group 注册表。读多写少，读走内存缓存，写穿透到 store。
 type Meta struct {
 	st                 *store.Store
+	rep                replication.Replicator
+	rt                 replication.Router
 	autoCreate         bool
 	defaultQueues      uint32
 	defaultMaxAttempts int32
@@ -106,16 +113,31 @@ type Meta struct {
 
 // New 构造并从 store 加载全部已有配置。
 // defaultMaxAttempts<=0 时使用 DefaultMaxAttempts（防御配置层漏校验）。
-func New(st *store.Store, autoCreate bool, defaultQueues uint32, defaultMaxAttempts int32, logger *slog.Logger) (*Meta, error) {
+//
+// rep/rt 为复制抽象与组路由视图：单机档传 replication.NewStandalone(st)
+// 与 StandaloneRouter{}，集群档由 main 装配。
+func New(rep replication.Replicator, rt replication.Router, st *store.Store,
+	autoCreate bool, defaultQueues uint32, defaultMaxAttempts int32, logger *slog.Logger) (*Meta, error) {
 	if defaultMaxAttempts <= 0 {
 		defaultMaxAttempts = DefaultMaxAttempts
 	}
 	m := &Meta{
-		st: st, autoCreate: autoCreate, defaultQueues: defaultQueues, defaultMaxAttempts: defaultMaxAttempts,
+		st: st, rep: rep, rt: rt, autoCreate: autoCreate, defaultQueues: defaultQueues, defaultMaxAttempts: defaultMaxAttempts,
 		logger: logger.With("mod", "meta"),
-		topics: map[string]TopicConfig{}, groups: map[string]GroupConfig{},
 	}
-	err := st.Scan([]byte(store.TopicMetaPrefix), store.PrefixUpperBound([]byte(store.TopicMetaPrefix)), 0,
+	if err := m.loadLocked(); err != nil {
+		return nil, err
+	}
+	m.logger.Info("meta 加载完成", "topics", len(m.topics), "groups", len(m.groups))
+	return m, nil
+}
+
+// loadLocked 从 store 全量重读 topic/group 配置重建两个缓存 map。
+// 调用方必须已持有写锁（New 未发布对象除外）；先重置再扫描，保证
+// Reload 后残留的已删条目不残留。
+func (m *Meta) loadLocked() error {
+	m.topics = map[string]TopicConfig{}
+	err := m.st.Scan([]byte(store.TopicMetaPrefix), store.PrefixUpperBound([]byte(store.TopicMetaPrefix)), 0,
 		func(k, v []byte) (bool, error) {
 			var tc TopicConfig
 			if err := json.Unmarshal(v, &tc); err != nil {
@@ -125,9 +147,10 @@ func New(st *store.Store, autoCreate bool, defaultQueues uint32, defaultMaxAttem
 			return true, nil
 		})
 	if err != nil {
-		return nil, err
+		return err
 	}
-	err = st.Scan([]byte(store.GroupMetaPrefix), store.PrefixUpperBound([]byte(store.GroupMetaPrefix)), 0,
+	m.groups = map[string]GroupConfig{}
+	err = m.st.Scan([]byte(store.GroupMetaPrefix), store.PrefixUpperBound([]byte(store.GroupMetaPrefix)), 0,
 		func(k, v []byte) (bool, error) {
 			var gc GroupConfig
 			if err := json.Unmarshal(v, &gc); err != nil {
@@ -137,10 +160,24 @@ func New(st *store.Store, autoCreate bool, defaultQueues uint32, defaultMaxAttem
 			return true, nil
 		})
 	if err != nil {
-		return nil, err
+		return err
 	}
-	m.logger.Info("meta 加载完成", "topics", len(m.topics), "groups", len(m.groups))
-	return m, nil
+	return nil
+}
+
+// Reload 丢弃内存缓存并从 store 全量重读（集群档 follower 的
+// OnApplied 钩子触发；单机档无跨节点写，正常不会用到）。
+//
+// 写锁期间读请求阻塞：注册表读多写少、全量重读只在配置写批次
+// 落盘后发生一次，频率极低，可接受的短暂阻塞。
+func (m *Meta) Reload() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if err := m.loadLocked(); err != nil {
+		return err
+	}
+	m.logger.Info("meta 缓存已重载", "topics", len(m.topics), "groups", len(m.groups))
+	return nil
 }
 
 // GetTopic 查询 topic 配置。
@@ -153,7 +190,7 @@ func (m *Meta) GetTopic(name string) (TopicConfig, bool) {
 
 // EnsureTopic 获取 topic；不存在且开启自动创建时按默认队列数创建。
 // 名字合法性校验优先于其他逻辑，确保无效名字返回 ErrBadName 而非 ErrTopicNotFound。
-func (m *Meta) EnsureTopic(name string) (TopicConfig, error) {
+func (m *Meta) EnsureTopic(ctx context.Context, name string) (TopicConfig, error) {
 	if err := ValidateName(name); err != nil {
 		return TopicConfig{}, err
 	}
@@ -163,11 +200,11 @@ func (m *Meta) EnsureTopic(name string) (TopicConfig, error) {
 	if !m.autoCreate {
 		return TopicConfig{}, fmt.Errorf("%w: %s", ErrTopicNotFound, name)
 	}
-	return m.CreateTopic(name, m.defaultQueues)
+	return m.CreateTopic(ctx, name, m.defaultQueues)
 }
 
 // CreateTopic 创建 topic；已存在时幂等返回现有配置（不改队列数）。
-func (m *Meta) CreateTopic(name string, queues uint32) (TopicConfig, error) {
+func (m *Meta) CreateTopic(ctx context.Context, name string, queues uint32) (TopicConfig, error) {
 	if err := ValidateName(name); err != nil {
 		return TopicConfig{}, err
 	}
@@ -183,7 +220,9 @@ func (m *Meta) CreateTopic(name string, queues uint32) (TopicConfig, error) {
 	raw, _ := json.Marshal(tc)
 	b := m.st.NewBatch()
 	b.Set(store.TopicMetaKey(name), raw)
-	if err := m.st.Apply(b); err != nil {
+	// 经 Replicator 提交：leader 路径落盘成功后更新内存缓存即时可见；
+	// follower 的盲 apply 不碰缓存，靠 OnApplied→Reload（装配见 main）
+	if err := m.rep.Apply(ctx, m.rt.MetaGroup(), b); err != nil {
 		return TopicConfig{}, fmt.Errorf("持久化 topic %s: %w", name, err)
 	}
 	m.topics[name] = tc
@@ -192,7 +231,7 @@ func (m *Meta) CreateTopic(name string, queues uint32) (TopicConfig, error) {
 }
 
 // EnsureGroup 获取订阅组，不存在则注册（消费组首次出现即注册，不受 autoCreate 开关限制）。
-func (m *Meta) EnsureGroup(name string) (GroupConfig, error) {
+func (m *Meta) EnsureGroup(ctx context.Context, name string) (GroupConfig, error) {
 	m.mu.RLock()
 	gc, ok := m.groups[name]
 	m.mu.RUnlock()
@@ -211,7 +250,7 @@ func (m *Meta) EnsureGroup(name string) (GroupConfig, error) {
 	raw, _ := json.Marshal(gc)
 	b := m.st.NewBatch()
 	b.Set(store.GroupMetaKey(name), raw)
-	if err := m.st.Apply(b); err != nil {
+	if err := m.rep.Apply(ctx, m.rt.MetaGroup(), b); err != nil {
 		return GroupConfig{}, fmt.Errorf("持久化 group %s: %w", name, err)
 	}
 	m.groups[name] = gc
@@ -251,7 +290,7 @@ func (m *Meta) Groups() []GroupConfig {
 
 // UpdateTopicRetention 修改 topic 保留时长并持久化。retentionMs 必须 >0：
 // 0 在 TopicConfig 里是"M1 旧数据回退默认"的哨兵值，允许写入会让两种语义混淆。
-func (m *Meta) UpdateTopicRetention(name string, retentionMs int64) (TopicConfig, error) {
+func (m *Meta) UpdateTopicRetention(ctx context.Context, name string, retentionMs int64) (TopicConfig, error) {
 	if retentionMs <= 0 {
 		return TopicConfig{}, fmt.Errorf("retention_ms 必须 >0，得到 %d", retentionMs)
 	}
@@ -265,7 +304,7 @@ func (m *Meta) UpdateTopicRetention(name string, retentionMs int64) (TopicConfig
 	raw, _ := json.Marshal(tc)
 	b := m.st.NewBatch()
 	b.Set(store.TopicMetaKey(name), raw)
-	if err := m.st.Apply(b); err != nil {
+	if err := m.rep.Apply(ctx, m.rt.MetaGroup(), b); err != nil {
 		return TopicConfig{}, fmt.Errorf("持久化 topic %s: %w", name, err)
 	}
 	m.topics[name] = tc
@@ -276,7 +315,7 @@ func (m *Meta) UpdateTopicRetention(name string, retentionMs int64) (TopicConfig
 // DeleteTopic 删除 topic 注册表条目。只删注册表——msg/keyidx/alloc 等数据清理
 // 是 adminops.PurgeTopicData 的职责（本包边界：不管队列内容）。不存在返回
 // ErrTopicNotFound，让 Admin API 能区分 404 与 500。
-func (m *Meta) DeleteTopic(name string) error {
+func (m *Meta) DeleteTopic(ctx context.Context, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.topics[name]; !ok {
@@ -284,7 +323,7 @@ func (m *Meta) DeleteTopic(name string) error {
 	}
 	b := m.st.NewBatch()
 	b.Delete(store.TopicMetaKey(name))
-	if err := m.st.Apply(b); err != nil {
+	if err := m.rep.Apply(ctx, m.rt.MetaGroup(), b); err != nil {
 		return fmt.Errorf("删除 topic %s: %w", name, err)
 	}
 	delete(m.topics, name)
@@ -293,7 +332,7 @@ func (m *Meta) DeleteTopic(name string) error {
 }
 
 // DeleteGroup 删除订阅组注册表条目（cursor/inflight 清理归 adminops.PurgeGroupData）。
-func (m *Meta) DeleteGroup(name string) error {
+func (m *Meta) DeleteGroup(ctx context.Context, name string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if _, ok := m.groups[name]; !ok {
@@ -301,7 +340,7 @@ func (m *Meta) DeleteGroup(name string) error {
 	}
 	b := m.st.NewBatch()
 	b.Delete(store.GroupMetaKey(name))
-	if err := m.st.Apply(b); err != nil {
+	if err := m.rep.Apply(ctx, m.rt.MetaGroup(), b); err != nil {
 		return fmt.Errorf("删除 group %s: %w", name, err)
 	}
 	delete(m.groups, name)

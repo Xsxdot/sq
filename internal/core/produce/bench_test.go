@@ -11,12 +11,14 @@
 package produce
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
 	"testing"
 
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -27,7 +29,7 @@ import (
 func BenchmarkAppendParallel(b *testing.B) {
 	// fixture 照 newTestProducer（produce_test.go:25）改造：*testing.B、
 	// store.Open(dir, true /*syncWrites——基准量的就是 fsync 合并*/, ...)、
-	// meta.New(st, true, 16 /*16 队列，给并发留出跨队列并行度*/, 16, ...)
+	// meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 16 /*16 队列，给并发留出跨队列并行度*/, 16, ...)
 	p, _ := newBenchProducer(b, b.TempDir())
 	// 固定 62B 载荷（命名如实标注），不随改锁调整，保证 Task 8 A/B 对比公平。
 	body := []byte("benchmark-payload-62B.........................................")
@@ -35,7 +37,7 @@ func BenchmarkAppendParallel(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			m := &core.Message{Topic: "t-bench", Body: body}
-			if _, err := p.Append(m); err != nil {
+			if _, err := p.Append(context.Background(), m); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -51,11 +53,11 @@ func newBenchProducer(b *testing.B, dir string) (*Producer, *store.Store) {
 		b.Fatalf("store: %v", err)
 	}
 	b.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 16, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 16, 16, slog.Default())
 	if err != nil {
 		b.Fatalf("meta: %v", err)
 	}
-	return New(st, mt, slog.Default()), st
+	return New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default()), st
 }
 
 // BenchmarkAppendQueueSweep 固定并发（由 -cpu/GOMAXPROCS 决定）只变队列数，
@@ -70,15 +72,15 @@ func BenchmarkAppendQueueSweep(b *testing.B) {
 				b.Fatalf("store: %v", err)
 			}
 			b.Cleanup(func() { st.Close() })
-			mt, err := meta.New(st, true, queues, 16, slog.Default())
+			mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, queues, 16, slog.Default())
 			if err != nil {
 				b.Fatalf("meta: %v", err)
 			}
-			p := New(st, mt, slog.Default())
+			p := New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 			b.ResetTimer()
 			b.RunParallel(func(pb *testing.PB) {
 				for pb.Next() {
-					if _, err := p.Append(&core.Message{Topic: "t-sweep", Body: body}); err != nil {
+					if _, err := p.Append(context.Background(), &core.Message{Topic: "t-sweep", Body: body}); err != nil {
 						b.Fatal(err)
 					}
 				}
@@ -99,7 +101,7 @@ func BenchmarkAppendBatch32(b *testing.B) {
 			for i := range msgs {
 				msgs[i] = &core.Message{Topic: "t-batch", Body: body}
 			}
-			if _, err := p.AppendBatch(msgs); err != nil {
+			if _, err := p.AppendBatch(context.Background(), msgs); err != nil {
 				b.Fatal(err)
 			}
 		}

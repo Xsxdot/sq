@@ -12,6 +12,7 @@ import (
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -29,11 +30,11 @@ func newFixture(t *testing.T, interval time.Duration, maxChecks int) *fixture {
 		t.Fatalf("store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 1, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
-	pr := produce.New(st, mt, slog.Default())
+	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
 	return &fixture{st: st, pr: pr, dl: dl, mgr: New(st, pr, mt, interval, maxChecks, slog.Default())}
 }
@@ -68,7 +69,7 @@ func msg(topic string) *core.Message {
 
 func TestStageWritesHalfAndIdxAtomically(t *testing.T) {
 	f := newFixture(t, 30*time.Second, 15)
-	m, txID, err := f.mgr.Stage(msg("t-txn"))
+	m, txID, err := f.mgr.Stage(context.Background(), msg("t-txn"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -92,8 +93,8 @@ func TestStageWritesHalfAndIdxAtomically(t *testing.T) {
 
 func TestCommitMovesToMsgAndCleansHalf(t *testing.T) {
 	f := newFixture(t, 30*time.Second, 15)
-	_, txID, _ := f.mgr.Stage(msg("t-txn"))
-	found, err := f.mgr.End(txID, true)
+	_, txID, _ := f.mgr.Stage(context.Background(), msg("t-txn"))
+	found, err := f.mgr.End(context.Background(), txID, true)
 	if err != nil || !found {
 		t.Fatalf("End(commit): found=%v err=%v", found, err)
 	}
@@ -112,8 +113,8 @@ func TestCommitMovesToMsgAndCleansHalf(t *testing.T) {
 
 func TestRollbackDeletesEverything(t *testing.T) {
 	f := newFixture(t, 30*time.Second, 15)
-	_, txID, _ := f.mgr.Stage(msg("t-txn"))
-	found, err := f.mgr.End(txID, false)
+	_, txID, _ := f.mgr.Stage(context.Background(), msg("t-txn"))
+	found, err := f.mgr.End(context.Background(), txID, false)
 	if err != nil || !found {
 		t.Fatalf("End(rollback): found=%v err=%v", found, err)
 	}
@@ -128,7 +129,7 @@ func TestRollbackDeletesEverything(t *testing.T) {
 
 func TestEndUnknownTxIDIsIdempotent(t *testing.T) {
 	f := newFixture(t, 30*time.Second, 15)
-	found, err := f.mgr.End("NO-SUCH-TX", true)
+	found, err := f.mgr.End(context.Background(), "NO-SUCH-TX", true)
 	if err != nil {
 		t.Fatalf("未知 txID 不该报错（幂等）: %v", err)
 	}
@@ -139,9 +140,9 @@ func TestEndUnknownTxIDIsIdempotent(t *testing.T) {
 
 func TestEndTwiceSecondIsNoop(t *testing.T) {
 	f := newFixture(t, 30*time.Second, 15)
-	_, txID, _ := f.mgr.Stage(msg("t-txn"))
-	f.mgr.End(txID, true)
-	found, err := f.mgr.End(txID, true) // SDK 网络重试会走到这里
+	_, txID, _ := f.mgr.Stage(context.Background(), msg("t-txn"))
+	f.mgr.End(context.Background(), txID, true)
+	found, err := f.mgr.End(context.Background(), txID, true) // SDK 网络重试会走到这里
 	if err != nil || found {
 		t.Fatalf("重复 commit 应为幂等 no-op: found=%v err=%v", found, err)
 	}
@@ -158,11 +159,11 @@ func TestEndTwiceSecondIsNoop(t *testing.T) {
 // 已决断）保证重放终止：第二段落盘后，一切再次 EndTransaction 均为幂等 no-op。
 func TestTxnCommitRedelivers(t *testing.T) {
 	f := newFixture(t, 30*time.Second, 15)
-	_, txID, _ := f.mgr.Stage(msg("t-txn"))
+	_, txID, _ := f.mgr.Stage(context.Background(), msg("t-txn"))
 	f.mgr.afterAppendHook = func() { panic("simulated crash between phases") }
 	func() {
 		defer func() { recover() }()
-		f.mgr.End(txID, true)
+		f.mgr.End(context.Background(), txID, true)
 	}()
 	// 崩溃后：消息已入队（1 条），half 两键仍在
 	if n := f.msgCount(t); n != 1 {
@@ -173,7 +174,7 @@ func TestTxnCommitRedelivers(t *testing.T) {
 	}
 	// 重放 End：halfidx 仍在 → 重新提交 → 重复消息，两键清空
 	f.mgr.afterAppendHook = nil
-	found, err := f.mgr.End(txID, true)
+	found, err := f.mgr.End(context.Background(), txID, true)
 	if err != nil || !found {
 		t.Fatalf("重放 End(commit): found=%v err=%v", found, err)
 	}
@@ -184,7 +185,7 @@ func TestTxnCommitRedelivers(t *testing.T) {
 		t.Fatalf("重放后 half 应清空: %d", f.halfCount(t))
 	}
 	// 第二段落盘后：再次 End 为幂等 no-op（既有先读后删判定的保护）
-	found, err = f.mgr.End(txID, true)
+	found, err = f.mgr.End(context.Background(), txID, true)
 	if err != nil || found {
 		t.Fatalf("决断完成后的重复 End 应为幂等 no-op: found=%v err=%v", found, err)
 	}
@@ -198,7 +199,7 @@ func TestEndConcurrentDistinctTx(t *testing.T) {
 	const n = 16
 	txIDs := make([]string, n)
 	for i := 0; i < n; i++ {
-		_, txID, err := f.mgr.Stage(&core.Message{Topic: "tx-cc", Body: []byte("x")})
+		_, txID, err := f.mgr.Stage(context.Background(), &core.Message{Topic: "tx-cc", Body: []byte("x")})
 		if err != nil {
 			t.Fatalf("Stage: %v", err)
 		}
@@ -209,7 +210,7 @@ func TestEndConcurrentDistinctTx(t *testing.T) {
 		wg.Add(1)
 		go func(id string) {
 			defer wg.Done()
-			found, err := f.mgr.End(id, true)
+			found, err := f.mgr.End(context.Background(), id, true)
 			if err != nil || !found {
 				t.Errorf("End(%s): found=%v err=%v", id, found, err)
 			}

@@ -23,6 +23,7 @@ import (
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -55,11 +56,11 @@ func TestSoakE2E(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 	defer st.Close()
-	mt, err := meta.New(st, true, 16, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 16, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
-	pr := produce.New(st, mt, slog.Default())
+	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 	dl := New(st, mt, pr, slog.Default())
 	logger := slog.Default().With("mod", "soak-e2e")
 	logger.Info("soak-e2e 开始", "duration", dur.String(), "dir", dir,
@@ -81,7 +82,7 @@ func TestSoakE2E(t *testing.T) {
 					return
 				default:
 				}
-				if _, err := pr.Append(&core.Message{Topic: "t-soak-e2e", Body: body}); err != nil {
+				if _, err := pr.Append(context.Background(), &core.Message{Topic: "t-soak-e2e", Body: body}); err != nil {
 					t.Errorf("Append: %v", err)
 					return
 				}

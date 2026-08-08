@@ -40,7 +40,7 @@ func (s *Server) EndTransaction(ctx context.Context, req *pb.EndTransactionReque
 		return &pb.EndTransactionResponse{Status: errStatus(pb.Code_BAD_REQUEST,
 			"resolution 必须为 COMMIT 或 ROLLBACK")}, nil
 	}
-	found, err := s.tx.End(txID, commit)
+	found, err := s.tx.End(ctx, txID, commit)
 	if err != nil {
 		s.logger.Error("EndTransaction 失败", "tx_id", txID,
 			"msg_id", req.GetMessageId(), "topic", req.GetTopic().GetName(),

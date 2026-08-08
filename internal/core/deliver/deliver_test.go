@@ -37,6 +37,7 @@ import (
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -58,24 +59,24 @@ func newFixtureMaxAttempts(t *testing.T, maxAttempts int32) *fixture {
 		t.Fatalf("store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, maxAttempts, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 1, maxAttempts, slog.Default())
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
-	pr := produce.New(st, mt, slog.Default())
+	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 	return &fixture{st: st, pr: pr, dl: New(st, mt, pr, slog.Default())}
 }
 
 func (f *fixture) send(t *testing.T, topic, body string) {
 	t.Helper()
-	if _, err := f.pr.Append(&core.Message{Topic: topic, Body: []byte(body)}); err != nil {
+	if _, err := f.pr.Append(context.Background(), &core.Message{Topic: topic, Body: []byte(body)}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 }
 
 func (f *fixture) sendTagged(t *testing.T, topic, body, tag string) {
 	t.Helper()
-	if _, err := f.pr.Append(&core.Message{Topic: topic, Body: []byte(body), Tag: tag}); err != nil {
+	if _, err := f.pr.Append(context.Background(), &core.Message{Topic: topic, Body: []byte(body), Tag: tag}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 }
@@ -83,7 +84,7 @@ func (f *fixture) sendTagged(t *testing.T, topic, body, tag string) {
 // sendGrouped 发送一条顺序消息（MessageGroup 非空，M4 顺序锁用例专用辅助）
 func (f *fixture) sendGrouped(t *testing.T, topic, body, group string) {
 	t.Helper()
-	if _, err := f.pr.Append(&core.Message{Topic: topic, Body: []byte(body), MessageGroup: group}); err != nil {
+	if _, err := f.pr.Append(context.Background(), &core.Message{Topic: topic, Body: []byte(body), MessageGroup: group}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 }
@@ -679,13 +680,13 @@ func TestMixedQueueHeadOfLineBlocking(t *testing.T) {
 // 不会被锁拦成永久堵塞
 func TestOrderedTagFilteredStillSkipped(t *testing.T) {
 	f := newFixture(t)
-	if _, err := f.pr.Append(&core.Message{Topic: "t", Body: []byte("a"), MessageGroup: "g1", Tag: "keep"}); err != nil {
+	if _, err := f.pr.Append(context.Background(), &core.Message{Topic: "t", Body: []byte("a"), MessageGroup: "g1", Tag: "keep"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.pr.Append(&core.Message{Topic: "t", Body: []byte("b"), MessageGroup: "g1", Tag: "drop"}); err != nil {
+	if _, err := f.pr.Append(context.Background(), &core.Message{Topic: "t", Body: []byte("b"), MessageGroup: "g1", Tag: "drop"}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := f.pr.Append(&core.Message{Topic: "t", Body: []byte("c"), MessageGroup: "g1", Tag: "keep"}); err != nil {
+	if _, err := f.pr.Append(context.Background(), &core.Message{Topic: "t", Body: []byte("c"), MessageGroup: "g1", Tag: "keep"}); err != nil {
 		t.Fatal(err)
 	}
 	filter, err := ParseTagFilter("keep")
@@ -726,7 +727,7 @@ func TestForwardToDLQHappyPathUnblocksOrdered(t *testing.T) {
 	if err != nil || len(msgs) != 1 {
 		t.Fatalf("首投: %d %v", len(msgs), err)
 	}
-	ok, err := f.dl.ForwardToDLQ("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt)
+	ok, err := f.dl.ForwardToDLQ(context.Background(), "g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt)
 	if err != nil || !ok {
 		t.Fatalf("ForwardToDLQ: %v %v", ok, err)
 	}
@@ -748,10 +749,10 @@ func TestForwardToDLQStaleHandle(t *testing.T) {
 	f := newFixture(t)
 	f.sendGrouped(t, "t", "a", "g1")
 	msgs, _ := f.dl.Receive(context.Background(), "g", "t", 0, 1, time.Minute, 0, nil)
-	if ok, err := f.dl.ForwardToDLQ("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt+1); ok || err != nil {
+	if ok, err := f.dl.ForwardToDLQ(context.Background(), "g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt+1); ok || err != nil {
 		t.Fatalf("attempt 不匹配应幂等拒绝: %v %v", ok, err)
 	}
-	if ok, err := f.dl.ForwardToDLQ("g", "t", 0, 999, 1); ok || err != nil {
+	if ok, err := f.dl.ForwardToDLQ(context.Background(), "g", "t", 0, 999, 1); ok || err != nil {
 		t.Fatalf("不存在的 offset 应幂等拒绝: %v %v", ok, err)
 	}
 	// 原 inflight 未被误删：a 仍可 ack
@@ -778,7 +779,7 @@ func TestDLQMoveRedelivers(t *testing.T) {
 	f.dl.afterAppendHook = func() { panic("simulated crash between phases") }
 	func() {
 		defer func() { recover() }()
-		f.dl.ForwardToDLQ("g", "t", 0, off, att)
+		f.dl.ForwardToDLQ(context.Background(), "g", "t", 0, off, att)
 	}()
 	// 崩溃后：死信已有 1 条，源 inflight 仍在
 	dlqTopic := meta.DLQTopicName("g")
@@ -790,7 +791,7 @@ func TestDLQMoveRedelivers(t *testing.T) {
 	}
 	// 重放 ForwardToDLQ：attempt 匹配 → 再次转入 → 死信 2 条、inflight 清空
 	f.dl.afterAppendHook = nil
-	ok, err := f.dl.ForwardToDLQ("g", "t", 0, off, att)
+	ok, err := f.dl.ForwardToDLQ(context.Background(), "g", "t", 0, off, att)
 	if err != nil || !ok {
 		t.Fatalf("重放 ForwardToDLQ: ok=%v err=%v", ok, err)
 	}

@@ -2,12 +2,14 @@
 package query
 
 import (
+	"context"
 	"log/slog"
 	"testing"
 
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -18,21 +20,21 @@ func newFixture(t *testing.T) (*store.Store, *produce.Producer) {
 		t.Fatalf("store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 1, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
-	return st, produce.New(st, mt, slog.Default())
+	return st, produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 }
 
 func TestByKeyFindsMessages(t *testing.T) {
 	st, pr := newFixture(t)
 	for _, body := range []string{"a", "b", "c"} {
-		if _, err := pr.Append(&core.Message{Topic: "t", Body: []byte(body), Keys: []string{"oid"}}); err != nil {
+		if _, err := pr.Append(context.Background(), &core.Message{Topic: "t", Body: []byte(body), Keys: []string{"oid"}}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	pr.Append(&core.Message{Topic: "t", Body: []byte("other"), Keys: []string{"other-key"}})
+	pr.Append(context.Background(), &core.Message{Topic: "t", Body: []byte("other"), Keys: []string{"other-key"}})
 
 	msgs, err := ByKey(st, "t", "oid", 0)
 	if err != nil || len(msgs) != 3 {
@@ -49,7 +51,7 @@ func TestByKeyFindsMessages(t *testing.T) {
 func TestBrowse(t *testing.T) {
 	st, pr := newFixture(t)
 	for i := 0; i < 5; i++ {
-		if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte{byte('0' + i)}}); err != nil {
+		if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte{byte('0' + i)}}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -69,9 +71,9 @@ func TestBrowse(t *testing.T) {
 // TestByKeyNoPrefixCollision 查 "oid" 不得混入 "oid2" 与 "oid/x" 的消息。
 func TestByKeyNoPrefixCollision(t *testing.T) {
 	st, pr := newFixture(t)
-	pr.Append(&core.Message{Topic: "t", Body: []byte("hit"), Keys: []string{"oid"}})
-	pr.Append(&core.Message{Topic: "t", Body: []byte("miss1"), Keys: []string{"oid2"}})
-	pr.Append(&core.Message{Topic: "t", Body: []byte("miss2"), Keys: []string{"oid/x"}})
+	pr.Append(context.Background(), &core.Message{Topic: "t", Body: []byte("hit"), Keys: []string{"oid"}})
+	pr.Append(context.Background(), &core.Message{Topic: "t", Body: []byte("miss1"), Keys: []string{"oid2"}})
+	pr.Append(context.Background(), &core.Message{Topic: "t", Body: []byte("miss2"), Keys: []string{"oid/x"}})
 	msgs, err := ByKey(st, "t", "oid", 0)
 	if err != nil || len(msgs) != 1 || string(msgs[0].Body) != "hit" {
 		t.Fatalf("ByKey 精确性: %d %v", len(msgs), err)
@@ -81,7 +83,7 @@ func TestByKeyNoPrefixCollision(t *testing.T) {
 // TestByKeySkipsPurgedMessage retention 清走消息但索引未清（清理竞态）时跳过不报错。
 func TestByKeySkipsPurgedMessage(t *testing.T) {
 	st, pr := newFixture(t)
-	m, _ := pr.Append(&core.Message{Topic: "t", Body: []byte("x"), Keys: []string{"k"}})
+	m, _ := pr.Append(context.Background(), &core.Message{Topic: "t", Body: []byte("x"), Keys: []string{"k"}})
 	b := st.NewBatch()
 	b.Delete(store.MsgKey("t", m.QueueID, m.Offset))
 	if err := st.Apply(b); err != nil {

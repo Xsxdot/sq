@@ -11,6 +11,7 @@
 package produce
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"sync"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -51,11 +53,11 @@ func TestSoak(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 	defer st.Close()
-	mt, err := meta.New(st, true, 16, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 16, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
-	p := New(st, mt, slog.Default())
+	p := New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 	logger := slog.Default().With("mod", "soak")
 	logger.Info("soak 开始", "duration", dur.String(), "dir", dir, "queues", 16, "workers", 64)
 
@@ -73,7 +75,7 @@ func TestSoak(t *testing.T) {
 					return
 				default:
 				}
-				if _, err := p.Append(&core.Message{Topic: "t-soak", Body: body}); err != nil {
+				if _, err := p.Append(context.Background(), &core.Message{Topic: "t-soak", Body: body}); err != nil {
 					t.Errorf("Append: %v", err)
 					return
 				}

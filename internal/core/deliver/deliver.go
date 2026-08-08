@@ -124,7 +124,7 @@ func (d *Deliverer) lockQueue(group, topic string, q uint32) *sync.Mutex {
 // filter 非 nil 时只投 tag 命中的新消息：不匹配的跳过并推进本组位点，
 // 不投递、不占 inflight（对该组永久跳过）。阶段 1 的过期重投不重新过滤。
 func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible, wait time.Duration, filter *TagFilter) ([]*core.Message, error) {
-	gc, err := d.mt.EnsureGroup(group)
+	gc, err := d.mt.EnsureGroup(ctx, group)
 	if err != nil {
 		return nil, err
 	}
@@ -134,7 +134,7 @@ func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID ui
 		// 这个窗口期内的写入会错过 close 广播，导致长轮询白等到超时——
 		// 订阅在前，即便取件与写入之间发生竞态，wakeCh 也一定能收到这次唤醒。
 		wakeCh := d.pr.Subscribe(topic)
-		msgs, err := d.receiveOnce(group, topic, queueID, maxMsgs, invisible, gc.EffectiveMaxAttempts(), filter)
+		msgs, err := d.receiveOnce(ctx, group, topic, queueID, maxMsgs, invisible, gc.EffectiveMaxAttempts(), filter)
 		if err != nil || len(msgs) > 0 {
 			return msgs, err
 		}
@@ -163,10 +163,10 @@ func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID ui
 // 它的 inflight 兜底记录必然已持久化，崩溃后该消息仍会被重投而不是丢失）。
 // 解锁后同队列的下一次取件/确认立即可进锁定序，与本批共享同一次 fsync——
 // 队列内 group commit 在消费路径生效的机制，与 produce 侧完全同款。
-func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter *TagFilter) ([]*core.Message, error) {
+func (d *Deliverer) receiveOnce(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter *TagFilter) ([]*core.Message, error) {
 	qlock := d.lockQueue(group, topic, queueID)
 	qlock.Lock()
-	out, pending, applied, err := d.receiveOnceLocked(group, topic, queueID, maxMsgs, invisible, maxAttempts, filter)
+	out, pending, applied, err := d.receiveOnceLocked(ctx, group, topic, queueID, maxMsgs, invisible, maxAttempts, filter)
 	qlock.Unlock()
 	if err != nil || !applied {
 		return out, err
@@ -183,7 +183,7 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 //
 // 返回：(消息, pending, applied, error)。applied=false 表示本轮无暂存写入
 // （批次已 Close 回收），pending 为零值，调用方无需 Wait。
-func (d *Deliverer) receiveOnceLocked(group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter *TagFilter) ([]*core.Message, store.Pending, bool, error) {
+func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter *TagFilter) ([]*core.Message, store.Pending, bool, error) {
 	now := time.Now().UnixMilli()
 	expireAt := now + invisible.Milliseconds()
 	var out []*core.Message
@@ -262,7 +262,7 @@ func (d *Deliverer) receiveOnceLocked(group, topic string, queueID uint32, maxMs
 		// 锁语义没有破坏：本方法已持队列锁，Append 拿的是 produce 自己的锁，
 		// 两把锁全程单向（deliver → produce），无环即无死锁。
 		if r.attempts >= maxAttempts {
-			if err := d.moveToDLQ(group, topic, queueID, r.offset, m, r.attempts, "投递次数耗尽（未在不可见期内 ack）"); err != nil {
+			if err := d.moveToDLQ(ctx, group, topic, queueID, r.offset, m, r.attempts, "投递次数耗尽（未在不可见期内 ack）"); err != nil {
 				b.Close()
 				return nil, store.Pending{}, false, err
 			}
@@ -574,7 +574,7 @@ func (d *Deliverer) changeInvisibleLocked(group, topic string, queueID uint32, o
 // 返回：(true, nil) 已转入（或目标消息已被 retention 清理、孤儿 inflight 已
 // 清除——调用方要的"这条消息别再投了"两种情况下都已成立）；(false, nil)
 // 目标不存在或句柄陈旧；错误仅在存储故障时返回。
-func (d *Deliverer) ForwardToDLQ(group, topic string, queueID uint32, offset uint64, attempt int32) (bool, error) {
+func (d *Deliverer) ForwardToDLQ(ctx context.Context, group, topic string, queueID uint32, offset uint64, attempt int32) (bool, error) {
 	// 与 Ack/ChangeInvisible 同理：直接读写 inflight 必须持队列锁（类型注释
 	// 声明的并发安全前提），否则与过期重投的读-改-写交错
 	qlock := d.lockQueue(group, topic, queueID)
@@ -621,7 +621,7 @@ func (d *Deliverer) ForwardToDLQ(group, topic string, queueID uint32, offset uin
 	}
 	// moveToDLQ 内部：两段式转入（先写死信、后删源 inflight），并打 Info 日志。
 	// attempts/reason 写进死信属性，供控制台回答「试了几次、为什么进来」。
-	if err := d.moveToDLQ(group, topic, queueID, offset, m, attempt, "客户端显式转入死信"); err != nil {
+	if err := d.moveToDLQ(ctx, group, topic, queueID, offset, m, attempt, "客户端显式转入死信"); err != nil {
 		return false, err
 	}
 	return true, nil
@@ -634,11 +634,11 @@ func (d *Deliverer) ForwardToDLQ(group, topic string, queueID uint32, offset uin
 // 投递次数与转入原因（sq-dlq-attempts/sq-dlq-reason）——控制台的死信列表
 // 要回答的第一个问题就是「试了几次、为什么进来的」，事后从日志里翻这两项
 // 成本远高于当场写进属性；MessageGroup 置空——死信不再参与顺序语义。
-func (d *Deliverer) moveToDLQ(group, topic string, queueID uint32, offset uint64,
+func (d *Deliverer) moveToDLQ(ctx context.Context, group, topic string, queueID uint32, offset uint64,
 	m *core.Message, attempts int32, reason string) error {
 	dlqTopic := meta.DLQTopicName(group)
 	// 死信 topic 固定 1 队列：量小、顺序无关、控制台浏览简单。CreateTopic 幂等。
-	if _, err := d.mt.CreateTopic(dlqTopic, 1); err != nil {
+	if _, err := d.mt.CreateTopic(ctx, dlqTopic, 1); err != nil {
 		return fmt.Errorf("创建 DLQ topic %s: %w", dlqTopic, err)
 	}
 	props := make(map[string]string, len(m.Properties)+5) // +3 来源坐标 +2 投递次数与原因
@@ -659,7 +659,7 @@ func (d *Deliverer) moveToDLQ(group, topic string, queueID uint32, offset uint64
 	// 先写后删；崩溃窗口（死信落盘后、inflight 删除前）重放 = 重复死信条目，
 	// at-least-once 语义内——重投扫描会再次把超限消息转入，死信区出现两条
 	// 同 ID 条目，死信消费端按消息 ID 幂等即可。次序不得反转（反转 = 丢失）。
-	if _, err := d.pr.Append(dlq); err != nil {
+	if _, err := d.pr.Append(ctx, dlq); err != nil {
 		return fmt.Errorf("消息转入 DLQ (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 	}
 	if d.afterAppendHook != nil {

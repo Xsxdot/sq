@@ -62,7 +62,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 	t := time.NewTicker(scanInterval)
 	defer t.Stop()
 	for {
-		moved, err := s.Pass()
+		moved, err := s.Pass(ctx)
 		if err != nil {
 			// 单趟失败只记日志不退出：store 瞬时故障恢复后下一趟自然重试，
 			// 头部条目还在原地（移入失败不会删除条目）
@@ -83,7 +83,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 }
 
 // Pass 执行一趟到期搬运，返回移入 msg/ 的条数（被清理的坏条目不计入）。
-func (s *Scheduler) Pass() (int, error) {
+func (s *Scheduler) Pass(ctx context.Context) (int, error) {
 	now := time.Now().UnixMilli()
 	// 先收集后搬运：Scan 回调的 k/v 仅回调期间有效，且回调里不能再开写
 	// 事务（迭代器与写入交错），必须拷贝出来
@@ -120,7 +120,7 @@ func (s *Scheduler) Pass() (int, error) {
 		// 落盘后、第二段前）重放 = 重复投递，at-least-once 语义内——条目残留 =
 		// 下趟重搬 = 目标队列多一条同 ID 消息，消费端按 ID 幂等即可。次序不得
 		// 反转（先删后写 = 崩溃丢消息，绝不允许）。
-		if _, err := s.pr.Append(m); err != nil {
+		if _, err := s.pr.Append(ctx, m); err != nil {
 			// 失败即中断本趟：条目未删除，下一趟从头重扫自然重试
 			return moved, fmt.Errorf("延时消息移入 (msg_id=%s topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
 		}

@@ -81,7 +81,7 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 	// 已禁止批内混入事务/延时/FIFO）；含特殊消息的多条请求走下方逐条回退
 	// 路径，行为与历史版本完全一致。
 	if batchable(msgs) {
-		stored, err := s.pr.AppendBatch(msgs)
+		stored, err := s.pr.AppendBatch(ctx, msgs)
 		if err != nil {
 			s.logger.Warn("SendMessage 批量写入失败", "topic", msgs[0].Topic, "count", len(msgs), "err", err)
 			return &pb.SendMessageResponse{
@@ -118,13 +118,13 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 			// 半消息进暂存区：无队列无 offset（entry.Offset 回 0），
 			// TransactionId 必须回填——SDK 的 transactionImpl 靠它发起
 			// Commit/RollBack，漏了它整个事务 API 在客户端侧无法收尾
-			stored, txID, err = s.tx.Stage(m)
+			stored, txID, err = s.tx.Stage(ctx, m)
 		case m.DeliverAtMs > 0:
 			// 延时消息进暂存区（未分配 offset，entry 里 Offset 回 0——SDK 的
 			// SendReceipt 只消费 MessageId，offset 字段对延时场景无意义）
-			stored, err = s.pr.AppendDelay(m)
+			stored, err = s.pr.AppendDelay(ctx, m)
 		default:
-			stored, err = s.pr.Append(m)
+			stored, err = s.pr.Append(ctx, m)
 		}
 		if err != nil {
 			// Append 内部会调用 meta.EnsureTopic，因此它的失败同样分"客户端输入

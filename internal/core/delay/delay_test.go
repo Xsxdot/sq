@@ -13,6 +13,7 @@ import (
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -30,11 +31,11 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatalf("store: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 1, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
-	pr := produce.New(st, mt, slog.Default())
+	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
 	return &fixture{st: st, pr: pr, dl: dl, sc: New(st, pr, slog.Default())}
 }
@@ -80,7 +81,7 @@ func TestPassMovesDueAndPreservesMessage(t *testing.T) {
 	past := time.Now().Add(-time.Second).UnixMilli()
 	f.putDelay(t, 0, past, &core.Message{ID: "m1", Topic: "t", Body: []byte("hello"),
 		Keys: []string{"k1"}, Tag: "tg", BornAtMs: 123})
-	moved, err := f.sc.Pass()
+	moved, err := f.sc.Pass(context.Background())
 	if err != nil || moved != 1 {
 		t.Fatalf("Pass: moved=%d err=%v", moved, err)
 	}
@@ -118,7 +119,7 @@ func TestDelayMoveRedeliversOnCrashBetweenPhases(t *testing.T) {
 	f.sc.afterAppendHook = func() { panic("simulated crash between phases") }
 	func() {
 		defer func() { recover() }()
-		f.sc.Pass()
+		f.sc.Pass(context.Background())
 	}()
 	// 崩溃后：目标消息已在（第一段已提交），delay 条目也在（第二段未执行）
 	if n := f.delayCount(t); n != 1 {
@@ -129,7 +130,7 @@ func TestDelayMoveRedeliversOnCrashBetweenPhases(t *testing.T) {
 	}
 	// 下一趟完整 Pass：重搬 → 重复消息，条目清空
 	f.sc.afterAppendHook = nil
-	moved, err := f.sc.Pass()
+	moved, err := f.sc.Pass(context.Background())
 	if err != nil || moved != 1 {
 		t.Fatalf("重放 Pass: moved=%d err=%v", moved, err)
 	}
@@ -144,7 +145,7 @@ func TestDelayMoveRedeliversOnCrashBetweenPhases(t *testing.T) {
 func TestPassLeavesNotDueEntries(t *testing.T) {
 	f := newFixture(t)
 	f.putDelay(t, 0, time.Now().Add(time.Hour).UnixMilli(), &core.Message{ID: "m1", Topic: "t", Body: []byte("x")})
-	moved, err := f.sc.Pass()
+	moved, err := f.sc.Pass(context.Background())
 	if err != nil || moved != 0 {
 		t.Fatalf("未到期不应移动: %d %v", moved, err)
 	}
@@ -160,7 +161,7 @@ func TestPassDeletesCorruptEntryInsteadOfWedging(t *testing.T) {
 	if err := f.st.Apply(b); err != nil {
 		t.Fatal(err)
 	}
-	moved, err := f.sc.Pass()
+	moved, err := f.sc.Pass(context.Background())
 	if err != nil || moved != 0 {
 		t.Fatalf("坏条目不算移动也不算错: %d %v", moved, err)
 	}
@@ -179,14 +180,14 @@ func TestPassRespectsBudgetAndDrains(t *testing.T) {
 		f.putDelay(t, i, past, &core.Message{ID: string(rune('a' + i)), Topic: "t", Body: []byte("x")})
 	}
 	// 单趟受预算限制
-	moved, err := f.sc.Pass()
+	moved, err := f.sc.Pass(context.Background())
 	if err != nil || moved != 2 {
 		t.Fatalf("首趟应恰好移动预算数: %d %v", moved, err)
 	}
 	// 连续 Pass 可排空
 	total := moved
 	for total < 5 {
-		n, err := f.sc.Pass()
+		n, err := f.sc.Pass(context.Background())
 		if err != nil || n == 0 {
 			t.Fatalf("排空中断: n=%d total=%d err=%v", n, total, err)
 		}

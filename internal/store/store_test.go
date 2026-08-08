@@ -284,3 +284,21 @@ func TestApplyWithOverridesSync(t *testing.T) {
 		t.Fatal("ApplyWith 提交后应可读")
 	}
 }
+
+// TestBatchTouchesPrefix 验证复制批次字节的键前缀判定：follower 侧盲 apply
+// 前用它判断批次是否触及某键族（如 meta/），是 meta 缓存重载钩子的判定件。
+func TestBatchTouchesPrefix(t *testing.T) {
+	st := openTestStore(t, t.TempDir())
+	defer st.Close()
+	b := st.NewBatch()
+	_ = b.Set([]byte("msg/t/0/1"), []byte("v"))
+	_ = b.Set([]byte("meta/topic/t"), []byte("v"))
+	repr := append([]byte(nil), b.Repr()...)
+	_ = b.Close()
+	if ok, _ := BatchTouchesPrefix(repr, []byte("meta/")); !ok {
+		t.Fatal("应命中 meta/ 前缀")
+	}
+	if ok, _ := BatchTouchesPrefix(repr, []byte("half/")); ok {
+		t.Fatal("不应命中 half/")
+	}
+}

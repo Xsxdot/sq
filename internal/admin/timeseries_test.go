@@ -21,7 +21,7 @@ import (
 func seedConsumption(t *testing.T, pr *produce.Producer, dl *deliver.Deliverer) {
 	t.Helper()
 	for i := 0; i < 3; i++ {
-		if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+		if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
 			t.Fatal(err)
 		}
 	}

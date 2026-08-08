@@ -13,6 +13,7 @@
 package produce
 
 import (
+	"context"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -39,6 +41,8 @@ type queueState struct {
 // Producer 写入引擎。并发安全。
 type Producer struct {
 	st     *store.Store
+	rep    replication.Replicator
+	rt     replication.Router
 	mt     *meta.Meta
 	logger *slog.Logger
 
@@ -58,14 +62,41 @@ type Producer struct {
 }
 
 // New 构造 Producer。offset 缓存懒加载（首写某队列时读一次 alloc/ key）。
-func New(st *store.Store, mt *meta.Meta, logger *slog.Logger) *Producer {
+//
+// rep/rt 为复制抽象与组路由视图：单机档传 replication.NewStandalone(st)
+// 与 StandaloneRouter{}，集群档由 main 装配。
+func New(rep replication.Replicator, rt replication.Router, st *store.Store,
+	mt *meta.Meta, logger *slog.Logger) *Producer {
 	return &Producer{
-		st: st, mt: mt, logger: logger.With("mod", "produce"),
+		st: st, rep: rep, rt: rt, mt: mt, logger: logger.With("mod", "produce"),
 		qstates: map[string]*queueState{}, rr: map[string]uint32{}, wakers: map[string]chan struct{}{},
 	}
 }
 
 func qkey(topic string, q uint32) string { return fmt.Sprintf("%s/%d", topic, q) }
+
+// InvalidateCounters 使全部 offset/seq 计数缓存失效（集群档组 leader 变更时
+// 由 OnLeaderChange 钩子触发；单机档无变更事件，正常不会调用）。
+//
+// 为什么必须失效：offset 计数器只在所属组的 leader 上权威——follower 节点
+// 的 alloc/ 值可能滞后（复制在途）；本节点重新当选 leader 时，若沿用旧内存
+// 值（重新当选前跟随期间可能已落后多笔写），会出现重复分配（内存值高于盘上
+// 多数派事实）或跳号（内存值低于多数派事实）。置 loaded=false 后，重新当选
+// 后的第一笔写强制从 alloc/ 重读——复制保证盘上是多数派事实，重读即回到
+// 权威值。seq（delay）计数器同理。
+func (p *Producer) InvalidateCounters() {
+	p.mu.Lock()
+	for _, qs := range p.qstates {
+		qs.mu.Lock()
+		qs.loaded = false
+		qs.mu.Unlock()
+	}
+	p.mu.Unlock()
+	p.delayMu.Lock()
+	p.delayLoaded = false
+	p.delayMu.Unlock()
+	p.logger.Info("leader 变更，offset 缓存失效")
+}
 
 // Append 写入一条普通消息（spec §5 流程 1）：队列选择、offset 分配、消息与
 // alloc 计数器 + Keys 索引同一 Batch 原子提交，fsync 完成后唤醒长轮询。
@@ -76,11 +107,11 @@ func qkey(topic string, q uint32) string { return fmt.Sprintf("%s/%d", topic, q)
 // 批次删来源）——单机单批原子在集群多 raft 组下不可表达，本方法不再提供
 // 跨域注入点。调用方不得在持有本 Producer 任何锁的临界区内调用本方法
 // （p.mu 与 queueState.mu 均不可重入）。
-func (p *Producer) Append(m *core.Message) (*core.Message, error) {
+func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, error) {
 	if len(m.Body) == 0 || len(m.Body) > MaxBodySize {
 		return nil, fmt.Errorf("消息体大小非法: %d（上限 %d）", len(m.Body), MaxBodySize)
 	}
-	tc, err := p.mt.EnsureTopic(m.Topic)
+	tc, err := p.mt.EnsureTopic(ctx, m.Topic)
 	if err != nil {
 		return nil, err
 	}
@@ -112,6 +143,8 @@ func (p *Producer) Append(m *core.Message) (*core.Message, error) {
 
 	// 段 2（qs.mu）：offset 分配 + 编码 + 落盘。同队列串行（offset 顺序 ==
 	// 落盘顺序，FIFO 根基），跨队列并行（group commit 合并 fsync）。
+	// 组号 g 必须在此锁内、offset 分配之后计算——QueueID 到此刻才确定，
+	// GroupForQueue 是「队列→组」的入盘映射（Task 4 约定），提前算会错组。
 	qs.mu.Lock()
 	off, err := qs.nextOffsetLocked(p.st, m.Topic, m.QueueID)
 	if err != nil {
@@ -138,7 +171,8 @@ func (p *Producer) Append(m *core.Message) (*core.Message, error) {
 		}
 		b.Set(store.KeyIdxKey(m.Topic, key, m.StoreAtMs, m.QueueID, m.Offset), nil)
 	}
-	pending, err := p.st.ApplyAsync(b)
+	g := p.rt.GroupForQueue(m.Topic, m.QueueID)
+	pending, err := p.rep.ApplyAsync(ctx, g, b)
 	if err != nil {
 		qs.mu.Unlock()
 		return nil, fmt.Errorf("写入消息 %s (topic=%s q=%d off=%d): %w", m.ID, m.Topic, m.QueueID, m.Offset, err)
@@ -184,7 +218,7 @@ func (p *Producer) Append(m *core.Message) (*core.Message, error) {
 //
 // 原子性：delay 条目与 seq 计数器同一 Batch 提交，理由与 Append 的
 // offset 计数器完全相同（崩溃后计数器与已写条目严格一致，seq 绝不复用）。
-func (p *Producer) AppendDelay(m *core.Message) (*core.Message, error) {
+func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (*core.Message, error) {
 	if m.DeliverAtMs <= 0 {
 		return nil, fmt.Errorf("AppendDelay 要求 DeliverAtMs>0，得到 %d", m.DeliverAtMs)
 	}
@@ -193,11 +227,11 @@ func (p *Producer) AppendDelay(m *core.Message) (*core.Message, error) {
 	}
 	// 写入时就确认 topic 存在（autoCreate 时创建）：错误要在发送端立刻暴露，
 	// 不能等到几小时后到期移入时才发现 topic 不存在、消息无处可去。
-	if _, err := p.mt.EnsureTopic(m.Topic); err != nil {
+	if _, err := p.mt.EnsureTopic(ctx, m.Topic); err != nil {
 		return nil, err
 	}
 	if m.DeliverAtMs <= time.Now().UnixMilli() {
-		return p.Append(m)
+		return p.Append(ctx, m)
 	}
 	if m.ID == "" {
 		m.ID = core.NewMessageID()
@@ -219,7 +253,9 @@ func (p *Producer) AppendDelay(m *core.Message) (*core.Message, error) {
 	b := p.st.NewBatch()
 	b.Set(store.DelayKey(m.DeliverAtMs, seq), raw)
 	b.Set(store.DelayAllocKey(), store.PutU64(seq+1))
-	pending, err := p.st.ApplyAsync(b)
+	// 延时暂存区键族归元数据组（delay/ 与队列无关，无 GroupForQueue 映射）
+	g := p.rt.MetaGroup()
+	pending, err := p.rep.ApplyAsync(ctx, g, b)
 	if err != nil {
 		p.delayMu.Unlock()
 		return nil, fmt.Errorf("写入延时消息 %s (topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
@@ -270,7 +306,7 @@ func (p *Producer) nextDelaySeqLocked() (uint64, error) {
 //
 // 注意：整批绑定单一队列与 RocketMQ batch 绑定单 MessageQueue 的语义一致；
 // 批与批之间仍按轮询换队列，长期负载均衡不受影响。
-func (p *Producer) AppendBatch(msgs []*core.Message) ([]*core.Message, error) {
+func (p *Producer) AppendBatch(ctx context.Context, msgs []*core.Message) ([]*core.Message, error) {
 	if len(msgs) == 0 {
 		return nil, fmt.Errorf("AppendBatch 要求至少一条消息")
 	}
@@ -286,7 +322,7 @@ func (p *Producer) AppendBatch(msgs []*core.Message) ([]*core.Message, error) {
 			return nil, fmt.Errorf("消息体大小非法: %d（上限 %d）", len(m.Body), MaxBodySize)
 		}
 	}
-	tc, err := p.mt.EnsureTopic(topic)
+	tc, err := p.mt.EnsureTopic(ctx, topic)
 	if err != nil {
 		return nil, err
 	}
@@ -313,7 +349,8 @@ func (p *Producer) AppendBatch(msgs []*core.Message) ([]*core.Message, error) {
 	}
 	p.mu.Unlock()
 
-	// 段 2（qs.mu）：连续 offset 段分配 + 编码 + 单批定序。
+	// 段 2（qs.mu）：连续 offset 段分配 + 编码 + 单批定序。组号 g 同
+	// Append：锁内、qid 分配后计算（队列→组映射此时才可判定）。
 	qs.mu.Lock()
 	off, err := qs.nextOffsetLocked(p.st, topic, qid)
 	if err != nil {
@@ -341,7 +378,8 @@ func (p *Producer) AppendBatch(msgs []*core.Message) ([]*core.Message, error) {
 	}
 	// alloc 计数器一次写到 off+N，与全部消息同批原子（语义红线 3 的批量形态）
 	b.Set(store.AllocKey(topic, qid), store.PutU64(off+uint64(len(msgs))))
-	pending, err := p.st.ApplyAsync(b)
+	g := p.rt.GroupForQueue(topic, qid)
+	pending, err := p.rep.ApplyAsync(ctx, g, b)
 	if err != nil {
 		qs.mu.Unlock()
 		return nil, fmt.Errorf("批量写入 %d 条 (topic=%s q=%d off=%d): %w", len(msgs), topic, qid, off, err)

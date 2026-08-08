@@ -20,6 +20,7 @@ import (
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -33,11 +34,11 @@ func newBenchDeliverer(b *testing.B, n int) *Deliverer {
 		b.Fatalf("store: %v", err)
 	}
 	b.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 1, 16, slog.Default())
 	if err != nil {
 		b.Fatalf("meta: %v", err)
 	}
-	pr := produce.New(st, mt, slog.Default())
+	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 	d := New(st, mt, pr, slog.Default())
 	exp := time.Now().Add(time.Hour).UnixMilli()
 	const chunk = 4096 // 分块提交，避免单个超大 Batch 撑爆内存

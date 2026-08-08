@@ -450,7 +450,7 @@ func (s *Server) ChangeInvisibleDuration(ctx context.Context, req *pb.ChangeInvi
 // EnsureTopic 失败按性质分类，规则见 server.go 的 topicErrStatus。
 func (s *Server) QueryAssignment(ctx context.Context, req *pb.QueryAssignmentRequest) (*pb.QueryAssignmentResponse, error) {
 	name := req.GetTopic().GetName()
-	tc, err := s.mt.EnsureTopic(name)
+	tc, err := s.mt.EnsureTopic(ctx, name)
 	if err != nil {
 		return &pb.QueryAssignmentResponse{Status: s.topicErrStatus("QueryAssignment", name, err)}, nil
 	}

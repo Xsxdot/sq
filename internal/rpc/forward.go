@@ -23,7 +23,7 @@ func (s *Server) ForwardMessageToDeadLetterQueue(ctx context.Context, req *pb.Fo
 		s.logger.Warn("forward 句柄无法解析", "handle", truncateForLog(req.GetReceiptHandle()), "msg_id", req.GetMessageId(), "err", err)
 		return &pb.ForwardMessageToDeadLetterQueueResponse{Status: errStatus(pb.Code_INVALID_RECEIPT_HANDLE, err.Error())}, nil
 	}
-	ok, err := s.dl.ForwardToDLQ(g, topic, q, off, attempt)
+	ok, err := s.dl.ForwardToDLQ(ctx, g, topic, q, off, attempt)
 	if err != nil {
 		s.logger.Error("forward 转入死信失败", "group", g, "topic", topic, "queue", q, "offset", off, "err", err)
 		return &pb.ForwardMessageToDeadLetterQueueResponse{Status: errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error())}, nil

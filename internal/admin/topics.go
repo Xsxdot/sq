@@ -58,7 +58,7 @@ func (s *Server) handleTopicCreate(w http.ResponseWriter, r *http.Request) {
 		s.httpError(w, http.StatusConflict, "topic %s 已存在", req.Name)
 		return
 	}
-	tc, err := s.mt.CreateTopic(req.Name, req.Queues)
+	tc, err := s.mt.CreateTopic(r.Context(), req.Name, req.Queues)
 	if err != nil {
 		if errors.Is(err, meta.ErrBadName) {
 			s.httpError(w, http.StatusBadRequest, "%v", err)
@@ -69,7 +69,7 @@ func (s *Server) handleTopicCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.RetentionMs > 0 {
-		if tc, err = s.mt.UpdateTopicRetention(req.Name, req.RetentionMs); err != nil {
+		if tc, err = s.mt.UpdateTopicRetention(r.Context(), req.Name, req.RetentionMs); err != nil {
 			s.logger.Error("admin 设置 retention 失败", "topic", req.Name, "err", err)
 			s.httpError(w, http.StatusInternalServerError, "%v", err)
 			return
@@ -125,7 +125,7 @@ func (s *Server) handleTopicPatch(w http.ResponseWriter, r *http.Request) {
 		s.httpError(w, http.StatusBadRequest, "retention_ms 必须 >0")
 		return
 	}
-	tc, err := s.mt.UpdateTopicRetention(name, req.RetentionMs)
+	tc, err := s.mt.UpdateTopicRetention(r.Context(), name, req.RetentionMs)
 	if err != nil {
 		if errors.Is(err, meta.ErrTopicNotFound) {
 			s.httpError(w, http.StatusNotFound, "%v", err)
@@ -153,7 +153,7 @@ func (s *Server) handleTopicDelete(w http.ResponseWriter, r *http.Request) {
 		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	if err := s.mt.DeleteTopic(name); err != nil {
+	if err := s.mt.DeleteTopic(r.Context(), name); err != nil {
 		s.logger.Error("admin 删除 topic 注册表失败", "topic", name, "err", err)
 		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return

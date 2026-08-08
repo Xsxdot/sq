@@ -32,6 +32,7 @@ import (
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
 	"github.com/xushixin/sq/internal/core/txn"
+	"github.com/xushixin/sq/internal/replication"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 	"github.com/xushixin/sq/internal/store"
 )
@@ -69,11 +70,11 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, autoCreate, 4, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, autoCreate, 4, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("meta.New: %v", err)
 	}
-	pr := produce.New(st, mt, slog.Default())
+	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
 	cfg, err := config.Load("")
 	if err != nil {

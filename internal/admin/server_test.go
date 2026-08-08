@@ -16,6 +16,7 @@ import (
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
 	"github.com/xushixin/sq/internal/metrics"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 	"github.com/xushixin/sq/internal/sysinfo"
 )
@@ -35,11 +36,11 @@ func newTestServerWithConns(t *testing.T, user, pass string, conns ConnCounter) 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 1, 16, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
-	pr := produce.New(st, mt, slog.Default())
+	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
 	sp := metrics.NewSampler(st, mt, time.Hour, slog.Default())
 	// sys 与 /metrics 的系统 Collector、/admin/system 共用同一个
@@ -58,11 +59,11 @@ func newTestServerNoSampler(t *testing.T, user, pass string) (*Server, *store.St
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 1, 16, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
-	pr := produce.New(st, mt, slog.Default())
+	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 	dl := deliver.New(st, mt, pr, slog.Default())
 	sys := sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default())
 	s := New(st, mt, pr, dl, user, pass, sys, nil, metrics.NewRegistry(st, mt, sys, nil, nil, slog.Default()), nil, slog.Default())

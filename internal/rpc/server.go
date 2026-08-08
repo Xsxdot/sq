@@ -184,7 +184,7 @@ func (s *Server) messageQueues(tc meta.TopicConfig, topic *pb.Resource) []*pb.Me
 // EnsureTopic 的失败按性质分类，规则见 topicErrStatus。
 func (s *Server) QueryRoute(ctx context.Context, req *pb.QueryRouteRequest) (*pb.QueryRouteResponse, error) {
 	name := req.GetTopic().GetName()
-	tc, err := s.mt.EnsureTopic(name)
+	tc, err := s.mt.EnsureTopic(ctx, name)
 	if err != nil {
 		return &pb.QueryRouteResponse{Status: s.topicErrStatus("QueryRoute", name, err)}, nil
 	}
@@ -201,7 +201,7 @@ func (s *Server) QueryRoute(ctx context.Context, req *pb.QueryRouteRequest) (*pb
 // 是服务端内部故障，报成客户端输入错误会误导客户端停止本该重试的请求。
 func (s *Server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
 	if g := req.GetGroup().GetName(); g != "" {
-		if _, err := s.mt.EnsureGroup(g); err != nil {
+		if _, err := s.mt.EnsureGroup(ctx, g); err != nil {
 			if errors.Is(err, meta.ErrBadName) {
 				s.logger.Warn("Heartbeat 注册消费组失败：名字非法", "group", g, "err", err)
 				return &pb.HeartbeatResponse{Status: errStatus(pb.Code_ILLEGAL_CONSUMER_GROUP, err.Error())}, nil

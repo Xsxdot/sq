@@ -147,7 +147,7 @@ func (s *Server) handleGroupDelete(w http.ResponseWriter, r *http.Request) {
 		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return
 	}
-	if err := s.mt.DeleteGroup(name); err != nil && !errors.Is(err, meta.ErrGroupNotFound) {
+	if err := s.mt.DeleteGroup(r.Context(), name); err != nil && !errors.Is(err, meta.ErrGroupNotFound) {
 		s.logger.Error("admin 删除组注册表失败", "group", name, "err", err)
 		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return

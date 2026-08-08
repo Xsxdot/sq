@@ -12,6 +12,7 @@
 package produce
 
 import (
+	"context"
 	"hash/fnv"
 	"log/slog"
 	"sync"
@@ -20,6 +21,7 @@ import (
 
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -29,11 +31,11 @@ func newTestProducer(t *testing.T, dir string) (*Producer, *store.Store) {
 	if err != nil {
 		t.Fatalf("store: %v", err)
 	}
-	mt, err := meta.New(st, true, 4, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 4, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
-	return New(st, mt, slog.Default()), st
+	return New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default()), st
 }
 
 func TestAppendAssignsMonotonicOffsets(t *testing.T) {
@@ -41,7 +43,7 @@ func TestAppendAssignsMonotonicOffsets(t *testing.T) {
 	defer st.Close()
 	seen := map[uint32]uint64{} // queueID -> 上一个 offset
 	for i := 0; i < 20; i++ {
-		m, err := p.Append(&core.Message{Topic: "t1", Body: []byte("x")})
+		m, err := p.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")})
 		if err != nil {
 			t.Fatalf("Append: %v", err)
 		}
@@ -67,7 +69,7 @@ func TestAppendOffsetsSurviveRestart(t *testing.T) {
 	p, st := newTestProducer(t, dir)
 	before := map[uint32]uint64{} // queueID -> 重启前最后一次 offset
 	for i := 0; i < 8; i++ {      // 4 队列各写 2 条
-		m, err := p.Append(&core.Message{Topic: "t1", Body: []byte("x")})
+		m, err := p.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")})
 		if err != nil {
 			t.Fatalf("Append: %v", err)
 		}
@@ -77,7 +79,7 @@ func TestAppendOffsetsSurviveRestart(t *testing.T) {
 
 	p2, st2 := newTestProducer(t, dir)
 	defer st2.Close()
-	m, err := p2.Append(&core.Message{Topic: "t1", Body: []byte("y")})
+	m, err := p2.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("y")})
 	if err != nil {
 		t.Fatalf("重启后 Append: %v", err)
 	}
@@ -93,7 +95,7 @@ func TestMessageGroupPinsQueue(t *testing.T) {
 	defer st.Close()
 	var q uint32
 	for i := 0; i < 5; i++ {
-		m, err := p.Append(&core.Message{Topic: "t2", Body: []byte("x"), MessageGroup: "user-1"})
+		m, err := p.Append(context.Background(), &core.Message{Topic: "t2", Body: []byte("x"), MessageGroup: "user-1"})
 		if err != nil {
 			t.Fatalf("Append: %v", err)
 		}
@@ -109,7 +111,7 @@ func TestSubscribeWakesOnAppend(t *testing.T) {
 	p, st := newTestProducer(t, t.TempDir())
 	defer st.Close()
 	ch := p.Subscribe("t3")
-	if _, err := p.Append(&core.Message{Topic: "t3", Body: []byte("x")}); err != nil {
+	if _, err := p.Append(context.Background(), &core.Message{Topic: "t3", Body: []byte("x")}); err != nil {
 		t.Fatalf("Append: %v", err)
 	}
 	select {
@@ -123,7 +125,7 @@ func TestSubscribeWakesOnAppend(t *testing.T) {
 func TestAppendWritesKeyIndex(t *testing.T) {
 	pr, st := newTestProducer(t, t.TempDir()) // 本文件既有 fixture（Task 3 已改 4 参 meta.New）
 	defer st.Close()
-	m, err := pr.Append(&core.Message{Topic: "t", Body: []byte("x"), Keys: []string{"k1", "k2"}})
+	m, err := pr.Append(context.Background(), &core.Message{Topic: "t", Body: []byte("x"), Keys: []string{"k1", "k2"}})
 	if err != nil {
 		t.Fatalf("Append: %v", err)
 	}
@@ -159,7 +161,7 @@ func TestAppendConcurrentNoDupNoHole(t *testing.T) {
 			defer wg.Done()
 			for i := 0; i < perG; i++ {
 				m := &core.Message{Topic: "t-conc", Body: []byte("x")}
-				if _, err := p.Append(m); err != nil {
+				if _, err := p.Append(context.Background(), m); err != nil {
 					errs <- err
 				}
 			}
@@ -208,7 +210,7 @@ func TestAppendConcurrentNoDupNoHole(t *testing.T) {
 // sendDelay 构造一条延时消息并 AppendDelay（测试辅助）
 func sendDelay(t *testing.T, p *Producer, topic string, body string, dueMs int64) *core.Message {
 	t.Helper()
-	m, err := p.AppendDelay(&core.Message{Topic: topic, Body: []byte(body), DeliverAtMs: dueMs})
+	m, err := p.AppendDelay(context.Background(), &core.Message{Topic: topic, Body: []byte(body), DeliverAtMs: dueMs})
 	if err != nil {
 		t.Fatalf("AppendDelay: %v", err)
 	}
@@ -264,10 +266,10 @@ func TestAppendDelayPastDueFallsThroughToImmediate(t *testing.T) {
 func TestAppendDelayRejectsInvalid(t *testing.T) {
 	p, st := newTestProducer(t, t.TempDir())
 	defer st.Close()
-	if _, err := p.AppendDelay(&core.Message{Topic: "t", Body: nil, DeliverAtMs: time.Now().Add(time.Hour).UnixMilli()}); err == nil {
+	if _, err := p.AppendDelay(context.Background(), &core.Message{Topic: "t", Body: nil, DeliverAtMs: time.Now().Add(time.Hour).UnixMilli()}); err == nil {
 		t.Fatal("空 body 应拒绝")
 	}
-	if _, err := p.AppendDelay(&core.Message{Topic: "t", Body: []byte("x"), DeliverAtMs: 0}); err == nil {
+	if _, err := p.AppendDelay(context.Background(), &core.Message{Topic: "t", Body: []byte("x"), DeliverAtMs: 0}); err == nil {
 		t.Fatal("DeliverAtMs<=0 是编程错误，应拒绝")
 	}
 }
@@ -303,7 +305,7 @@ func TestAppendConcurrentSameGroupOffsetsContiguous(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perG; i++ {
-				if _, err := p.Append(&core.Message{Topic: "fifo-cc", MessageGroup: "g1", Body: []byte("x")}); err != nil {
+				if _, err := p.Append(context.Background(), &core.Message{Topic: "fifo-cc", MessageGroup: "g1", Body: []byte("x")}); err != nil {
 					t.Errorf("Append: %v", err)
 					return
 				}
@@ -339,7 +341,7 @@ func TestAppendBatchContiguousSameQueue(t *testing.T) {
 	for i := range msgs {
 		msgs[i] = &core.Message{Topic: "tb", Body: []byte("x"), Keys: []string{"k-idx"}}
 	}
-	stored, err := p.AppendBatch(msgs)
+	stored, err := p.AppendBatch(context.Background(), msgs)
 	if err != nil {
 		t.Fatalf("AppendBatch: %v", err)
 	}
@@ -378,11 +380,11 @@ func TestAppendBatchRejectsSpecialMessages(t *testing.T) {
 		{Topic: "tb2", Body: []byte("x"), Transactional: true},
 	}
 	for i, special := range cases {
-		if _, err := p.AppendBatch([]*core.Message{{Topic: "tb2", Body: []byte("x")}, special}); err == nil {
+		if _, err := p.AppendBatch(context.Background(), []*core.Message{{Topic: "tb2", Body: []byte("x")}, special}); err == nil {
 			t.Fatalf("case %d: 含特殊消息的批应报错", i)
 		}
 	}
-	if _, err := p.AppendBatch(nil); err == nil {
+	if _, err := p.AppendBatch(context.Background(), nil); err == nil {
 		t.Fatal("空批应报错")
 	}
 }
@@ -401,7 +403,7 @@ func TestAppendDelayConcurrentSeqUnique(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perG; i++ {
-				if _, err := p.AppendDelay(&core.Message{Topic: "dly-cc", Body: []byte("x"), DeliverAtMs: due}); err != nil {
+				if _, err := p.AppendDelay(context.Background(), &core.Message{Topic: "dly-cc", Body: []byte("x"), DeliverAtMs: due}); err != nil {
 					t.Errorf("AppendDelay: %v", err)
 					return
 				}
@@ -436,7 +438,7 @@ func TestAppendBatchAtomicOnInvalidBody(t *testing.T) {
 		{Topic: "tb3", Body: []byte("ok")},
 		{Topic: "tb3", Body: nil}, // 非法：空 body
 	}
-	if _, err := p.AppendBatch(msgs); err == nil {
+	if _, err := p.AppendBatch(context.Background(), msgs); err == nil {
 		t.Fatal("含空 body 的批应报错")
 	}
 	// 4 个队列全部确认零落盘

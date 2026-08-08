@@ -20,6 +20,7 @@ import (
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 	"github.com/xushixin/sq/internal/sysinfo"
 )
@@ -31,18 +32,18 @@ func fixture(t *testing.T) (*store.Store, *meta.Meta, *produce.Producer, *delive
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 1, 16, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
-	pr := produce.New(st, mt, slog.Default())
+	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 	return st, mt, pr, deliver.New(st, mt, pr, slog.Default())
 }
 
 func TestCollectDerivesStats(t *testing.T) {
 	st, mt, pr, dl := fixture(t)
 	for i := 0; i < 3; i++ {
-		if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+		if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -74,7 +75,7 @@ func TestCollectDerivesStats(t *testing.T) {
 
 func TestRegistryExposesMetrics(t *testing.T) {
 	st, mt, pr, _ := fixture(t)
-	if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+	if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
 		t.Fatal(err)
 	}
 	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()), nil, nil, slog.Default())
@@ -157,12 +158,12 @@ func TestSystemMetricsSurviveStoreFailure(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 1, 16, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
-	pr := produce.New(st, mt, slog.Default())
-	if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
+	if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
 		t.Fatal(err)
 	}
 	blocked := &atomic.Bool{}

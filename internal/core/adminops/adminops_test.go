@@ -11,6 +11,7 @@ import (
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -21,11 +22,11 @@ func fixture(t *testing.T) (*store.Store, *meta.Meta, *produce.Producer, *delive
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 1, 16, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
-	pr := produce.New(st, mt, slog.Default())
+	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
 	return st, mt, pr, deliver.New(st, mt, pr, slog.Default())
 }
 
@@ -44,11 +45,11 @@ func countPrefix(t *testing.T, st *store.Store, lower []byte) int {
 func TestPurgeTopicData(t *testing.T) {
 	st, mt, pr, _ := fixture(t)
 	for i := 0; i < 3; i++ {
-		if _, err := pr.Append(&core.Message{Topic: "del-me", Body: []byte("x"), Keys: []string{"k1"}}); err != nil {
+		if _, err := pr.Append(context.Background(), &core.Message{Topic: "del-me", Body: []byte("x"), Keys: []string{"k1"}}); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if _, err := pr.Append(&core.Message{Topic: "keep", Body: []byte("y"), Keys: []string{"k1"}}); err != nil {
+	if _, err := pr.Append(context.Background(), &core.Message{Topic: "keep", Body: []byte("y"), Keys: []string{"k1"}}); err != nil {
 		t.Fatal(err)
 	}
 	tc, _ := mt.GetTopic("del-me")
@@ -72,7 +73,7 @@ func TestPurgeTopicData(t *testing.T) {
 
 func TestPurgeGroupData(t *testing.T) {
 	st, _, pr, dl := fixture(t)
-	if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+	if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
 		t.Fatal(err)
 	}
 	// 真实消费一条：产生 cursor 与 inflight
