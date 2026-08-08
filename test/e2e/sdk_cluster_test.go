@@ -17,10 +17,14 @@
 //     自动走 cluster.Rejoin）→ 三节点对账（路由恢复 + 无丢失）。
 //
 // 边界：
-//   - 事务用例放在三节点健康期：EndTransaction 落 meta leader 后，若
-//     目标队列组 leader 是别节点，txn.End 第一段走 ForwardAppend——这是
-//     官方 SDK 可达的最长分布式路径（plan 风险自记 ①，两跳转发链中
-//     ForwardApply 一跳因 SDK 寻址行为不可达，属防御代码不删）
+//   - 事务用例放在三节点健康期，以 broker 日志证据断言两跳转发链真实可达
+//     （plan 风险自记 ① 的 keep-vs-delete 判定）：SDK 的发送/提交落在
+//     非 meta leader 节点时，Stage 与 End 第二段经 ApplyOrForward 触发
+//     ForwardApply（转发节点日志「跨节点转发批次」）；End 第一段落在非
+//     队列 0 所属组 leader 节点时经 ForwardAppend 转发（日志「事务提交
+//     消息跨节点转发」）。用例连发 6 条事务（SDK 发布负载均衡按队列轮询，
+//     6 队列覆盖 3 组 3 节点），逐节点日志 grep 后断言两类转发各 ≥1 次
+//     ——两跳均有实测证据，转发代码是承重路径而非防御死代码
 //   - 消费吞吐只记粗略数字（plan 风险自记 ②：Receive 每次都过 raft
 //     提案，防止量级劣化无感），非 benchmark
 //   - 内存峰值：轮询 /proc/<pid>/status VmHWM（Linux；非 Linux 跳过）
@@ -65,6 +69,13 @@ const (
 	// clusterProduceCount 三节点健康期发送的消息条数（非 200 的整数倍
 	// 会破坏「全收全 ack」断言的可读性，固定 200 与 plan 一致）。
 	clusterProduceCount = 200
+
+	// txnForwardProbeCount 事务转发链探针的事务条数：SDK 发布负载均衡
+	// 按队列轮询（topic 6 队列 = 3 组 × 2 队列，覆盖 3 个节点），连发
+	// 6 条保证两类转发（End 第一段 ForwardAppend / Stage·End 第二段
+	// ForwardApply）都至少命中一次——测试据此对 broker 日志做转发
+	// 证据断言（plan 风险自记① 的 keep-vs-delete 裁决）。
+	txnForwardProbeCount = 6
 )
 
 // pickPorts 选 n 个互不相同的空闲端口（与 pickPort 同款 bind-probe 语义，
@@ -590,30 +601,51 @@ func TestThreeNodeClusterE2E(t *testing.T) {
 	// 注意：consumer 不在这里 GracefulStop——kill 后阶段要复用它
 	// （同组游标继续，收 kill 后新增；见「继续发收」段注释）。
 
-	// ---- 事务用例（plan 风险自记 ①）：最长分布式路径 ----
-	// EndTransaction 落 meta leader；若目标队列组 leader 是别节点，
-	// txn.End 第一段走 ForwardAppend（控制通道转发 + leader 侧 offset
-	// 分配）——官方 SDK 可达的最长路径。事务消息独立 topic，避免与
-	// 200 条普通消息的消费位点交织。
+	// ---- 事务用例（plan 风险自记 ①）：两跳转发链的可达性证据 ----
+	// 事务消息独立 topic，避免与 200 条普通消息的消费位点交织。
+	// 转发链：Stage/End 第二段的 half 键写经 ApplyOrForward（接收节点
+	// 非 meta leader → ForwardApply），End 第一段的队列写入在接收节点
+	// 非队列 0 所属组 leader 时经 ForwardAppend 转发。SDK 的发布负载
+	// 均衡按队列轮询（6 队列 = 3 组 × 2 队列，覆盖 3 个节点），连发
+	// txnForwardProbeCount 条保证两类转发都至少命中一次；提交完成后
+	// 逐节点日志 grep 断言（转发节点 Info 日志，见下述两个计数）。
 	txnProducer := newClusterProducer(t, multi, "e2e-cluster-txn")
 	txnConsumer := newClusterConsumer(t, multi, "e2e-cluster-txn-g", "e2e-cluster-txn")
-	tx := txnProducer.BeginTransaction()
-	recs, err := txnProducer.SendWithTransaction(context.Background(),
-		&rmq.Message{Topic: "e2e-cluster-txn", Body: []byte("cluster-txn-commit")}, tx)
-	if err != nil {
-		t.Fatalf("SendWithTransaction: %v", err)
+	txnSent := map[string]bool{}
+	for i := 0; i < txnForwardProbeCount; i++ {
+		tx := txnProducer.BeginTransaction()
+		recs, err := txnProducer.SendWithTransaction(context.Background(),
+			&rmq.Message{Topic: "e2e-cluster-txn", Body: []byte(fmt.Sprintf("cluster-txn-commit #%d", i))}, tx)
+		if err != nil {
+			t.Fatalf("SendWithTransaction #%d: %v", i, err)
+		}
+		if len(recs) == 0 || recs[0].MessageID == "" {
+			t.Fatalf("SendWithTransaction #%d 返回空回执: %v", i, recs)
+		}
+		txnSent[recs[0].MessageID] = true
+		if err := tx.Commit(); err != nil {
+			t.Fatalf("事务提交 #%d 失败: %v", i, err)
+		}
 	}
-	if len(recs) == 0 || recs[0].MessageID == "" {
-		t.Fatalf("SendWithTransaction 返回空回执: %v", recs)
+	t.Logf("事务已提交 %d 条 msgId=%v（两跳转发链探针）", len(txnSent), txnSent)
+	txnGot := recvAllAck(t, txnConsumer, len(txnSent), 60*time.Second, "事务提交后消费")
+	for id := range txnSent {
+		if !txnGot[id] {
+			t.Fatalf("事务消息 %s 未收到（事务链路断裂）", id)
+		}
 	}
-	txnMsgID := recs[0].MessageID
-	if err := tx.Commit(); err != nil {
-		t.Fatalf("事务提交失败: %v", err)
+	// 转发证据断言：逐节点日志 grep。SDK 轮询 6 队列必然落到不同节点，
+	// 两类转发日志合计都应为正——这是风险自记① 的 keep-vs-delete 裁决
+	// （转发代码是承重路径，删了就断链，不是防御死代码）。
+	fwdAppend := countLogLines(t, logPaths, "事务提交消息跨节点转发") // End 第一段 ForwardAppend（txn.go）
+	fwdApply := countLogLines(t, logPaths, "跨节点转发批次")          // Stage/End 第二段 ForwardApply（replication.go）
+	t.Logf("事务转发证据：ForwardAppend 第一段=%d 次，ForwardApply 第二段=%d 次（全节点日志合计）",
+		fwdAppend, fwdApply)
+	if fwdAppend == 0 {
+		t.Fatalf("事务 End 第一段 ForwardAppend 零次：SDK 轮询应覆盖非队列 0 组 leader 节点（转发链证据缺失）")
 	}
-	t.Logf("事务已提交 msgId=%s（跨节点转发链）", txnMsgID)
-	txnGot := recvAllAck(t, txnConsumer, 1, 60*time.Second, "事务提交后消费")
-	if !txnGot[txnMsgID] {
-		t.Fatalf("事务消息 %s 未收到（ForwardAppend 转发链断裂）", txnMsgID)
+	if fwdApply == 0 {
+		t.Fatalf("事务 Stage/End 第二段 ForwardApply 零次：SDK 轮询应覆盖非 meta leader 节点（转发链证据缺失）")
 	}
 	txnProducer.GracefulStop()
 	txnConsumer.GracefulStop()
@@ -760,6 +792,26 @@ func newClusterConsumer(t *testing.T, endpoint, group, topic string) rmq.SimpleC
 		t.Fatalf("consumer.Start: %v", err)
 	}
 	return c
+}
+
+// countLogLines 统计全部 broker 日志文件中包含 needle 的行数。
+//
+// 用途：跨节点转发链的证据断言（事务用例）——转发动作在**转发节点**
+// 打 Info 日志（ForwardAppend 见 txn.go「事务提交消息跨节点转发」、
+// ForwardApply 见 replication.go「跨节点转发批次」），测试在事务完成后
+// 逐节点日志 grep 计数，据此判定哪些跳真实执行过（plan 风险自记①）。
+func countLogLines(t *testing.T, logPaths []string, needle string) int {
+	t.Helper()
+	total := 0
+	for _, p := range logPaths {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Logf("读取 broker 日志 %s 失败: %v", p, err)
+			continue
+		}
+		total += strings.Count(string(raw), needle)
+	}
+	return total
 }
 
 // recvAll 轮询消费直到收齐 want 个不同 msgId 或超时，返回收到的 msgId
