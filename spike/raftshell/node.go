@@ -53,6 +53,9 @@ type Node struct {
 	leader  atomic.Uint64
 
 	done chan struct{} // run 循环完全退出（含 WAL 关闭）后关闭，测试/调用方同步用
+	// cancel 是 Start 派生出的运行上下文取消函数，StopClean（干净关机）
+	// 通过它退出 run 循环；为 nil 表示 Start 尚未被调用。
+	cancel context.CancelFunc
 
 	mu      sync.Mutex
 	waiters map[uint64]chan struct{} // 提案 id → commit 通知；id 编码在 payload 前 8 字节
@@ -81,20 +84,32 @@ func NewNode(id uint64, peers []raft.Peer, dir string, mode AckMode, tr Transpor
 		return nil, err
 	}
 	storage := raft.NewMemoryStorage()
-	cfg := &raft.Config{
+	n := newNode(id, raft.StartNode(raftConfig(id, storage), peers), storage, wal, tr, mode, lg)
+	lg.Info("节点初始化完成", "id", id, "mode", mode.String(), "peers", len(peers))
+	return n, nil
+}
+
+// raftConfig 构造共享的 raft 配置：tick 参数、单消息/在途日志上限、
+// 丢弃日志器（raft 库自身日志噪音大，关键节点由我们的 slog 承担）。
+func raftConfig(id uint64, storage *raft.MemoryStorage) *raft.Config {
+	return &raft.Config{
 		ID:              id,
 		ElectionTick:    10,
 		HeartbeatTick:   1,
 		Storage:         storage,
 		MaxSizePerMsg:   1 << 20,
 		MaxInflightMsgs: 256,
-		// raft 库自身日志噪音大（每 tick/每消息都有输出），用丢弃 logger 压掉，
-		// 关键节点由我们自己的 slog 承担（见 handleReady/run）。
-		Logger: &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)},
+		Logger:          &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)},
 	}
-	n := &Node{
+}
+
+// newNode 组装 Node 结构（不启动 run 循环）。
+// NewNode（StartNode 初始引导）与 Cluster.Restart 的两种恢复路径
+// （RestartNode 原身份回归 / 空存储 learner 重入）共用。
+func newNode(id uint64, rn raft.Node, storage *raft.MemoryStorage, wal *WAL, tr Transport, mode AckMode, lg *slog.Logger) *Node {
+	return &Node{
 		id:      id,
-		rn:      raft.StartNode(cfg, peers),
+		rn:      rn,
 		storage: storage,
 		wal:     wal,
 		tr:      tr,
@@ -104,15 +119,36 @@ func NewNode(id uint64, peers []raft.Peer, dir string, mode AckMode, tr Transpor
 		waiters: make(map[uint64]chan struct{}),
 		done:    make(chan struct{}),
 	}
-	lg.Info("节点初始化完成", "id", id, "mode", mode.String(), "peers", len(peers))
-	return n, nil
 }
 
 // Start 启动节点的后台循环（tick、消息接收、Ready 处理），不阻塞。
 // ctx 取消时节点退出并关闭 WAL。
 func (n *Node) Start(ctx context.Context) {
+	// 从调用方 ctx 派生：CancelFunc 保存在节点上，StopClean 干净关机可用
+	ctx, cancel := context.WithCancel(ctx)
+	n.cancel = cancel
 	n.lg.Info("节点启动", "id", n.id)
 	go n.run(ctx)
+}
+
+// StopClean 干净关机：先写持久化的干净关机标记（Sync 落盘），再取消
+// 节点运行。重启时 Restart 读到标记即走原身份 RestartNode 回归。
+//
+// 参数：
+//   - ctx: 保留以与 Propose 等接口签名一致；标记写入与退出不依赖它
+//
+// 注意：
+//   - 必须在 Start 之后调用（需要 cancel）
+//   - 标记写入同步完成且先于 cancel：run 循环退出时 WAL Close 不会早于标记落盘
+//   - 标记写失败按「不干净关机」处理（等同无标记），不阻塞退出
+func (n *Node) StopClean(ctx context.Context) {
+	if err := n.wal.MarkCleanShutdown(); err != nil {
+		// 标记未落盘：下次重启将走 learner 重入路径，等同于断电，
+		// 属于安全退化而非数据丢失
+		n.lg.Error("写干净关机标记失败，按不干净关机处理", "id", n.id, "err", err)
+	}
+	n.lg.Info("干净关机标记已写入，退出", "id", n.id)
+	n.cancel()
 }
 
 func (n *Node) run(ctx context.Context) {
@@ -169,6 +205,8 @@ func (n *Node) handleReady(ctx context.Context, rd raft.Ready) {
 			// v3 的 raftpb 是 protobuf-go v2 生成：需要显式 Unmarshal
 			_ = proto.Unmarshal(ent.Data, &cc)
 			n.rn.ApplyConfChange(&cc)
+			// 按 ConfChange.Id 通知 ProposeConfChange 的等待方（见该函数）
+			n.notify(cc.GetId())
 			n.lg.Info("成员变更已 apply", "id", n.id, "type", cc.GetType().String(), "node", cc.GetNodeId())
 		case raftpb.EntryNormal:
 			if len(ent.Data) >= 8 {
@@ -211,6 +249,46 @@ func (n *Node) Propose(ctx context.Context, payload []byte) error {
 	case <-ctx.Done():
 		// 超时：条目可能仍会被提交，但调用方已放弃等待，
 		// 删除 waiter 防泄漏；后续 apply 时 notify 找不到它即可。
+		n.removeWaiter(id)
+		return ctx.Err()
+	}
+}
+
+// ProposeConfChange 提出一条成员变更并阻塞直到它被 commit 且 apply
+// 到本节点 FSM。
+//
+// 实现：复用提案 waiter 机制——ConfChange.Id 充当提案 id（raft 库原样
+// 把它编进 EntryConfChange 的 Data），apply 时按 Id 通知等待方，
+// 见 handleReady 的 EntryConfChange 分支。
+//
+// 参数：
+//   - ctx: 控制等待；超时/取消后 waiter 被移除（条目可能仍会被提交）
+//   - ccType: 变更类型（ConfChangeAddNode/ConfChangeRemoveNode/
+//     ConfChangeAddLearnerNode）
+//   - nodeID: 变更目标节点 ID
+//
+// 返回：
+//   - nil：成员变更已 apply
+//   - error：ProposeConfChange 失败或 ctx 超时/取消
+func (n *Node) ProposeConfChange(ctx context.Context, ccType raftpb.ConfChangeType, nodeID uint64) error {
+	id := n.nextID.Add(1)
+	ch := make(chan struct{})
+	n.mu.Lock()
+	n.waiters[id] = ch
+	n.mu.Unlock()
+
+	// ConfChange 的标量字段在 protobuf-go v2 开放结构下是指针，取址传参；
+	// ProposeConfChange 要求 ConfChangeI 接口（AsV1 为指针接收者），传指针
+	cc := raftpb.ConfChange{Type: ccType.Enum(), NodeId: &nodeID, Id: &id}
+	if err := n.rn.ProposeConfChange(ctx, &cc); err != nil {
+		n.removeWaiter(id)
+		return err
+	}
+	select {
+	case <-ch:
+		n.lg.Debug("成员变更已 apply", "id", n.id, "cc", ccType.String(), "node", nodeID)
+		return nil
+	case <-ctx.Done():
 		n.removeWaiter(id)
 		return ctx.Err()
 	}
