@@ -260,6 +260,20 @@ func KeyIdxKeyPrefix(topic, key string) []byte {
 	return k[:len(k)-20]
 }
 
+// ParseKeyIdxQueueID 解析索引 key 中的 queueID（retention/adminops 按队列分桶用）。
+// 布局同 ParseKeyIdxKey：尾部定长二进制第 12..16 字节即 4B BE queueID，
+// 不校验 topic/key 段（分桶只需要队列号，省一次全量解析）。
+func ParseKeyIdxQueueID(k []byte) (uint32, error) {
+	rest, ok := bytes.CutPrefix(k, []byte(keyIdxPrefix))
+	if !ok {
+		return 0, fmt.Errorf("非法 keyidx key: %q", k)
+	}
+	if len(rest) < 1+20 || rest[len(rest)-21] != '/' {
+		return 0, fmt.Errorf("keyidx key 结构错误: %q", k)
+	}
+	return binary.BigEndian.Uint32(rest[len(rest)-12 : len(rest)-8]), nil
+}
+
 // HandleSecretKey receipt handle 签名密钥：meta/handle_secret。
 // 首次启动生成、永不轮换——轮换会使全部在途 handle 失效，收益为零。
 func HandleSecretKey() []byte { return []byte("meta/handle_secret") }
@@ -324,6 +338,15 @@ func ParseCursorKey(k []byte) (group, topic string, queueID uint32, err error) {
 	}
 	topic = string(rest[:j])
 	return group, topic, binary.BigEndian.Uint32(rest[j+1:]), nil
+}
+
+// ParseCursorTopicQueue 解析 cursor key 中的 (topic, queueID)——adminops 按
+// (topic,qid) 分桶清理用。布局同 ParseCursorKey，只提取组路由所需字段：
+// 组号 GroupForQueue(topic, qid) 同时管该队列的 cursor/ 与 inflight/ 键族，
+// 分桶只认这两段。
+func ParseCursorTopicQueue(k []byte) (string, uint32, error) {
+	_, topic, qid, err := ParseCursorKey(k)
+	return topic, qid, err
 }
 
 // MetricKey 时序采样点主键：metric/{tsMs:8B}，值为 JSON 编码的分钟聚合点。

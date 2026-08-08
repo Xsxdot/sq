@@ -148,7 +148,7 @@ func (s *Server) handleTopicDelete(w http.ResponseWriter, r *http.Request) {
 		s.httpError(w, http.StatusNotFound, "topic %s 不存在", name)
 		return
 	}
-	if err := adminops.PurgeTopicData(s.st, tc, s.logger); err != nil {
+	if err := adminops.PurgeTopicData(r.Context(), s.rep, s.rt, s.fwd, s.st, tc, s.logger); err != nil {
 		s.logger.Error("admin 清理 topic 数据失败", "topic", name, "err", err)
 		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return

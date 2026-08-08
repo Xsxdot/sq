@@ -71,17 +71,19 @@ func run() error {
 		return err
 	}
 	defer st.Close()
-	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, cfg.AutoCreateTopic, cfg.DefaultQueueNums, cfg.DefaultMaxAttempts, logger)
+	rep := replication.NewStandalone(st)
+	rt := replication.StandaloneRouter{}
+	mt, err := meta.New(rep, rt, st, cfg.AutoCreateTopic, cfg.DefaultQueueNums, cfg.DefaultMaxAttempts, logger)
 	if err != nil {
 		return err
 	}
-	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, logger)
-	dl := deliver.New(st, mt, pr, logger)
+	pr := produce.New(rep, rt, st, mt, logger)
+	dl := deliver.New(rep, rt, st, mt, pr, logger)
 
 	// 事务管理器。构造顺序有讲究：rpc.Server 要拿它处理 Send/EndTransaction，
 	// 回查调度器又要拿 rpc.Server 当 Notifier（下发回查命令）——先建 Manager、
 	// 再建 Server、最后起调度 goroutine，依赖环在构造期就被拆开。
-	tx := txn.New(st, pr, mt, cfg.TxnInterval(), cfg.TxnMaxChecks, logger)
+	tx := txn.New(rep, rt, st, pr, mt, cfg.TxnInterval(), cfg.TxnMaxChecks, logger)
 
 	// writeBlocked 由 retention 每趟探测磁盘后更新，rpc.SendMessage 据此拒写。
 	// 必须先于 metrics registry 创建：registry 里的系统 Collector 要拿着
@@ -128,7 +130,7 @@ func run() error {
 	// defer 为 LIFO：本 defer 注册在 st.Close 的 defer 之后，故先执行。
 	retCtx, retCancel := context.WithCancel(context.Background())
 	var retWG sync.WaitGroup
-	rm := retention.New(st, mt, cfg.RetentionInterval(), cfg.DataDir, cfg.DiskWatermarkPercent, writeBlocked, logger)
+	rm := retention.New(rep, rt, st, mt, cfg.RetentionInterval(), cfg.DataDir, cfg.DiskWatermarkPercent, writeBlocked, logger)
 	retWG.Add(1)
 	go func() { defer retWG.Done(); rm.Run(retCtx) }()
 	defer func() { retCancel(); retWG.Wait() }()
@@ -138,7 +140,7 @@ func run() error {
 	// 不会在 store 关闭后提交搬运批次。
 	dlyCtx, dlyCancel := context.WithCancel(context.Background())
 	var dlyWG sync.WaitGroup
-	ds := delay.New(st, pr, logger)
+	ds := delay.New(rep, rt, st, pr, logger)
 	dlyWG.Add(1)
 	go func() { defer dlyWG.Done(); ds.Run(dlyCtx) }()
 	defer func() { dlyCancel(); dlyWG.Wait() }()
@@ -157,7 +159,9 @@ func run() error {
 	// 注册在 st.Close 的 defer 之后（LIFO 先执行），保证 handler 不会在 store
 	// 关闭后还在读写它。
 	if cfg.AdminListen != "" {
-		adm := admin.New(st, mt, pr, dl, cfg.AdminUsername, cfg.AdminPassword, sys, sp, reg, srv, logger)
+		// fwd 单机档传 nil：StandaloneRouter 的 IsLeader 恒真，adminops 的
+		// 转发分支不可达（集群档由 Task 11 的装配替换此处）。
+		adm := admin.New(rep, rt, nil, st, mt, pr, dl, cfg.AdminUsername, cfg.AdminPassword, sys, sp, reg, srv, logger)
 		aln, err := net.Listen("tcp", cfg.AdminListen)
 		if err != nil {
 			return fmt.Errorf("admin HTTP 监听 %s: %w", cfg.AdminListen, err)

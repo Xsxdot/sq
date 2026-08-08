@@ -352,6 +352,10 @@ func (s *Sampler) reduceMinute(minute int64) MinutePoint {
 }
 
 // persist 把一个分钟点写入 Pebble。
+//
+// 复制豁免（batch③ 刻意留痕）：metric/ 是本节点可观测数据，绕过 Replicator
+// 直连 store——三节点各采各的，复制会同键互覆（MetricKey 只带 tsMs，无节点
+// 维度）；快照追齐（batch④）可能混入他节点历史点，可观测数据可接受，不做过滤。
 func (s *Sampler) persist(mp MinutePoint) error {
 	raw, err := json.Marshal(mp)
 	if err != nil {
@@ -392,6 +396,9 @@ func (s *Sampler) History(fromMs int64) ([]Point, error) {
 
 // expire 删除 cutoffMs 之前的全部分钟点（与 retention 同样用 DeleteRange，
 // 一条区间墓碑顶掉逐条删除）。
+//
+// 复制豁免同 persist：metric/ 是本节点可观测数据，刻意绕过 Replicator——
+// 三节点各采各的，复制会同键互覆；过期删除也只在本地发生。
 func (s *Sampler) expire(cutoffMs int64) error {
 	b := s.st.NewBatch()
 	b.DeleteRange(store.MetricKey(0), store.MetricKey(cutoffMs))

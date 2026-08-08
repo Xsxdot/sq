@@ -63,8 +63,10 @@ func newFixtureMaxAttempts(t *testing.T, maxAttempts int32) *fixture {
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
-	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
-	return &fixture{st: st, pr: pr, dl: New(st, mt, pr, slog.Default())}
+	rep := replication.NewStandalone(st)
+	rt := replication.StandaloneRouter{}
+	pr := produce.New(rep, rt, st, mt, slog.Default())
+	return &fixture{st: st, pr: pr, dl: New(rep, rt, st, mt, pr, slog.Default())}
 }
 
 func (f *fixture) send(t *testing.T, topic, body string) {
@@ -102,7 +104,7 @@ func TestReceiveAckFlow(t *testing.T) {
 	}
 	// ack 后不应再收到
 	for _, m := range msgs {
-		if ok, err := f.dl.Ack("g", "t", m.QueueID, m.Offset, m.DeliveryAttempt); !ok || err != nil {
+		if ok, err := f.dl.Ack(context.Background(), "g", "t", m.QueueID, m.Offset, m.DeliveryAttempt); !ok || err != nil {
 			t.Fatalf("Ack: %v %v", ok, err)
 		}
 	}
@@ -144,11 +146,11 @@ func TestAckIdempotent(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t", "a")
 	msgs, _ := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
-	ok, err := f.dl.Ack("g", "t", msgs[0].QueueID, msgs[0].Offset, msgs[0].DeliveryAttempt)
+	ok, err := f.dl.Ack(context.Background(), "g", "t", msgs[0].QueueID, msgs[0].Offset, msgs[0].DeliveryAttempt)
 	if !ok || err != nil {
 		t.Fatalf("首次 Ack: %v %v", ok, err)
 	}
-	ok, err = f.dl.Ack("g", "t", msgs[0].QueueID, msgs[0].Offset, msgs[0].DeliveryAttempt)
+	ok, err = f.dl.Ack(context.Background(), "g", "t", msgs[0].QueueID, msgs[0].Offset, msgs[0].DeliveryAttempt)
 	if ok || err != nil { // 重复 ack：ok=false 且无错（记录已不存在）
 		t.Fatalf("重复 Ack 应幂等: %v %v", ok, err)
 	}
@@ -297,7 +299,7 @@ func TestAckStaleAttemptRejected(t *testing.T) {
 	}
 
 	// 用陈旧 attempt(1) ack：应视为陈旧句柄，幂等拒绝，不能删掉 attempt=2 的记录
-	ok, err := f.dl.Ack("g", "t", 0, offset, staleAttempt)
+	ok, err := f.dl.Ack(context.Background(), "g", "t", 0, offset, staleAttempt)
 	if ok || err != nil {
 		t.Fatalf("陈旧 attempt 的 ack 应为 (false,nil): %v %v", ok, err)
 	}
@@ -325,11 +327,11 @@ func TestAckCorrectAttemptSucceeds(t *testing.T) {
 	if err != nil || len(second) != 1 || second[0].DeliveryAttempt != 2 {
 		t.Fatalf("过期重投应得 attempt=2: %d %v", len(second), second)
 	}
-	ok, err := f.dl.Ack("g", "t", 0, second[0].Offset, second[0].DeliveryAttempt)
+	ok, err := f.dl.Ack(context.Background(), "g", "t", 0, second[0].Offset, second[0].DeliveryAttempt)
 	if !ok || err != nil {
 		t.Fatalf("正确 attempt 的 ack 应成功: %v %v", ok, err)
 	}
-	ok, err = f.dl.Ack("g", "t", 0, second[0].Offset, second[0].DeliveryAttempt)
+	ok, err = f.dl.Ack(context.Background(), "g", "t", 0, second[0].Offset, second[0].DeliveryAttempt)
 	if ok || err != nil {
 		t.Fatalf("记录已被删除，重复 ack 应幂等失败: %v %v", ok, err)
 	}
@@ -346,7 +348,7 @@ func TestChangeInvisibleExtendsWindow(t *testing.T) {
 	if err != nil || len(msgs) != 1 {
 		t.Fatalf("首取: %d %v", len(msgs), err)
 	}
-	ok, err := f.dl.ChangeInvisible("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt, time.Minute)
+	ok, err := f.dl.ChangeInvisible(context.Background(), "g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt, time.Minute)
 	if !ok || err != nil {
 		t.Fatalf("ChangeInvisible: %v %v", ok, err)
 	}
@@ -372,7 +374,7 @@ func TestChangeInvisiblePreservesAttempts(t *testing.T) {
 	if err != nil || len(second) != 1 || second[0].DeliveryAttempt != 2 {
 		t.Fatalf("过期重投应得 attempt=2: %d %v", len(second), second)
 	}
-	ok, err := f.dl.ChangeInvisible("g", "t", 0, second[0].Offset, second[0].DeliveryAttempt, 60*time.Millisecond)
+	ok, err := f.dl.ChangeInvisible(context.Background(), "g", "t", 0, second[0].Offset, second[0].DeliveryAttempt, 60*time.Millisecond)
 	if !ok || err != nil {
 		t.Fatalf("ChangeInvisible: %v %v", ok, err)
 	}
@@ -389,7 +391,7 @@ func TestChangeInvisiblePreservesAttempts(t *testing.T) {
 // INVALID_RECEIPT_HANDLE 让客户端静默丢弃，后者才是 INTERNAL_SERVER_ERROR。
 func TestChangeInvisibleUnknownOffsetReturnsFalse(t *testing.T) {
 	f := newFixture(t)
-	ok, err := f.dl.ChangeInvisible("g", "t", 0, 999, 1, time.Minute)
+	ok, err := f.dl.ChangeInvisible(context.Background(), "g", "t", 0, 999, 1, time.Minute)
 	if ok || err != nil {
 		t.Fatalf("未知 offset 应为 (false,nil): %v %v", ok, err)
 	}
@@ -538,7 +540,7 @@ func TestOrderedDeliversOneAtATime(t *testing.T) {
 		t.Fatalf("未 ack 不应投出后续顺序消息: %d %v", len(again), err)
 	}
 	// ack 后放行下一条
-	if _, err := f.dl.Ack("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt); err != nil {
+	if _, err := f.dl.Ack(context.Background(), "g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt); err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
 	next, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
@@ -568,7 +570,7 @@ func TestOrderedStuckOnExpiredRedelivery(t *testing.T) {
 		t.Fatalf("重投后 b 仍应被顺序锁拦住: %d %v", len(blocked), err)
 	}
 	// ack 重投那次的句柄（attempt=2）后放行 b
-	if _, err := f.dl.Ack("g", "t", 0, red[0].Offset, red[0].DeliveryAttempt); err != nil {
+	if _, err := f.dl.Ack(context.Background(), "g", "t", 0, red[0].Offset, red[0].DeliveryAttempt); err != nil {
 		t.Fatalf("Ack: %v", err)
 	}
 	next, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
@@ -667,7 +669,7 @@ func TestMixedQueueHeadOfLineBlocking(t *testing.T) {
 	if err != nil || !ok || store.GetU64(v) != 2 {
 		t.Fatalf("位点应停在被拦消息处（2）: %v %v", v, err)
 	}
-	if _, err := f.dl.Ack("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt); err != nil {
+	if _, err := f.dl.Ack(context.Background(), "g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt); err != nil {
 		t.Fatalf("Ack a: %v", err)
 	}
 	next, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
@@ -697,7 +699,7 @@ func TestOrderedTagFilteredStillSkipped(t *testing.T) {
 	if err != nil || len(msgs) != 1 || string(msgs[0].Body) != "a" {
 		t.Fatalf("首投 a: %+v %v", msgs, err)
 	}
-	if _, err := f.dl.Ack("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt); err != nil {
+	if _, err := f.dl.Ack(context.Background(), "g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt); err != nil {
 		t.Fatal(err)
 	}
 	// b 不匹配被永久跳过，直接投 c
@@ -756,7 +758,7 @@ func TestForwardToDLQStaleHandle(t *testing.T) {
 		t.Fatalf("不存在的 offset 应幂等拒绝: %v %v", ok, err)
 	}
 	// 原 inflight 未被误删：a 仍可 ack
-	if ok, err := f.dl.Ack("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt); !ok || err != nil {
+	if ok, err := f.dl.Ack(context.Background(), "g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt); !ok || err != nil {
 		t.Fatalf("原记录应完好: %v %v", ok, err)
 	}
 }
@@ -814,7 +816,7 @@ func TestAckBatchMixedEntries(t *testing.T) {
 	if err != nil || len(msgs) != 2 {
 		t.Fatalf("receive: %v msgs=%d", err, len(msgs))
 	}
-	results, err := f.dl.AckBatch("g", "ab-t", 0, []AckEntry{
+	results, err := f.dl.AckBatch(context.Background(), "g", "ab-t", 0, []AckEntry{
 		{Offset: msgs[0].Offset, Attempt: msgs[0].DeliveryAttempt}, // 有效
 		{Offset: msgs[1].Offset, Attempt: 99},                      // 陈旧 attempt
 		{Offset: 9999, Attempt: 1},                                 // 不存在
@@ -843,7 +845,7 @@ func TestAckBatchAllInvalidNoWrite(t *testing.T) {
 	if err != nil || len(msgs) != 1 {
 		t.Fatalf("receive: %v", err)
 	}
-	results, err := f.dl.AckBatch("g", "ab2-t", 0, []AckEntry{
+	results, err := f.dl.AckBatch(context.Background(), "g", "ab2-t", 0, []AckEntry{
 		{Offset: msgs[0].Offset, Attempt: 42}, // 陈旧
 		{Offset: 8888, Attempt: 1},            // 不存在
 	})
@@ -878,7 +880,7 @@ func TestConcurrentReceiveAckNoRace(t *testing.T) {
 					return
 				}
 				for _, m := range msgs {
-					ok, err := f.dl.Ack("g", "cc-t", 0, m.Offset, m.DeliveryAttempt)
+					ok, err := f.dl.Ack(context.Background(), "g", "cc-t", 0, m.Offset, m.DeliveryAttempt)
 					if err != nil {
 						t.Errorf("Ack off=%d: %v", m.Offset, err)
 						return

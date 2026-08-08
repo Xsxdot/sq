@@ -367,7 +367,7 @@ func (s *Server) AckMessage(ctx context.Context, req *pb.AckMessageRequest) (*pb
 		for j, sl := range slots {
 			acks[j] = deliver.AckEntry{Offset: sl.offset, Attempt: sl.attempt}
 		}
-		results, err := s.dl.AckBatch(k.group, k.topic, k.q, acks)
+		results, err := s.dl.AckBatch(ctx, k.group, k.topic, k.q, acks)
 		if err != nil {
 			// 存储故障：该组整体失败（AckBatch 单 Batch 原子，不存在部分生效），
 			// 客户端对这些 entry 重试即可
@@ -434,7 +434,7 @@ func (s *Server) ChangeInvisibleDuration(ctx context.Context, req *pb.ChangeInvi
 		s.logger.Warn("改不可见时长 handle 非法", "handle", truncateForLog(req.GetReceiptHandle()), "err", err)
 		return &pb.ChangeInvisibleDurationResponse{Status: errStatus(pb.Code_INVALID_RECEIPT_HANDLE, err.Error())}, nil
 	}
-	ok, err := s.dl.ChangeInvisible(g, topic, q, off, attempt, req.GetInvisibleDuration().AsDuration())
+	ok, err := s.dl.ChangeInvisible(ctx, g, topic, q, off, attempt, req.GetInvisibleDuration().AsDuration())
 	if err != nil {
 		s.logger.Error("改不可见时长失败", "group", g, "topic", topic, "queue", q, "offset", off, "attempt", attempt, "err", err)
 		return &pb.ChangeInvisibleDurationResponse{Status: errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error())}, nil

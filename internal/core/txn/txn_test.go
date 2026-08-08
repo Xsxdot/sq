@@ -34,9 +34,11 @@ func newFixture(t *testing.T, interval time.Duration, maxChecks int) *fixture {
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
-	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
-	dl := deliver.New(st, mt, pr, slog.Default())
-	return &fixture{st: st, pr: pr, dl: dl, mgr: New(st, pr, mt, interval, maxChecks, slog.Default())}
+	rep := replication.NewStandalone(st)
+	rt := replication.StandaloneRouter{}
+	pr := produce.New(rep, rt, st, mt, slog.Default())
+	dl := deliver.New(rep, rt, st, mt, pr, slog.Default())
+	return &fixture{st: st, pr: pr, dl: dl, mgr: New(rep, rt, st, pr, mt, interval, maxChecks, slog.Default())}
 }
 
 // msgCount 统计 msg/ 区消息条数（两段式重放用例断言目标队列条数用）。

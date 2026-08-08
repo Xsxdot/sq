@@ -81,7 +81,7 @@ func TestPassSendsRecoverAndReschedules(t *testing.T) {
 	f := newFixture(t, 30*time.Second, 15)
 	txID := stageOverdue(t, f, "t-check")
 	n := &fakeNotifier{send: true}
-	sent, err := f.mgr.Pass(n)
+	sent, err := f.mgr.Pass(context.Background(), n)
 	if err != nil || sent != 1 {
 		t.Fatalf("Pass: sent=%d err=%v", sent, err)
 	}
@@ -109,7 +109,7 @@ func TestPassReschedulesEvenWhenNoProducerOnline(t *testing.T) {
 	f := newFixture(t, 30*time.Second, 15)
 	txID := stageOverdue(t, f, "t-check")
 	n := &fakeNotifier{send: false}
-	if _, err := f.mgr.Pass(n); err != nil {
+	if _, err := f.mgr.Pass(context.Background(), n); err != nil {
 		t.Fatal(err)
 	}
 	refRaw, _, _ := f.st.Get(store.HalfIdxKey(txID))
@@ -125,7 +125,7 @@ func TestPassDropsAfterMaxChecks(t *testing.T) {
 	txID := stageOverdue(t, f, "t-drop")
 	n := &fakeNotifier{send: true}
 	for i := 0; i < 3; i++ {
-		if _, err := f.mgr.Pass(n); err != nil {
+		if _, err := f.mgr.Pass(context.Background(), n); err != nil {
 			t.Fatal(err)
 		}
 		// 先查再改写：本条已超限丢弃时（halfCount==0）条目已不存在，
@@ -155,7 +155,7 @@ func TestPassSkipsEntryEndedInBetween(t *testing.T) {
 		t.Fatal("End 失败")
 	}
 	n := &fakeNotifier{send: true}
-	sent, err := f.mgr.Pass(n)
+	sent, err := f.mgr.Pass(context.Background(), n)
 	if err != nil || sent != 0 || len(n.got) != 0 {
 		t.Fatalf("已决断事务被回查: sent=%d got=%v err=%v", sent, n.got, err)
 	}
@@ -177,7 +177,7 @@ func TestPassDeletesBadHalfKeyAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := &fakeNotifier{send: true}
-	sent, err := f.mgr.Pass(n)
+	sent, err := f.mgr.Pass(context.Background(), n)
 	if err != nil || sent != 2 {
 		t.Fatalf("Pass: sent=%d err=%v（坏 key 1 条 + 健康 1 条均计入 handled）", sent, err)
 	}
@@ -212,7 +212,7 @@ func TestPassDeletesCorruptHalfIdxAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := &fakeNotifier{send: true}
-	sent, err := f.mgr.Pass(n)
+	sent, err := f.mgr.Pass(context.Background(), n)
 	if err != nil || sent != 1 {
 		t.Fatalf("Pass: sent=%d err=%v（坏 halfidx 条目计入 handled）", sent, err)
 	}
@@ -252,7 +252,7 @@ func TestPassDeletesCorruptValueWithMissingIdx(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := &fakeNotifier{send: true}
-	sent, err := f.mgr.Pass(n)
+	sent, err := f.mgr.Pass(context.Background(), n)
 	if err != nil || sent != 1 {
 		t.Fatalf("Pass: sent=%d err=%v（坏条目计入 handled，不报错）", sent, err)
 	}

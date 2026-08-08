@@ -70,12 +70,14 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 		t.Fatalf("store.Open: %v", err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, autoCreate, 4, 16, slog.Default())
+	rep := replication.NewStandalone(st)
+	rt := replication.StandaloneRouter{}
+	mt, err := meta.New(rep, rt, st, autoCreate, 4, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("meta.New: %v", err)
 	}
-	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
-	dl := deliver.New(st, mt, pr, slog.Default())
+	pr := produce.New(rep, rt, st, mt, slog.Default())
+	dl := deliver.New(rep, rt, st, mt, pr, slog.Default())
 	cfg, err := config.Load("")
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
@@ -83,7 +85,7 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 	cfg.AutoCreateTopic = autoCreate // cfg 与 meta 的 autoCreate 必须一致，预检（send.go 第零遍）读的是 cfg
 	blocked := &atomic.Bool{}
 	// txn 管理器与生产装配同参数（30s 首查间隔、15 次上限，见 config 默认值）
-	tx := txn.New(st, pr, mt, 30*time.Second, 15, slog.Default())
+	tx := txn.New(rep, rt, st, pr, mt, 30*time.Second, 15, slog.Default())
 	srv := New(cfg, mt, pr, dl, tx, blocked, []byte("test-handle-secret"), slog.Default())
 
 	lis := bufconn.Listen(1 << 20)

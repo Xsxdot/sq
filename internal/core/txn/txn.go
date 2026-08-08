@@ -16,6 +16,11 @@
 //   - 崩溃恢复零代码：half/halfidx 全在 Pebble，重启后扫描即恢复；
 //     Stage/回滚/改期均为单批原子操作；commit 是两段式（先写 msg/ 后删
 //     两键），崩溃窗口重放 = 重复提交 = 重复消息，at-least-once 语义内
+//
+// 组归属（batch③）：half/ 与 halfidx/ 键族归元数据组（rt.MetaGroup()）——
+// 事务暂存区与队列无关，无 GroupForQueue 映射；提交段的两段分别归目标队列
+// 组（消息追加）与元数据组（删 half 两键）。EndTransaction 可能落在任意
+// 节点：非 leader 组经 fwd 转发，见 End 内分支注释。
 package txn
 
 import (
@@ -31,6 +36,7 @@ import (
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -47,6 +53,9 @@ type HalfRef struct {
 // 会把已决断的事务复活成僵尸），但不同 txID 之间毫无共享状态，全局锁徒然
 // 让所有事务的 fsync 串行化。同 txID 恒定落在同一分片，互斥保证不变。
 type Manager struct {
+	rep           replication.Replicator
+	rt            replication.Router
+	fwd           replication.Forwarder // 跨节点转发（集群档）；单机档 nil——IsLeader 恒真，转发分支不可达
 	st            *store.Store
 	pr            *produce.Producer
 	mt            *meta.Meta
@@ -76,9 +85,17 @@ func (t *Manager) lockFor(txID string) *sync.Mutex {
 }
 
 // New 构造事务管理器。checkInterval/maxChecks 来自 config（已在 Load 校验为正）。
-func New(st *store.Store, pr *produce.Producer, mt *meta.Meta,
+//
+// rep/rt 为复制抽象与组路由视图（单机档传 replication.NewStandalone(st) 与
+// StandaloneRouter{}，集群档由 main 装配）；fwd 从 rt 断言取得——集群档的
+// rt 即 *replication.Cluster（同时实现 Forwarder），单机档的
+// StandaloneRouter 不实现 Forwarder，断言得 nil；单机 IsLeader 恒真，转发
+// 分支不可达，nil 不会解引用。
+func New(rep replication.Replicator, rt replication.Router, st *store.Store,
+	pr *produce.Producer, mt *meta.Meta,
 	checkInterval time.Duration, maxChecks int, logger *slog.Logger) *Manager {
-	return &Manager{st: st, pr: pr, mt: mt,
+	fwd, _ := rt.(replication.Forwarder)
+	return &Manager{rep: rep, rt: rt, fwd: fwd, st: st, pr: pr, mt: mt,
 		checkInterval: checkInterval, maxChecks: maxChecks,
 		logger: logger.With("mod", "txn")}
 }
@@ -117,7 +134,8 @@ func (t *Manager) Stage(ctx context.Context, m *core.Message) (*core.Message, st
 	b := t.st.NewBatch()
 	b.Set(store.HalfKey(next, txID), raw)
 	b.Set(store.HalfIdxKey(txID), ref)
-	if err := t.st.Apply(b); err != nil {
+	// half 键族归元数据组（与队列无关，无 GroupForQueue 映射）
+	if err := t.rep.Apply(ctx, t.rt.MetaGroup(), b); err != nil {
 		return nil, "", fmt.Errorf("写入半消息 %s (topic=%s tx=%s): %w", m.ID, m.Topic, txID, err)
 	}
 	t.logger.Info("事务半消息已暂存", "topic", m.Topic, "msg_id", m.ID,
@@ -157,7 +175,7 @@ func (t *Manager) End(ctx context.Context, txID string, commit bool) (bool, erro
 			"tx_id", txID, "next_check_ms", ref.NextCheckMs)
 		b := t.st.NewBatch()
 		b.Delete(store.HalfIdxKey(txID))
-		if aerr := t.st.Apply(b); aerr != nil {
+		if aerr := t.rep.Apply(ctx, t.rt.MetaGroup(), b); aerr != nil {
 			return false, fmt.Errorf("删除孤儿 halfidx (tx=%s): %w", txID, aerr)
 		}
 		return false, nil
@@ -166,7 +184,7 @@ func (t *Manager) End(ctx context.Context, txID string, commit bool) (bool, erro
 		b := t.st.NewBatch()
 		b.Delete(halfKey)
 		b.Delete(store.HalfIdxKey(txID))
-		if err := t.st.Apply(b); err != nil {
+		if err := t.rep.Apply(ctx, t.rt.MetaGroup(), b); err != nil {
 			return false, fmt.Errorf("回滚删除半消息 (tx=%s): %w", txID, err)
 		}
 		t.logger.Info("事务已回滚", "tx_id", txID, "checks", ref.Checks)
@@ -182,8 +200,30 @@ func (t *Manager) End(ctx context.Context, txID string, commit bool) (bool, erro
 	// 既有幂等判定天然兜底：End 先读 halfidx（不存在即已决断），第二段落盘后
 	// 一切再次 EndTransaction 均为幂等 no-op；窗口内重试则重复提交一次，
 	// 仅此而已——重复有界、不丢失。
+	//
+	// 集群档分派：EndTransaction 可能落在任意节点。第一段的目标队列组与本节点
+	// leader 关系不定——本节点是目标组 leader 时本地 pr.Append（offset 分配在
+	// 本节点）；否则经 fwd.ForwardAppend 把消息字节交给目标组 leader 追加
+	//（leader-only 构造的跨节点延伸，offset 在 leader 侧分配）。
+	// 半消息 m 此刻 QueueID 为零（暂存态未选队），转发组号按
+	// rt.GroupForQueue(m.Topic, m.QueueID) 计算——选队由 leader 侧 produce 栈
+	// 完成，发起方按此组寻址（错组时 leader 侧 Append 自然报 ErrNotLeader
+	// 回传，调用方重试）。
 	idxKey := store.HalfIdxKey(txID)
-	stored, err := t.pr.Append(ctx, m)
+	g := t.rt.GroupForQueue(m.Topic, m.QueueID)
+	var stored *core.Message
+	if t.rt.IsLeader(g) {
+		stored, err = t.pr.Append(ctx, m)
+	} else {
+		qid, off, ferr := t.fwd.ForwardAppend(ctx, g, raw)
+		if ferr != nil {
+			return false, fmt.Errorf("转发提交半消息 (tx=%s msg=%s topic=%s g=%d): %w", txID, m.ID, m.Topic, g, ferr)
+		}
+		// 转发只回坐标：拼出日志所需的存储信息（ID/topic 本就来自半消息本体）
+		stored = &core.Message{ID: m.ID, Topic: m.Topic, QueueID: qid, Offset: off}
+		t.logger.Info("事务提交消息跨节点转发", "tx_id", txID, "g", g,
+			"msg_id", m.ID, "topic", m.Topic, "queue", qid, "offset", off)
+	}
 	if err != nil {
 		return false, fmt.Errorf("提交半消息 (tx=%s msg=%s topic=%s): %w", txID, m.ID, m.Topic, err)
 	}
@@ -193,10 +233,12 @@ func (t *Manager) End(ctx context.Context, txID string, commit bool) (bool, erro
 	// 第二段：独立批次删 half 两键。失败只记 Error 不回滚第一段——消息已提交
 	// 入队是既成事实，两键残留 = 重放再次提交 = 重复消息（可接受）；日志带
 	// 全坐标，便于按 tx_id/msg_id 在 msg/ 与 half/ 两侧核对。
+	// 第二段归元数据组；本节点非 meta leader 时经 fwd.ForwardApply 转发——
+	// 批次是构造无关的两个绝对键 Delete，转发安全（跨节点重放无副作用）。
 	b := t.st.NewBatch()
 	b.Delete(halfKey)
 	b.Delete(idxKey)
-	if err := t.st.Apply(b); err != nil {
+	if err := t.applyMetaOrForward(ctx, b); err != nil {
 		t.logger.Error("半消息已提交入队但 half 键删除失败——重放将重复提交产生重复消息（at-least-once 允许）",
 			"tx_id", txID, "msg_id", stored.ID, "topic", stored.Topic,
 			"queue", stored.QueueID, "offset", stored.Offset, "err", err)
@@ -213,6 +255,29 @@ func (t *Manager) ChecksTotal() uint64 { return t.checks.Load() }
 
 // DroppedTotal 返回累计超限丢弃条数。
 func (t *Manager) DroppedTotal() uint64 { return t.dropped.Load() }
+
+// applyMetaOrForward 把构造无关批次提交到元数据组：本节点是 meta leader 时
+// rep.Apply 本地提案；否则经 fwd 转发给 meta leader（End 的第二段专用——
+// EndTransaction 可能落在任意节点，而 half 键族归元数据组）。批次归属：
+// 两条路径返回后调用方都不再持有（转发路径内部完成 Repr 拷贝与 Close）。
+func (t *Manager) applyMetaOrForward(ctx context.Context, b *store.Batch) error {
+	g := t.rt.MetaGroup()
+	if t.rt.IsLeader(g) {
+		return t.rep.Apply(ctx, g, b)
+	}
+	// 转发路径：Repr 字节归批次所有，先拷贝再 Close（同 replication.Cluster
+	// 的批次回收契约）；Close 失败仅 Warn——字节已取出，不阻断转发。
+	repr := append([]byte(nil), b.Repr()...)
+	if err := b.Close(); err != nil {
+		t.logger.Warn("转发前回收批次失败（字节已取出，不阻断转发）", "g", g, "err", err)
+	}
+	if err := t.fwd.ForwardApply(ctx, g, repr); err != nil {
+		t.logger.Warn("转发 half 键删除批次失败", "g", g, "bytes", len(repr), "err", err)
+		return err
+	}
+	t.logger.Info("事务决断键删除跨节点转发", "g", g, "bytes", len(repr))
+	return nil
+}
 
 // scanInterval 回查扫描间隔。1s 对「几十秒级的回查间隔」精度绰绰有余。
 // var 而非 const：测试需注入小值。
@@ -238,7 +303,7 @@ func (t *Manager) RunChecker(ctx context.Context, n Notifier) {
 	tk := time.NewTicker(scanInterval)
 	defer tk.Stop()
 	for {
-		handled, err := t.Pass(n)
+		handled, err := t.Pass(ctx, n)
 		if err != nil {
 			// 单趟失败只记日志不退出：store 瞬时故障恢复后下一趟自然重试
 			t.logger.Error("txn 回查趟失败", "err", err)
@@ -258,7 +323,7 @@ func (t *Manager) RunChecker(ctx context.Context, n Notifier) {
 }
 
 // Pass 执行一趟到期回查，返回处理条数（下发+改期、超限丢弃、坏条目清理，均计入）。
-func (t *Manager) Pass(n Notifier) (int, error) {
+func (t *Manager) Pass(ctx context.Context, n Notifier) (int, error) {
 	now := time.Now().UnixMilli()
 	// 先收集后处理：Scan 回调里不能开写事务（迭代器与写入交错会破坏迭代），
 	// 坏 key 也只能拷贝原始字节、扫描结束后统一批量删除（为什么见下方注释）
@@ -295,7 +360,7 @@ func (t *Manager) Pass(n Notifier) (int, error) {
 		for _, k := range badKeys {
 			b.Delete(k)
 		}
-		if err := t.st.Apply(b); err != nil {
+		if err := t.rep.Apply(ctx, t.rt.MetaGroup(), b); err != nil {
 			return 0, fmt.Errorf("删除坏 half key: %w", err)
 		}
 		for _, k := range badKeys {
@@ -311,13 +376,13 @@ func (t *Manager) Pass(n Notifier) (int, error) {
 			// half key 只能由扫描回调侧给出；从 idx 重建在 idx 缺失/损坏时会失败，
 			// 留下每趟重扫重报的残留窗口（见 dropLocked 注释）
 			t.logger.Error("half 条目解码失败，丢弃坏条目", "tx_id", d.txID, "err", err)
-			if err := t.dropLocked(d.txID, d.halfKey); err != nil {
+			if err := t.dropLocked(ctx, d.txID, d.halfKey); err != nil {
 				return handled, err
 			}
 			handled++
 			continue
 		}
-		send, err := t.checkOne(d.halfKey, d.txID, m)
+		send, err := t.checkOne(ctx, d.halfKey, d.txID, m)
 		if err != nil {
 			// 失败即中断本趟：条目未动，下一趟重扫自然重试
 			return handled, err
@@ -346,7 +411,7 @@ func (t *Manager) Pass(n Notifier) (int, error) {
 // 因此任一方总能看到另一方的完整结果；若先下发后改期，客户端可能在两者的
 // 间隙完成 End，改期一方再按旧键重写就把已决断的事务复活成僵尸。
 // 下发本身是网络操作，放在锁外，避免一个慢客户端拖住全部事务状态迁移。
-func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, error) {
+func (t *Manager) checkOne(ctx context.Context, halfKey []byte, txID string, m *core.Message) (bool, error) {
 	mu := t.lockFor(txID)
 	mu.Lock()
 	defer mu.Unlock()
@@ -369,7 +434,7 @@ func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, 
 		b := t.st.NewBatch()
 		b.Delete(halfKey)
 		b.Delete(store.HalfIdxKey(txID))
-		if aerr := t.st.Apply(b); aerr != nil {
+		if aerr := t.rep.Apply(ctx, t.rt.MetaGroup(), b); aerr != nil {
 			return false, fmt.Errorf("删除坏 halfidx 条目 (tx=%s): %w", txID, aerr)
 		}
 		return false, nil
@@ -381,7 +446,7 @@ func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, 
 		b := t.st.NewBatch()
 		b.Delete(oldKey)
 		b.Delete(store.HalfIdxKey(txID))
-		if err := t.st.Apply(b); err != nil {
+		if err := t.rep.Apply(ctx, t.rt.MetaGroup(), b); err != nil {
 			return false, fmt.Errorf("丢弃超限半消息 (tx=%s): %w", txID, err)
 		}
 		t.dropped.Add(1)
@@ -405,7 +470,7 @@ func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, 
 			"tx_id", txID, "next_check_ms", ref.NextCheckMs)
 		b := t.st.NewBatch()
 		b.Delete(store.HalfIdxKey(txID))
-		if aerr := t.st.Apply(b); aerr != nil {
+		if aerr := t.rep.Apply(ctx, t.rt.MetaGroup(), b); aerr != nil {
 			return false, fmt.Errorf("删除孤儿 halfidx (tx=%s): %w", txID, aerr)
 		}
 		return false, nil
@@ -415,7 +480,7 @@ func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, 
 	b.Delete(oldKey)
 	b.Set(store.HalfKey(next, txID), raw)
 	b.Set(store.HalfIdxKey(txID), newRef)
-	if err := t.st.Apply(b); err != nil {
+	if err := t.rep.Apply(ctx, t.rt.MetaGroup(), b); err != nil {
 		return false, fmt.Errorf("半消息改期 (tx=%s): %w", txID, err)
 	}
 	t.checks.Add(1)
@@ -428,12 +493,12 @@ func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, 
 // 为什么直接传 halfKey 而不是从 idx 重建：坏条目的值已无法解码，删除只能靠
 // half key 定位；若此时 idx 恰好缺失或损坏，从 idx 重建会失败，坏条目将永远
 // 留在盘上、每趟重扫重报（da3a330 修掉坏 key 洪水后的同类残留窗口）。
-func (t *Manager) dropLocked(txID string, halfKey []byte) error {
+func (t *Manager) dropLocked(ctx context.Context, txID string, halfKey []byte) error {
 	mu := t.lockFor(txID)
 	mu.Lock()
 	defer mu.Unlock()
 	b := t.st.NewBatch()
 	b.Delete(halfKey)
 	b.Delete(store.HalfIdxKey(txID))
-	return t.st.Apply(b)
+	return t.rep.Apply(ctx, t.rt.MetaGroup(), b)
 }

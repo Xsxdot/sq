@@ -35,9 +35,11 @@ func newFixture(t *testing.T) *fixture {
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
-	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
-	dl := deliver.New(st, mt, pr, slog.Default())
-	return &fixture{st: st, pr: pr, dl: dl, sc: New(st, pr, slog.Default())}
+	rep := replication.NewStandalone(st)
+	rt := replication.StandaloneRouter{}
+	pr := produce.New(rep, rt, st, mt, slog.Default())
+	dl := deliver.New(rep, rt, st, mt, pr, slog.Default())
+	return &fixture{st: st, pr: pr, dl: dl, sc: New(rep, rt, st, pr, slog.Default())}
 }
 
 // putDelay 直接向暂存区写一条到期条目（绕过 AppendDelay 的直通逻辑）

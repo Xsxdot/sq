@@ -15,6 +15,10 @@
 //     中间态 = 重放重复投递，at-least-once 语义内
 //   - 时钟回拨（NTP 校时）只会让扫描上界暂时变小、到期条目晚一点被搬运
 //     ——仅延迟投递，不丢失不提前（spec §7 时钟策略）
+//
+// 组归属（batch③）：delay/ 暂存区键族归元数据组（rt.MetaGroup()）——
+// 暂存条目未选队，无 GroupForQueue 映射；移入第一段（消息追加）归目标
+// 队列组，本节点非目标组 leader 时经 fwd 转发（见 Pass 内分支注释）。
 package delay
 
 import (
@@ -25,6 +29,7 @@ import (
 
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -39,6 +44,9 @@ var maxMovePerPass = 512
 
 // Scheduler 延时消息调度器。单 goroutine 运行（Run），Pass 可单独调用（测试用）。
 type Scheduler struct {
+	rep    replication.Replicator
+	rt     replication.Router
+	fwd    replication.Forwarder // 跨节点转发（集群档）；单机档 nil——IsLeader 恒真，转发分支不可达
 	st     *store.Store
 	pr     *produce.Producer
 	logger *slog.Logger
@@ -49,9 +57,16 @@ type Scheduler struct {
 	afterAppendHook func()
 }
 
-// New 构造调度器。
-func New(st *store.Store, pr *produce.Producer, logger *slog.Logger) *Scheduler {
-	return &Scheduler{st: st, pr: pr, logger: logger.With("mod", "delay")}
+// New 构造调度器。rep/rt 为复制抽象与组路由视图（单机档传
+// replication.NewStandalone(st) 与 StandaloneRouter{}，集群档由 main 装配）；
+// fwd 从 rt 断言取得——集群档的 rt 即 *replication.Cluster（同时实现
+// Forwarder），单机档的 StandaloneRouter 不实现 Forwarder，断言得 nil；
+// 单机 IsLeader 恒真，转发分支不可达，nil 不会解引用。
+func New(rep replication.Replicator, rt replication.Router, st *store.Store,
+	pr *produce.Producer, logger *slog.Logger) *Scheduler {
+	fwd, _ := rt.(replication.Forwarder)
+	return &Scheduler{rep: rep, rt: rt, fwd: fwd, st: st, pr: pr,
+		logger: logger.With("mod", "delay")}
 }
 
 // Run 阻塞运行调度循环：启动即跑一趟，此后每 scanInterval 一趟；单趟满额
@@ -109,7 +124,8 @@ func (s *Scheduler) Pass(ctx context.Context) (int, error) {
 			s.logger.Error("delay 条目解码失败，删除坏条目", "key", fmt.Sprintf("%q", d.key), "err", err)
 			b := s.st.NewBatch()
 			b.Delete(d.key)
-			if err := s.st.Apply(b); err != nil {
+			// 坏条目归元数据组（delay/ 键族与队列无关）
+			if err := s.rep.Apply(ctx, s.rt.MetaGroup(), b); err != nil {
 				return moved, fmt.Errorf("删除坏 delay 条目: %w", err)
 			}
 			continue
@@ -120,9 +136,31 @@ func (s *Scheduler) Pass(ctx context.Context) (int, error) {
 		// 落盘后、第二段前）重放 = 重复投递，at-least-once 语义内——条目残留 =
 		// 下趟重搬 = 目标队列多一条同 ID 消息，消费端按 ID 幂等即可。次序不得
 		// 反转（先删后写 = 崩溃丢消息，绝不允许）。
-		if _, err := s.pr.Append(ctx, m); err != nil {
-			// 失败即中断本趟：条目未删除，下一趟从头重扫自然重试
-			return moved, fmt.Errorf("延时消息移入 (msg_id=%s topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
+		//
+		// 第一段的目标队列组与本节点 leader 关系不定（调度器在 meta leader 上
+		// 跑，但目标队列可能属于别的组）：本节点是目标组 leader 时本地
+		// pr.Append（offset 分配在本节点）；否则经 fwd.ForwardAppend 把消息字节
+		// 交给目标组 leader 追加（leader-only 构造的跨节点延伸）。
+		// 暂存消息此刻 QueueID 为零（未选队），转发组号按
+		// rt.GroupForQueue(m.Topic, m.QueueID) 计算——选队由 leader 侧 produce
+		// 栈完成，发起方按此组寻址。
+		g := s.rt.GroupForQueue(m.Topic, m.QueueID)
+		if s.rt.IsLeader(g) {
+			if _, err := s.pr.Append(ctx, m); err != nil {
+				// 失败即中断本趟：条目未删除，下一趟从头重扫自然重试
+				return moved, fmt.Errorf("延时消息移入 (msg_id=%s topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
+			}
+		} else {
+			qid, off, ferr := s.fwd.ForwardAppend(ctx, g, d.raw)
+			if ferr != nil {
+				// 失败即中断本趟：条目未删除，下一趟从头重扫自然重试
+				return moved, fmt.Errorf("转发延时消息移入 (msg_id=%s topic=%s due=%d g=%d): %w", m.ID, m.Topic, m.DeliverAtMs, g, ferr)
+			}
+			// 转发只回坐标：回填用于第二段日志核对（源条目坐标即 leader 侧分配值）
+			m.QueueID = qid
+			m.Offset = off
+			s.logger.Info("延时消息跨节点转发", "msg_id", m.ID, "topic", m.Topic,
+				"queue", qid, "offset", off, "g", g, "due_ms", m.DeliverAtMs)
 		}
 		if s.afterAppendHook != nil {
 			s.afterAppendHook()
@@ -130,10 +168,12 @@ func (s *Scheduler) Pass(ctx context.Context) (int, error) {
 		moved++
 		// 第二段：独立批次删 delay 条目。失败只记 Error 不回滚第一段——消息已
 		// 入队是既成事实，条目残留 = 下趟重搬 = 重复（可接受）；日志把两段坐标
-		// 都带上，便于运维按 msg_id 在两边核对。
+		// 都带上，便于运维按 msg_id 在两边核对。第二段归元数据组——调度器只在
+		// meta leader 上跑（Task 8 门控），本节点必是 leader，直接 rep.Apply
+		// 无需转发。
 		b := s.st.NewBatch()
 		b.Delete(key)
-		if err := s.st.Apply(b); err != nil {
+		if err := s.rep.Apply(ctx, s.rt.MetaGroup(), b); err != nil {
 			s.logger.Error("延时消息已入队但 delay 条目删除失败——条目残留，下趟重搬将产生重复投递（at-least-once 允许）",
 				"msg_id", m.ID, "topic", m.Topic, "queue", m.QueueID, "offset", m.Offset,
 				"due_ms", m.DeliverAtMs, "delay_key", fmt.Sprintf("%q", key), "err", err)

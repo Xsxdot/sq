@@ -32,12 +32,14 @@ func fixture(t *testing.T) (*store.Store, *meta.Meta, *produce.Producer, *delive
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, true, 1, 16, slog.Default())
+	rep := replication.NewStandalone(st)
+	rt := replication.StandaloneRouter{}
+	mt, err := meta.New(rep, rt, st, true, 1, 16, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
-	pr := produce.New(replication.NewStandalone(st), replication.StandaloneRouter{}, st, mt, slog.Default())
-	return st, mt, pr, deliver.New(st, mt, pr, slog.Default())
+	pr := produce.New(rep, rt, st, mt, slog.Default())
+	return st, mt, pr, deliver.New(rep, rt, st, mt, pr, slog.Default())
 }
 
 func TestCollectDerivesStats(t *testing.T) {
