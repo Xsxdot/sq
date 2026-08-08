@@ -212,20 +212,31 @@ func (p *Producer) AppendDelay(m *core.Message) (*core.Message, error) {
 		return nil, err
 	}
 	p.delayMu.Lock()
-	defer p.delayMu.Unlock()
 	seq, err := p.nextDelaySeqLocked()
 	if err != nil {
+		p.delayMu.Unlock()
 		return nil, err
 	}
 	b := p.st.NewBatch()
 	b.Set(store.DelayKey(m.DeliverAtMs, seq), raw)
 	b.Set(store.DelayAllocKey(), store.PutU64(seq+1))
-	if err := p.st.Apply(b); err != nil {
+	pending, err := p.st.ApplyAsync(b)
+	if err != nil {
+		p.delayMu.Unlock()
 		return nil, fmt.Errorf("写入延时消息 %s (topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
 	}
-	// 与 Append 同理：Apply 成功后才推进内存缓存，失败的写不能烧掉 seq
+	// 定序成功即推进 seq 缓存并解锁：并发的延时写入随即进锁定序，与本条共享
+	// 同一次 fsync（拆分提交，与 AppendWith 的 qs.next 同款）。提前推进的安全性
+	// 论证也相同：WaitSync 失败 == WAL sync 失败 == Pebble 不可恢复错误态，
+	// 重启后 seq 计数器与条目由同批原子提交保证一致，内存里烧掉的 seq 无害。
 	p.delayNext = seq + 1
 	p.delayLoaded = true
+	p.delayMu.Unlock()
+
+	// 锁外等待持久化：fsync 完成之前绝不确认（语义红线 1）
+	if err := pending.Wait(); err != nil {
+		return nil, fmt.Errorf("等待延时消息 %s 持久化 (topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
+	}
 	p.logger.Debug("延时消息已暂存", "topic", m.Topic, "msg_id", m.ID,
 		"due_ms", m.DeliverAtMs, "seq", seq)
 	return m, nil

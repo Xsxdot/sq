@@ -20,6 +20,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -39,9 +40,10 @@ type HalfRef struct {
 	Checks      int   `json:"checks"`
 }
 
-// Manager 事务管理器。并发安全：mu 串行化「同一 txID 的状态迁移」——
-// End（客户端决断）与回查调度器的改期都会搬移 half 键，两者交错时后者
-// 必须看到前者的结果，否则已提交的事务会被改期逻辑复活成僵尸半消息。
+// Manager 事务管理器。并发安全：锁按 txID 分片（txnLockShards 片）——
+// 「同一 txID 的状态迁移」必须串行（End 与回查改期都会搬移 half 键，交错
+// 会把已决断的事务复活成僵尸），但不同 txID 之间毫无共享状态，全局锁徒然
+// 让所有事务的 fsync 串行化。同 txID 恒定落在同一分片，互斥保证不变。
 type Manager struct {
 	st            *store.Store
 	pr            *produce.Producer
@@ -50,9 +52,20 @@ type Manager struct {
 	maxChecks     int
 	logger        *slog.Logger
 
-	mu      sync.Mutex
+	mus     [txnLockShards]sync.Mutex
 	checks  atomic.Uint64 // 累计回查排期次数（/metrics 的 sq_txn_checks_total）
 	dropped atomic.Uint64 // 累计超限丢弃条数（/metrics 的 sq_txn_dropped_total）
+}
+
+// txnLockShards 事务锁分片数。32 片对「低频但可能并发」的事务决断绰绰有余；
+// 片内条目哈希碰撞只影响并行度，不影响正确性。
+const txnLockShards = 32
+
+// lockFor 返回 txID 对应的分片锁。fnv 与 produce 的 FIFO 选队保持同一哈希家族。
+func (t *Manager) lockFor(txID string) *sync.Mutex {
+	h := fnv.New32a()
+	h.Write([]byte(txID))
+	return &t.mus[h.Sum32()%txnLockShards]
 }
 
 // New 构造事务管理器。checkInterval/maxChecks 来自 config（已在 Load 校验为正）。
@@ -111,8 +124,9 @@ func (t *Manager) Stage(m *core.Message) (*core.Message, string, error) {
 // 重试（第一次已生效）、回查决断与客户端决断赛跑输的一方、超限已丢弃。
 // 三者都不是错误，调用方按幂等成功处理（记 Warn 即可）。
 func (t *Manager) End(txID string, commit bool) (bool, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	mu := t.lockFor(txID)
+	mu.Lock()
+	defer mu.Unlock()
 	refRaw, ok, err := t.st.Get(store.HalfIdxKey(txID))
 	if err != nil {
 		return false, fmt.Errorf("读取 halfidx (tx=%s): %w", txID, err)
@@ -309,8 +323,9 @@ func (t *Manager) Pass(n Notifier) (int, error) {
 // 间隙完成 End，改期一方再按旧键重写就把已决断的事务复活成僵尸。
 // 下发本身是网络操作，放在锁外，避免一个慢客户端拖住全部事务状态迁移。
 func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, error) {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	mu := t.lockFor(txID)
+	mu.Lock()
+	defer mu.Unlock()
 	refRaw, ok, err := t.st.Get(store.HalfIdxKey(txID))
 	if err != nil {
 		return false, fmt.Errorf("读取 halfidx (tx=%s): %w", txID, err)
@@ -390,8 +405,9 @@ func (t *Manager) checkOne(halfKey []byte, txID string, m *core.Message) (bool, 
 // half key 定位；若此时 idx 恰好缺失或损坏，从 idx 重建会失败，坏条目将永远
 // 留在盘上、每趟重扫重报（da3a330 修掉坏 key 洪水后的同类残留窗口）。
 func (t *Manager) dropLocked(txID string, halfKey []byte) error {
-	t.mu.Lock()
-	defer t.mu.Unlock()
+	mu := t.lockFor(txID)
+	mu.Lock()
+	defer mu.Unlock()
 	b := t.st.NewBatch()
 	b.Delete(halfKey)
 	b.Delete(store.HalfIdxKey(txID))

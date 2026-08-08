@@ -74,8 +74,8 @@ func RetryBackoff(attempts int32) time.Duration {
 }
 
 // Deliverer POP 消费引擎。并发安全：同一队列的取件/确认/改不可见时间全部在
-// 该队列的 qmu 临界区内执行（Receive 经 receiveOnce、Ack、ChangeInvisible
-// 三者都在方法开头取同一把队列锁），不同队列并行。
+// 该队列的 qmu 临界区内执行（Receive 经 receiveOnce、Ack/AckBatch、
+// ChangeInvisible 三者都在方法开头取同一把队列锁），不同队列并行。
 // 三者共同读写同一片 inflight 键空间，若只有 Receive 持锁而 Ack/
 // ChangeInvisible 不持锁，会出现"重投覆盖后的记录被陈旧 Ack 误删"
 // "ChangeInvisible 的读-改-写覆盖掉并发重投写入的新 attempts"等竞态——
@@ -153,14 +153,32 @@ func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID ui
 	}
 }
 
-// receiveOnce 单次取件：过期 inflight 重投 + 新消息（可带 Tag 过滤），
-// 合计不超过 maxMsgs。maxAttempts 为该组的生效投递上限，重投候选
-// attempts 达到上限时转入死信 topic，不再投递。
+// receiveOnce 单次取件：锁内定序（receiveOnceLocked），锁外等待持久化。
+// inflight 与 cursor 落盘之前绝不交件（语义红线 1/3——消费者拿到消息时，
+// 它的 inflight 兜底记录必然已持久化，崩溃后该消息仍会被重投而不是丢失）。
+// 解锁后同队列的下一次取件/确认立即可进锁定序，与本批共享同一次 fsync——
+// 队列内 group commit 在消费路径生效的机制，与 produce 侧完全同款。
 func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter *TagFilter) ([]*core.Message, error) {
 	qlock := d.lockQueue(group, topic, queueID)
 	qlock.Lock()
-	defer qlock.Unlock()
+	out, pending, applied, err := d.receiveOnceLocked(group, topic, queueID, maxMsgs, invisible, maxAttempts, filter)
+	qlock.Unlock()
+	if err != nil || !applied {
+		return out, err
+	}
+	if err := pending.Wait(); err != nil {
+		return nil, fmt.Errorf("等待取件批次持久化 (group=%s topic=%s q=%d): %w", group, topic, queueID, err)
+	}
+	return out, nil
+}
 
+// receiveOnceLocked 单次取件的锁内部分：过期 inflight 重投 + 新消息扫描
+// （可带 Tag 过滤），合计不超过 maxMsgs；批次组装完成后 ApplyAsync 定序。
+// 调用方必须持有该队列的 qlock；fsync 等待由调用方在锁外完成。
+//
+// 返回：(消息, pending, applied, error)。applied=false 表示本轮无暂存写入
+// （批次已 Close 回收），pending 为零值，调用方无需 Wait。
+func (d *Deliverer) receiveOnceLocked(group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter *TagFilter) ([]*core.Message, store.Pending, bool, error) {
 	now := time.Now().UnixMilli()
 	expireAt := now + invisible.Milliseconds()
 	var out []*core.Message
@@ -205,13 +223,13 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 	})
 	if err != nil {
 		b.Close() // 未提交，按批次生命周期契约自行回收
-		return nil, fmt.Errorf("扫描 inflight (group=%s topic=%s q=%d): %w", group, topic, queueID, err)
+		return nil, store.Pending{}, false, fmt.Errorf("扫描 inflight (group=%s topic=%s q=%d): %w", group, topic, queueID, err)
 	}
 	for _, r := range reds {
 		raw, ok, err := d.st.Get(store.MsgKey(topic, queueID, r.offset))
 		if err != nil {
 			b.Close()
-			return nil, fmt.Errorf("读取重投消息 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, r.offset, err)
+			return nil, store.Pending{}, false, fmt.Errorf("读取重投消息 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, r.offset, err)
 		}
 		if !ok {
 			// 消息已被 retention 清理但 inflight 残留：清掉记录并跳过（M2 起 retention 会同步清理）。
@@ -230,7 +248,7 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 		m, err := core.DecodeMessage(raw)
 		if err != nil {
 			b.Close()
-			return nil, fmt.Errorf("解码重投消息 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, r.offset, err)
+			return nil, store.Pending{}, false, fmt.Errorf("解码重投消息 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, r.offset, err)
 		}
 		// 投递次数耗尽：转入死信 topic，不再投递。
 		// DLQ 写入与 inflight 删除经 AppendWith 同批原子提交，与本函数的取件批次 b
@@ -241,7 +259,7 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 		if r.attempts >= maxAttempts {
 			if err := d.moveToDLQ(group, topic, queueID, r.offset, m, r.attempts, "投递次数耗尽（未在不可见期内 ack）"); err != nil {
 				b.Close()
-				return nil, err
+				return nil, store.Pending{}, false, err
 			}
 			if r.ordered {
 				// 卡住队头的顺序消息已随 inflight 一并移除：顺序锁释放，
@@ -281,7 +299,7 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 	cursor := uint64(0)
 	if v, ok, err := d.st.Get(store.CursorKey(group, topic, queueID)); err != nil {
 		b.Close()
-		return nil, fmt.Errorf("读取 fetch 位点 (group=%s topic=%s q=%d): %w", group, topic, queueID, err)
+		return nil, store.Pending{}, false, fmt.Errorf("读取 fetch 位点 (group=%s topic=%s q=%d): %w", group, topic, queueID, err)
 	} else if ok {
 		cursor = store.GetU64(v)
 	}
@@ -329,7 +347,7 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 		})
 		if err != nil {
 			b.Close()
-			return nil, fmt.Errorf("扫描新消息 (topic=%s q=%d cursor=%d): %w", topic, queueID, cursor, err)
+			return nil, store.Pending{}, false, fmt.Errorf("扫描新消息 (topic=%s q=%d cursor=%d): %w", topic, queueID, cursor, err)
 		}
 		if newCursor > cursor {
 			staged = true
@@ -351,13 +369,15 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 	// 这正是我们想要的：孤儿清理不算"投递成功"，不该打断长轮询。
 	if !staged {
 		b.Close()
-		return nil, nil
+		return nil, store.Pending{}, false, nil
 	}
 	if newCursor > cursor {
 		b.Set(store.CursorKey(group, topic, queueID), store.PutU64(newCursor))
 	}
-	if err := d.st.Apply(b); err != nil {
-		return nil, fmt.Errorf("提交取件批次 (group=%s topic=%s q=%d): %w", group, topic, queueID, err)
+	pending, err := d.st.ApplyAsync(b)
+	if err != nil {
+		// ApplyAsync 失败的批次按 store 约定弃给 GC
+		return nil, store.Pending{}, false, fmt.Errorf("提交取件批次 (group=%s topic=%s q=%d): %w", group, topic, queueID, err)
 	}
 	if len(out) == 0 {
 		// 本轮做了"无投递但有写入"的工作：清理孤儿 inflight（上面那条 Warn
@@ -367,11 +387,11 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 		// 队列空转，从而忽略掉刚刚发生的数据修复或过滤推进。
 		d.logger.Debug("本轮无可投递消息，仅清理了孤儿 inflight 或推进了过滤位点",
 			"group", group, "topic", topic, "queue", queueID, "cursor", newCursor)
-		return out, nil
+	} else {
+		d.logger.Debug("投递消息已定序", "group", group, "topic", topic, "queue", queueID,
+			"count", len(out), "redelivered", len(reds), "cursor", newCursor)
 	}
-	d.logger.Debug("投递消息", "group", group, "topic", topic, "queue", queueID,
-		"count", len(out), "redelivered", len(reds), "cursor", newCursor)
-	return out, nil
+	return out, pending, true, nil
 }
 
 // Ack 确认消息。attempt 必须与该 offset 当前持久化的 InflightState.Attempts 一致——
@@ -385,41 +405,101 @@ func (d *Deliverer) receiveOnce(group, topic string, queueID uint32, maxMsgs int
 // 说明这是一个陈旧句柄，语义上等价于"记录已不存在"：幂等返回 (false, nil)，不报错。
 //
 // inflight 不存在或 attempt 不匹配都返回 (false, nil)，幂等，不算错误。
+// 实现即 AckBatch 单条形态，校验/锁/持久化语义完全一致。
 func (d *Deliverer) Ack(group, topic string, queueID uint32, offset uint64, attempt int32) (bool, error) {
-	// 与 receiveOnce 共享队列锁：Ack 要执行的 Get→校验→Delete 若不与重投互斥，
-	// receiveOnce 的过期重投（Get 旧记录→写入新 attempts）可能与本方法的
-	// Get→Delete 交错，产生"删掉了重投后新记录"或"看到重投前的旧 attempts"
-	// 之类的竞态。持有同一把 qmu 是类型注释里"并发安全"这句话成立的前提。
+	results, err := d.AckBatch(group, topic, queueID, []AckEntry{{Offset: offset, Attempt: attempt}})
+	if err != nil {
+		return false, err
+	}
+	return results[0].OK, nil
+}
+
+// AckEntry 批量确认的单条输入：offset + 消费者持有的 attempt（校验规则见 Ack 注释）。
+type AckEntry struct {
+	Offset  uint64
+	Attempt int32
+}
+
+// AckResult 批量确认的单条结果。OK=false 即落空（已 ack / 已重投 / 陈旧
+// attempt——三种情况统一归约，与 Ack 返回 (false,nil) 的幂等语义一致）。
+type AckResult struct {
+	Offset uint64
+	OK     bool
+}
+
+// AckBatch 单一 (group,topic,queue) 的批量确认：一把队列锁、逐条校验、
+// 有效条目的 Delete 合成单个 Batch、一次 fsync。
+//
+// 参数：entries 至少一条（rpc 层保证；空批直接返回 nil,nil 防御）。
+// 返回：与 entries 同序的结果；error 仅存储故障（此时整组失败，任何条目
+// 都未确认——单 Batch 原子性保证不存在部分生效）。
+//
+// 锁与持久化（与 produce/receiveOnce 的拆分提交同款论证）：
+//   - 队列锁内完成全部 Get→校验→Delete 暂存与 ApplyAsync（定序 + memtable
+//     发布），解锁后同队列的下一个拿锁者读到的 inflight 状态与提交顺序一致；
+//   - fsync 等待（Wait）在锁外，同队列多个在途确认由 Pebble commit pipeline
+//     合并为一次 fsync——ack 吞吐从 1/fsync延迟 解放为 合并深度/fsync延迟；
+//   - Wait 成功前绝不向调用方报告确认成功（语义红线 1）。
+func (d *Deliverer) AckBatch(group, topic string, queueID uint32, entries []AckEntry) ([]AckResult, error) {
+	if len(entries) == 0 {
+		return nil, nil
+	}
 	qlock := d.lockQueue(group, topic, queueID)
 	qlock.Lock()
-	defer qlock.Unlock()
-
-	k := store.InflightKey(group, topic, queueID, offset)
-	v, ok, err := d.st.Get(k)
-	if err != nil {
-		return false, fmt.Errorf("ack 查询 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
-	}
-	if !ok {
-		d.logger.Debug("ack 目标不存在（重复 ack 或已重投）", "group", group, "topic", topic, "queue", queueID, "offset", offset)
-		return false, nil
-	}
-	ist, err := core.DecodeInflight(v)
-	if err != nil {
-		return false, fmt.Errorf("解码 inflight (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
-	}
-	if ist.Attempts != attempt {
-		d.logger.Debug("ack attempt 不匹配（陈旧句柄，已被重投覆盖）",
-			"group", group, "topic", topic, "queue", queueID, "offset", offset,
-			"want_attempt", ist.Attempts, "got_attempt", attempt)
-		return false, nil
-	}
+	results := make([]AckResult, len(entries))
 	b := d.st.NewBatch()
-	b.Delete(k)
-	if err := d.st.Apply(b); err != nil {
-		return false, fmt.Errorf("ack (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+	staged := 0
+	for i, e := range entries {
+		results[i] = AckResult{Offset: e.Offset}
+		k := store.InflightKey(group, topic, queueID, e.Offset)
+		v, ok, err := d.st.Get(k)
+		if err != nil {
+			qlock.Unlock()
+			// 未提交而放弃的批次必须自行 Close 回收（store.NewBatch 契约路径 2）
+			b.Close()
+			return nil, fmt.Errorf("批量 ack 查询 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, e.Offset, err)
+		}
+		if !ok {
+			// 已 ack 或已重投：幂等落空，不影响其它条目（语义红线 4）
+			d.logger.Debug("批量 ack 目标不存在（重复 ack 或已重投）",
+				"group", group, "topic", topic, "queue", queueID, "offset", e.Offset)
+			continue
+		}
+		ist, err := core.DecodeInflight(v)
+		if err != nil {
+			qlock.Unlock()
+			b.Close()
+			return nil, fmt.Errorf("批量 ack 解码 inflight (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, e.Offset, err)
+		}
+		if ist.Attempts != e.Attempt {
+			d.logger.Debug("批量 ack attempt 不匹配（陈旧句柄，已被重投覆盖）",
+				"group", group, "topic", topic, "queue", queueID, "offset", e.Offset,
+				"want_attempt", ist.Attempts, "got_attempt", e.Attempt)
+			continue
+		}
+		b.Delete(k)
+		results[i].OK = true
+		staged++
 	}
-	d.logger.Debug("消息已确认", "group", group, "topic", topic, "queue", queueID, "offset", offset, "attempt", attempt)
-	return true, nil
+	if staged == 0 {
+		qlock.Unlock()
+		b.Close() // 全部落空：零写入，批次走自行回收路径
+		return results, nil
+	}
+	pending, err := d.st.ApplyAsync(b)
+	if err != nil {
+		qlock.Unlock()
+		// ApplyAsync 失败的批次按 store 约定弃给 GC，不再 Close
+		return nil, fmt.Errorf("批量 ack 提交 (group=%s topic=%s q=%d n=%d): %w", group, topic, queueID, staged, err)
+	}
+	qlock.Unlock()
+	// 锁外等待持久化：fsync 完成前绝不报告确认成功（语义红线 1）
+	if err := pending.Wait(); err != nil {
+		return nil, fmt.Errorf("等待批量 ack 持久化 (group=%s topic=%s q=%d n=%d): %w", group, topic, queueID, staged, err)
+	}
+	d.logger.Debug("消息已确认", "group", group, "topic", topic, "queue", queueID,
+		"requested", len(entries), "acked", staged)
+	return results, nil
 }
 
 // ChangeInvisible 重设不可见截止时间（消费端主动延长/缩短处理时间）。
@@ -429,41 +509,54 @@ func (d *Deliverer) Ack(group, topic string, queueID uint32, offset uint64, atte
 // "别人正在处理的新一轮投递"上，等于让消费者延长了一个不属于自己的窗口。
 //
 // inflight 不存在或 attempt 不匹配都返回 (false, nil)，幂等，不算错误。
+// 拆分提交：锁内定序（changeInvisibleLocked），锁外等 fsync——成功返回前
+// 新的过期时间必然已持久化（语义红线 1）。
 func (d *Deliverer) ChangeInvisible(group, topic string, queueID uint32, offset uint64, attempt int32, invisible time.Duration) (bool, error) {
-	// 与 Ack 同理：必须持队列锁再做 Get→改→Set，否则这次读-改-写可能与
-	// receiveOnce 的过期重投交错，覆盖掉重投写入的新 Attempts（丢更新），
-	// 或在 Ack 的 Delete 与本方法的 Set 之间发生"删除后又被写回"的复活。
 	qlock := d.lockQueue(group, topic, queueID)
 	qlock.Lock()
-	defer qlock.Unlock()
+	pending, ok, err := d.changeInvisibleLocked(group, topic, queueID, offset, attempt, invisible)
+	qlock.Unlock()
+	if err != nil || !ok {
+		return false, err
+	}
+	if err := pending.Wait(); err != nil {
+		return false, fmt.Errorf("等待改不可见时间持久化 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+	}
+	d.logger.Debug("已更新不可见时间", "group", group, "topic", topic, "queue", queueID,
+		"offset", offset, "attempt", attempt, "invisible_ms", invisible.Milliseconds())
+	return true, nil
+}
 
+// changeInvisibleLocked 锁内部分：Get→校验→Set→ApplyAsync。调用方必须持队列锁。
+// 与 receiveOnce 的过期重投互斥的理由见 wrapper 注释（读-改-写不能与重投交错）。
+func (d *Deliverer) changeInvisibleLocked(group, topic string, queueID uint32, offset uint64, attempt int32, invisible time.Duration) (store.Pending, bool, error) {
 	k := store.InflightKey(group, topic, queueID, offset)
 	v, ok, err := d.st.Get(k)
 	if err != nil {
-		return false, fmt.Errorf("改不可见时间查询 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+		return store.Pending{}, false, fmt.Errorf("改不可见时间查询 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 	}
 	if !ok {
 		d.logger.Debug("改不可见时间目标不存在（已 ack 或已重投）", "group", group, "topic", topic, "queue", queueID, "offset", offset)
-		return false, nil
+		return store.Pending{}, false, nil
 	}
 	ist, err := core.DecodeInflight(v)
 	if err != nil {
-		return false, fmt.Errorf("解码 inflight (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+		return store.Pending{}, false, fmt.Errorf("解码 inflight (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 	}
 	if ist.Attempts != attempt {
 		d.logger.Debug("改不可见时间 attempt 不匹配（陈旧句柄，已被重投覆盖）",
 			"group", group, "topic", topic, "queue", queueID, "offset", offset,
 			"want_attempt", ist.Attempts, "got_attempt", attempt)
-		return false, nil
+		return store.Pending{}, false, nil
 	}
 	ist.ExpireAtMs = time.Now().Add(invisible).UnixMilli()
 	b := d.st.NewBatch()
 	b.Set(k, core.EncodeInflight(ist))
-	if err := d.st.Apply(b); err != nil {
-		return false, fmt.Errorf("改不可见时间 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+	pending, err := d.st.ApplyAsync(b)
+	if err != nil {
+		return store.Pending{}, false, fmt.Errorf("改不可见时间 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 	}
-	d.logger.Debug("已更新不可见时间", "group", group, "topic", topic, "queue", queueID, "offset", offset, "attempt", attempt, "invisible_ms", invisible.Milliseconds())
-	return true, nil
+	return pending, true, nil
 }
 
 // ForwardToDLQ 将一条 inflight 消息显式转入死信 %DLQ%{group}（协议

@@ -314,46 +314,87 @@ func (s *Server) toPBMessage(m *core.Message, group string, invisible time.Durat
 	}
 }
 
-// AckMessage 批量确认。逐条独立处理：handle 解析失败或 ack 落空都不影响其它条目，
-// 每条 entry 各自的 Status 反映该条结果；顶层 Status 由 ackAggregateStatus
-// 从这些 entry 状态汇总而来，不是固定 OK（见该函数注释：只看顶层 Status 的
-// 客户端——常见 SDK 形状——需要靠这个字段判断"这批是否需要重试"）。
+// AckMessage 批量确认。两遍处理：第一遍逐条解码 handle（失败的当场生成
+// per-entry 失败结果，不影响其它条目）；第二遍把解码成功的按
+// (group,topic,queue) 分组，每组一次 deliver.AckBatch——同队列多条合成
+// 单个 Pebble Batch 一次 fsync（官方 SDK 批量 ack 即刻受益）。
+//
+// per-entry 语义与逐条时代完全一致：落空（已 ack/已重投/陈旧 attempt）
+// 翻译成 INVALID_RECEIPT_HANDLE（SDK 收到即静默丢弃、不重试，正是想要的）；
+// 存储故障时该组全部 INTERNAL_SERVER_ERROR。响应 entries 严格保持请求顺序。
+// 顶层 Status 仍由 ackAggregateStatus 聚合（规则与理由见该函数注释）。
 func (s *Server) AckMessage(ctx context.Context, req *pb.AckMessageRequest) (*pb.AckMessageResponse, error) {
-	entries := make([]*pb.AckMessageResultEntry, 0, len(req.GetEntries()))
-	for _, e := range req.GetEntries() {
+	type ackSlot struct {
+		idx     int
+		offset  uint64
+		attempt int32
+		e       *pb.AckMessageEntry
+	}
+	type ackKey struct {
+		group string
+		topic string
+		q     uint32
+	}
+	entries := make([]*pb.AckMessageResultEntry, len(req.GetEntries()))
+	groups := make(map[ackKey][]ackSlot)
+	var order []ackKey // 按首次出现序处理各组，行为确定可测
+	for i, e := range req.GetEntries() {
 		g, topic, q, off, attempt, err := receiptDecode(s.handleSecret, e.GetReceiptHandle())
 		if err != nil {
 			// 非法 handle 是客户端问题（篡改/损坏/过期协议版本），Warn 即可，
 			// 不是服务端故障。handle 是客户端可控的任意长度字符串，日志里只留
 			// 截断预览（truncateForLog），不把不受信任的输入原样灌进日志。
 			s.logger.Warn("ack handle 非法", "handle", truncateForLog(e.GetReceiptHandle()), "err", err)
-			entries = append(entries, &pb.AckMessageResultEntry{
+			entries[i] = &pb.AckMessageResultEntry{
 				// ReceiptHandle 必须回填：MessageId 在客户端请求里可能为空
 				// （proto 字段非必填），此时 ReceiptHandle 是客户端把这条失败
-				// 结果关联回自己请求里对应 entry 的唯一线索，遗漏它会让
-				// 调用方在 MessageId 为空时无法定位是哪条 ack 失败了。
+				// 结果关联回自己请求里对应 entry 的唯一线索。
 				Status:        errStatus(pb.Code_INVALID_RECEIPT_HANDLE, err.Error()),
 				MessageId:     e.GetMessageId(),
 				ReceiptHandle: e.GetReceiptHandle(),
-			})
+			}
 			continue
 		}
-		ok, err := s.dl.Ack(g, topic, q, off, attempt)
-		st := okStatus()
-		if err != nil {
-			s.logger.Error("ack 失败", "group", g, "topic", topic, "queue", q, "offset", off, "attempt", attempt, "err", err)
-			st = errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error())
-		} else if !ok {
-			// ack 落空的三种情况——已被 ack 过、已被过期重投覆盖、或本来就是携带
-			// 陈旧 attempt 的句柄——deliver.Ack 内部已经把它们统一归约成
-			// (false, nil)。这里再往上翻译成协议码时同样不细分：RocketMQ SDK
-			// 收到 INVALID_RECEIPT_HANDLE 就是静默丢弃、不重试，这正是我们想要
-			// 的行为（重试一个已经不对应任何有效 inflight 记录的 ack 没有意义），
-			// 不是需要在 Error 级别报警的服务端故障。
-			st = errStatus(pb.Code_INVALID_RECEIPT_HANDLE, "receipt 已失效")
+		k := ackKey{group: g, topic: topic, q: q}
+		if _, seen := groups[k]; !seen {
+			order = append(order, k)
 		}
-		entries = append(entries, &pb.AckMessageResultEntry{Status: st, MessageId: e.GetMessageId(), ReceiptHandle: e.GetReceiptHandle()})
+		groups[k] = append(groups[k], ackSlot{idx: i, offset: off, attempt: attempt, e: e})
 	}
+	for _, k := range order {
+		slots := groups[k]
+		acks := make([]deliver.AckEntry, len(slots))
+		for j, sl := range slots {
+			acks[j] = deliver.AckEntry{Offset: sl.offset, Attempt: sl.attempt}
+		}
+		results, err := s.dl.AckBatch(k.group, k.topic, k.q, acks)
+		if err != nil {
+			// 存储故障：该组整体失败（AckBatch 单 Batch 原子，不存在部分生效），
+			// 客户端对这些 entry 重试即可
+			s.logger.Error("批量 ack 失败", "group", k.group, "topic", k.topic,
+				"queue", k.q, "count", len(slots), "err", err)
+			for _, sl := range slots {
+				entries[sl.idx] = &pb.AckMessageResultEntry{
+					Status:        errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error()),
+					MessageId:     sl.e.GetMessageId(),
+					ReceiptHandle: sl.e.GetReceiptHandle(),
+				}
+			}
+			continue
+		}
+		for j, sl := range slots {
+			st := okStatus()
+			if !results[j].OK {
+				// 落空的三种情况已在 deliver 层归约成 OK=false，翻译规则与
+				// 逐条时代一致（理由见旧实现注释：SDK 收到该码即静默丢弃）
+				st = errStatus(pb.Code_INVALID_RECEIPT_HANDLE, "receipt 已失效")
+			}
+			entries[sl.idx] = &pb.AckMessageResultEntry{
+				Status: st, MessageId: sl.e.GetMessageId(), ReceiptHandle: sl.e.GetReceiptHandle(),
+			}
+		}
+	}
+	s.logger.Debug("AckMessage 处理完成", "entries", len(entries), "groups", len(order))
 	return &pb.AckMessageResponse{Status: ackAggregateStatus(entries), Entries: entries}, nil
 }
 
