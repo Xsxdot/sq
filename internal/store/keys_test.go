@@ -211,7 +211,7 @@ func TestHalfKeyOrdering(t *testing.T) {
 func TestHalfScanUpperBound(t *testing.T) {
 	// 上界必须恰好包含 nowMs 内全部 txID，且不含 nowMs+1 的任何条目
 	now := int64(5000)
-	in := HalfKey(5000, "\xff\xff")   // nowMs 内字典序最大的 txID 形态
+	in := HalfKey(5000, "\xff\xff") // nowMs 内字典序最大的 txID 形态
 	out := HalfKey(5001, "")
 	ub := HalfScanUpperBound(now)
 	if bytes.Compare(in, ub) >= 0 {
@@ -224,9 +224,9 @@ func TestHalfScanUpperBound(t *testing.T) {
 
 func TestParseHalfKeyRejectsBadKey(t *testing.T) {
 	for _, bad := range [][]byte{
-		[]byte("half/short"),          // 不足 8B ms
-		HalfKey(1000, ""),             // txID 为空
-		[]byte("delay/xxxxxxxxxxxx"),  // 前缀不对
+		[]byte("half/short"),         // 不足 8B ms
+		HalfKey(1000, ""),            // txID 为空
+		[]byte("delay/xxxxxxxxxxxx"), // 前缀不对
 	} {
 		if _, _, err := ParseHalfKey(bad); err == nil {
 			t.Fatalf("坏 key %q 未被拒绝", bad)

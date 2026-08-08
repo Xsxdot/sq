@@ -14,6 +14,7 @@ package store
 import (
 	"fmt"
 	"log/slog"
+	"sync"
 	"testing"
 )
 
@@ -66,6 +67,93 @@ func TestScanRangeAndLimit(t *testing.T) {
 	})
 	if err != nil || len(got) != 2 || got[0] != "a/1" || got[1] != "a/2" {
 		t.Fatalf("Scan: %v %v", got, err)
+	}
+}
+
+// TestApplyAsyncThenWaitPersists 验证拆分式提交（sync 模式）：ApplyAsync 定序、
+// Wait 等待持久化，之后数据可读。
+func TestApplyAsyncThenWaitPersists(t *testing.T) {
+	s, err := Open(t.TempDir(), true, slog.Default())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	b := s.NewBatch()
+	b.Set([]byte("k1"), []byte("v1"), nil)
+	pending, err := s.ApplyAsync(b)
+	if err != nil {
+		t.Fatalf("ApplyAsync: %v", err)
+	}
+	if err := pending.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	v, ok, err := s.Get([]byte("k1"))
+	if err != nil || !ok || string(v) != "v1" {
+		t.Fatalf("Get k1 = %q ok=%v err=%v, want v1", v, ok, err)
+	}
+}
+
+// TestApplyAsyncNoSyncFallback 验证 syncWrites=false 的退化路径：ApplyAsync 内
+// 一次性完成提交，Wait 只做批次回收，行为与 sync 模式外观一致。
+func TestApplyAsyncNoSyncFallback(t *testing.T) {
+	s, err := Open(t.TempDir(), false, slog.Default())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	b := s.NewBatch()
+	b.Set([]byte("k2"), []byte("v2"), nil)
+	pending, err := s.ApplyAsync(b)
+	if err != nil {
+		t.Fatalf("ApplyAsync: %v", err)
+	}
+	if err := pending.Wait(); err != nil {
+		t.Fatalf("Wait: %v", err)
+	}
+	v, ok, err := s.Get([]byte("k2"))
+	if err != nil || !ok || string(v) != "v2" {
+		t.Fatalf("Get k2 = %q ok=%v err=%v, want v2", v, ok, err)
+	}
+}
+
+// TestApplyAsyncConcurrentAllDurable 验证并发拆分式提交全部持久化——这是
+// group commit 合并 fsync 的使用形态，不能有条目丢失或错序覆盖。
+func TestApplyAsyncConcurrentAllDurable(t *testing.T) {
+	s, err := Open(t.TempDir(), true, slog.Default())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer s.Close()
+	const goroutines, perG = 16, 20
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func(g int) {
+			defer wg.Done()
+			for i := 0; i < perG; i++ {
+				b := s.NewBatch()
+				key := fmt.Sprintf("cc/%d/%d", g, i)
+				b.Set([]byte(key), []byte("x"), nil)
+				pending, err := s.ApplyAsync(b)
+				if err != nil {
+					t.Errorf("ApplyAsync %s: %v", key, err)
+					return
+				}
+				if err := pending.Wait(); err != nil {
+					t.Errorf("Wait %s: %v", key, err)
+					return
+				}
+			}
+		}(g)
+	}
+	wg.Wait()
+	for g := 0; g < goroutines; g++ {
+		for i := 0; i < perG; i++ {
+			key := fmt.Sprintf("cc/%d/%d", g, i)
+			if _, ok, err := s.Get([]byte(key)); err != nil || !ok {
+				t.Fatalf("key %s 丢失: ok=%v err=%v", key, ok, err)
+			}
+		}
 	}
 }
 

@@ -113,6 +113,62 @@ func (s *Store) Apply(b *pebble.Batch) error {
 	return b.Close()
 }
 
+// Pending 一次「已定序、待确认持久化」的提交。值类型，热路径零额外分配。
+// 由 ApplyAsync 返回；调用方必须恰好调用一次 Wait，且在 Wait 成功前不得
+// 把这次写入当作已持久化（不得 ACK、不得唤醒读者）。
+type Pending struct {
+	b        *pebble.Batch
+	start    time.Time
+	needSync bool // true=还需 SyncWait（sync 模式）；false=提交已完成，Wait 只回收批次
+}
+
+// ApplyAsync 提交批次——写 WAL、发布可见、完成定序——但不等待 fsync。
+//
+// 与 Apply 的关系：Apply == ApplyAsync + Wait。写热路径（produce）用拆分形式
+// 把 fsync 等待挪出队列锁，让 Pebble commit pipeline 把同队列多条在途提交
+// 合并为一次 fsync（group commit）；其余调用点无此需求，继续用 Apply。
+//
+// syncWrites=false 的部署没有「等待 fsync」阶段：本方法内一次性完成提交，
+// 返回的 Pending.Wait 退化为纯批次回收。
+//
+// 失败时批次按 Apply 同款约定丢给 GC，调用方不得再碰（理由见 Apply 注释）。
+func (s *Store) ApplyAsync(b *pebble.Batch) (Pending, error) {
+	start := time.Now()
+	if !s.sync {
+		if err := b.Commit(pebble.NoSync); err != nil {
+			return Pending{}, fmt.Errorf("store ApplyAsync: %w", err)
+		}
+		if OnApplyObserve != nil {
+			OnApplyObserve(time.Since(start))
+		}
+		return Pending{b: b}, nil
+	}
+	// ApplyNoSyncWait 要求 opts.Sync=true（Pebble 契约）：批次进入 commit
+	// pipeline 排队等待 WAL fsync，但本调用不阻塞等它完成。
+	if err := s.db.ApplyNoSyncWait(b, pebble.Sync); err != nil {
+		return Pending{}, fmt.Errorf("store ApplyAsync: %w", err)
+	}
+	return Pending{b: b, start: start, needSync: true}, nil
+}
+
+// Wait 等待批次持久化完成并回收批次。
+//
+// 观测口径与 Apply 一致：OnApplyObserve 覆盖「提交开始 → 持久化完成」全程，
+// 直方图语义不因拆分而改变。SyncWait 失败时批次丢给 GC（同 Apply 约定）；
+// WAL sync 失败意味着 Pebble 已进入不可恢复错误态，后续写入都会失败，
+// 调用方把错误上抛即可，无需（也无法）在此挽救。
+func (p Pending) Wait() error {
+	if p.needSync {
+		if err := p.b.SyncWait(); err != nil {
+			return fmt.Errorf("store WaitSync: %w", err)
+		}
+		if OnApplyObserve != nil {
+			OnApplyObserve(time.Since(p.start))
+		}
+	}
+	return p.b.Close()
+}
+
 // Scan 按 [lower, upper) 升序遍历，最多 limit 条（limit<=0 不限）。
 // fn 返回 false 或 error 时停止；k/v 底层内存仅回调期间有效，需持有请自行拷贝。
 func (s *Store) Scan(lower, upper []byte, limit int, fn func(k, v []byte) (bool, error)) error {
