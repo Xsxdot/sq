@@ -106,9 +106,23 @@ func (b *Batch) Repr() []byte { return b.b.Repr() }
 
 // NewBatchFromRepr 从复制来的批次字节重建类型化批次——follower 盲 apply
 // 的唯一入口。坏字节在此报错，不进 Apply。
+//
+// 注意：内部必须先拷贝 data 再交给 pebble 的 SetRepr——SetRepr 是
+// 零拷贝接管（b.data 直接指向传入切片），而本方法返回的批次在
+// ApplyWith 提交后会 Close 回收到 Pebble 的 batch sync.Pool，池中批次
+// 连同 b.data 一起被下一次 NewBatch 复用。若直接传调用方的切片：
+//   - applyEntry 传的是 raft 日志条目自身的 Data 缓冲（protobuf 反序列
+//     化后 cap > len，Set 追加是原地写），条目字节与池中批次共享同一
+//     块内存；
+//   - 之后任何一组 raftstore.Persist 复用该池中批次写 raft/<g>/hs 等
+//     键，就会原地覆盖 raft 日志条目在 MemoryStorage 里的内容，把日志
+//     写花（三节点 e2e 复现的「raft/1/hs 混入 FSM 批次」损坏，apply 时
+//     panic）。
+//
+// 拷贝成本是每 apply 一次 memcpy，相对批次解析与提交可忽略。
 func (s *Store) NewBatchFromRepr(data []byte) (*Batch, error) {
 	nb := s.db.NewBatch()
-	if err := nb.SetRepr(data); err != nil {
+	if err := nb.SetRepr(append([]byte(nil), data...)); err != nil {
 		// 批次已废弃，按 Apply 失败同款约定丢给 GC（见 Apply 注释）
 		return nil, fmt.Errorf("store NewBatchFromRepr: %w", err)
 	}

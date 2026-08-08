@@ -276,6 +276,10 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 			if len(ent.Data) > 16 {
 				data = ent.Data[16:]
 			}
+			if len(ent.Data) > 0 && len(ent.Data) <= 16 {
+				gr.lg.Warn("疑似损坏条目：普通条目数据 ≤16B 无批次载荷", "index", ent.GetIndex(),
+					"len", len(ent.Data), "head", fmt.Sprintf("%x", ent.Data))
+			}
 			gr.applyEntry(ent.GetIndex(), data)
 			if id, ok := proposalWaiter(ent.Data, gr.selfID); ok {
 				gr.notifyWaiter(gr.propWaiters, id)
@@ -340,7 +344,11 @@ func (gr *group) applyEntry(index uint64, data []byte) {
 		b = gr.st.NewBatch()
 	}
 	if err != nil {
-		gr.lg.Error("FSM 批次重建失败，组停摆", "index", index, "err", err)
+		// 坏批次字节是严重的数据完整性问题，panic 前把载荷头与长度留痕
+		// （完整 dump 离线解码在排查时按需补充；日志头 64B 已足够定位
+		// 损坏形态，如混入的 raftstore 键族）
+		gr.lg.Error("FSM 批次重建失败，组停摆", "index", index, "len", len(data),
+			"first64", fmt.Sprintf("%x", data[:min(len(data), 64)]), "err", err)
 		panic(err)
 	}
 	if err := b.Set(appliedKey(gr.g), store.PutU64(index)); err != nil {
