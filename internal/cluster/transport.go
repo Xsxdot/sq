@@ -170,8 +170,10 @@ func (t *transport) Send(g uint32, msgs []*raftpb.Message) {
 // 新消息，但队列里还压着变更前的心跳等积压——它们携带变更前的 commit
 // 索引（min(旧 Match, committed)），对端若以空/短日志重入，收到即
 // 触发 raft 库的 tocommit 越界 panic（排障见 Manager.ProposeConfChange
-// 注释）。趁节点离线排空队列是确定的：对端不在线时发送 goroutine
-// 没有在途写（拨号失败循环），队列排空后重连只会收到新成员状态消息。
+// 注释）。排空的确定性依赖「对端离线」假设：离线时发送 goroutine
+// 停在拨号失败循环、没有在途写，队列排空后重连只会收到新成员状态
+// 消息。对端在线的 Remove（活节点成员变更）不在此列——已出队的帧在
+// 写中途仍可能送达，属 batch③ 范围。
 //
 // 幂等：重复调用（多组各自 Remove 同一节点）安全。
 func (t *transport) DropPeer(id uint64) {
@@ -250,10 +252,26 @@ func (t *transport) sendLoop(ctx context.Context, peerID uint64, addr string) {
 			}
 			continue
 		}
-		if ctx.Err() == nil { // 拨号成功但恰逢取消：不打连接日志直接退出
+		// 出站连接注册进与入站连接同一个 conns 看门狗集合：ctx 取消时
+		// 看门狗统一关闭全部连接，解除 writeLoop 中阻塞的 conn.Write——
+		// 否则被对端拖住不读的写会无视 ctx 取消一直挂到对端关 socket。
+		t.connsMu.Lock()
+		if ctx.Err() != nil { // 拨号成功但恰逢取消：不入集合，直接丢弃
+			t.connsMu.Unlock()
+			conn.Close()
+			return
+		}
+		t.conns[conn] = struct{}{}
+		t.connsMu.Unlock()
+		if ctx.Err() == nil { // 恰逢取消时跳过上报（关机后不打日志）
 			t.lg.Info("peer 已连接", "self", t.self, "peer", peerID, "addr", addr)
 		}
 		writeErr := t.writeLoop(ctx, conn, q, peerID, drops, &lastDropLog)
+		// 写循环已返回（断线/取消）：连接退出看门狗集合再关闭。
+		// 与看门狗的双重 Close 安全（net.Conn Close 幂等）。
+		t.connsMu.Lock()
+		delete(t.conns, conn)
+		t.connsMu.Unlock()
 		conn.Close()
 		if ctx.Err() != nil { // 正常关机路径的断开不打 Info（会误导成故障）
 			return

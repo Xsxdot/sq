@@ -128,9 +128,13 @@ func (s *Store) ApplyWith(b *Batch, sync bool) error {
 	if err := b.b.Commit(opt); err != nil {
 		return fmt.Errorf("store ApplyWith: %w", err)
 	}
+	// OnApplyObserve 只观测成功提交：失败路径由调用方打日志，
+	// 混进观测会污染 fsync 延迟直方图分布。
 	if OnApplyObserve != nil {
 		OnApplyObserve(time.Since(start))
 	}
+	// 成功后必须 Close 回收批次：Pebble 把关闭的批次还回内部
+	// sync.Pool 复用，热路径不能持续分配新的 batch 结构。
 	return b.b.Close()
 }
 

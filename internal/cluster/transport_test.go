@@ -82,11 +82,18 @@ func TestTransportDropPeerDrainsQueue(t *testing.T) {
 		func(uint32, *raftpb.Message) {}, testSlog(t))
 	from, to := uint64(1), uint64(2)
 	typ := raftpb.MsgHeartbeat
-	for i := 0; i < 100; i++ { // 全部积压在队列
+	// 远超队列容量（4096）：既攒出积压又真正触发在途丢弃——drops 计数
+	// 与 DropPeer 的重置都被实际锻炼到（只发 100 条的话 drops 恒为 0，
+	// 断言形同虚设）。
+	const sends = 10000
+	for i := 0; i < sends; i++ {
 		tr.Send(0, []*raftpb.Message{{Type: &typ, From: &from, To: &to}})
 	}
 	if n := len(tr.queues[2]); n == 0 {
 		t.Fatal("积压前置不成立：队列应为空？——测试自身有问题")
+	}
+	if n := tr.drops[2].Load(); n == 0 {
+		t.Fatal("丢弃计数应为非零——Send 的满则丢路径未被触发")
 	}
 	tr.DropPeer(2)
 	if n := len(tr.queues[2]); n != 0 {

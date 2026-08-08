@@ -34,6 +34,10 @@ import (
 // clusterReplicator 是场景测试用的薄复制器，与 replication.Cluster 同
 // 语义：取批次物理字节 → 提进 Manager.Propose（组内阻塞到 apply）→
 // 回收批次。不直接 import internal/replication 的原因见文件头边界。
+//
+// 与 replication.Cluster 的刻意差异：本 shim 在 b.Close() 失败时直接
+// 报错，那边仅记 Warn 继续——测试从严，batch④ 场景套件不得把它当
+// 作该处行为的精确规格。
 type clusterReplicator struct{ m *Manager }
 
 // Apply 提交批次：字节先拷贝（Repr 内存归批次所有）再 Close，

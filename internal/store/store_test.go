@@ -266,7 +266,13 @@ func TestNewBatchFromReprRejectsGarbage(t *testing.T) {
 // 行为断言只能到「提交成功且可读」——fsync 是否真实发生无法在单测观测，
 // 由集成层（cluster）的两档吞吐差异间接验证。
 func TestApplyWithOverridesSync(t *testing.T) {
-	st := openTestStore(t, t.TempDir())
+	// 全局档位显式开成 false：若用 openTestStore（sync=true）则
+	// ApplyWith(b, true) ≡ Apply，测不出「参数覆盖全局档位」这一维度。
+	st, err := Open(t.TempDir(), false, slog.Default())
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer st.Close()
 	b := st.NewBatch()
 	if err := b.Set([]byte("k"), []byte("v")); err != nil {
 		t.Fatal(err)

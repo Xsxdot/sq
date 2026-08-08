@@ -262,7 +262,12 @@ func confStateFromEntries(ents []*raftpb.Entry, commit uint64) *raftpb.ConfState
 		}
 		var cc raftpb.ConfChange
 		cc.Reset()
-		_ = proto.Unmarshal(ent.Data, &cc)
+		if err := proto.Unmarshal(ent.Data, &cc); err != nil {
+			// 损坏的 ConfChange 条目：跳过成员表合成——缺一个成员会在
+			// 重启时响亮失败（成员缺失），而零值 cc（NodeId=0）拼进
+			// Voters 是静默的错误成员表，比跳过危险得多。
+			continue
+		}
 		id := cc.GetNodeId()
 		switch cc.GetType() {
 		case raftpb.ConfChangeAddNode:

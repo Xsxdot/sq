@@ -76,6 +76,18 @@ func TestManagerCleanRestartResumes(t *testing.T) {
 func TestManagerUncleanRestartRefusesResume(t *testing.T) {
 	dir := t.TempDir()
 	st1, m1 := startSoloManager(t, dir, AckQuorumMem)
+	// kill 前先落地一条提案，保证至少一轮 Ready 被处理（HardState/
+	// 条目已持久化）：若 kill 抢在全部组第一个 Ready 之前，盘上不会
+	// 有任何 raft 状态，重启会走 fresh 路径——既往 ~1/16 抖动源。
+	b := st1.NewBatch()
+	_ = b.Set([]byte("meta/topic/t1"), []byte("v"))
+	repr := append([]byte(nil), b.Repr()...)
+	_ = b.Close()
+	pctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := m1.Propose(pctx, MetaGroup, repr); err != nil {
+		t.Fatal(err)
+	}
 	m1.kill() // 测试后门：cancel 运行 ctx，不写标记
 	<-m1.Done()
 	if err := st1.Close(); err != nil {

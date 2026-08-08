@@ -238,6 +238,11 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	// 接着提出的下一条 ConfChange 会落在「pendingConfIndex > applied」
 	// 校验窗口内，被 raft 静默替换成空普通条目——替换不可观察、ccWaiter
 	// 永不通知，调用方只能等超时（Task 7 集成测试抓到的缺口）。
+	//
+	// 注意：晚于 Advance 只是把窗口收窄，并非闭合——raft 内部 applied
+	// 的推进要等节点 goroutine 消费 advancec 后才发生，µs 级残余窗口内
+	// 背靠背的两条 ConfChange 仍可能被静默替换；proposeConfChange 对
+	// 空条目替换的检测与重试是 batch③ 的兜底缓解。
 	for _, id := range appliedCC {
 		gr.notifyWaiter(gr.ccWaiters, id)
 	}
@@ -383,6 +388,11 @@ func (gr *group) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTyp
 // step 是消息投递入口（transport 读帧 goroutine 调用），把 raft 消息
 // 交给本组处理。异步入队由 run 循环单 goroutine 消费，tick 与 Step
 // 因此不会竞争。
+//
+// 全量入队不会撑爆 inbox 的不变量：单组在途消息 ≤ 2×MaxInflightMsgs
+// （256）=512，小于 inbox 容量 1024——三节点拓扑下每条消息至多往返
+// 一次（出站 + 对端回包），raft 的 inflight 上限即入队总量上界；
+// 单节点组稳态不产自消息（自我投递仅出现在选举期）。
 //
 // 注意：m 必须为指针——v3 的 raftpb.Message 内嵌互斥锁
 // （protoimpl.MessageState），按值传递会触发 vet copylocks，
