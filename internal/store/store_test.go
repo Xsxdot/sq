@@ -222,3 +222,59 @@ func TestScanNonPositiveLimitMeansUnlimited(t *testing.T) {
 		}
 	}
 }
+
+// TestBatchReprRoundTrip 验证复制载荷的往返一致性：leader 侧组装的批次
+// 导出字节，follower 侧重建并 apply 后，数据逐键一致——这是「复制物理
+// batch 字节而非逻辑命令」（V2 spec §4）的最小正确性锚点。
+func TestBatchReprRoundTrip(t *testing.T) {
+	src := openTestStore(t, t.TempDir())
+	dst := openTestStore(t, t.TempDir())
+	b := src.NewBatch()
+	if err := b.Set([]byte("k1"), []byte("v1")); err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Delete([]byte("k-absent")); err != nil {
+		t.Fatal(err)
+	}
+	repr := append([]byte(nil), b.Repr()...) // Repr 底层内存归批次所有，拷贝后再提交
+	if err := src.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	rb, err := dst.NewBatchFromRepr(repr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := dst.Apply(rb); err != nil {
+		t.Fatal(err)
+	}
+	v, ok, err := dst.Get([]byte("k1"))
+	if err != nil || !ok || string(v) != "v1" {
+		t.Fatalf("follower 侧 apply 后 Get(k1) = %q,%v,%v; want v1,true,nil", v, ok, err)
+	}
+}
+
+// TestNewBatchFromReprRejectsGarbage 坏字节必须在重建时报错，而不是
+// apply 时 panic——复制链路上的损坏要在最早的边界被拦下。
+func TestNewBatchFromReprRejectsGarbage(t *testing.T) {
+	st := openTestStore(t, t.TempDir())
+	if _, err := st.NewBatchFromRepr([]byte("not-a-batch")); err == nil {
+		t.Fatal("坏批次字节应报错，得到 nil")
+	}
+}
+
+// TestApplyWithOverridesSync ApplyWith 的 sync 参数独立于 Store 全局档位。
+// 行为断言只能到「提交成功且可读」——fsync 是否真实发生无法在单测观测，
+// 由集成层（cluster）的两档吞吐差异间接验证。
+func TestApplyWithOverridesSync(t *testing.T) {
+	st := openTestStore(t, t.TempDir())
+	b := st.NewBatch()
+	if err := b.Set([]byte("k"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.ApplyWith(b, true); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok, _ := st.Get([]byte("k")); !ok {
+		t.Fatal("ApplyWith 提交后应可读")
+	}
+}

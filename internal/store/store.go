@@ -95,6 +95,45 @@ func (b *Batch) DeleteRange(start, end []byte) error { return b.b.DeleteRange(st
 // Close 回收未提交的批次（决定不提交时的唯一合法出口）。
 func (b *Batch) Close() error { return b.b.Close() }
 
+// Repr 返回批次的 Pebble 物理字节表示——集群模式的复制载荷（V2 spec §4：
+// 复制物理 batch 字节而非逻辑命令）。
+//
+// 注意：返回的切片底层内存归批次所有，提案方需在批次 Commit/Close 前
+// 拷贝（raft 库会长期持有日志条目）。
+func (b *Batch) Repr() []byte { return b.b.Repr() }
+
+// NewBatchFromRepr 从复制来的批次字节重建类型化批次——follower 盲 apply
+// 的唯一入口。坏字节在此报错，不进 Apply。
+func (s *Store) NewBatchFromRepr(data []byte) (*Batch, error) {
+	nb := s.db.NewBatch()
+	if err := nb.SetRepr(data); err != nil {
+		// 批次已废弃，按 Apply 失败同款约定丢给 GC（见 Apply 注释）
+		return nil, fmt.Errorf("store NewBatchFromRepr: %w", err)
+	}
+	return &Batch{b: nb}, nil
+}
+
+// ApplyWith 与 Apply 同语义，但本次刷盘由 sync 参数显式决定，不看全局
+// 档位。供集群层使用：raft 日志持久化的 sync 由确认档（quorum-fsync/
+// quorum-mem）逐次决定，FSM apply 则总是 NoSync（持久性由 raft 日志与
+// 后台批量刷盘承担，spec §5）。
+//
+// 失败/成功的批次归属与 Apply 完全一致（见 Apply 注释）。
+func (s *Store) ApplyWith(b *Batch, sync bool) error {
+	opt := pebble.NoSync
+	if sync {
+		opt = pebble.Sync
+	}
+	start := time.Now()
+	if err := b.b.Commit(opt); err != nil {
+		return fmt.Errorf("store ApplyWith: %w", err)
+	}
+	if OnApplyObserve != nil {
+		OnApplyObserve(time.Since(start))
+	}
+	return b.b.Close()
+}
+
 // Apply 原子提交批次并按配置刷盘。这是唯一写入口（见类型注释）。
 //
 // 成功时批次由 Apply 关闭并回收到 Pebble 内存池；调用方不再拥有此批次。
@@ -112,22 +151,7 @@ func (b *Batch) Close() error { return b.b.Close() }
 // 写下这段是为了防止有人"顺手修好"：本项目 6 个调用点全都在 Apply 出错后直接
 // 返回，这是刻意的，不是遗漏。
 func (s *Store) Apply(b *Batch) error {
-	opt := pebble.NoSync
-	if s.sync {
-		opt = pebble.Sync
-	}
-	start := time.Now()
-	if err := b.b.Commit(opt); err != nil {
-		return fmt.Errorf("store Apply: %w", err)
-	}
-	if OnApplyObserve != nil {
-		// 只观测成功提交：失败路径由调用方带上下文记日志，混进直方图反而
-		// 会把错误重试的耗时污染进正常刷盘分布。
-		OnApplyObserve(time.Since(start))
-	}
-	// 提交成功，关闭批次以回收到 Pebble 的 sync.Pool（见 Pebble DB.Set 源码）。
-	// 这确保热路径不会持续分配新的批次结构。
-	return b.b.Close()
+	return s.ApplyWith(b, s.sync)
 }
 
 // Pending 一次「已定序、待确认持久化」的提交。值类型，热路径零额外分配。
