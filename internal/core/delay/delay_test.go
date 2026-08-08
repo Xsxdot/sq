@@ -54,6 +54,17 @@ func (f *fixture) putDelay(t *testing.T, seq uint64, dueMs int64, m *core.Messag
 	}
 }
 
+// msgCount 统计 msg/ 区的消息条数（两段式重放用例断言目标队列条数用）。
+func (f *fixture) msgCount(t *testing.T) int {
+	t.Helper()
+	n := 0
+	pfx := []byte("msg/")
+	if err := f.st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) { n++; return true, nil }); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 func (f *fixture) delayCount(t *testing.T) int {
 	t.Helper()
 	n := 0
@@ -86,12 +97,47 @@ func TestPassMovesDueAndPreservesMessage(t *testing.T) {
 		got.Tag != "tg" || got.BornAtMs != 123 {
 		t.Fatalf("消息字段丢失: %+v", got)
 	}
-	// Keys 索引在移入时由 AppendWith 顺带写入
+	// Keys 索引在移入时由 Append 顺带写入
 	kpfx := store.KeyIdxKeyPrefix("t", "k1")
 	found := 0
 	f.st.Scan(kpfx, store.PrefixUpperBound(kpfx), 0, func(k, v []byte) (bool, error) { found++; return true, nil })
 	if found != 1 {
 		t.Fatalf("keyidx 未写入: %d", found)
+	}
+}
+
+// TestDelayMoveRedeliversOnCrashBetweenPhases 两段式移入的崩溃窗口重放语义：
+// 第一段（消息入 msg/）落盘后、第二段（删 delay 条目）前崩溃——条目残留。
+// 下一趟 Pass 重搬：目标队列出现两条同 ID 消息（at-least-once 允许的重复），
+// 但绝不出现「条目没了消息也没了」（丢失）。afterAppendHook 仅测试注入。
+func TestDelayMoveRedeliversOnCrashBetweenPhases(t *testing.T) {
+	f := newFixture(t)
+	past := time.Now().Add(-time.Second).UnixMilli()
+	f.putDelay(t, 0, past, &core.Message{ID: "m1", Topic: "t", Body: []byte("x")})
+	// 钩子在 Append 成功后 panic，模拟两段之间的进程崩溃
+	f.sc.afterAppendHook = func() { panic("simulated crash between phases") }
+	func() {
+		defer func() { recover() }()
+		f.sc.Pass()
+	}()
+	// 崩溃后：目标消息已在（第一段已提交），delay 条目也在（第二段未执行）
+	if n := f.delayCount(t); n != 1 {
+		t.Fatalf("崩溃后 delay 条目应残留: %d", n)
+	}
+	if n := f.msgCount(t); n != 1 {
+		t.Fatalf("崩溃后目标消息应已在: %d", n)
+	}
+	// 下一趟完整 Pass：重搬 → 重复消息，条目清空
+	f.sc.afterAppendHook = nil
+	moved, err := f.sc.Pass()
+	if err != nil || moved != 1 {
+		t.Fatalf("重放 Pass: moved=%d err=%v", moved, err)
+	}
+	if n := f.delayCount(t); n != 0 {
+		t.Fatalf("重放后 delay 条目应清空: %d", n)
+	}
+	if n := f.msgCount(t); n != 2 {
+		t.Fatalf("重放后目标队列应为 2 条（at-least-once 重复）: %d", n)
 	}
 }
 

@@ -4,8 +4,9 @@
 // 职责：
 //   - Stage：TRANSACTION 消息在 produce.Append 之前分流至 half/ 暂存区，
 //     half 条目与 halfidx 反查索引同批原子提交
-//   - End：commit 经 produce.AppendWith 原子移入 msg/ 并删除两键；
-//     rollback 原子删除两键；txID 不存在时幂等返回 found=false
+//   - End：commit 经 produce.Append 移入 msg/（第一段），再独立批次删除
+//     half 两键（第二段，两段式）；rollback 原子删除两键；txID 不存在时
+//     幂等返回 found=false
 //   - RunChecker：周期扫描到期半消息，经 Notifier 下发回查、改期重扫，
 //     超限丢弃；坏 half 条目/坏 half key 删除止损，不阻塞扫描（Task 4 实现）
 //
@@ -13,7 +14,8 @@
 //   - 不 import 任何 proto/pb（回查命令的协议编码在 rpc 层，经 Notifier 反转）
 //   - 不管提交后的消费语义（deliver 的事）；提交后的消息就是普通消息
 //   - 崩溃恢复零代码：half/halfidx 全在 Pebble，重启后扫描即恢复；
-//     每次状态迁移都是单批原子操作，不存在两键不一致的中间态
+//     Stage/回滚/改期均为单批原子操作；commit 是两段式（先写 msg/ 后删
+//     两键），崩溃窗口重放 = 重复提交 = 重复消息，at-least-once 语义内
 package txn
 
 import (
@@ -55,6 +57,11 @@ type Manager struct {
 	mus     [txnLockShards]sync.Mutex
 	checks  atomic.Uint64 // 累计回查排期次数（/metrics 的 sq_txn_checks_total）
 	dropped atomic.Uint64 // 累计超限丢弃条数（/metrics 的 sq_txn_dropped_total）
+
+	// afterAppendHook 测试专用注入钩子（生产恒为 nil）：在 End 提交分支第一段
+	// （消息入队）成功后、第二段（删 half 两键）前调用，用于模拟两段之间
+	// 进程崩溃。生产代码绝不允许设置。
+	afterAppendHook func()
 }
 
 // txnLockShards 事务锁分片数。32 片对「低频但可能并发」的事务决断绰绰有余；
@@ -169,15 +176,32 @@ func (t *Manager) End(txID string, commit bool) (bool, error) {
 	if err != nil {
 		return false, fmt.Errorf("解码半消息 (tx=%s): %w", txID, err)
 	}
-	// 写 msg/（正常分配队列与 offset、写 keyidx、唤醒长轮询）+ 删两个 half 键，
-	// 同一 Batch 原子提交：与 delay 到期搬运同构，不存在丢失或重复
+	// 两段式提交：第一段写目标（msg/，正常分配队列与 offset、写 keyidx、唤醒
+	// 长轮询），第二段独立批次删 half 两键。先写后删；崩溃窗口重放 = 重复提交
+	// = 重复消息，at-least-once 语义内。次序不得反转（反转 = 丢失）。
+	// 既有幂等判定天然兜底：End 先读 halfidx（不存在即已决断），第二段落盘后
+	// 一切再次 EndTransaction 均为幂等 no-op；窗口内重试则重复提交一次，
+	// 仅此而已——重复有界、不丢失。
 	idxKey := store.HalfIdxKey(txID)
-	stored, err := t.pr.AppendWith(m, func(b *store.Batch) {
-		b.Delete(halfKey)
-		b.Delete(idxKey)
-	})
+	stored, err := t.pr.Append(m)
 	if err != nil {
 		return false, fmt.Errorf("提交半消息 (tx=%s msg=%s topic=%s): %w", txID, m.ID, m.Topic, err)
+	}
+	if t.afterAppendHook != nil {
+		t.afterAppendHook()
+	}
+	// 第二段：独立批次删 half 两键。失败只记 Error 不回滚第一段——消息已提交
+	// 入队是既成事实，两键残留 = 重放再次提交 = 重复消息（可接受）；日志带
+	// 全坐标，便于按 tx_id/msg_id 在 msg/ 与 half/ 两侧核对。
+	b := t.st.NewBatch()
+	b.Delete(halfKey)
+	b.Delete(idxKey)
+	if err := t.st.Apply(b); err != nil {
+		t.logger.Error("半消息已提交入队但 half 键删除失败——重放将重复提交产生重复消息（at-least-once 允许）",
+			"tx_id", txID, "msg_id", stored.ID, "topic", stored.Topic,
+			"queue", stored.QueueID, "offset", stored.Offset, "err", err)
+		return false, fmt.Errorf("删除 half 键 (tx=%s msg=%s topic=%s q=%d off=%d): %w",
+			txID, stored.ID, stored.Topic, stored.QueueID, stored.Offset, err)
 	}
 	t.logger.Info("事务已提交", "tx_id", txID, "msg_id", stored.ID,
 		"topic", stored.Topic, "queue", stored.QueueID, "offset", stored.Offset, "checks", ref.Checks)

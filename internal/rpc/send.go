@@ -184,7 +184,7 @@ func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 			return nil, errStatus(pb.Code_ILLEGAL_DELIVERY_TIME, "DELAY 消息缺少 delivery_timestamp")
 		}
 		// 延时与顺序不可组合（M4）：SDK 两者都设时按组判定标 FIFO（上面的
-		// 分支拒绝），裸客户端标 DELAY 带组同样拒绝——到期搬运经 AppendWith
+		// 分支拒绝），裸客户端标 DELAY 带组同样拒绝——到期搬运经 Append
 		// 重新入队，无法承诺组内相对顺序。
 		if sp.GetMessageGroup() != "" {
 			return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,

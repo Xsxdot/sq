@@ -67,14 +67,16 @@ func New(st *store.Store, mt *meta.Meta, logger *slog.Logger) *Producer {
 
 func qkey(topic string, q uint32) string { return fmt.Sprintf("%s/%d", topic, q) }
 
-// AppendWith 在 Append 基础上，把 extra 组装的额外写操作并入同一原子批次。
+// Append 写入一条普通消息（spec §5 流程 1）：队列选择、offset 分配、消息与
+// alloc 计数器 + Keys 索引同一 Batch 原子提交，fsync 完成后唤醒长轮询。
+// 本方法是本 Producer 唯一的普通消息追加入口（AppendDelay 为延时专用入口）。
 //
-// 用途：DLQ 转入（写死信消息 + 删源 inflight）、M3 延时转正（写消息 + 删 delay
-// 条目）等「消息写入必须与另一处状态变更同生共死」的场景。extra 可为 nil。
-//
-// 注意：extra 只应操作与本消息无键冲突的 key；extra 内不得再调用本 Producer
-// 的任何方法（p.mu 与 queueState.mu 均不可重入）。
-func (p *Producer) AppendWith(m *core.Message, extra func(b *store.Batch)) (*core.Message, error) {
+// 注意：消息追加只保证本消息语义域内原子；跨语义域的关联写（DLQ 转入、延时
+// 转正、事务提交时的来源删除）由调用方以两段式完成（先 Append 写目标，后独立
+// 批次删来源）——单机单批原子在集群多 raft 组下不可表达，本方法不再提供
+// 跨域注入点。调用方不得在持有本 Producer 任何锁的临界区内调用本方法
+// （p.mu 与 queueState.mu 均不可重入）。
+func (p *Producer) Append(m *core.Message) (*core.Message, error) {
 	if len(m.Body) == 0 || len(m.Body) > MaxBodySize {
 		return nil, fmt.Errorf("消息体大小非法: %d（上限 %d）", len(m.Body), MaxBodySize)
 	}
@@ -136,9 +138,6 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *store.Batch)) (*cor
 		}
 		b.Set(store.KeyIdxKey(m.Topic, key, m.StoreAtMs, m.QueueID, m.Offset), nil)
 	}
-	if extra != nil {
-		extra(b)
-	}
 	pending, err := p.st.ApplyAsync(b)
 	if err != nil {
 		qs.mu.Unlock()
@@ -176,7 +175,7 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *store.Batch)) (*cor
 // AppendDelay 将延时消息写入 delay/ 暂存区（spec §5 流程 3 前半）。
 //
 // 参数：m.DeliverAtMs 必须 >0（协议层已保证 DELAY 消息带 delivery_timestamp，
-// <=0 属编程错误直接报错）。到期时间已过（<=now）时直通 AppendWith 立即投递：
+// <=0 属编程错误直接报错）。到期时间已过（<=now）时直通 Append 立即投递：
 // 语义上"到期的延时消息"就是普通消息，绕道暂存区再被调度器搬回来只是
 // 多一次读写放大，结果完全相同。
 //
@@ -198,7 +197,7 @@ func (p *Producer) AppendDelay(m *core.Message) (*core.Message, error) {
 		return nil, err
 	}
 	if m.DeliverAtMs <= time.Now().UnixMilli() {
-		return p.AppendWith(m, nil)
+		return p.Append(m)
 	}
 	if m.ID == "" {
 		m.ID = core.NewMessageID()
@@ -226,7 +225,7 @@ func (p *Producer) AppendDelay(m *core.Message) (*core.Message, error) {
 		return nil, fmt.Errorf("写入延时消息 %s (topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
 	}
 	// 定序成功即推进 seq 缓存并解锁：并发的延时写入随即进锁定序，与本条共享
-	// 同一次 fsync（拆分提交，与 AppendWith 的 qs.next 同款）。提前推进的安全性
+	// 同一次 fsync（拆分提交，与 Append 的 qs.next 同款）。提前推进的安全性
 	// 论证也相同：WaitSync 失败 == WAL sync 失败 == Pebble 不可恢复错误态，
 	// 重启后 seq 计数器与条目由同批原子提交保证一致，内存里烧掉的 seq 无害。
 	p.delayNext = seq + 1
@@ -257,9 +256,6 @@ func (p *Producer) nextDelaySeqLocked() (uint64, error) {
 	}
 	return store.GetU64(v), nil
 }
-
-// Append 写入一条普通消息（M1 签名保持不变）。
-func (p *Producer) Append(m *core.Message) (*core.Message, error) { return p.AppendWith(m, nil) }
 
 // AppendBatch 将同一 topic 的一批普通消息整批落入同一队列：连续 offset 段
 // [off, off+N)、单个 Pebble Batch、一次 fsync，整批原子——要么全部落盘要么
@@ -338,7 +334,7 @@ func (p *Producer) AppendBatch(msgs []*core.Message) ([]*core.Message, error) {
 		b.Set(store.MsgKey(topic, qid, m.Offset), raw)
 		for _, key := range m.Keys {
 			if key == "" {
-				continue // 空 key 无检索意义（与 AppendWith 同款防御）
+				continue // 空 key 无检索意义（与 Append 同款防御）
 			}
 			b.Set(store.KeyIdxKey(topic, key, m.StoreAtMs, qid, m.Offset), nil)
 		}
@@ -350,7 +346,7 @@ func (p *Producer) AppendBatch(msgs []*core.Message) ([]*core.Message, error) {
 		qs.mu.Unlock()
 		return nil, fmt.Errorf("批量写入 %d 条 (topic=%s q=%d off=%d): %w", len(msgs), topic, qid, off, err)
 	}
-	// 提前推进的理由与 AppendWith 完全相同（见其注释）
+	// 提前推进的理由与 Append 完全相同（见其注释）
 	qs.next = off + uint64(len(msgs))
 	qs.loaded = true
 	qs.mu.Unlock()

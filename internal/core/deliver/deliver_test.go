@@ -706,6 +706,17 @@ func TestOrderedTagFilteredStillSkipped(t *testing.T) {
 	}
 }
 
+// countMsgs 统计某 topic 队列的消息条数（两段式重放用例断言死信条数用）。
+func countMsgs(t *testing.T, st *store.Store, topic string, q uint32) int {
+	t.Helper()
+	n := 0
+	lo := store.MsgQueuePrefix(topic, q)
+	if err := st.Scan(lo, store.PrefixUpperBound(lo), 0, func(k, v []byte) (bool, error) { n++; return true, nil }); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 // 显式转入 DLQ：inflight 删除、消息入 %DLQ%{group}、顺序锁释放
 func TestForwardToDLQHappyPathUnblocksOrdered(t *testing.T) {
 	f := newFixture(t)
@@ -746,6 +757,48 @@ func TestForwardToDLQStaleHandle(t *testing.T) {
 	// 原 inflight 未被误删：a 仍可 ack
 	if ok, err := f.dl.Ack("g", "t", 0, msgs[0].Offset, msgs[0].DeliveryAttempt); !ok || err != nil {
 		t.Fatalf("原记录应完好: %v %v", ok, err)
+	}
+}
+
+// TestDLQMoveRedelivers 两段式死信转入的崩溃窗口重放（经 ForwardToDLQ 协议
+// 路径走 moveToDLQ 原语）：第一段（死信消息写入）后崩溃，源 inflight 未删 →
+// 重放再次转入 → 死信区两条同 ID 条目（at-least-once 允许，消费端按 ID 幂等），
+// 但绝不出现「inflight 删了死信却没有」（丢失）。
+//
+// 为什么用 ForwardToDLQ 而非超限重投路径触发：两者走同一 moveToDLQ；forward
+// 的队列锁由 defer 释放，panic 恢复后无需手工解锁，崩溃模拟最干净。
+func TestDLQMoveRedelivers(t *testing.T) {
+	f := newFixture(t)
+	f.send(t, "t", "poison")
+	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("首取: %d %v", len(msgs), err)
+	}
+	off, att := msgs[0].Offset, msgs[0].DeliveryAttempt
+	f.dl.afterAppendHook = func() { panic("simulated crash between phases") }
+	func() {
+		defer func() { recover() }()
+		f.dl.ForwardToDLQ("g", "t", 0, off, att)
+	}()
+	// 崩溃后：死信已有 1 条，源 inflight 仍在
+	dlqTopic := meta.DLQTopicName("g")
+	if n := countMsgs(t, f.st, dlqTopic, 0); n != 1 {
+		t.Fatalf("崩溃后死信应已有 1 条: %d", n)
+	}
+	if _, ok, _ := f.st.Get(store.InflightKey("g", "t", 0, off)); !ok {
+		t.Fatal("崩溃后源 inflight 应残留")
+	}
+	// 重放 ForwardToDLQ：attempt 匹配 → 再次转入 → 死信 2 条、inflight 清空
+	f.dl.afterAppendHook = nil
+	ok, err := f.dl.ForwardToDLQ("g", "t", 0, off, att)
+	if err != nil || !ok {
+		t.Fatalf("重放 ForwardToDLQ: ok=%v err=%v", ok, err)
+	}
+	if n := countMsgs(t, f.st, dlqTopic, 0); n != 2 {
+		t.Fatalf("重放后死信应为 2 条（at-least-once 重复）: %d", n)
+	}
+	if _, ok, _ := f.st.Get(store.InflightKey("g", "t", 0, off)); ok {
+		t.Fatal("重放后源 inflight 应已删除")
 	}
 }
 

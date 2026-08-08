@@ -38,6 +38,17 @@ func newFixture(t *testing.T, interval time.Duration, maxChecks int) *fixture {
 	return &fixture{st: st, pr: pr, dl: dl, mgr: New(st, pr, mt, interval, maxChecks, slog.Default())}
 }
 
+// msgCount 统计 msg/ 区消息条数（两段式重放用例断言目标队列条数用）。
+func (f *fixture) msgCount(t *testing.T) int {
+	t.Helper()
+	n := 0
+	pfx := []byte("msg/")
+	if err := f.st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) { n++; return true, nil }); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 func (f *fixture) halfCount(t *testing.T) int {
 	t.Helper()
 	n := 0
@@ -138,6 +149,44 @@ func TestEndTwiceSecondIsNoop(t *testing.T) {
 	got, _ := f.dl.Receive(context.Background(), "g", "t-txn", 0, 10, time.Minute, 0, nil)
 	if len(got) != 1 {
 		t.Fatalf("重复 End 导致消息条数 = %d", len(got))
+	}
+}
+
+// TestTxnCommitRedelivers 两段式提交的崩溃窗口重放：第一段（消息入 msg/）后
+// 崩溃，half 两键未删 → 重放 End 再次提交 → 目标队列两条同 ID 消息（重复提交
+// = 重复消息，at-least-once 允许）。End 先读后删的幂等判定（halfidx 不存在即
+// 已决断）保证重放终止：第二段落盘后，一切再次 EndTransaction 均为幂等 no-op。
+func TestTxnCommitRedelivers(t *testing.T) {
+	f := newFixture(t, 30*time.Second, 15)
+	_, txID, _ := f.mgr.Stage(msg("t-txn"))
+	f.mgr.afterAppendHook = func() { panic("simulated crash between phases") }
+	func() {
+		defer func() { recover() }()
+		f.mgr.End(txID, true)
+	}()
+	// 崩溃后：消息已入队（1 条），half 两键仍在
+	if n := f.msgCount(t); n != 1 {
+		t.Fatalf("崩溃后消息应已入队: %d", n)
+	}
+	if f.halfCount(t) != 1 {
+		t.Fatalf("崩溃后 half 条目应残留: %d", f.halfCount(t))
+	}
+	// 重放 End：halfidx 仍在 → 重新提交 → 重复消息，两键清空
+	f.mgr.afterAppendHook = nil
+	found, err := f.mgr.End(txID, true)
+	if err != nil || !found {
+		t.Fatalf("重放 End(commit): found=%v err=%v", found, err)
+	}
+	if n := f.msgCount(t); n != 2 {
+		t.Fatalf("重放后目标队列应为 2 条（重复提交 = 重复消息，at-least-once 允许）: %d", n)
+	}
+	if f.halfCount(t) != 0 {
+		t.Fatalf("重放后 half 应清空: %d", f.halfCount(t))
+	}
+	// 第二段落盘后：再次 End 为幂等 no-op（既有先读后删判定的保护）
+	found, err = f.mgr.End(txID, true)
+	if err != nil || found {
+		t.Fatalf("决断完成后的重复 End 应为幂等 no-op: found=%v err=%v", found, err)
 	}
 }
 

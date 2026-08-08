@@ -89,6 +89,11 @@ type Deliverer struct {
 
 	mu  sync.Mutex
 	qmu map[string]*sync.Mutex // "group/topic/qid" -> 队列级锁
+
+	// afterAppendHook 测试专用注入钩子（生产恒为 nil）：在 moveToDLQ 第一段
+	// （死信消息写入）成功后、第二段（删源 inflight）前调用，用于模拟两段
+	// 之间进程崩溃。生产代码绝不允许设置。
+	afterAppendHook func()
 }
 
 // New 构造 Deliverer。
@@ -251,10 +256,10 @@ func (d *Deliverer) receiveOnceLocked(group, topic string, queueID uint32, maxMs
 			return nil, store.Pending{}, false, fmt.Errorf("解码重投消息 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, r.offset, err)
 		}
 		// 投递次数耗尽：转入死信 topic，不再投递。
-		// DLQ 写入与 inflight 删除经 AppendWith 同批原子提交，与本函数的取件批次 b
-		// 相互独立（此消息不进 b，不置 staged）。崩溃窗口内至多重复转入
-		//（at-least-once），死信消费端按消息 ID 幂等即可。
-		// 锁语义没有破坏：本方法已持队列锁，AppendWith 拿的是 produce 自己的锁，
+		// DLQ 写入与源 inflight 删除是两段式（先写后删，独立批次），与本函数的
+		// 取件批次 b 相互独立（此消息不进 b，不置 staged）。崩溃窗口内至多重复
+		// 转入（at-least-once），死信消费端按消息 ID 幂等即可。
+		// 锁语义没有破坏：本方法已持队列锁，Append 拿的是 produce 自己的锁，
 		// 两把锁全程单向（deliver → produce），无环即无死锁。
 		if r.attempts >= maxAttempts {
 			if err := d.moveToDLQ(group, topic, queueID, r.offset, m, r.attempts, "投递次数耗尽（未在不可见期内 ack）"); err != nil {
@@ -614,7 +619,7 @@ func (d *Deliverer) ForwardToDLQ(group, topic string, queueID uint32, offset uin
 	if err != nil {
 		return false, fmt.Errorf("解码 forward 消息 (topic=%s q=%d off=%d): %w", topic, queueID, offset, err)
 	}
-	// moveToDLQ 内部：DLQ 写入与 inflight 删除同批原子提交，并打 Info 日志。
+	// moveToDLQ 内部：两段式转入（先写死信、后删源 inflight），并打 Info 日志。
 	// attempts/reason 写进死信属性，供控制台回答「试了几次、为什么进来」。
 	if err := d.moveToDLQ(group, topic, queueID, offset, m, attempt, "客户端显式转入死信"); err != nil {
 		return false, err
@@ -622,7 +627,7 @@ func (d *Deliverer) ForwardToDLQ(group, topic string, queueID uint32, offset uin
 	return true, nil
 }
 
-// moveToDLQ 将投递次数耗尽的消息复制入 %DLQ%{group} 并原子删除源 inflight。
+// moveToDLQ 将投递次数耗尽的消息复制入 %DLQ%{group} 并删除源 inflight。
 //
 // 死信保留原消息 ID/Body/Tag/Keys（ID 不变便于全链路追踪），来源坐标写入
 // Properties（sq-origin-topic/queue/offset，控制台溯源与重发用），并附上
@@ -650,8 +655,27 @@ func (d *Deliverer) moveToDLQ(group, topic string, queueID uint32, offset uint64
 		Properties: props, Body: m.Body, BornAtMs: m.BornAtMs,
 	}
 	infKey := store.InflightKey(group, topic, queueID, offset)
-	if _, err := d.pr.AppendWith(dlq, func(b *store.Batch) { b.Delete(infKey) }); err != nil {
+	// 两段式转入：第一段写死信（d.pr.Append），第二段独立批次删源 inflight。
+	// 先写后删；崩溃窗口（死信落盘后、inflight 删除前）重放 = 重复死信条目，
+	// at-least-once 语义内——重投扫描会再次把超限消息转入，死信区出现两条
+	// 同 ID 条目，死信消费端按消息 ID 幂等即可。次序不得反转（反转 = 丢失）。
+	if _, err := d.pr.Append(dlq); err != nil {
 		return fmt.Errorf("消息转入 DLQ (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+	}
+	if d.afterAppendHook != nil {
+		d.afterAppendHook()
+	}
+	// 第二段：独立批次删源 inflight。失败只记 Error 不回滚第一段——死信已
+	// 写入是既成事实，inflight 残留 = 下次重投扫描再次转入 = 重复死信条目
+	//（可接受）；日志带全坐标，便于按 msg_id 在死信与源队列两侧核对。
+	b := d.st.NewBatch()
+	b.Delete(infKey)
+	if err := d.st.Apply(b); err != nil {
+		d.logger.Error("死信消息已写入但源 inflight 删除失败——重放窗口将产生重复死信条目（at-least-once 允许）",
+			"group", group, "msg_id", dlq.ID, "dlq_topic", dlqTopic,
+			"origin_topic", topic, "origin_queue", queueID, "origin_offset", offset, "err", err)
+		return fmt.Errorf("删除源 inflight (group=%s topic=%s q=%d off=%d msg_id=%s): %w",
+			group, topic, queueID, offset, dlq.ID, err)
 	}
 	d.logger.Info("消息投递超限转入死信", "group", group, "topic", topic, "queue", queueID,
 		"offset", offset, "msg_id", m.ID, "dlq_topic", dlqTopic)

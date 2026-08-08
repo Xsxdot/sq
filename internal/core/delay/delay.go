@@ -3,14 +3,16 @@
 //
 // 职责：
 //   - 周期（scanInterval）扫描 [DelayPrefix, DelayScanUpperBound(now))，
-//     到期条目经 produce.AppendWith 写入 msg/ 并同批原子删除 delay 条目
+//     到期条目经 produce.Append 写入 msg/（第一段），再独立批次删除
+//     delay 条目（第二段）
 //   - 单趟预算 maxMovePerPass，满额立即续趟排空积压（不等下个 tick）
 //
 // 边界：
 //   - 不感知协议；不管投递/重试/DLQ——移入 msg/ 后就是普通消息，一切
 //     消费语义由 deliver 负责
 //   - 崩溃恢复零代码：暂存区在 Pebble，重启后从头扫描即恢复；移入是
-//     单批原子操作，不存在"已入 msg/ 但 delay 条目残留"的中间态
+//     两段式（先写后删），崩溃窗口存在"已入 msg/ 但 delay 条目残留"的
+//     中间态 = 重放重复投递，at-least-once 语义内
 //   - 时钟回拨（NTP 校时）只会让扫描上界暂时变小、到期条目晚一点被搬运
 //     ——仅延迟投递，不丢失不提前（spec §7 时钟策略）
 package delay
@@ -40,6 +42,11 @@ type Scheduler struct {
 	st     *store.Store
 	pr     *produce.Producer
 	logger *slog.Logger
+
+	// afterAppendHook 测试专用注入钩子（生产恒为 nil）：在第一段（消息入队）
+	// 成功后、第二段（删 delay 条目）前调用，用于模拟两段之间进程崩溃。
+	// 生产代码绝不允许设置。
+	afterAppendHook func()
 }
 
 // New 构造调度器。
@@ -108,14 +115,31 @@ func (s *Scheduler) Pass() (int, error) {
 			continue
 		}
 		key := d.key
-		// 写 msg/（正常分配队列与 offset、写 keyidx、唤醒长轮询）+ 删 delay
-		// 条目，同一 Batch 原子提交：崩溃窗口内要么都发生要么都不发生，
-		// 不存在丢失或重复投递
-		if _, err := s.pr.AppendWith(m, func(b *store.Batch) { b.Delete(key) }); err != nil {
+		// 两段式移入：第一段写目标（msg/，正常分配队列与 offset、写 keyidx、
+		// 唤醒长轮询），第二段独立批次删 delay 条目。先写后删；崩溃窗口（第一段
+		// 落盘后、第二段前）重放 = 重复投递，at-least-once 语义内——条目残留 =
+		// 下趟重搬 = 目标队列多一条同 ID 消息，消费端按 ID 幂等即可。次序不得
+		// 反转（先删后写 = 崩溃丢消息，绝不允许）。
+		if _, err := s.pr.Append(m); err != nil {
 			// 失败即中断本趟：条目未删除，下一趟从头重扫自然重试
 			return moved, fmt.Errorf("延时消息移入 (msg_id=%s topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
 		}
+		if s.afterAppendHook != nil {
+			s.afterAppendHook()
+		}
 		moved++
+		// 第二段：独立批次删 delay 条目。失败只记 Error 不回滚第一段——消息已
+		// 入队是既成事实，条目残留 = 下趟重搬 = 重复（可接受）；日志把两段坐标
+		// 都带上，便于运维按 msg_id 在两边核对。
+		b := s.st.NewBatch()
+		b.Delete(key)
+		if err := s.st.Apply(b); err != nil {
+			s.logger.Error("延时消息已入队但 delay 条目删除失败——条目残留，下趟重搬将产生重复投递（at-least-once 允许）",
+				"msg_id", m.ID, "topic", m.Topic, "queue", m.QueueID, "offset", m.Offset,
+				"due_ms", m.DeliverAtMs, "delay_key", fmt.Sprintf("%q", key), "err", err)
+			return moved, fmt.Errorf("删除 delay 条目 (msg_id=%s topic=%s q=%d off=%d due=%d): %w",
+				m.ID, m.Topic, m.QueueID, m.Offset, m.DeliverAtMs, err)
+		}
 		s.logger.Debug("延时消息已移入队列", "msg_id", m.ID, "topic", m.Topic,
 			"queue", m.QueueID, "offset", m.Offset, "due_ms", m.DeliverAtMs)
 	}

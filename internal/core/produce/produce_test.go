@@ -144,21 +144,6 @@ func TestAppendWritesKeyIndex(t *testing.T) {
 	}
 }
 
-// TestAppendWithExtraAtomic extra 写操作与消息同批提交。
-func TestAppendWithExtraAtomic(t *testing.T) {
-	pr, st := newTestProducer(t, t.TempDir())
-	defer st.Close()
-	marker := []byte("test/marker")
-	_, err := pr.AppendWith(&core.Message{Topic: "t", Body: []byte("x")},
-		func(b *store.Batch) { b.Set(marker, []byte("1")) })
-	if err != nil {
-		t.Fatalf("AppendWith: %v", err)
-	}
-	if _, ok, _ := st.Get(marker); !ok {
-		t.Fatal("extra 写操作未随消息落盘")
-	}
-}
-
 func TestAppendConcurrentNoDupNoHole(t *testing.T) {
 	// Producer 类型注释声称「并发安全」，此用例在 -race 下钉住它，并断言
 	// offset 分配无重复无空洞、alloc 计数器与消息数严格一致。
