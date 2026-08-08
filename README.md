@@ -77,7 +77,7 @@ advertise_port: 8081
 data_dir: "./data"
 fsync: sync                   # sync|async
 auto_create_topic: true
-default_queue_nums: 4
+default_queue_nums: 16
 default_max_attempts: 16       # 新订阅组默认最大投递次数，超过转入 %DLQ%{group}
 retention_check_interval: 5m   # 过期清理扫描间隔（Go duration 格式）
 disk_watermark_percent: 85     # 磁盘使用率超过即拒写保读；0=关闭。状态可在控制台
@@ -104,6 +104,18 @@ txn_max_checks: 15             # 单条半消息最大回查次数，超限丢�
 ```bash
 ./sq -config sq.yaml
 ```
+
+### 写吞吐与队列数
+
+写吞吐的第一决定因素是 topic 的队列数，不是磁盘速度：
+`吞吐 ≈ min(队列数, 客户端并发) × fsync速率 × group commit 合并系数`。
+
+- 默认 `default_queue_nums: 16` 适合大多数场景；高吞吐 topic 建议显式建
+  topic 并给更多队列（Admin API `queues` 参数，上限 1024）。
+- 单条 fsync 延迟决定单队列的串行下限；批量发送（SDK batch send）与更高
+  客户端并发都能进一步摊薄 fsync。
+- 参考实测（2 vCPU 云主机、fsync 456 次/s）：256 队列 + 256 并发可达
+  5 万+ msg/s，内存峰值 ~72MB（由 Pebble 配置决定，不随负载增长）。
 
 ## 升级注意
 

@@ -27,7 +27,7 @@ func TestLoadDefaults(t *testing.T) {
 		t.Fatalf("Load: %v", err)
 	}
 	if cfg.GRPCListen != ":8081" || cfg.DataDir != "./data" ||
-		cfg.Fsync != "sync" || !cfg.AutoCreateTopic || cfg.DefaultQueueNums != 4 {
+		cfg.Fsync != "sync" || !cfg.AutoCreateTopic || cfg.DefaultQueueNums != 16 {
 		t.Fatalf("unexpected defaults: %+v", cfg)
 	}
 }

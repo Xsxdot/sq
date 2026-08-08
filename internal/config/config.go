@@ -76,7 +76,8 @@ func Load(path string) (*Config, error) {
 	cfg := &Config{
 		GRPCListen: ":8081", AdvertiseHost: "127.0.0.1", AdvertisePort: 8081,
 		DataDir: "./data", Fsync: "sync",
-		AutoCreateTopic: true, DefaultQueueNums: 4, DefaultMaxAttempts: 16, LogLevel: "info",
+		AutoCreateTopic: true, DefaultQueueNums: 16, // 16：写吞吐 ≈ min(队列数,并发)×fsync速率×合并系数，4 会把云盘部署封在 ~1k msg/s
+		DefaultMaxAttempts: 16, LogLevel: "info",
 		RetentionCheckInterval: "5m",
 		DiskWatermarkPercent:   85,
 		AdminListen:            ":8082",
