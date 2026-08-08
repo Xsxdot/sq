@@ -699,6 +699,17 @@ func (m *Manager) Done() <-chan struct{} {
 	return m.doneCh
 }
 
+// Store 返回 Manager 持有的 store 实例。
+//
+// 为什么需要这个访问器：Rejoin 在编排内部重开 store（Wipe 后 pebble
+// 句柄失效，原实例已关闭），返回的 Manager 持有新实例——main 装配
+// meta/produce 等 core 组件必须拿这个新实例，而不是自己再开一份
+// （同目录重复 Open 会撞 pebble 文件锁）。清理类调用方（测试）此前
+// 直接读 m.st，导出后统一走本方法。
+func (m *Manager) Store() *store.Store {
+	return m.st
+}
+
 // GroupForQueue 返回 topic+queueID 归属的数据组号（1..DataGroups）。
 //
 // 入盘契约，永不可变——变更即存量数据错组，黄金值测试锁死。

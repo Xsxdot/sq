@@ -30,19 +30,20 @@ import (
 // "整批任一条失败即整体失败"这句话在字面上和效果上一致：失败就是真的什么
 // 都没写。
 func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*pb.SendMessageResponse, error) {
-	// 入口快速失败：本节点不是该 topic 队列所属组的 leader 时，整批消息的
-	// 提案都注定被拒（follower 上写路径经复制层报 ErrNotLeader）——与其等
-	// 批次构造 + 编解码完成后才在提案处失败，不如入口就拒，省一次批次构造。
+	// 入口快速失败：本节点对 topic 的任一队列组都不是 leader（整机处在
+	// 选举窗口或分区）时，整批消息的提案都注定被拒——与其等批次构造 +
+	// 编解码完成后才在提案处失败，不如入口就拒，省一次批次构造。
 	//
-	// 用队列 0 作探针是协议层能力的边界：SendMessage 请求不带队列号，目标
-	// 队列由 produce 内部轮询选定，协议层无法预知；探针只负责识别「本节点
-	// 明确不是写主人」的情形（如整机处在选举窗口或分区），单队列误判由
-	// propose 的 ErrNotLeader 映射兜底（同样回 HA_NOT_AVAILABLE，见
-	// topicErrStatus）。事务消息暂存走元数据组（MetaIsLeader），但同样
-	// 有映射兜底，这里不额外分支。
+	// 为什么必须查「任一队列组」而不是用队列 0 作代理：多组集群里
+	// topic 的队列摊布在多个组上（GroupForQueue 入盘映射），本节点
+	// 可能是队列 1/3/5 所在组的 leader 却不是队列 0 所在组的 leader——
+	// 只查队列 0 会把能服务的节点误拒（SDK 拿到 HA_NOT_AVAILABLE 后
+	// 隔离该端点、重试预算烧在错误的候选上，三节点 e2e 实测发送失败）。
+	// 探针只做「本节点明确不是写主人」的粗筛，单组误判（探针放行但
+	// propose 的 rr 选到别组队列）由 propose 的 ErrNotLeader 映射兜底。
 	if msgs := req.GetMessages(); len(msgs) > 0 {
-		if topic := msgs[0].GetTopic().GetName(); !s.rv.SelfIsLeader(topic, 0) {
-			s.logger.Debug("SendMessage 快速失败：本节点非该 topic 队列所属组 leader", "topic", topic)
+		if topic := msgs[0].GetTopic().GetName(); !s.leadsAnyQueueGroup(topic) {
+			s.logger.Debug("SendMessage 快速失败：本节点非该 topic 任一队列组 leader", "topic", topic)
 			return &pb.SendMessageResponse{Status: errStatus(pb.Code_HA_NOT_AVAILABLE,
 				"本节点不是该 topic 队列的当前 leader，请向 leader 节点重试")}, nil
 		}

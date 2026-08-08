@@ -130,8 +130,24 @@ func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, 
 		h.Write([]byte(m.MessageGroup))
 		m.QueueID = h.Sum32() % tc.Queues
 	} else {
-		m.QueueID = p.rr[m.Topic] % tc.Queues
+		// 普通消息轮询选队。集群档多组摊布下，rr 落在哪条队列决定了提案
+		// 进哪个 raft 组——offset 分配是 leader-only 构造（Task 8 不变量），
+		// 本节点只该写自己 lead 的组。逐条尝试直到选中本节点 lead 组的
+		// 队列；全部不命中（探针放行后理论不可达）返回 ErrNotLeader，
+		// 由 SDK 换节点重试（三节点 e2e 实测：盲目 rr 会让单节点反复
+		// 提案到自己不 lead 的组，SDK 重试预算 5 次可能耗尽）。
+		for i := uint32(0); i < tc.Queues; i++ {
+			q := (p.rr[m.Topic] + i) % tc.Queues
+			if p.rt.IsLeader(p.rt.GroupForQueue(m.Topic, q)) {
+				m.QueueID = q
+				break
+			}
+		}
 		p.rr[m.Topic]++
+		if !p.rt.IsLeader(p.rt.GroupForQueue(m.Topic, m.QueueID)) {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("%w: topic %s 本节点未 lead 任何队列组", replication.ErrNotLeader, m.Topic)
+		}
 	}
 	k := qkey(m.Topic, m.QueueID)
 	qs, ok := p.qstates[k]
@@ -338,9 +354,23 @@ func (p *Producer) AppendBatch(ctx context.Context, msgs []*core.Message) ([]*co
 	}
 
 	// 段 1（p.mu）：整批一次队列选择——批内同队列是一次 fsync 与整批原子的前提。
+	// 集群档多组摊布下必须只选本节点 lead 组的队列（offset 分配是
+	// leader-only 构造，理由同 Append 段 1 注释）；全部不命中返回
+	// ErrNotLeader 由 SDK 换节点重试。
 	p.mu.Lock()
-	qid := p.rr[topic] % tc.Queues
+	qid := uint32(0)
+	for i := uint32(0); i < tc.Queues; i++ {
+		q := (p.rr[topic] + i) % tc.Queues
+		if p.rt.IsLeader(p.rt.GroupForQueue(topic, q)) {
+			qid = q
+			break
+		}
+	}
 	p.rr[topic]++
+	if !p.rt.IsLeader(p.rt.GroupForQueue(topic, qid)) {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("%w: topic %s 本节点未 lead 任何队列组", replication.ErrNotLeader, topic)
+	}
 	k := qkey(topic, qid)
 	qs, ok := p.qstates[k]
 	if !ok {

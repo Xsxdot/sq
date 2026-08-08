@@ -51,3 +51,53 @@ metrics_retention_hours: 168
 # 半消息回查间隔（Go duration）；单条最大回查次数，超限丢弃并记日志
 txn_check_interval: 30s
 txn_max_checks: 15
+
+# —— 集群模式（V2，三节点主备）——
+# 不填本段 = 单机模式（行为与 v1 完全一致）；段一旦出现即集群模式。
+#
+# 节点身份：node_id 必须出现在下方 peers 的 id 中；raft_listen 是本节点
+# raft 组间复制流量的监听地址（与 grpc_listen 必须不同端口）。
+# data_groups 数据组数：首启时持久化进盘、此后不可变（改配置不改盘上事实）。
+# ack 确认档位：quorum-mem（日志 NoSync + 后台批量 fsync）| quorum-fsync
+# （每条日志确认前带 fsync，最保守）。
+# peers 成员表（含本节点）；1 个 = 单机→单节点集群升级形态。
+#
+# 无人值守自愈（默认行为，无需配置）：上次不干净关机（断电/kill -9）的节点
+# 启动时检测到盘上日志缺尾段，会**自动清空自己的数据目录**并以 learner
+# 身份经存活 leader 重新加入集群（日志留痕在 Error 级：清目录是破坏性
+# 动作，日志是补偿）。拒启等人工介入违背高可用初衷，因此这是默认行为；
+# 如需保留现场排查，在集群启动前先备份数据目录。
+#
+# 三节点示例（每节点一份配置，node_id/raft_listen/grpc_listen 各自不同）：
+# cluster:
+#   node_id: 1
+#   raft_listen: ":9081"
+#   data_groups: 3
+#   ack: quorum-mem
+#   peers:
+#     - id: 1
+#       raft_addr: "127.0.0.1:9081"
+#       advertise_host: "127.0.0.1"
+#       advertise_port: 8081
+#     - id: 2
+#       raft_addr: "127.0.0.1:9082"
+#       advertise_host: "127.0.0.1"
+#       advertise_port: 8082
+#     - id: 3
+#       raft_addr: "127.0.0.1:9083"
+#       advertise_host: "127.0.0.1"
+#       advertise_port: 8083
+#
+# 单节点集群（单机升级形态）：
+# cluster:
+#   node_id: 1
+#   raft_listen: ":9081"
+#   data_groups: 3
+#   ack: quorum-mem
+#   peers:
+#     - id: 1
+#       raft_addr: "127.0.0.1:9081"
+#       advertise_host: "127.0.0.1"
+#       advertise_port: 8081
+# 注意：不填 cluster 段 = 单机模式。本示例默认不带集群段，按上例
+# 自行取消注释即可开启（复制即用的默认配置不应静默切换部署形态）。

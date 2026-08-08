@@ -136,8 +136,13 @@ func (t *Manager) Stage(ctx context.Context, m *core.Message) (*core.Message, st
 	b := t.st.NewBatch()
 	b.Set(store.HalfKey(next, txID), raw)
 	b.Set(store.HalfIdxKey(txID), ref)
-	// half 键族归元数据组（与队列无关，无 GroupForQueue 映射）
-	if err := t.rep.Apply(ctx, t.rt.MetaGroup(), b); err != nil {
+	// half 键族归元数据组（与队列无关，无 GroupForQueue 映射）。
+	// 集群档：SendWithTransaction 可能落在任意节点，本节点非 meta
+	// leader 时经 fwd.ForwardApply 转发给 meta leader 提案——批次是
+	// 构造无关的两个绝对键 Set，跨节点重放无副作用（e2e 实测：SDK 的
+	// 重试候选是队列组 leader，meta leader 若恰好不 lead 任何队列组，
+	// 纯 rep.Apply 的 ErrNotLeader 会耗尽 SDK 重试预算，事务发送失败）。
+	if err := replication.ApplyOrForward(ctx, t.rep, t.rt, t.fwd, t.rt.MetaGroup(), b, t.logger); err != nil {
 		return nil, "", fmt.Errorf("写入半消息 %s (topic=%s tx=%s): %w", m.ID, m.Topic, txID, err)
 	}
 	t.logger.Info("事务半消息已暂存", "topic", m.Topic, "msg_id", m.ID,
@@ -177,7 +182,7 @@ func (t *Manager) End(ctx context.Context, txID string, commit bool) (bool, erro
 			"tx_id", txID, "next_check_ms", ref.NextCheckMs)
 		b := t.st.NewBatch()
 		b.Delete(store.HalfIdxKey(txID))
-		if aerr := t.rep.Apply(ctx, t.rt.MetaGroup(), b); aerr != nil {
+		if aerr := replication.ApplyOrForward(ctx, t.rep, t.rt, t.fwd, t.rt.MetaGroup(), b, t.logger); aerr != nil {
 			return false, fmt.Errorf("删除孤儿 halfidx (tx=%s): %w", txID, aerr)
 		}
 		return false, nil
@@ -186,7 +191,7 @@ func (t *Manager) End(ctx context.Context, txID string, commit bool) (bool, erro
 		b := t.st.NewBatch()
 		b.Delete(halfKey)
 		b.Delete(store.HalfIdxKey(txID))
-		if err := t.rep.Apply(ctx, t.rt.MetaGroup(), b); err != nil {
+		if err := replication.ApplyOrForward(ctx, t.rep, t.rt, t.fwd, t.rt.MetaGroup(), b, t.logger); err != nil {
 			return false, fmt.Errorf("回滚删除半消息 (tx=%s): %w", txID, err)
 		}
 		t.logger.Info("事务已回滚", "tx_id", txID, "checks", ref.Checks)

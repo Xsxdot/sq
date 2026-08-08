@@ -1,9 +1,20 @@
-// sq 主入口。装配 config/store/core/rpc 并托管进程生命周期。
+// sq 主入口。装配 config/store/core/rpc（集群档含 cluster.Manager）并
+// 托管进程生命周期。
+//
+// 职责：
+//   - 单机/集群二选一装配复制层：cfg.ClusterEnabled()==false 时走
+//     Standalone + StandaloneRouter + StaticRouteView（v1 逐字节行为）；
+//     集群档按下方装配序组装 cluster.Manager 并注入全部复制后端
+//   - 不干净关机（ErrUncleanShutdown）的无人值守自愈：打日志留痕后
+//     cluster.Rejoin 清空数据目录以 learner 重入——拒启等人工介入违背
+//     高可用初衷，破坏性动作的补偿是日志
+//
 // 边界：只做装配与启停，不含业务逻辑；退出码非 0 表示启动失败。
 package main
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"flag"
 	"fmt"
@@ -22,7 +33,9 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 
 	"github.com/xushixin/sq/internal/admin"
+	"github.com/xushixin/sq/internal/cluster"
 	"github.com/xushixin/sq/internal/config"
+	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/delay"
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
@@ -47,7 +60,18 @@ func main() {
 //
 // 装配顺序（严格自底向上，后者依赖前者）：
 //
-//	config → store → meta → produce → deliver → rpc.Server → grpc.Server
+//	config → store → [集群档] cluster.NewManager → meta → produce → deliver → rpc.Server → grpc.Server
+//
+// 集群档装配序（plan Task 11，硬性要求）：
+//
+//	config → store.Open → cluster.NewManager（含日志回放；ErrUncleanShutdown
+//	→ 打 Error 日志 → st.Close → cluster.Rejoin 自愈）→ Manager.Start → 等 meta 组
+//	出 leader（60s 超时）→ rep/rt/fwd 构造 → meta.New（此时 FSM 完整）→ produce/deliver/
+//	txn/delay/retention 注入 → secret（集群档走 Replicated 变体）→ rpc.New（RouteView）
+//	→ OnApplied/OnLeaderChange 钩子闭包接线（meta.Reload / produce.InvalidateCounters
+//	——闭包内 go 出去，钩子契约不阻塞）→ ControlHandler 注册（ForwardAppend 落
+//	pr.Append、ForwardApply 落 rep.Apply）→ 其余照旧。停机：gRPC 排空 → 定时器退出
+//	→ Manager.StopClean → st.Close（defer LIFO 序对齐现有注释风格）
 //
 // 生命周期收尾：defer st.Close() 在函数声明处即挂好——store.Open 成功后
 // 任何后续失败路径（包括 net.Listen 失败）都会经由 defer 正常关闭 store，
@@ -70,14 +94,172 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	defer st.Close()
-	rep := replication.NewStandalone(st)
-	rt := replication.StandaloneRouter{}
-	mt, err := meta.New(rep, rt, st, cfg.AutoCreateTopic, cfg.DefaultQueueNums, cfg.DefaultMaxAttempts, logger)
+	// 闭包而非裸 st.Close()：集群档 Rejoin 会换掉 st（内部重开 store），
+	// defer 必须关「退出时指向的那个实例」——裸调用在声明处就绑死了
+	// 旧实例，重入路径会漏关新 store（见下方集群分支）。
+	defer func() { st.Close() }()
+
+	// 集群运行 ctx：跨整个进程生命周期（Manager.Start/Rejoin 共用，
+	// Rejoin 的 ctx 兼作重启后 Manager 的 run ctx——Task 10 审查注记
+	// 不得传短超时；LoadOrCreateHandleSecretReplicated 的轮询也用它）。
+	// 单机档不用，但声明无副作用。
+	runCtx, runCancel := context.WithCancel(context.Background())
+	defer runCancel()
+
+	// 复制层装配：单机档零额外开销直通；集群档把全部写路径接进 raft 组。
+	//
+	// 为什么 rep/rt/fwd 先声明后赋值：集群档的装配钩子（OnApplied/
+	// OnLeaderChange/ControlHandler）要在 cluster.NewManager 的 Options
+	// 里以闭包形式注入，而这些闭包引用 mt/pr/rep——它们在 NewManager
+	// 之后才构造。闭包捕获变量而非值：声明在前、赋值在后，钩子触发
+	// 时（Start 之后）变量已就位。
+	var (
+		rep replication.Replicator
+		rt  replication.Router
+		fwd replication.Forwarder
+		rv  rpc.RouteView
+		mt  *meta.Meta
+		pr  *produce.Producer
+		m   *cluster.Manager // 集群档非 nil；单机档保持 nil
+	)
+	if cfg.ClusterEnabled() {
+		cc := cfg.Cluster
+		// 确认档位映射：config 已校验合法值
+		mode := cluster.AckQuorumMem
+		if cc.Ack == "quorum-fsync" {
+			mode = cluster.AckQuorumFsync
+		}
+		// 装配钩子（Options 注入，Ready 循环内同步触发、闭包内 go 出去）。
+		// OnApplied 触发 meta.Reload：follower 盲 apply 不碰缓存，靠钩子
+		// 重载；但只有触及 meta 键族的批次才值得整表重载（消息批次触发
+		// Reload 是纯浪费），用 store.BatchTouchesPrefix 判定。空条目
+		// （选举等）repr 为 nil，直接跳过（Task 2 审查注记）。
+		// OnLeaderChange 触发 produce.InvalidateCounters：重新当选 leader
+		// 后 offset 缓存可能滞后多数派事实，必须失效。
+		//
+		// 闭包捕获 mt/pr 变量（声明在函数顶部、赋值为其后的 meta.New/
+		// produce.New）：装配序把 Start 放在 meta.New 之前，Start 后
+		// 立即触发的领导权事件（单节点即刻当选）可能先于变量赋值——
+		// 钩子触发时若依赖尚未构造，跳过该次（produce 未装配就没有
+		// 缓存可失效，语义等价）。两个闭包在 NewManager 与 Rejoin 间
+		// 复用：重入后的新 Manager 同样需要这两条装配线。
+		onApplied := func(g uint32, repr []byte) {
+			// 空条目（选举/成员变更）repr 为 nil：无 FSM 数据，跳过
+			if len(repr) == 0 {
+				return
+			}
+			if mt == nil {
+				return // 装配窗口（Start→meta.New）内无缓存可重载
+			}
+			touches, terr := store.BatchTouchesPrefix(repr, []byte("meta/"))
+			if terr != nil {
+				// 批次解析失败只在坏字节时发生，apply 路径已经验过一遍，
+				// 这里防御性跳过，不影响主链路
+				logger.Warn("OnApplied 批次解析失败，跳过缓存重载", "g", g, "err", terr)
+				return
+			}
+			if !touches {
+				return // 不触及 meta 键族（纯消息批次），无需重载
+			}
+			go func() {
+				// Reload 失败不致命（部分态）：下一条 applied 条目会
+				// 再次触发重载，最终收敛（Task 6 审查注记）
+				if rerr := mt.Reload(); rerr != nil {
+					logger.Error("meta 缓存重载失败（下一条 applied 条目会重试）", "g", g, "err", rerr)
+				}
+			}()
+		}
+		onLeaderChange := func(g uint32, leader uint64, isSelf bool) {
+			if !isSelf {
+				return
+			}
+			if pr == nil {
+				return // 装配窗口（Start→produce.New）内无缓存可失效
+			}
+			go pr.InvalidateCounters()
+		}
+		// 控制处理器：本节点自己的 PrepareJoin（op=3）由 Manager 自装
+		// 处理，这里只注册转发两个 op——见 cluster.Options 注释。
+		// ForwardAppend 分支：解码消息 → pr.Append（本节点必为目标组
+		// leader——发起方按 Leader(g) 寻址；错发时 Append 内的 propose
+		// 自然报 ErrNotLeader 随控制帧回传）。ForwardApply 分支：重建
+		// 批次 → rep.Apply 提案（构造无关批次，跨节点重放安全）。
+		controlHandler := func(op byte, payload []byte) ([]byte, error) {
+			switch op {
+			case cluster.OpForwardAppend:
+				return handleForwardAppend(payload, pr)
+			case cluster.OpForwardApply:
+				return handleForwardApply(payload, st, rep)
+			default:
+				return nil, fmt.Errorf("未知控制 op %d", op)
+			}
+		}
+		opts := cluster.Options{
+			NodeID:                 cc.NodeID,
+			Peers:                  cc.PeerRaftAddrs(),
+			DataGroups:             cc.DataGroups,
+			Mode:                   mode,
+			Store:                  st,
+			Logger:                 logger,
+			LeaderBalancerInterval: leaderBalanceInterval,
+			AutoPromoteLearners:    true, // 重入自愈的最后一环：追平后自动升 voter
+			OnApplied:              onApplied,
+			OnLeaderChange:         onLeaderChange,
+			ControlHandler:         controlHandler,
+		}
+		m, err = cluster.NewManager(opts)
+		if errors.Is(err, cluster.ErrUncleanShutdown) {
+			// 无人值守自愈是集群模式默认行为：清空数据目录是破坏性动作，
+			// 日志留痕是补偿——拒启等人工介入违背高可用初衷。
+			logger.Error("检测到不干净关机，即将清空数据目录以 learner 重入", "dir", cfg.DataDir)
+			if cerr := st.Close(); cerr != nil {
+				return fmt.Errorf("关闭旧 store 后重入: %w", cerr)
+			}
+			opts.Store = nil // Rejoin 忽略 Store/Listener，内部按 dataDir 重开
+			m, err = cluster.Rejoin(runCtx, opts, cfg.DataDir)
+			if err != nil {
+				return fmt.Errorf("集群重入失败: %w", err)
+			}
+			st = m.Store() // Rejoin 内部重开了 store，后续装配用新实例
+			// Rejoin 内部已 Start（第 5 步），不重复 Start
+		} else if err != nil {
+			return err
+		} else {
+			m.Start(runCtx)
+		}
+		// 等 meta 组出 leader（60s 超时）：meta 组 leader 悬空时全部
+		// meta 写路径（建 topic/group、事务暂存、handle secret）都会
+		// 失败，半残启动比拒绝启动更糟——超时报错退出。
+		if err := waitMetaLeader(m, logger, metaLeaderWaitTimeout); err != nil {
+			return err
+		}
+		// 集群后端三合一：*replication.Cluster 同时实现 Replicator、
+		// Router 与 Forwarder（rt 断言取得 fwd，见 txn.New/delay.New）
+		cl := replication.NewCluster(m)
+		rep, rt, fwd = cl, cl, cl
+		rv = clusterRouteView{m: m, cc: cc}
+		// 停机顺序：gRPC 排空（上面 select 分支）→ 定时器退出（各自 defer）
+		// → Manager.StopClean → st.Close。本 defer 注册在 st.Close 的 defer
+		// 之后（LIFO 先执行），且晚于各定时器 defer（先执行），顺序正好
+		// 是「定时器退出 → StopClean → st.Close」。
+		defer func() {
+			sctx, cancel := context.WithTimeout(context.Background(), stopCleanTimeout)
+			defer cancel()
+			if err := m.StopClean(sctx); err != nil {
+				logger.Error("集群干净停机失败（下次启动将走 learner 重入）", "err", err)
+			}
+		}()
+	} else {
+		rep = replication.NewStandalone(st)
+		rt = replication.StandaloneRouter{}
+		rv = rpc.StaticRouteView(cfg)
+	}
+
+	mt, err = meta.New(rep, rt, st, cfg.AutoCreateTopic, cfg.DefaultQueueNums, cfg.DefaultMaxAttempts, logger)
 	if err != nil {
 		return err
 	}
-	pr := produce.New(rep, rt, st, mt, logger)
+	pr = produce.New(rep, rt, st, mt, logger)
 	dl := deliver.New(rep, rt, st, mt, pr, logger)
 
 	// 事务管理器。构造顺序有讲究：rpc.Server 要拿它处理 Send/EndTransaction，
@@ -95,15 +277,24 @@ func run() error {
 	// receipt handle 签名密钥：首次启动生成并持久化，此后原样加载（重启不换钥，
 	// 在途 handle 跨重启仍有效）。必须在 rpc.New 之前加载——Server 用它给
 	// 每个 handle 加签/验签，无密钥则全部 ack/改不可见时长请求会被拒。
-	handleSecret, err := rpc.LoadOrCreateHandleSecret(st, logger)
+	// 集群档走 Replicated 变体：密钥经 MetaGroup 复制，三节点同值——客户端
+	// 在节点间轮询时任一节点都能验签；非 leader 节点轮询等 leader 写入
+	//（leader 首次启动会生成，见 rpc/handle_secret.go）。
+	var handleSecret []byte
+	if cfg.ClusterEnabled() {
+		handleSecret, err = rpc.LoadOrCreateHandleSecretReplicated(runCtx, st, rep, rt, logger)
+	} else {
+		handleSecret, err = rpc.LoadOrCreateHandleSecret(st, logger)
+	}
 	if err != nil {
 		return err
 	}
 	// rpc.Server 需在 metrics 块之前构造：metrics（/metrics 的
 	// sq_connections）与 admin 控制台都要拿 srv.ConnectionCount。rpc.New
 	// 无副作用，上移不改变任何行为。
-	// 路由视图：单机形态恒指向本节点（集群形态由 v2 装配在 main 侧注入）
-	srv := rpc.New(cfg, rpc.StaticRouteView(cfg), mt, pr, dl, tx, writeBlocked, handleSecret, logger)
+	// 路由视图：单机形态恒指向本节点（StaticRouteView）；集群形态指向
+	// 各队列所属组的当前 leader（clusterRouteView，见 clusterview.go）
+	srv := rpc.New(cfg, rv, mt, pr, dl, tx, writeBlocked, handleSecret, logger)
 
 	// metrics registry 必须先于任何后台 goroutine 装配：NewRegistry 会写包级
 	// 钩子 store.OnApplyObserve，其契约是「装配阶段设置一次、之后只读」——
@@ -160,9 +351,10 @@ func run() error {
 	// 注册在 st.Close 的 defer 之后（LIFO 先执行），保证 handler 不会在 store
 	// 关闭后还在读写它。
 	if cfg.AdminListen != "" {
-		// fwd 单机档传 nil：StandaloneRouter 的 IsLeader 恒真，adminops 的
-		// 转发分支不可达（集群档由 Task 11 的装配替换此处）。
-		adm := admin.New(rep, rt, nil, st, mt, pr, dl, cfg.AdminUsername, cfg.AdminPassword, sys, sp, reg, srv, logger)
+		// fwd 单机档为 nil：StandaloneRouter 的 IsLeader 恒真，adminops 的
+		// 转发分支不可达（nil 不会被解引用）；集群档即 *replication.Cluster，
+		// adminops 成片清理跨组时经它转发给目标组 leader。
+		adm := admin.New(rep, rt, fwd, st, mt, pr, dl, cfg.AdminUsername, cfg.AdminPassword, sys, sp, reg, srv, logger)
 		aln, err := net.Listen("tcp", cfg.AdminListen)
 		if err != nil {
 			return fmt.Errorf("admin HTTP 监听 %s: %w", cfg.AdminListen, err)
@@ -219,9 +411,16 @@ func run() error {
 
 	errCh := make(chan error, 1)
 	go func() { errCh <- gs.Serve(lis) }()
-	logger.Info("sq 已启动", "grpc_listen", cfg.GRPCListen,
-		"advertise", cfg.AdvertiseHost, "data_dir", cfg.DataDir, "fsync", cfg.Fsync,
-		"txn_check_interval", cfg.TxnCheckInterval, "txn_max_checks", cfg.TxnMaxChecks)
+	if cfg.ClusterEnabled() {
+		logger.Info("sq 已启动（集群模式）", "grpc_listen", cfg.GRPCListen,
+			"advertise", cfg.AdvertiseHost, "data_dir", cfg.DataDir, "fsync", cfg.Fsync,
+			"node_id", cfg.Cluster.NodeID, "data_groups", cfg.Cluster.DataGroups,
+			"ack", cfg.Cluster.Ack, "peers", len(cfg.Cluster.Peers))
+	} else {
+		logger.Info("sq 已启动（单机模式）", "grpc_listen", cfg.GRPCListen,
+			"advertise", cfg.AdvertiseHost, "data_dir", cfg.DataDir, "fsync", cfg.Fsync,
+			"txn_check_interval", cfg.TxnCheckInterval, "txn_max_checks", cfg.TxnMaxChecks)
+	}
 
 	select {
 	case sig := <-sigCh:
@@ -259,6 +458,110 @@ func run() error {
 // 让所有「有正常终点」的请求自己走完。超过它还没结束的，只可能是没有正常
 // 终点的流（见下方 gracefulStop 的说明）。
 const gracefulStopTimeout = 30 * time.Second
+
+// metaLeaderWaitTimeout 等 meta 组出 leader 的上限。取值 60s：集群首次
+// 启动的选举在秒级完成，60s 只为吸收「同机多节点 + 机器慢」的极端抖动；
+// 超过它说明集群起不来（无 quorum / 选举故障），按启动失败退出——半残
+// 启动比拒绝启动更糟（全部 meta 写路径会以 HA_NOT_AVAILABLE 毒化客户端
+// 路由缓存）。
+const metaLeaderWaitTimeout = 60 * time.Second
+
+// leaderBalanceInterval 集群档的 leader 摊布/自动升 voter 循环节拍。
+// 取 5s：摊布是控制面动作（向 preferred 节点转移领导权），秒级即可，
+// 过短会在节点抖动期制造无谓转移；AutoPromoteLearners 与该循环共节拍，
+// 重入节点追平后最多一个节拍内被升回 voter。
+const leaderBalanceInterval = 5 * time.Second
+
+// stopCleanTimeout Manager.StopClean 的等待上限。StopClean 等待全部组
+// run 循环退出并写干净关机标记：组退出是本地动作（取消 run ctx 后
+// Ready 循环自然结束），30s 是「异常卡死时的兜底」而非常态预算。
+const stopCleanTimeout = 30 * time.Second
+
+// forwardOpTimeout 控制通道转发请求（ForwardAppend/ForwardApply）的单次
+// 处理上限。转发落在目标组 leader 的提案路径上，正常毫秒级完成；30s 的
+// 余量吸收 quorum 抖动，超时后对端按控制通道错误重试。
+const forwardOpTimeout = 30 * time.Second
+
+// waitMetaLeader 轮询直到 meta 组选出 leader，或超时报错。
+//
+// 为什么必须等：meta 组 leader 悬空时，一切 meta 键族写入（topic/group
+// 注册、事务 half、handle secret）都会以 ErrNotLeader 失败——此时继续
+// 装配 core 只会得到一个「起了但什么都写不进」的半残节点。等 leader
+// 就位再装配，保证对外可见即可用（起不来比半残强）。
+func waitMetaLeader(m *cluster.Manager, logger *slog.Logger, timeout time.Duration) error {
+	deadline := time.Now().Add(timeout)
+	for {
+		if _, ok := m.Leader(cluster.MetaGroup); ok {
+			logger.Info("meta 组 leader 已就绪")
+			return nil
+		}
+		if time.Now().After(deadline) {
+			return fmt.Errorf("meta 组在 %s 内未选出 leader（集群未就绪）", timeout)
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+}
+
+// handleForwardAppend 处理 OpForwardAppend 控制请求：把一条已编码消息交给
+// 本节点 produce 栈追加（offset 在 leader 侧分配）。
+//
+// 载荷：payload=[4B BE 目标组][core.EncodeMessage 字节]；响应：
+// [4B BE queueID][8B BE offset]（replication.ForwardAppend 的解析契约）。
+//
+// 注意：本节点必为目标组 leader——发起方按 Leader(g) 寻址；错发（leader
+// 换手/寻址过期）时 Append 内的 propose 自然报 ErrNotLeader，随控制帧
+// 错误文本回传，调用方据此重试。处理器运行在传输层读循环内（控制通道
+// 短连接，一次往返），阻塞只影响本连接，与 handlePrepareJoin 同契约。
+func handleForwardAppend(payload []byte, pr *produce.Producer) ([]byte, error) {
+	if pr == nil {
+		return nil, errors.New("转发处理器未就绪（装配中）")
+	}
+	if len(payload) < 4 {
+		return nil, fmt.Errorf("ForwardAppend 载荷过短: %d B", len(payload))
+	}
+	m, err := core.DecodeMessage(payload[4:])
+	if err != nil {
+		return nil, fmt.Errorf("解码转发消息: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), forwardOpTimeout)
+	defer cancel()
+	stored, err := pr.Append(ctx, m)
+	if err != nil {
+		return nil, err
+	}
+	resp := make([]byte, 12)
+	binary.BigEndian.PutUint32(resp[:4], stored.QueueID)
+	binary.BigEndian.PutUint64(resp[4:], stored.Offset)
+	return resp, nil
+}
+
+// handleForwardApply 处理 OpForwardApply 控制请求：把构造无关批次
+// （纯 Delete/DeleteRange/绝对值 Set）提交到目标组。
+//
+// 载荷：payload=[4B BE 目标组][store.Batch.Repr 字节]；响应空。
+//
+// 注意：批次重建失败（坏字节）即拒绝——apply 路径不允许任何静默降级，
+// 与 group.applyEntry 的失败哲学一致。提交失败（含 ErrNotLeader）随
+// 控制帧错误文本回传调用方。
+func handleForwardApply(payload []byte, st *store.Store, rep replication.Replicator) ([]byte, error) {
+	if rep == nil {
+		return nil, errors.New("转发处理器未就绪（装配中）")
+	}
+	if len(payload) < 4 {
+		return nil, fmt.Errorf("ForwardApply 载荷过短: %d B", len(payload))
+	}
+	g := binary.BigEndian.Uint32(payload[:4])
+	b, err := st.NewBatchFromRepr(payload[4:])
+	if err != nil {
+		return nil, fmt.Errorf("重建转发批次: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), forwardOpTimeout)
+	defer cancel()
+	if err := rep.Apply(ctx, g, b); err != nil {
+		return nil, err
+	}
+	return nil, nil
+}
 
 // gracefulStop 带上限地优雅停机：先让在途 RPC 自然结束，超时则强制中断。
 //

@@ -32,6 +32,9 @@ import (
 type fakeRouteView struct {
 	queueEndpoint func(topic string, queueID uint32) (host string, port int32, brokerName string, ok bool)
 	selfLeader    bool
+	// selfLeaderOf 按队列细化 leader 判定（多组摊布场景：本节点 lead
+	// 部分队列的组）；nil 时退回 selfLeader 全量判定。
+	selfLeaderOf func(topic string, queueID uint32) bool
 }
 
 func (f fakeRouteView) QueueEndpoint(topic string, queueID uint32) (string, int32, string, bool) {
@@ -41,8 +44,13 @@ func (f fakeRouteView) QueueEndpoint(topic string, queueID uint32) (string, int3
 	return "", 0, "", false
 }
 
-func (f fakeRouteView) SelfIsLeader(string, uint32) bool { return f.selfLeader }
-func (f fakeRouteView) MetaIsLeader() bool               { return f.selfLeader }
+func (f fakeRouteView) SelfIsLeader(topic string, queueID uint32) bool {
+	if f.selfLeaderOf != nil {
+		return f.selfLeaderOf(topic, queueID)
+	}
+	return f.selfLeader
+}
+func (f fakeRouteView) MetaIsLeader() bool { return f.selfLeader }
 
 // errInjectingReplicator 测试用假 Replicator：一切提交返回注入的错误，用于在
 // 协议层之下注入 ErrNotLeader（等价于真实集群里 follower 的提案路径）。
@@ -158,6 +166,61 @@ func TestSendOnNonLeaderReturnsHANotAvailable(t *testing.T) {
 			t.Fatalf("ErrNotLeader 应映射为 HA_NOT_AVAILABLE，得到 %v", resp.GetStatus())
 		}
 	})
+}
+
+// TestSendOnMultiGroupLeadsOtherQueuePassesEntryProbe 多组摊布下，本节点
+// lead topic 的**部分**队列组（不是队列 0 的组）时，SendMessage 入口探针
+// 必须放行——三节点 e2e 实测的回归：旧探针只查队列 0，把能服务其他队列
+// 组的节点误拒成 HA_NOT_AVAILABLE，SDK 重试预算烧在错误候选上，发送周期
+// 性失败（e2e 见真章，probe 语义修正）。
+func TestSendOnMultiGroupLeadsOtherQueuePassesEntryProbe(t *testing.T) {
+	// 本节点只 lead 队列 3 的组（队列 0/1/2 的组都在别的节点）
+	rv := fakeRouteView{
+		selfLeaderOf: func(_ string, queueID uint32) bool { return queueID == 3 },
+	}
+	c := newTestEnvWith(t, true, rv, nil).client
+	// 先 QueryRoute 把 topic 建出来（autoCreate=true，meta 里才有
+	// 队列数信息供探针遍历）——真实集群里 SDK 生产者也总是先查路由
+	if _, err := c.QueryRoute(context.Background(), &pb.QueryRouteRequest{
+		Topic: &pb.Resource{Name: "t-multigroup"},
+	}); err != nil {
+		t.Fatalf("QueryRoute 建 topic: %v", err)
+	}
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic:            &pb.Resource{Name: "t-multigroup"},
+			SystemProperties: &pb.SystemProperties{MessageType: pb.MessageType_NORMAL},
+			Body:             []byte("x"),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("lead 部分队列组时应放行（入口不拒），得到 %v", resp.GetStatus())
+	}
+}
+
+// TestSendOnMultiGroupLeadsNoQueueFailsFast 多组摊布下，本节点对 topic
+// 全部队列组都不是 leader 时，SendMessage 入口探针必须快速失败。
+func TestSendOnMultiGroupLeadsNoQueueFailsFast(t *testing.T) {
+	rv := fakeRouteView{
+		selfLeaderOf: func(string, uint32) bool { return false },
+	}
+	c := newTestEnvWith(t, true, rv, nil).client
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic:            &pb.Resource{Name: "t-multigroup-none"},
+			SystemProperties: &pb.SystemProperties{MessageType: pb.MessageType_NORMAL},
+			Body:             []byte("x"),
+		}},
+	})
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	if resp.GetStatus().GetCode() != pb.Code_HA_NOT_AVAILABLE {
+		t.Fatalf("对全部队列组都不是 leader 应快速失败为 HA_NOT_AVAILABLE，得到 %v", resp.GetStatus())
+	}
 }
 
 // TestReceiveOnNonLeaderFailsFastWithoutLongPoll follower 上 ReceiveMessage

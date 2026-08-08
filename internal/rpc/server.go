@@ -109,6 +109,28 @@ func (s *Server) Shutdown() {
 // Register 把 Server 挂载到 gRPC server 上。
 func (s *Server) Register(gs *grpc.Server) { pb.RegisterMessagingServiceServer(gs, s) }
 
+// leadsAnyQueueGroup 本节点是否是 topic 任一队列所属组的 leader。
+//
+// SendMessage 入口快速失败的判定件：topic 的队列摊布在多个组上，只要
+// 本节点 lead 其中任一队列的组，就存在「rr 选到本节点组」的可能——此时
+// 不能入口拒（propose 的 ErrNotLeader 才是兜底）；只有本节点对全部队列
+// 组都不是 leader（选举窗口/分区）才快速失败。
+//
+// topic 未注册（autoCreate 即将创建）时按 meta 组判定：创建写归 meta
+// 组（topic 注册本身），本节点不是 meta leader 则创建注定失败。
+func (s *Server) leadsAnyQueueGroup(topic string) bool {
+	tc, ok := s.mt.GetTopic(topic)
+	if !ok {
+		return s.rv.MetaIsLeader()
+	}
+	for q := uint32(0); q < tc.Queues; q++ {
+		if s.rv.SelfIsLeader(topic, q) {
+			return true
+		}
+	}
+	return false
+}
+
 // okStatus 构造成功状态。
 func okStatus() *pb.Status { return &pb.Status{Code: pb.Code_OK, Message: "ok"} }
 
