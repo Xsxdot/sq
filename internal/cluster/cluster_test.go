@@ -202,6 +202,70 @@ func TestClusterUncleanNodeRejoinsAsLearner(t *testing.T) {
 	tc.waitConverged(t, []string{"meta/topic/t0000", "meta/topic/t0099", "meta/topic/t0100", "meta/topic/t0199"}, 60*time.Second)
 }
 
+// TestControlRoundTrip 节点 A 经 Manager.Control 调 B 的控制通道：
+// B 的 ControlHandler 收到 op/payload 并应答，A 取回应答；handler
+// 报错时 A 收到带错误文本的 error；未知节点与超大 payload 在发送
+// 侧直接拒绝（不发起连接）。
+func TestControlRoundTrip(t *testing.T) {
+	// 双节点 harness（控制通道是点对点 RPC，无需多数派语义）：
+	// B 注入 ControlHandler——op=7 回显 payload、op=8 报错，并把
+	// 每次调用推进 got 供断言「B 确实收到了」
+	got := make(chan struct {
+		op      byte
+		payload []byte
+	}, 8)
+	handler := func(op byte, payload []byte) ([]byte, error) {
+		got <- struct {
+			op      byte
+			payload []byte
+		}{op, append([]byte(nil), payload...)}
+		switch op {
+		case 7:
+			return append([]byte(nil), payload...), nil
+		case 8:
+			return nil, errors.New("handler-boom")
+		default:
+			return nil, fmt.Errorf("unexpected op %d", op)
+		}
+	}
+	tc := newTestClusterN(t, AckQuorumMem, Options{ControlHandler: handler}, 2)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := tc.mgrs[1]
+
+	// 成功路径：A 调 B 得回显，且 B 的 handler 确实收到 op=7 payload="ping"
+	resp, err := a.Control(ctx, 2, 7, []byte("ping"))
+	if err != nil {
+		t.Fatalf("Control 成功路径: %v", err)
+	}
+	if string(resp) != "ping" {
+		t.Fatalf("应答 %q; want %q", resp, "ping")
+	}
+	evt := <-got
+	if evt.op != 7 || string(evt.payload) != "ping" {
+		t.Fatalf("B 的 handler 收到 op=%d payload=%q; want op=7 payload=\"ping\"", evt.op, evt.payload)
+	}
+
+	// 错误路径：B 的 handler 返回 error，A 侧错误必须带该文本
+	if _, err := a.Control(ctx, 2, 8, []byte("x")); err == nil || !strings.Contains(err.Error(), "handler-boom") {
+		t.Fatalf("错误路径 err=%v; want 含 handler-boom", err)
+	}
+	evt = <-got
+	if evt.op != 8 {
+		t.Fatalf("B 的 handler 收到 op=%d; want 8", evt.op)
+	}
+
+	// 未知节点：Peers 表无此节点，发送侧直接报错
+	if _, err := a.Control(ctx, 99, 1, nil); err == nil {
+		t.Fatal("未知节点 Control 应报错，得到 nil")
+	}
+
+	// 超大 payload（16MiB 帧上限）：发送侧直接拒绝，不发起连接
+	if _, err := a.Control(ctx, 2, 9, make([]byte, maxFrameLen)); err == nil {
+		t.Fatal("超大 payload 应被发送侧拒绝，得到 nil")
+	}
+}
+
 // appliedEvt 是 OnApplied 钩子收集器的事件：组号 + 原始批次 repr。
 type appliedEvt struct {
 	g    uint32
@@ -237,17 +301,18 @@ type testCluster struct {
 
 // newTestCluster 起三节点集群（真实 TCP），不带钩子注入。
 func newTestCluster(t *testing.T, mode AckMode) *testCluster {
-	return newTestClusterOpts(t, mode, Options{})
+	return newTestClusterN(t, mode, Options{}, 3)
 }
 
 // newTestClusterOpts 起三节点集群（真实 TCP），并支持注入装配钩子。
 //
-// hookOpts 只消费 OnLeaderChange/OnApplied 两个字段：对应钩子非 nil 时，
-// harness 为每个节点挂上包裹闭包——把事件推进该节点的收集器 channel
-// （appliedChs/leaderChs），再转发给注入的 raw 钩子。钩子签名不带节点
-// id，逐节点 channel 分流是测试断言「三节点都收到」的观测面。
+// hookOpts 只消费 OnLeaderChange/OnApplied/ControlHandler 三个字段：
+// 对应钩子非 nil 时，harness 为每个节点挂上包裹闭包——把事件推进该
+// 节点的收集器 channel（appliedChs/leaderChs），再转发给注入的 raw
+// 钩子。钩子签名不带节点 id，逐节点 channel 分流是测试断言「三节点
+// 都收到」的观测面。
 //
-// 装配序：先 net.Listen ×3 收集地址再拼 Peers 表——解拨号先有鸡还是
+// 装配序：先 net.Listen ×n 收集地址再拼 Peers 表——解拨号先有鸡还是
 // 先有蛋（传输层按 Peers 拨号，必须拿到全部地址后才能建 Manager），
 // 然后逐节点 store.Open(t.TempDir()/id) + NewManager（Listener 注入
 // 已建监听）+ Start。
@@ -256,11 +321,17 @@ func newTestCluster(t *testing.T, mode AckMode) *testCluster {
 // kill 过的节点跳过 StopClean（运行 ctx 已取消）；rejoin 过的节点
 // 已重置 killed 标记，按存活节点正常收尾（stores/mgrs 指向新实例）。
 func newTestClusterOpts(t *testing.T, mode AckMode, hookOpts Options) *testCluster {
+	return newTestClusterN(t, mode, hookOpts, 3)
+}
+
+// newTestClusterN 同 newTestClusterOpts，但节点数可配：控制通道等
+// 无需多数派语义的测试用双节点即可，避免三节点无谓的选举开销。
+func newTestClusterN(t *testing.T, mode AckMode, hookOpts Options, n uint64) *testCluster {
 	t.Helper()
-	// 1. 先建三个监听器收集地址，再拼 Peers 表
-	lstns := make([]net.Listener, 0, 3)
-	peers := make(map[uint64]string, 3)
-	for i := uint64(1); i <= 3; i++ {
+	// 1. 先建 n 个监听器收集地址，再拼 Peers 表
+	lstns := make([]net.Listener, 0, n)
+	peers := make(map[uint64]string, n)
+	for i := uint64(1); i <= n; i++ {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("节点 %d 预建监听: %v", i, err)
@@ -269,23 +340,23 @@ func newTestClusterOpts(t *testing.T, mode AckMode, hookOpts Options) *testClust
 		peers[i] = ln.Addr().String()
 	}
 	tc := &testCluster{
-		dirs:       make(map[uint64]string, 3),
-		stores:     make(map[uint64]*store.Store, 3),
-		mgrs:       make(map[uint64]*Manager, 3),
+		dirs:       make(map[uint64]string, n),
+		stores:     make(map[uint64]*store.Store, n),
+		mgrs:       make(map[uint64]*Manager, n),
 		peers:      peers,
-		killed:     make(map[uint64]bool, 3),
+		killed:     make(map[uint64]bool, n),
 		dataGroups: 3,
 		mode:       mode,
 	}
 	if hookOpts.OnApplied != nil {
-		tc.appliedChs = make(map[uint64]chan appliedEvt, 3)
+		tc.appliedChs = make(map[uint64]chan appliedEvt, n)
 	}
 	if hookOpts.OnLeaderChange != nil {
-		tc.leaderChs = make(map[uint64]chan leaderEvt, 3)
+		tc.leaderChs = make(map[uint64]chan leaderEvt, n)
 	}
 	// 2. 逐节点开 store + NewManager + Start（节点目录 = t.TempDir()/id，
 	//    WipeForRejoin 只需清节点目录，父目录保留）
-	for i := uint64(1); i <= 3; i++ {
+	for i := uint64(1); i <= n; i++ {
 		dir := fmt.Sprintf("%s/%d", t.TempDir(), i)
 		st, err := store.Open(dir, false, testSlog(t))
 		if err != nil {
@@ -325,6 +396,7 @@ func newTestClusterOpts(t *testing.T, mode AckMode, hookOpts Options) *testClust
 			Logger:         testSlog(t),
 			OnLeaderChange: onLC,
 			OnApplied:      onApplied,
+			ControlHandler: hookOpts.ControlHandler,
 		})
 		if err != nil {
 			t.Fatalf("节点 %d NewManager: %v", i, err)

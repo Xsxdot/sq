@@ -24,6 +24,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/fnv"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -71,6 +72,13 @@ type Options struct {
 	// （空条目 repr 为 nil）。
 	OnLeaderChange func(g uint32, leader uint64, isSelf bool)
 	OnApplied      func(g uint32, repr []byte)
+
+	// ControlHandler 是控制通道的接收处理器（batch③，可为 nil）：对端
+	// 经 Manager.Control 发起短连接 RPC 时，传输层读循环在同一连接上
+	// 同步调用它，返回值作为应答帧写回（错误返回作为失败应答带回调用
+	// 方）。nil 时对端收到「控制通道未装配」错误帧。
+	// 注意：处理在传输层读循环内同步执行，不得阻塞（重活自行 dispatch）。
+	ControlHandler func(op byte, payload []byte) ([]byte, error)
 }
 
 // Manager 是多组装配体：持有全部 raft 组、传输层与恢复判定。
@@ -90,6 +98,10 @@ type Manager struct {
 	// Options 字段注释（Ready 循环内同步触发，不得阻塞）
 	onLeaderChange func(g uint32, leader uint64, isSelf bool)
 	onApplied      func(g uint32, repr []byte)
+
+	// controlHandler 是控制通道接收处理器（Options 透传，nil 安全）：
+	// 传输层收到 ControlGroup 帧时在读循环内同步调用（transport.control）
+	controlHandler func(op byte, payload []byte) ([]byte, error)
 
 	cancel         context.CancelFunc // 运行 ctx 取消句柄（StopClean/kill 用）
 	doneCh         chan struct{}      // 全部组 + flusher 完全退出后关闭
@@ -139,6 +151,7 @@ func NewManager(o Options) (*Manager, error) {
 		groups:         make(map[uint32]*group, o.DataGroups+1),
 		onLeaderChange: o.OnLeaderChange,
 		onApplied:      o.OnApplied,
+		controlHandler: o.ControlHandler,
 		doneCh:         make(chan struct{}),
 	}
 	m.rs = newRaftStore(o.Store, lg)
@@ -331,7 +344,7 @@ func (m *Manager) Start(ctx context.Context) {
 		} else {
 			m.lg.Debug("收到未知组的消息，丢弃", "g", g)
 		}
-	}, m.lg)
+	}, m.controlHandler, m.lg)
 	m.tr.Start(rctx)
 
 	for g := uint32(0); g < m.Groups(); g++ {
@@ -478,6 +491,92 @@ func (m *Manager) Leader(g uint32) (nodeID uint64, ok bool) {
 	}
 	id := gr.leader()
 	return id, id != 0
+}
+
+// Control 向指定节点发起一次控制通道 RPC（短连接，一次往返）。
+//
+// 生命周期：查 Peers 表拿地址 → 拨号 → 写请求帧（[op][payload]，
+// 组号 ControlGroup）→ 读响应帧 → 关闭。独立短连接、不复用 raft
+// 消息流——raft 流是单向流水（batch② 设计），控制是低频 RPC（join、
+// 转发），交织会让低频请求被流水消息排队挤出队头阻塞；短连接也天然
+// 免除了生命周期清理。
+//
+// 参数：
+//   - ctx: 控制整个往返的时限——拨号（DialContext）、读写 deadline
+//     均取 ctx；无 deadline 时读写不设限（连接关闭即返回错误）
+//   - nodeID: 目标节点，必须存在于 Peers 表（否则报错，不发起连接）
+//   - op: 控制操作码（0..0x7F，高位 0x80 为响应保留位）
+//   - payload: 请求载荷
+//
+// 返回：
+//   - handler 应答数据（成功路径）
+//   - 错误信息：未知节点/拨号失败/响应协议错；handler 返回的错误会
+//     以「控制调用失败: <文本>」的形式原样带回
+//
+// 注意：
+//   - payload 过大（请求帧超过 16MiB 上限）时发送侧直接拒绝，不拨号
+//   - 对端 ControlHandler 为 nil 时返回「控制通道未装配」错误
+func (m *Manager) Control(ctx context.Context, nodeID uint64, op byte, payload []byte) ([]byte, error) {
+	addr, ok := m.peers[nodeID]
+	if !ok {
+		return nil, fmt.Errorf("cluster: 未知节点 %d（Peers 表无此节点）", nodeID)
+	}
+	// 发送侧帧长校验：请求帧 = 4B 帧长 + 4B 组号 + 1B op + payload，
+	// 超过 maxFrameLen 直接拒绝——对端收帧同样限长，发了也白发。
+	if 4+1+len(payload) > maxFrameLen {
+		return nil, fmt.Errorf("cluster: 控制请求 payload %d B 超帧上限 %d B", len(payload), maxFrameLen)
+	}
+	conn, err := (&net.Dialer{}).DialContext(ctx, "tcp", addr)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: 控制连接节点 %d（%s）: %w", nodeID, addr, err)
+	}
+	defer conn.Close()
+	if d, ok := ctx.Deadline(); ok {
+		// 读写 deadline 均取 ctx：读响应时对端 handler 卡死也不会
+		// 无限挂起，整个往返被 ctx 时限圈住
+		_ = conn.SetDeadline(d)
+	}
+	// 请求帧 payload = [op][请求 payload]，复用信封帧编码
+	ctrl := append([]byte{op}, payload...)
+	if _, err := conn.Write(encodeFrame(nil, ControlGroup, ctrl)); err != nil {
+		return nil, fmt.Errorf("cluster: 控制请求写节点 %d: %w", nodeID, err)
+	}
+	m.lg.Debug("控制请求已发送", "peer", nodeID, "op", op, "len", len(payload))
+	// 响应帧同构：[4B 帧长][4B ControlGroup][1B op(响应位)][1B 状态][应答]
+	header := make([]byte, 4)
+	if _, err := io.ReadFull(conn, header); err != nil {
+		return nil, fmt.Errorf("cluster: 读控制响应头节点 %d: %w", nodeID, err)
+	}
+	frameLen := binary.BigEndian.Uint32(header)
+	// 最小合法响应帧 6 字节（4B 组号 + 1B op + 1B 状态）：<6 时
+	// 下面 body[5] 会越界，坏对端可直接打崩调用方，必须防御。
+	if frameLen < 6 || frameLen > maxFrameLen {
+		return nil, fmt.Errorf("cluster: 节点 %d 控制响应帧长 %d 非法", nodeID, frameLen)
+	}
+	body := make([]byte, int(frameLen))
+	if _, err := io.ReadFull(conn, body); err != nil {
+		return nil, fmt.Errorf("cluster: 读控制响应体节点 %d: %w", nodeID, err)
+	}
+	if g := binary.BigEndian.Uint32(body[:4]); g != ControlGroup {
+		return nil, fmt.Errorf("cluster: 节点 %d 控制响应组号 %d 异常（want %d）", nodeID, g, ControlGroup)
+	}
+	respOp := body[4]
+	if respOp&0x80 == 0 {
+		// 对端把请求帧回传（未置响应位）属协议错，不当作应答
+		return nil, fmt.Errorf("cluster: 节点 %d 控制响应缺响应标记（op=0x%x）", nodeID, respOp)
+	}
+	status := body[5]
+	respPayload := body[6:]
+	m.lg.Debug("控制响应已收到", "peer", nodeID, "op", respOp&^0x80, "len", len(respPayload))
+	switch status {
+	case 0:
+		return respPayload, nil
+	case 1:
+		// 失败：余下 payload 是对端 handler 的 UTF-8 错误文本，原样带回
+		return nil, fmt.Errorf("cluster: 节点 %d 控制调用失败: %s", nodeID, string(respPayload))
+	default:
+		return nil, fmt.Errorf("cluster: 节点 %d 控制响应状态字节 %d 异常", nodeID, status)
+	}
 }
 
 // Status 返回指定组的 raft 运行时状态（透传 rn.Status()）；组号非法
