@@ -88,7 +88,7 @@ type Manager struct {
 //  3. 恢复路径三分：
 //     - 有标记：各组 Load 回放磁盘日志，RestartNode 原身份回归
 //     - 无标记且盘上有 raft 状态（任一组的 HardState 或 applied 非零）：
-//       返回 ErrUncleanShutdown——异步刷盘下不得裸恢复
+//     返回 ErrUncleanShutdown——异步刷盘下不得裸恢复
 //     - 无标记且无 raft 状态（全新目录）：StartNode 按 Peers 引导
 //  4. 装配本节点监听（注入或按 Peers[NodeID]）
 //
@@ -467,12 +467,24 @@ func (m *Manager) Groups() uint32 {
 //
 // 重入编排原语：本批由测试 harness 驱动（Remove 旧 voter → AddLearner
 // → 追平 → AddNode）；生产编排属 batch③。
+//
+// Remove 应用完成后排空被移除节点的传输队列：raft 侧 Progress 已删除
+// 不再产生新消息，但队列里变更前的心跳等积压仍携带旧 commit 索引，
+// 对端以空/短日志重入（learner 重入流程）收到即触发 raft 库
+// "tocommit out of range" panic——Task 7 三节点集成测试抓到的缺口。
+// 趁节点离线排空是确定的（离线时无在途写，见 transport.DropPeer）。
 func (m *Manager) ProposeConfChange(ctx context.Context, g uint32, typ raftpb.ConfChangeType, nodeID uint64) error {
 	gr, ok := m.groups[g]
 	if !ok {
 		return fmt.Errorf("cluster: 未知数据组 %d（有效范围 [0, %d]）", g, m.Groups()-1)
 	}
-	return gr.proposeConfChange(ctx, typ, nodeID)
+	if err := gr.proposeConfChange(ctx, typ, nodeID); err != nil {
+		return err
+	}
+	if typ == raftpb.ConfChangeRemoveNode && m.tr != nil {
+		m.tr.DropPeer(nodeID)
+	}
+	return nil
 }
 
 // WipeForRejoin 清空整个数据目录，是 learner 重入的前置动作。

@@ -164,6 +164,34 @@ func (t *transport) Send(g uint32, msgs []*raftpb.Message) {
 	}
 }
 
+// DropPeer 排空指定 peer 的发送队列并清零丢弃计数。
+//
+// 成员变更移除节点后调用：raft 侧该节点的 Progress 已删除、不再产生
+// 新消息，但队列里还压着变更前的心跳等积压——它们携带变更前的 commit
+// 索引（min(旧 Match, committed)），对端若以空/短日志重入，收到即
+// 触发 raft 库的 tocommit 越界 panic（排障见 Manager.ProposeConfChange
+// 注释）。趁节点离线排空队列是确定的：对端不在线时发送 goroutine
+// 没有在途写（拨号失败循环），队列排空后重连只会收到新成员状态消息。
+//
+// 幂等：重复调用（多组各自 Remove 同一节点）安全。
+func (t *transport) DropPeer(id uint64) {
+	q, ok := t.queues[id]
+	if !ok {
+		return
+	}
+	for {
+		select {
+		case <-q:
+		default:
+			goto drained
+		}
+	}
+drained:
+	if d, ok := t.drops[id]; ok {
+		d.Store(0)
+	}
+}
+
 // acceptLoop 接受入站连接并为每连接开一个读 goroutine。
 //
 // 注意：退出路径不打日志——本循环唯一的退出方式就是 ctx 取消后的

@@ -71,3 +71,29 @@ func TestTransportDropsWhenPeerDown(t *testing.T) {
 		t.Fatal("对端不可达时 Send 阻塞——违反不阻塞契约")
 	}
 }
+
+// TestTransportDropPeerDrainsQueue 成员变更移除节点后，传输队列里
+// 变更前的心跳积压必须被 DropPeer 排空——不排空的话，对端以空/短日志
+// 重入时收到携带旧 commit 索引的陈旧心跳会触发 raft 库 tocommit 越界
+// panic（Task 7 集成测试抓到的缺口，见 Manager.ProposeConfChange）。
+func TestTransportDropPeerDrainsQueue(t *testing.T) {
+	ln, _ := net.Listen("tcp", "127.0.0.1:0")
+	tr := newTransport(1, ln, map[uint64]string{2: "127.0.0.1:1"}, // 1 端口必拒：无连接，消息全积压
+		func(uint32, *raftpb.Message) {}, testSlog(t))
+	from, to := uint64(1), uint64(2)
+	typ := raftpb.MsgHeartbeat
+	for i := 0; i < 100; i++ { // 全部积压在队列
+		tr.Send(0, []*raftpb.Message{{Type: &typ, From: &from, To: &to}})
+	}
+	if n := len(tr.queues[2]); n == 0 {
+		t.Fatal("积压前置不成立：队列应为空？——测试自身有问题")
+	}
+	tr.DropPeer(2)
+	if n := len(tr.queues[2]); n != 0 {
+		t.Fatalf("DropPeer 后队列残留 %d 条", n)
+	}
+	tr.DropPeer(2) // 幂等：重复调用不炸
+	if n := tr.drops[2].Load(); n != 0 {
+		t.Fatalf("DropPeer 后丢弃计数 = %d; want 0", n)
+	}
+}

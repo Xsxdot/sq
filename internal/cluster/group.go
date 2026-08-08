@@ -120,6 +120,11 @@ func newGroup(g uint32, rn raft.Node, storage *raft.MemoryStorage, rs *raftStore
 
 // raftConfig 构造共享的 raft 配置：tick 参数、单消息/在途日志上限、
 // 丢弃日志器（raft 库自身日志噪音大，关键节点由我们的 slog 承担）。
+//
+// DisableProposalForwarding 是内核契约：follower 上的 Propose 必须
+// 报错（batch③ 据此翻译成客户端可重试码），不静默转发——默认行为会
+// 把提案转发给 leader 并假成功，且任意字节载荷经转发进入日志后在
+// apply 时炸 FSM（batch④ 集成测试抓到的缺口，见 TestClusterProposeOnFollowerFails）。
 func raftConfig(id uint64, storage *raft.MemoryStorage) *raft.Config {
 	return &raft.Config{
 		ID:              id,
@@ -129,6 +134,8 @@ func raftConfig(id uint64, storage *raft.MemoryStorage) *raft.Config {
 		MaxSizePerMsg:   1 << 20,
 		MaxInflightMsgs: 256,
 		Logger:          &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)},
+		// 内核契约：follower 收到提案直接丢弃并返回错误，绝不转发给 leader
+		DisableProposalForwarding: true,
 	}
 }
 
@@ -188,6 +195,7 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 		gr.lg.Info("组 leader 变更", "lead", rd.SoftState.Lead, "term", rd.HardState.GetTerm())
 	}
 	// 3. CommittedEntries apply
+	appliedCC := make([]uint64, 0, 2) // 本轮回合的成员变更 id：Advance 后再通知
 	for _, ent := range rd.CommittedEntries {
 		// 重启重放的幂等保证：raft 可能重发已 apply 过的条目
 		// （conflict 回退重写后），跳过即可——FSM 已是该 index 的状态
@@ -204,9 +212,9 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 				panic(err)
 			}
 			gr.rn.ApplyConfChange(&cc)
-			// 按 ConfChange.Id 通知 ccWaiters——独立命名空间，
-			// 同 id 的普通提案 waiter 不会被误唤
-			gr.notifyWaiter(gr.ccWaiters, cc.GetId())
+			// 成员变更的 waiter 通知放到 Advance 之后（见循环外注释）：
+			// 这里只登记 id，不直接通知
+			appliedCC = append(appliedCC, cc.GetId())
 			gr.applied.Store(ent.GetIndex())
 			gr.lg.Debug("成员变更已 apply", "type", cc.GetType().String(), "node", cc.GetNodeId())
 		case raftpb.EntryNormal:
@@ -224,6 +232,15 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	}
 	// 4. Advance——raft 库据此确认本轮 Ready 已处理，继续产下一轮
 	gr.rn.Advance()
+	// 成员变更 waiter 通知必须晚于 Advance：raft 库在 Advance 时才更新
+	// 内部 applied 位点，FSM 层 apply（ApplyConfChange）发生时它仍停在
+	// 上一条。若此时就通知，编排层（Remove→AddLearner 背靠背提案）紧
+	// 接着提出的下一条 ConfChange 会落在「pendingConfIndex > applied」
+	// 校验窗口内，被 raft 静默替换成空普通条目——替换不可观察、ccWaiter
+	// 永不通知，调用方只能等超时（Task 7 集成测试抓到的缺口）。
+	for _, id := range appliedCC {
+		gr.notifyWaiter(gr.ccWaiters, id)
+	}
 }
 
 // syncPersist 判定本轮 Ready 持久化是否带 fsync。
