@@ -12,6 +12,7 @@
 package produce
 
 import (
+	"hash/fnv"
 	"log/slog"
 	"sync"
 	"testing"
@@ -301,5 +302,46 @@ func TestAppendDelaySeqPersistsAcrossReopen(t *testing.T) {
 	dpfx := []byte(store.DelayPrefix)
 	if n := countPrefix(t, st2, dpfx, store.PrefixUpperBound(dpfx)); n != 3 {
 		t.Fatalf("重启后 delay 条目数 = %d，期望 3（seq 撞 key 会覆盖变 2）", n)
+	}
+}
+
+// TestAppendConcurrentSameGroupOffsetsContiguous 是 group commit 解锁后的 FIFO
+// 回归测试：并发写同一 MessageGroup（固定落同一队列），验证 offset 恰为
+// 0..N-1 连续无洞无重、alloc 计数器与消息严格一致。解锁改动若破坏
+// 「offset 顺序 == 落盘顺序」的临界区，本测试在 -race 下必然暴露。
+func TestAppendConcurrentSameGroupOffsetsContiguous(t *testing.T) {
+	p, st := newTestProducer(t, t.TempDir())
+	defer st.Close()
+	const goroutines, perG = 8, 100
+	var wg sync.WaitGroup
+	for g := 0; g < goroutines; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perG; i++ {
+				if _, err := p.Append(&core.Message{Topic: "fifo-cc", MessageGroup: "g1", Body: []byte("x")}); err != nil {
+					t.Errorf("Append: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	// 用与实现相同的 fnv 哈希算出该 group 固定落的队列号（fixture 为 4 队列）
+	h := fnv.New32a()
+	h.Write([]byte("g1"))
+	qid := h.Sum32() % 4
+	total := uint64(goroutines * perG)
+	v, ok, err := st.Get(store.AllocKey("fifo-cc", qid))
+	if err != nil || !ok {
+		t.Fatalf("alloc 计数器缺失: ok=%v err=%v", ok, err)
+	}
+	if got := store.GetU64(v); got != total {
+		t.Fatalf("alloc 计数器 = %d, want %d", got, total)
+	}
+	for off := uint64(0); off < total; off++ {
+		if _, ok, err := st.Get(store.MsgKey("fifo-cc", qid, off)); err != nil || !ok {
+			t.Fatalf("offset %d 消息缺失: ok=%v err=%v", off, ok, err)
+		}
 	}
 }

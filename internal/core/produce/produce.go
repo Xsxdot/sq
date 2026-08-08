@@ -28,9 +28,9 @@ import (
 // MaxBodySize 消息体上限（spec §7）。
 const MaxBodySize = 4 * 1024 * 1024
 
-// queueState 单个 (topic, queue) 的写入状态。qs.mu 串行化同队列的
-// offset 分配与落盘；不同队列各持各锁，Apply 得以并发进入 Pebble，
-// group commit 才能把并发 fsync 合并（B1 的全部意义所在）。
+// queueState 单个 (topic, queue) 的写入状态。qs.mu 只串行化 offset 分配与
+// 批次定序（ApplyAsync 为止）；fsync 等待在锁外，同队列多条在途提交由 Pebble
+// commit pipeline 合并为一次 fsync——队列内 group commit 的关键。
 type queueState struct {
 	mu     sync.Mutex
 	next   uint64 // 下一 offset（懒加载自 alloc/ key）
@@ -140,16 +140,32 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *pebble.Batch)) (*co
 	if extra != nil {
 		extra(b)
 	}
-	if err := p.st.Apply(b); err != nil {
+	pending, err := p.st.ApplyAsync(b)
+	if err != nil {
 		qs.mu.Unlock()
 		return nil, fmt.Errorf("写入消息 %s (topic=%s q=%d off=%d): %w", m.ID, m.Topic, m.QueueID, m.Offset, err)
 	}
-	// Apply 成功才推进（失败的写不能烧 offset，原注释原样保留）
+	// ApplyAsync 成功 == 本条已在 WAL/memtable 中定序。此刻立即推进 offset 缓存
+	// 并解锁：同队列后继消息随即进锁定序，与本条一起挂在 commit pipeline 里共享
+	// 同一次 fsync——这就是 group commit 在队列内生效的机制（吞吐从 1/fsync延迟
+	// 变为 合并深度/fsync延迟）。
+	//
+	// 为什么敢在 Wait 之前推进 qs.next：若后续 WaitSync 失败，说明 WAL sync 失败、
+	// Pebble 已进入不可恢复错误态，之后所有写入都会失败，进程只能重启；重启后
+	// 计数器与实际落盘由「同批原子提交」保证严格一致，内存里烧掉的 offset 无害。
 	qs.next = off + 1
 	qs.loaded = true
 	qs.mu.Unlock()
 
-	// 段 3（p.mu）：唤醒长轮询。必须在落盘成功之后——被唤醒的订阅者读 store
+	// 锁外等待持久化：fsync 完成之前绝不返回、绝不唤醒（语义红线 1）。
+	// 可见性窗口说明（防止后人误改）：Pebble 的 Commit(Sync) 本就是「先发布可见、
+	// 后等 fsync」，拉取型读者在旧实现里同样可能于 fsync 完成前读到本条——本改动
+	// 没有扩大该窗口，只是把等待从锁内挪到锁外。
+	if err := pending.Wait(); err != nil {
+		return nil, fmt.Errorf("等待消息 %s 持久化 (topic=%s q=%d off=%d): %w", m.ID, m.Topic, m.QueueID, m.Offset, err)
+	}
+
+	// 段 3（p.mu）：唤醒长轮询。必须在持久化成功之后——被唤醒的订阅者读 store
 	// 必能看到这条消息。
 	p.mu.Lock()
 	p.wakeLocked(m.Topic)
