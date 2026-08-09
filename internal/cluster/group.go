@@ -297,14 +297,21 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 			// 成员表 + applied 同批落盘（同 V2 分支）：V1 路径罕见
 			// 但不能只更内存——重启后旧日志仍会被重放，内存成员表
 			// 不落盘就与持久化值分叉
+			// applyMu 临界区（同 applyEntry）：Snapshot 在同一把锁内读
+			// applied + confState，写批次与成员表必须与 applied 位点配对
+			// 提交——否则可能产出「元数据 index=N 却携带更新的成员表」
+			// 的快照，配对不变量被破坏
+			gr.applyMu.Lock()
 			if gr.rs != nil {
 				if err := gr.rs.SaveConfState(gr.g, cs, ent.GetIndex()); err != nil {
+					gr.applyMu.Unlock()
 					gr.lg.Error("成员表持久化失败，组停摆", "index", ent.GetIndex(), "err", err)
 					panic(err)
 				}
 				gr.confState.Store(cs) // Storage.Snapshot() 现场取用（Task 4）
 			}
 			gr.applied.Store(ent.GetIndex())
+			gr.applyMu.Unlock()
 			gr.lg.Debug("成员变更已 apply", "type", cc.GetType().String(), "node", cc.GetNodeId())
 		case raftpb.EntryConfChangeV2:
 			var v2 raftpb.ConfChangeV2
@@ -316,18 +323,26 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 			cs := gr.rn.ApplyConfChange(&v2)
 			// 成员表 + applied 同批落盘：截断之后日志前缀不复存在，
 			// 重启只能靠这份持久化成员表恢复（Task 3 的截断前提）
+			// applyMu 临界区（同 applyEntry）：Snapshot 在同一把锁内读
+			// applied + confState，写批次与成员表必须与 applied 位点配对
+			// 提交——否则可能产出「元数据 index=N 却携带更新的成员表」
+			// 的快照，配对不变量被破坏
+			gr.applyMu.Lock()
 			if gr.rs != nil {
 				if err := gr.rs.SaveConfState(gr.g, cs, ent.GetIndex()); err != nil {
+					gr.applyMu.Unlock()
 					gr.lg.Error("成员表持久化失败，组停摆", "index", ent.GetIndex(), "err", err)
 					panic(err)
 				}
 				gr.confState.Store(cs) // Storage.Snapshot() 现场取用（Task 4）
 			}
+			gr.applied.Store(ent.GetIndex())
+			gr.applyMu.Unlock()
 			// 成员变更的 waiter 通知放到 Advance 之后（见循环外注释）：
-			// 这里只登记（id, 是否本节点发起），不直接通知
+			// 这里只登记（id, 是否本节点发起），不直接通知；登记与
+			// 通知都不是状态写入，留在锁外
 			ccid, ours := ccWaiterInfo(&v2, gr.selfID)
 			appliedCC = append(appliedCC, ccApplied{id: ccid, notify: ours})
-			gr.applied.Store(ent.GetIndex())
 			if ch := v2.GetChanges(); len(ch) > 0 {
 				gr.lg.Debug("成员变更已 apply", "type", ch[0].GetType().String(), "node", ch[0].GetNodeId())
 			}
