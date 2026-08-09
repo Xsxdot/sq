@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/raftpb"
 
 	"github.com/xushixin/sq/internal/store"
 )
@@ -185,6 +186,48 @@ func startSoloManager(t *testing.T, dir string, mode AckMode) (*store.Store, *Ma
 		}
 	})
 	return st, m
+}
+
+// singleNodeManagerHarness 是单节点 Manager 的测试句柄：m 为已启动的
+// Manager（组 0..3 自选举），m.rs 即 Manager 的 raft 持久层——成员表
+// 与 applied 的磁盘状态直读都经它（内测包内字段可直达，无需访问器）。
+type singleNodeManagerHarness struct {
+	m *Manager
+}
+
+// startSingleNodeManager 启动单节点 Manager 并返回测试句柄，供
+// TestConfChangeAdvancesPersistedApplied 等端到端场景使用。与
+// startSoloManager 同 Options 模式（Peers 仅自己、数据组默认 3），
+// 测试结束自动 kill 并等待完全退出。
+func startSingleNodeManager(t *testing.T) *singleNodeManagerHarness {
+	t.Helper()
+	_, m := startSoloManager(t, t.TempDir(), AckQuorumMem)
+	return &singleNodeManagerHarness{m: m}
+}
+
+// TestConfChangeAdvancesPersistedApplied 端到端证明缺口已补：
+// 单节点组提一条 AddLearner，重启后 applied 位点不回退。
+func TestConfChangeAdvancesPersistedApplied(t *testing.T) {
+	h := startSingleNodeManager(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := h.m.ProposeConfChange(ctx, 0, raftpb.ConfChangeAddLearnerNode, 9); err != nil {
+		t.Fatalf("提 AddLearner: %v", err)
+	}
+	before, err := h.m.rs.Applied(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == 0 {
+		t.Fatal("ConfChange apply 后磁盘 applied 位点仍为 0——缺口未补")
+	}
+	cs, ok, err := h.m.rs.LoadConfState(0)
+	if err != nil || !ok {
+		t.Fatalf("成员表未持久化 ok=%v err=%v", ok, err)
+	}
+	if len(cs.Learners) != 1 || cs.Learners[0] != 9 {
+		t.Fatalf("成员表 learners = %v; want [9]", cs.Learners)
+	}
 }
 
 // TestListenAddrBindsSeparateFromPeersAdvertised 评审 I5 回归：Peers 里的

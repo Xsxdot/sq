@@ -140,3 +140,32 @@ func TestConfStateRejectsCorruptEntry(t *testing.T) {
 		t.Fatal("损坏的 ConfChange 条目应拒启报错，得到 nil")
 	}
 }
+
+// TestConfStateSurvivesRestartWithoutEntries batch④ 前置：截断之后
+// ConfChange 条目已不在日志里，重启不可能再靠重放合成成员表——
+// 成员表必须自己持久化。
+func TestConfStateSurvivesRestartWithoutEntries(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+
+	cs := &raftpb.ConfState{Voters: []uint64{1, 2}, Learners: []uint64{3}}
+	if err := rs.SaveConfState(7, cs, 42); err != nil {
+		t.Fatalf("SaveConfState: %v", err)
+	}
+	got, ok, err := rs.LoadConfState(7)
+	if err != nil || !ok {
+		t.Fatalf("LoadConfState ok=%v err=%v", ok, err)
+	}
+	if len(got.Voters) != 2 || got.Voters[0] != 1 || got.Voters[1] != 2 || len(got.Learners) != 1 || got.Learners[0] != 3 {
+		t.Fatalf("成员表 = %+v; want voters[1 2] learners[3]", got)
+	}
+	// applied 与成员表同批写入：ConfChange 条目 apply 后 applied 位点
+	// 必须一起落盘，否则重启会重放该条 ConfChange（batch③ 遗留缺口）
+	ap, err := rs.Applied(7)
+	if err != nil || ap != 42 {
+		t.Fatalf("applied = %d err=%v; want 42", ap, err)
+	}
+	if _, ok, _ := rs.LoadConfState(8); ok {
+		t.Fatal("未写过的组不得返回成员表")
+	}
+}

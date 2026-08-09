@@ -8,14 +8,17 @@
 //     要么新旧一致整体落盘，要么整体不落，不存在「新条目在、幽灵条目也在」
 //     的半截状态。批内次序本身无所谓（同批内无中间可见性），
 //     删尾必须与写条目同批才是语义关键。
-//   - 重启全量重读（Load）与按 commit 裁剪的成员表合成（confStateFromEntries）
+//   - 成员表的持久化（SaveConfState/LoadConfState）与重启恢复
+//     （Load + 干净关机判定）：成员表优先读持久化值，confStateFromEntries
+//     的日志重放合成仅作为旧数据目录的迁移路径
 //   - 数据组数契约（EnsureGroups）与干净关机标记（Mark/ConsumeCleanShutdown）
 //
 // 边界：
 //   - 不做日志截断与快照（batch④）：日志无界增长，learner 追齐走全量重放
 //   - 不持有 pebble：一切写经 store 唯一写入口（NewBatch + ApplyWith），
 //     本层没有裸 db 句柄——B2 唯一写入口在集群层同样成立
-//   - applied 的写入由 FSM apply 路径并进批次（Task 4），本层只读
+//   - applied 的写入两处：普通条目经 FSM apply 批次并进，ConfChange
+//     条目经 SaveConfState 与成员表同批
 //
 // 键布局（共库下以 raft/ 前缀隔离日志区与 FSM 区；键内定长二进制大端，
 // 保证字节序=数值序，区间扫描天然升序）：
@@ -23,8 +26,11 @@
 //	raft/groups                  → uint32 BE 数据组数（首启写入，此后校验）
 //	raft/clean_shutdown          → 干净关机标记（StopClean 写，启动读后删）
 //	raft/<g>/hs                  → HardState protobuf
+//	raft/<g>/conf                → ConfState protobuf（成员表，ConfChange
+//	                               apply 时整表覆盖写，SaveConfState）
 //	raft/<g>/ent/<index 8B BE>   → Entry protobuf
-//	raft/<g>/applied             → uint64 BE applied index（只读，写入在 Task 4）
+//	raft/<g>/applied             → uint64 BE applied index（普通条目经
+//	                               FSM 批次并进，ConfChange 与成员表同批）
 package cluster
 
 import (
@@ -47,6 +53,7 @@ const (
 	cleanShutdownKey  = "raft/clean_shutdown"
 	groupEntPrefixFmt = "raft/%d/ent/"
 	groupHsKeyFmt     = "raft/%d/hs"
+	groupConfFmt      = "raft/%d/conf"
 	groupAppliedFmt   = "raft/%d/applied"
 )
 
@@ -172,6 +179,56 @@ func (r *raftStore) Applied(g uint32) (uint64, error) {
 	return store.GetU64(data), nil
 }
 
+// SaveConfState 持久化一组的成员表，并与 applied 位点**同批**写入。
+//
+// 为什么同批：ConfChange 条目 apply 后若只更新内存 applied、不落盘，
+// 重启会从旧位点重放该条 ConfChange——raft 的 ApplyConfChange 本身幂等，
+// 但成员表来源一旦改成持久化值，重放就会用「旧成员表 + 重放变更」
+// 二次叠加，与 leader 的实际成员表分叉（batch③ 遗留缺口）。
+//
+// 参数：
+//   - g: 数据组号
+//   - cs: rn.ApplyConfChange 的返回值（raft 库算出的权威成员表）
+//   - applied: 本条 ConfChange 条目的 index
+func (r *raftStore) SaveConfState(g uint32, cs *raftpb.ConfState, applied uint64) error {
+	data, err := proto.Marshal(cs)
+	if err != nil {
+		return fmt.Errorf("raftstore SaveConfState 组 %d 编码: %w", g, err)
+	}
+	b := r.st.NewBatch()
+	if err := b.Set(confKey(g), data); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore SaveConfState 组 %d 写成员表: %w", g, err)
+	}
+	if err := b.Set(appliedKey(g), store.PutU64(applied)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore SaveConfState 组 %d 写 applied: %w", g, err)
+	}
+	// 成员表是选举安全的根：Sync 落盘，不进 quorum-mem 的异步刷盘队列
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore SaveConfState 组 %d: %w", g, err)
+	}
+	r.lg.Info("成员表已持久化", "g", g, "voters", cs.GetVoters(), "learners", cs.GetLearners(), "applied", applied)
+	return nil
+}
+
+// LoadConfState 读回一组的成员表；从未写入过时 ok=false（调用方回退到
+// confStateFromEntries 的日志重放路径，见 buildGroup）。
+func (r *raftStore) LoadConfState(g uint32) (*raftpb.ConfState, bool, error) {
+	data, ok, err := r.st.Get(confKey(g))
+	if err != nil {
+		return nil, false, fmt.Errorf("raftstore LoadConfState 组 %d: %w", g, err)
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	cs := &raftpb.ConfState{}
+	if err := proto.Unmarshal(data, cs); err != nil {
+		return nil, false, fmt.Errorf("raftstore LoadConfState 组 %d 解码: %w", g, err)
+	}
+	return cs, true, nil
+}
+
 // EnsureGroups 校验数据组数与磁盘记录一致。
 //
 // 首启（raft/groups 不存在）时写入 4B BE 组数并 Sync 落盘——这是一次性
@@ -245,6 +302,12 @@ func (r *raftStore) ConsumeCleanShutdown() (bool, error) {
 // confStateFromEntries 从日志条目重放成员变更，按 commit 裁剪后合成
 // 重启所需的 ConfState。
 //
+// **降级声明（batch④）**：本函数已从主路径降级为「旧数据目录一次性
+// 迁移路径」——新版本启动时成员表一律优先读持久化值（LoadConfState，
+// 见 buildGroup），只有 batch③ 及更早的数据目录从未写入过 raft/<g>/conf、
+// 首次升级到本版本时才走到这里。升级后的首次 ConfChange apply 会立即
+// 把成员表持久化，此路径此后不再被命中。
+//
 // raft 库 newRaft 只信任 Storage.InitialState() 返回的 ConfState，不会
 // 自己回放 ConfChange 条目重建成员表；而本批不做快照，因此必须由调用方
 // 重放。重放只到 commit 为止——commit 之外的未提交 ConfChange 尾巴
@@ -260,15 +323,16 @@ func (r *raftStore) ConsumeCleanShutdown() (bool, error) {
 // 比静默残留一个已移除的 voter 安全得多。
 //
 // 同时支持 V1 与 V2 两种 ConfChange 条目格式（V2 是 R4 起的提案格式，
-// 旧日志可能遗留 V1）；任一格式的解码失败都拒启。
+// 旧日志可能遗留 V1）；任一格式的解码失败都拒启。V2 条目可能携带多条
+// Changes（batch② 遗留的多变更守卫）：本进程从不产生联合共识条目，但
+// 旧日志与将来的 joint 提案都可能带多条——只取首条会漏掉后续变更，
+// 因此逐条遍历应用（applyOne）。
 func confStateFromEntries(ents []*raftpb.Entry, commit uint64) (*raftpb.ConfState, error) {
 	cs := &raftpb.ConfState{}
 	for _, ent := range ents {
 		if ent.GetIndex() > commit {
 			break // 条目升序，越过 commit 即全部未提交
 		}
-		var typ raftpb.ConfChangeType
-		var nodeID uint64
 		switch ent.GetType() {
 		case raftpb.EntryConfChange:
 			var cc raftpb.ConfChange
@@ -276,8 +340,7 @@ func confStateFromEntries(ents []*raftpb.Entry, commit uint64) (*raftpb.ConfStat
 			if err := proto.Unmarshal(ent.Data, &cc); err != nil {
 				return nil, fmt.Errorf("解码 ConfChange 条目 %d: %w", ent.GetIndex(), err)
 			}
-			typ = cc.GetType()
-			nodeID = cc.GetNodeId()
+			applyOne(cs, cc.GetType(), cc.GetNodeId())
 		case raftpb.EntryConfChangeV2:
 			var v2 raftpb.ConfChangeV2
 			v2.Reset()
@@ -286,30 +349,35 @@ func confStateFromEntries(ents []*raftpb.Entry, commit uint64) (*raftpb.ConfStat
 			}
 			ch := v2.GetChanges()
 			if len(ch) == 0 {
-				// 空 Changes（leave-joint 类条目）：不改变单代成员表，
-				// 跳过——本批从不产生联合共识条目，此分支仅防御
-				continue
+				continue // leave-joint 类空条目：不改变单代成员表
 			}
-			typ = ch[0].GetType()
-			nodeID = ch[0].GetNodeId()
+			for _, c := range ch {
+				applyOne(cs, c.GetType(), c.GetNodeId())
+			}
+			continue
 		default:
 			continue // 普通条目与选举空条目不参与成员表
 		}
-		switch typ {
-		case raftpb.ConfChangeAddNode:
-			removeUint64(&cs.Voters, nodeID)
-			removeUint64(&cs.Learners, nodeID)
-			cs.Voters = append(cs.Voters, nodeID)
-		case raftpb.ConfChangeAddLearnerNode:
-			removeUint64(&cs.Voters, nodeID)
-			removeUint64(&cs.Learners, nodeID)
-			cs.Learners = append(cs.Learners, nodeID)
-		case raftpb.ConfChangeRemoveNode:
-			removeUint64(&cs.Voters, nodeID)
-			removeUint64(&cs.Learners, nodeID)
-		}
 	}
 	return cs, nil
+}
+
+// applyOne 把单条成员变更应用到合成中的成员表（confStateFromEntries
+// 的公共应用步骤，V1 单条与 V2 多条 Changes 共用）。
+func applyOne(cs *raftpb.ConfState, typ raftpb.ConfChangeType, nodeID uint64) {
+	switch typ {
+	case raftpb.ConfChangeAddNode:
+		removeUint64(&cs.Voters, nodeID)
+		removeUint64(&cs.Learners, nodeID)
+		cs.Voters = append(cs.Voters, nodeID)
+	case raftpb.ConfChangeAddLearnerNode:
+		removeUint64(&cs.Voters, nodeID)
+		removeUint64(&cs.Learners, nodeID)
+		cs.Learners = append(cs.Learners, nodeID)
+	case raftpb.ConfChangeRemoveNode:
+		removeUint64(&cs.Voters, nodeID)
+		removeUint64(&cs.Learners, nodeID)
+	}
 }
 
 // removeUint64 从切片中移除第一个等于 v 的元素（不存在时静默）。
@@ -341,9 +409,17 @@ func hsKey(g uint32) []byte {
 	return []byte(fmt.Sprintf(groupHsKeyFmt, g))
 }
 
-// appliedKey 返回一组已应用位点键。写入由 FSM apply 路径并进批次（Task 4）。
+// appliedKey 返回一组已应用位点键。写入两处：普通条目经 applyEntry 的
+// FSM 批次并进（spec §5），ConfChange 条目经 SaveConfState 与成员表
+// 同批（见 SaveConfState 注释）。
 func appliedKey(g uint32) []byte {
 	return []byte(fmt.Sprintf(groupAppliedFmt, g))
+}
+
+// confKey 返回一组成员表的固定键。ConfChange apply 时整表覆盖写
+// （SaveConfState），单个固定键天然覆盖语义。
+func confKey(g uint32) []byte {
+	return []byte(fmt.Sprintf(groupConfFmt, g))
 }
 
 // putU32BE 大端编码 4 字节（组数/节点 ID 等 uint32 字段用；8B 用 store.PutU64）。

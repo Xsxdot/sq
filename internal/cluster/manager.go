@@ -280,10 +280,11 @@ func NewManager(o Options) (*Manager, error) {
 
 // buildGroup 构造单个 raft 组，按恢复路径分叉：
 //
-//   - clean：rs.Load 全量回放磁盘日志重建 MemoryStorage（合成快照元数据
-//     提供 ConfState 与起始位点），raft.RestartNode 恢复，且
-//     raftConfig.Applied = 磁盘 applied（raft 从 applied+1 重投递，
-//     配合 group 的跳过逻辑双保险，见下述 seeding 注释）
+//   - clean：rs.Load 全量回放磁盘日志重建 MemoryStorage（快照元数据
+//     提供 ConfState 与起始位点——成员表优先读持久化值 LoadConfState，
+//     旧目录无该值时回退日志重放合成，见函数内注释），raft.RestartNode
+//     恢复，且 raftConfig.Applied = 磁盘 applied（raft 从 applied+1
+//     重投递，配合 group 的跳过逻辑双保险，见下述 seeding 注释）
 //   - fresh：raft.StartNode 以引导成员表启动
 func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, error) {
 	storage := raft.NewMemoryStorage()
@@ -303,9 +304,20 @@ func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, e
 			// 相遇；干净路径 leader 的 Progress 仍保留，追齐从不会回退到
 			// index-1 对账（若未来做快照压缩，需按真实 term 补快照，见 B8.2）
 			snapTerm := first.GetTerm()
-			cs, err := confStateFromEntries(ents, hs.GetCommit())
+			// 成员表优先取持久化值（Task 2）：截断之后日志前缀已被删，
+			// 重放合成不再可能。仅当从未持久化过（batch③ 及更早的数据
+			// 目录首次升级到本版本）才回退到日志重放合成。
+			cs, ok, err := m.rs.LoadConfState(g)
 			if err != nil {
-				return nil, fmt.Errorf("cluster: 组 %d 成员表合成: %w", g, err)
+				return nil, fmt.Errorf("cluster: 组 %d 读成员表: %w", g, err)
+			}
+			if !ok {
+				cs, err = confStateFromEntries(ents, hs.GetCommit())
+				if err != nil {
+					return nil, fmt.Errorf("cluster: 组 %d 成员表合成: %w", g, err)
+				}
+				m.lg.Info("成员表由日志重放合成（旧数据目录首次升级）", "g", g,
+					"voters", cs.GetVoters(), "learners", cs.GetLearners())
 			}
 			snap := &raftpb.Snapshot{Metadata: &raftpb.SnapshotMetadata{
 				Index:     &snapIndex,

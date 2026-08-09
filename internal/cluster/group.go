@@ -86,6 +86,11 @@ type group struct {
 	applied atomic.Uint64 // 已 apply 的最高条目 index（重启重放幂等的基础）
 	lead    atomic.Uint64 // 当前 leader 节点 ID，SoftState 变化时更新
 
+	// confState 是当前成员表（rn.ApplyConfChange 的返回值，ConfChange
+	// apply 时同步更新）。重启时由 newGroup 从持久化值初始化（见
+	// newGroup）；Task 4 的 Storage.Snapshot() 现场取用它生成快照。
+	confState atomic.Pointer[raftpb.ConfState]
+
 	doneCh chan struct{} // run 循环完全退出后关闭，测试/调用方同步用
 
 	// waiter 双命名空间（终审观察项①）：普通提案与成员变更的 id 共用
@@ -141,6 +146,18 @@ func newGroup(g uint32, rn raft.Node, storage *raft.MemoryStorage, rs *raftStore
 	// 进程消亡，新进程的 id 空间不得与旧进程重叠（否则重启回零是
 	// 跨节点 id 碰撞的第二条路径）。
 	gr.nextID.Store(uint64(time.Now().UnixNano()))
+	// 成员表从持久化值初始化（Task 2）：重启后 Storage.Snapshot()
+	// 现场取用 gr.confState，无需再等第一条 ConfChange apply。
+	// rs 为 nil 的单元测试路径跳过；读回失败按不可恢复处理（与
+	// 「持久化失败一律 panic」同策略——成员表是选举安全的根）。
+	if rs != nil {
+		if cs, ok, err := rs.LoadConfState(g); err != nil {
+			gr.lg.Error("读回成员表失败", "err", err)
+			panic(err)
+		} else if ok {
+			gr.confState.Store(cs)
+		}
+	}
 	return gr
 }
 
@@ -248,7 +265,17 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 				gr.lg.Error("ConfChange 解码失败，组停摆", "index", ent.GetIndex(), "err", err)
 				panic(err)
 			}
-			gr.rn.ApplyConfChange(&cc)
+			cs := gr.rn.ApplyConfChange(&cc)
+			// 成员表 + applied 同批落盘（同 V2 分支）：V1 路径罕见
+			// 但不能只更内存——重启后旧日志仍会被重放，内存成员表
+			// 不落盘就与持久化值分叉
+			if gr.rs != nil {
+				if err := gr.rs.SaveConfState(gr.g, cs, ent.GetIndex()); err != nil {
+					gr.lg.Error("成员表持久化失败，组停摆", "index", ent.GetIndex(), "err", err)
+					panic(err)
+				}
+				gr.confState.Store(cs) // Storage.Snapshot() 现场取用（Task 4）
+			}
 			gr.applied.Store(ent.GetIndex())
 			gr.lg.Debug("成员变更已 apply", "type", cc.GetType().String(), "node", cc.GetNodeId())
 		case raftpb.EntryConfChangeV2:
@@ -258,7 +285,16 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 				gr.lg.Error("ConfChangeV2 解码失败，组停摆", "index", ent.GetIndex(), "err", err)
 				panic(err)
 			}
-			gr.rn.ApplyConfChange(&v2)
+			cs := gr.rn.ApplyConfChange(&v2)
+			// 成员表 + applied 同批落盘：截断之后日志前缀不复存在，
+			// 重启只能靠这份持久化成员表恢复（Task 3 的截断前提）
+			if gr.rs != nil {
+				if err := gr.rs.SaveConfState(gr.g, cs, ent.GetIndex()); err != nil {
+					gr.lg.Error("成员表持久化失败，组停摆", "index", ent.GetIndex(), "err", err)
+					panic(err)
+				}
+				gr.confState.Store(cs) // Storage.Snapshot() 现场取用（Task 4）
+			}
 			// 成员变更的 waiter 通知放到 Advance 之后（见循环外注释）：
 			// 这里只登记（id, 是否本节点发起），不直接通知
 			ccid, ours := ccWaiterInfo(&v2, gr.selfID)
