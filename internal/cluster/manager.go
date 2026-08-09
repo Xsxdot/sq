@@ -130,6 +130,27 @@ type Options struct {
 	// maxFrameLen（16MiB）——上界由配置面校验保证（见 config.go 的
 	// snapshot_chunk_bytes 校验）。
 	SnapshotChunkBytes int
+
+	// NoBootstrap 控制 fresh 路径的引导方式（batch④ Task 10，默认
+	// false）：false 时以 StartNode(peers) 引导完整成员表（新集群开机、
+	// 单节点形态、Rejoin——引导条目与 leader 日志在 (index, term) 上
+	// 撞车，探测锚在引导条目上，追齐走日志重放）；true 时空白启动
+	// （RestartNode 空存储，无引导条目、无成员表）——本节点被动等待
+	// leader 的追齐（未压缩日志 = 重放，压缩日志 = 快照，见 buildGroup
+	// fresh 分支注释）。Join 强制置 true：带成员表引导会让空目录节点
+	// 的日志与 leader 撞车、快照永不触发，只在 FSM 里的存量数据（单机
+	// →集群升级，spec §7）永远追不上（batch④ 扩容 e2e 抓到的根因）。
+	NoBootstrap bool
+
+	// BootstrapVoters 限定 fresh 路径的引导成员表（batch④ Task 10，
+	// nil 按 Peers 全量引导）：只引导给定子集为 voter，传输层地址表
+	// 仍用全量 Peers。单机种子扩容场景（spec §7）用：种子节点的数据
+	// 目录以单节点集群启动（raft 引导只含自己，否则多成员 quorum
+	// 不可达、永远选不出 leader），但传输层必须预先知道未来成员的
+	// 地址（Join 加入的新节点靠种子拨号/种子回拨——地址表不全，
+	// 发给新节点的消息会被传输层静默丢弃，快照永远到不了）。
+	// 校验：子集必须都在 Peers 表（无地址的引导成员无从拨号）。
+	BootstrapVoters []uint64
 }
 
 // Manager 是多组装配体：持有全部 raft 组、传输层与恢复判定。
@@ -180,10 +201,15 @@ type Manager struct {
 
 	// 截断循环（batch④）：truncateInterval 来自 Options（0 按默认 30s）；
 	// runCtx 是 Start 设置的运行上下文——循环随集群停机一并退出；
-	// truncateLoopOnce 保证重复启动只起一个循环（与 balancerOnce 同
-	// 模式）。
+	// truncateLoopOnce 保证重复启动只起一个循环。truncateLoopDone 是
+	// 循环退出信号（它写 store，必须被 Done 观察——见 Start 注释）。
 	truncateInterval time.Duration
-	truncateLoopOnce  sync.Once
+	truncateLoopOnce sync.Once
+	truncateLoopDone chan struct{}
+
+	// noBootstrap 来自 Options.NoBootstrap：fresh 路径的引导方式
+	// （StartNode 引导成员表 vs RestartNode 空白启动，见 Options 注释）。
+	noBootstrap bool
 
 	// snapshotChunkBytes 是快照分块的字节预算（Options.SnapshotChunkBytes
 	// 透传，0 按 defaultSnapshotChunkBytes）：handleFetchSnapshot 用它做
@@ -262,6 +288,7 @@ func NewManager(o Options) (*Manager, error) {
 		retainEntries:          o.RetainEntries,
 		truncateInterval:       o.TruncateInterval,
 		snapshotChunkBytes:     o.SnapshotChunkBytes,
+		noBootstrap:            o.NoBootstrap,
 		doneCh:                 make(chan struct{}),
 	}
 	m.rs = newRaftStore(o.Store, lg)
@@ -315,9 +342,18 @@ func NewManager(o Options) (*Manager, error) {
 	}
 
 	// 引导成员表：全量 Peers（fresh 路径 StartNode 按此追加 ConfChange
-	// 条目）；干净路径不传成员表，身份由日志回放恢复
+	// 条目）；Options.BootstrapVoters 非空时只引导给定子集（单机种子
+	// 扩容：raft 引导只含自己、传输层地址表仍全量，见 Options 注释）。
+	// 干净路径不传成员表，身份由日志回放恢复。
 	peers := make([]raft.Peer, 0, len(o.Peers))
-	for _, id := range sortedPeerIDs(o.Peers) {
+	bootIDs := o.BootstrapVoters
+	if len(bootIDs) == 0 {
+		bootIDs = sortedPeerIDs(o.Peers)
+	}
+	for _, id := range bootIDs {
+		if _, ok := o.Peers[id]; !ok {
+			return nil, fmt.Errorf("cluster: BootstrapVoters 节点 %d 不在 Peers 表——引导成员必须带地址（传输层拨号用）", id)
+		}
 		peers = append(peers, raft.Peer{ID: id})
 	}
 	for g := uint32(0); g <= o.DataGroups; g++ {
@@ -483,6 +519,35 @@ func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, e
 	if clean {
 		cfg.Applied = applied
 		rn = raft.RestartNode(cfg)
+	} else if m.noBootstrap {
+		// Join 空白启动（Options.NoBootstrap，仅 Join 置位）：空存储 +
+		// 空成员表，本节点成为被动 follower，等待 leader 的快照/日志
+		// 追齐赋予数据与成员表。
+		//
+		// 为什么必须空白而不是 StartNode(peers) 引导：StartNode 的
+		// Bootstrap 会为每个成员追加一条 term=1 的 ConfChangeAddNode
+		// 引导条目（index 1..n）并标记为已提交。leader 对空日志 follower
+		// 的探测会一路回退到其 lastIndex（=n），而 leader 日志在 1..n
+		// 上的 term 恰也是 1——(index, term) 撞车让锚点探测「匹配」，
+		// 追齐走日志重放而不是快照。存量数据若只在 FSM 里（单机→集群
+		// 升级，spec §7）不在日志里，重放永远带不过去，快照也永不触发
+		// （batch④ 扩容 e2e 抓到的根因）。空白启动下 follower 的日志
+		// 没有任何 term 可撞：探测一路回退到日志起点，走「重放或快照」
+		// 的 raft 标准判定（见下）。
+		//
+		// 空白启动的追齐路径分两种（都是 raft 标准语义）：
+		//   - leader 日志未压缩：探测回退到假想条目 0（未压缩日志的
+		//     term(0) 返回 0 而非越界），锚点匹配 → 全量日志重放——只
+		//     携带日志里的状态，FSM 里的存量（单机档数据）到不了
+		//   - leader 日志已压缩（截断循环把起点推到新节点之下）：term(0)
+		//     报 ErrCompacted → 只能 MsgSnap——快照从 leader 的活 store
+		//     现场生成（Task 4），FSM 存量（含单机档数据）整体到达
+		// 因此 Join 的完整语义 = 空白启动（消除撞车）+ 调用方确保 leader
+		// 日志已压缩到新节点起点之下（扩容 e2e 用 marker + 截断循环
+		// 显式制造，见测试注释；生产上单机档运行期间日志自然增长并被
+		// 周期截断）。压缩与否只决定「重放还是快照」，空白启动本身是
+		// 两者成立的前提。
+		rn = raft.RestartNode(cfg)
 	} else {
 		rn = raft.StartNode(cfg, peers)
 	}
@@ -588,20 +653,31 @@ func (m *Manager) Start(ctx context.Context) {
 	// goroutine，不参与 Done 观察（停机时随 runCtx 取消退出，不阻塞）
 	m.StartLeaderBalancer(m.leaderBalancerInterval)
 	// 截断循环（Options 注入周期，≤0 不启动；默认 30s）：随 Start 拉起、
-	// 随 runCtx 取消退出——纯后台维护，不参与 Done 观察（与摊布循环同
-	// 模式，停机时随集群退出，不阻塞 Done）
+	// 随 runCtx 取消退出。与摊布循环不同，它**写 store**（SaveSnapMeta/
+	// TruncateLog），必须参与 Done 观察——否则调用方按 Done 关 store 时
+	// 循环可能正执行到一半，对已关闭的 pebble 写直接 panic（batch④ 截断
+	// e2e 用 2s 周期抓到的停机竞态）。退出只多等一轮当前 truncateOnce
+	//（毫秒级），不阻塞停机。
 	m.truncateLoopOnce.Do(func() {
 		if m.truncateInterval > 0 {
-			go m.truncateLoop(m.runCtx, m.truncateInterval)
+			done := make(chan struct{})
+			m.truncateLoopDone = done
+			go func() {
+				defer close(done)
+				m.truncateLoop(m.runCtx, m.truncateInterval)
+			}()
 		}
 	})
-	// Done 观察者：全部组退出且 flusher 停止后关闭 doneCh
+	// Done 观察者：全部组、flusher 与截断循环退出后关闭 doneCh
 	go func() {
 		for _, gr := range m.groups {
 			<-gr.done()
 		}
 		if m.flusherDone != nil {
 			<-m.flusherDone
+		}
+		if m.truncateLoopDone != nil {
+			<-m.truncateLoopDone
 		}
 		close(m.doneCh)
 	}()
@@ -1589,4 +1665,121 @@ func prepareJoinPoll(ctx context.Context, lg *slog.Logger, o Options) error {
 		case <-time.After(200 * time.Millisecond):
 		}
 	}
+}
+
+// storeHasKeys 判定已打开的 store 是否非空（任何键存在即非空）。
+// Join 用它做「数据目录为空」的内容判定——目录句柄由调用方持有，
+// Join 不接触文件系统（签名不带 dataDir，见 Join 注释）。
+func storeHasKeys(st *store.Store) (bool, error) {
+	nonEmpty := false
+	err := st.Scan(nil, nil, 1, func(k, v []byte) (bool, error) {
+		nonEmpty = true
+		return false, nil
+	})
+	if err != nil {
+		return false, err
+	}
+	return nonEmpty, nil
+}
+
+// Join 把全新节点（空数据目录）以 learner 身份加入既有集群——spec §7
+// 「单机 → 集群平滑升级」的入口：新节点靠存活 leader 的快照追平存量
+// 数据，追平后由 leader 侧 AutoPromoteLearners 循环自动升 voter。
+//
+// 与 Rejoin 的语义分界（为什么两者必须分开）：
+//   - Rejoin（断电重入）：节点**已在**集群成员表里，目录里有旧状态
+//     （可能是不干净关机残留），必须先 WipeForRejoin 清空再 fresh 启动
+//   - Join（新加入）：节点**不在**成员表里，目录必须本来就是空的——
+//     learner 身份由 leader 侧 PrepareJoin 的 Remove→AddLearner 赋予
+//
+// 为什么 Join 拒绝非空目录：加入成功后 leader 的快照安装会整体清空本
+// 节点目标组的全部键（wipeGroupKeys，Task 7）——目录里若有存量数据
+// （哪怕是单机档的 FSM 数据），会被静默抹掉。这种混用本质是操作意图
+// 错位（该走 Rejoin 的走了 Join），必须显式报错指向 Rejoin，而不是让
+// 快照安装把数据悄悄清掉。
+//
+// 编排（与 Rejoin 的后半程同构，差别只在前置条件）：
+//  1. 校验数据目录为空——经 Options.Store 内容判定（零键 = 空）。Join
+//     签名不带 dataDir，目录句柄由调用方先 store.Open 后经 Store 传入，
+//     与 Rejoin「调用方持句柄」的职责一致；失败时 store 仍归调用方
+//  2. 轮询 seedPeers 发 PrepareJoin，收齐 0..DataGroups 全组 AddLearner
+//     完成——seedPeers 是**可达种子**子集（不必全量成员表），但全部组
+//     的 leader 必须落在种子集合里，否则该组永远等不到完成、30s 超时
+//     （调用方职责：种子覆盖全部组的 leader）
+//  3. 空白启动（强制 Options.NoBootstrap=true）+ Start：不引导成员表
+//     ——带引导的 StartNode 会与 leader 日志 (index, term) 撞车、快照
+//     永不触发，存量数据（单机档 FSM）永远追不上（根因与「重放 vs
+//     快照」的判定见 buildGroup fresh 分支注释）；空白启动消除撞车，
+//     追齐走 raft 标准判定（未压缩日志 = 重放，压缩日志 = MsgSnap）
+//  4. 返回；追平与升 voter 由 leader 侧 AutoPromoteLearners 自动完成
+//     ——落后到日志之外时有 Task 7 的快照兜底（batch③ 时这条路走不通，
+//     正是本批解的问题）
+//
+// 参数：
+//   - ctx: 控制 PrepareJoin 轮询的时限（轮询内部另有 30s 总时限）
+//   - o: Options，必须携带已打开的 Store 与完整成员表 Peers（含本节点
+//     地址；NewManager 与 peerAddrs 广播都需要）。Listener 可选：nil
+//     时按 ListenAddr/Peers[NodeID] 绑定（与 NewManager 同规则）
+//   - seedPeers: 本次轮询可达的种子节点（id → 监听地址）子集；空或只
+//     有本节点自己（自举语义，非加入语义）直接报错
+//
+// 返回：
+//   - 已启动的 Manager（成功时接管 store 所有权；调用方负责 StopClean）
+//   - 错误信息（带步骤名）；失败时 store 仍归调用方（可重试或自行关闭）
+func Join(ctx context.Context, o Options, seedPeers map[uint64]string) (*Manager, error) {
+	if o.Store == nil {
+		return nil, errors.New("cluster: Join 要求 Options.Store 已打开（调用方先 store.Open 数据目录）")
+	}
+	if o.DataGroups == 0 {
+		o.DataGroups = 3 // 与 NewManager 同一默认
+	}
+	lg := o.Logger
+	if lg == nil {
+		lg = slog.Default()
+	}
+	start := time.Now()
+
+	// 第 1 步：数据目录必须为空（零键）。拒绝语义与错误指向见函数注释
+	// ——「重入」与「新加入」是两个语义，混用会被快照安装静默清数据。
+	nonEmpty, err := storeHasKeys(o.Store)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: 加入编排第 1 步 校验空目录: %w", err)
+	}
+	if nonEmpty {
+		return nil, errors.New("cluster: Join 拒绝非空数据目录——「新加入」只接受空目录；本节点若曾在此目录运行过（断电重入），请关闭 store 后改用 Rejoin（它会清空目录并重赋身份）；混用会令快照安装静默清掉存量数据")
+	}
+	lg.Info("加入编排: 第 1 步 数据目录为空校验通过", "node", o.NodeID, "duration", time.Since(start).Round(time.Millisecond))
+
+	// 第 2 步：PrepareJoin 全组编排——只轮询可达种子（o.Peers 是完整
+	// 成员表，NewManager 需要；轮询视图单独用 seedPeers 子集，见
+	// prepareJoinPoll 的对端枚举语义）。
+	if len(seedPeers) == 0 {
+		return nil, errors.New("cluster: 加入编排第 2 步: seedPeers 为空——至少需要一个存活成员作为种子")
+	}
+	if _, onlySelf := seedPeers[o.NodeID]; onlySelf && len(seedPeers) == 1 {
+		return nil, errors.New("cluster: 加入编排第 2 步: seedPeers 只有本节点自己——Join 需要至少一个**存活成员**作为种子（单节点自举请直接 NewManager）")
+	}
+	pollOpts := o
+	pollOpts.Peers = seedPeers
+	if err := prepareJoinPoll(ctx, lg, pollOpts); err != nil {
+		return nil, fmt.Errorf("cluster: 加入编排第 2 步 PrepareJoin: %w", err)
+	}
+
+	// 第 3 步：NewManager 空白启动（NoBootstrap 强制置位，理由见函数
+	// 注释与 buildGroup fresh 分支——带成员表引导 = 快照永不触发）+ Start
+	o.NoBootstrap = true
+	m, err := NewManager(o)
+	if err != nil {
+		if errors.Is(err, ErrUncleanShutdown) {
+			return nil, fmt.Errorf("cluster: 加入编排第 3 步: 空目录仍报 ErrUncleanShutdown: %w", err)
+		}
+		return nil, fmt.Errorf("cluster: 加入编排第 3 步 NewManager: %w", err)
+	}
+	m.Start(ctx)
+
+	// 第 4 步：追平与升 voter 交给 leader 侧 AutoPromoteLearners 循环
+	// （落后到日志之外时由 Task 7 的快照兜底——正是本批要解的问题）
+	lg.Info("加入编排: 第 3/4 步 完成——fresh 启动，追平与升 voter 由 leader 侧自动循环接管",
+		"node", o.NodeID, "autoPromote", o.AutoPromoteLearners, "duration", time.Since(start).Round(time.Millisecond))
+	return m, nil
 }

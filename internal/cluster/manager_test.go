@@ -13,6 +13,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -232,6 +233,61 @@ func TestConfChangeAdvancesPersistedApplied(t *testing.T) {
 	}
 	if len(cs.Learners) != 1 || cs.Learners[0] != 9 {
 		t.Fatalf("成员表 learners = %v; want [9]", cs.Learners)
+	}
+}
+
+// TestJoinRejectsNonEmptyStore Join 的目录空校验（第 1 步）：带存量
+// 数据的目录必须拒绝并指向 Rejoin——加入成功后 leader 的快照安装会
+// 整体清空本节点目标组全部键（wipeGroupKeys，Task 7），非空目录混用
+// Join = 存量数据被静默抹掉。错误文本必须带 Rejoin 字样（语义分界）。
+func TestJoinRejectsNonEmptyStore(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	st := mustOpenStore(t, t.TempDir())
+	b := st.NewBatch()
+	if err := b.Set(store.TopicMetaKey("LEGACY"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	_, err := Join(ctx, Options{
+		NodeID:     2,
+		Peers:      map[uint64]string{1: "127.0.0.1:1", 2: "127.0.0.1:2"},
+		DataGroups: 3,
+		Store:      st,
+		Logger:     testSlog(t),
+	}, map[uint64]string{1: "127.0.0.1:1"})
+	if err == nil || !strings.Contains(err.Error(), "Rejoin") {
+		t.Fatalf("非空目录 Join 应报错并指向 Rejoin，得到: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestJoinRejectsBadSeeds Join 的种子校验（第 2 步前置）：seedPeers
+// 为空、或只有本节点自己（自举语义，不是加入语义——没有任何存活成员
+// 会给本节点发 PrepareJoin 的 AddLearner）都必须快速失败，而不是裸走
+// 30s 轮询超时。
+func TestJoinRejectsBadSeeds(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	open := func() *store.Store { return mustOpenStore(t, t.TempDir()) }
+	base := func(st *store.Store) Options {
+		return Options{
+			NodeID:     2,
+			Peers:      map[uint64]string{1: "127.0.0.1:1", 2: "127.0.0.1:2"},
+			DataGroups: 3,
+			Store:      st,
+			Logger:     testSlog(t),
+		}
+	}
+	if _, err := Join(ctx, base(open()), nil); err == nil {
+		t.Fatal("seedPeers 为空应报错，得到 nil")
+	}
+	if _, err := Join(ctx, base(open()), map[uint64]string{2: "127.0.0.1:2"}); err == nil {
+		t.Fatal("seedPeers 只有本节点自己应报错，得到 nil")
 	}
 }
 
