@@ -660,8 +660,11 @@ type ccApplied struct {
 // 旧判定「有条目或有 HardState 就刷」把 commit 轮也 fsync，每提案
 // 多一次盘。
 // 基准证据（BenchmarkProposeQuorumFsync，单节点 quorum-fsync 串行
-// 提案吞吐，-benchtime 3s ×5 取中位）：改前 ~8.4ms/op（≈119 ops/s）
-// → 改后 ~4.1ms/op（≈245 ops/s），约 2.06 倍——每提案省一次 fsync。
+// 提案延迟，-benchtime 3s ×5 取中位）：改前 ~8.4ms/op → 改后
+// ~4.1ms/op，约 2x（实测 ~1.82x，未锁频笔记本上三倍有效数字不成立）
+// ——每次提案少一次 fsync。该基准是 in-flight=1 的延迟度量，不做
+// ops/s 换算：吞吐 ≈ fsync 速率 × 并发，WAL group commit 在并发下
+// 摊销这次 fsync。
 // quorum-mem 档永不 Sync（NoSync 落盘 + Manager 层后台批量 fsync 兜底）。
 func (gr *group) syncPersist(rd raft.Ready) bool {
 	return gr.mode == AckQuorumFsync && rd.MustSync

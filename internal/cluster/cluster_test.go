@@ -1550,36 +1550,20 @@ func (h *snapHarness) healPartition(victim *Manager) {
 	victim.tr.setPartitioned(false)
 }
 
-// truncateNow 在组长节点上执行一次本地截断（Task 8 的 truncateOnce
-// 上线前的测试等价物）：SaveSnapMeta（锚点 = applied-retain，带 term
-// 与成员表）→ TruncateLog → mem.Compact，三步与生产的「先锚点后
-// 截断」顺序一致——截断之后日志起点越过落后方位点，raft 判定它只能
-// 靠 MsgSnap 追平。
+// truncateNow 在组长节点上执行一次截断：直接委托生产 truncateOnce
+// （含 minMatch 逃生门——learner 排除、hardLagCap 绝对上限、
+// probePeerAlive 存活探测），不再手工重实现「SaveSnapMeta →
+// TruncateLog → mem.Compact」三步——快照用例验证的就是生产路径，
+// 手工复刻反而会绕过逃生门、制造生产根本不会发生的假场景。探测每
+// 死 peer 约 +500ms（拨号超时上限），测试场景可接受，不要试图规避。
 func (h *snapHarness) truncateNow(t *testing.T, g uint32) {
 	t.Helper()
 	leader := h.leaderOf(t, g)
-	gr := leader.groups[g]
-	applied := gr.appliedIndex()
-	retain := leader.retainEntries
-	if applied <= retain {
-		t.Fatalf("组 %d applied=%d 不足以截断（retain=%d）", g, applied, retain)
+	upto, done := leader.truncateOnce(g)
+	if !done {
+		t.Fatalf("组 %d truncateOnce 未执行截断（done=false）——逃生门或保留量条件不满足", g)
 	}
-	upto := applied - retain
-	term, err := gr.mem.Term(upto)
-	if err != nil {
-		t.Fatalf("组 %d 锚点位 %d 的 term 不可查: %v", g, upto, err)
-	}
-	idx, tm := upto, term
-	meta := &raftpb.SnapshotMetadata{Index: &idx, Term: &tm, ConfState: gr.confState.Load()}
-	if err := leader.rs.SaveSnapMeta(g, meta); err != nil {
-		t.Fatal(err)
-	}
-	if err := leader.rs.TruncateLog(g, upto); err != nil {
-		t.Fatal(err)
-	}
-	if err := gr.mem.Compact(upto); err != nil {
-		t.Fatal(err)
-	}
+	_ = upto
 }
 
 // countLog 统计节点 m 的捕获日志中含 needle 的行数（快照路径证据：
