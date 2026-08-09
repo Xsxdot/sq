@@ -907,7 +907,16 @@ func (m *Manager) truncateOnce(g uint32) (uint64, bool) {
 	if !ok {
 		return 0, false
 	}
-	upto := gr.applied.Load()
+	// 成员表与位点同临界区配对——与 Task 4 applyEntry/Snapshot 同一纪律：
+	// 锚点 index（源自 applied）与 confState 必须取同一 apply 时刻，否则
+	// 会产出「index=N 却携带 N+k 成员表」的截断锚点。锁内只读两个原子，
+	// 无等待；mem.Term/SaveSnapMeta 等留在锁外（与 groupStorage.Snapshot
+	// 的「锁内取配对、锁外查 term」同构）。
+	gr.applyMu.Lock()
+	applied := gr.applied.Load()
+	cs := gr.confState.Load()
+	gr.applyMu.Unlock()
+	upto := applied
 	leader := false
 	if st, ok := m.Status(g); ok && st.RaftState == raft.StateLeader {
 		leader = true
@@ -931,7 +940,7 @@ func (m *Manager) truncateOnce(g uint32) (uint64, bool) {
 		return 0, false
 	}
 	idx, tm := upto, term
-	meta := &raftpb.SnapshotMetadata{Index: &idx, Term: &tm, ConfState: gr.confState.Load()}
+	meta := &raftpb.SnapshotMetadata{Index: &idx, Term: &tm, ConfState: cs}
 	if err := m.rs.SaveSnapMeta(g, meta); err != nil {
 		m.lg.Error("截断放弃：锚点落盘失败", "g", g, "upto", upto, "err", err)
 		return 0, false

@@ -210,6 +210,17 @@ func newGroup(g uint32, selfID uint64, storage *raft.MemoryStorage, snaps *snapR
 // 报错（batch③ 据此翻译成客户端可重试码），不静默转发——默认行为会
 // 把提案转发给 leader 并假成功，且任意字节载荷经转发进入日志后在
 // apply 时炸 FSM（batch④ 集成测试抓到的缺口，见 TestClusterProposeOnFollowerFails）。
+//
+// PreVote（raft thesis §9.6）消除长安装后的立即竞选中击：快照安装期间
+// run 循环阻塞、心跳无法被 Step，electionElapsed 攒满整个安装周期，而
+// promotable() 因 in-progress snapshot 为 false 不会中途竞选；安装一结束
+// Advance 后第一个 tick 即触发竞选，旧任期下直接 term bump、白白换一次
+// 主（生产级快照 = 分钟级 chunk RTT，每次安装都换主）。PreVote 先跑一轮
+// 预选（以 r.Term+1 发 MsgPreVote 但不递增任期，raft 源码「Never change
+// our term in response to a PreVote」）：掉队节点的预选被拒，term 不动。
+// 安全面：预选败北不发真实竞选，重分区收敛多一个 RTT 往返（1s 选举
+// 超时下可忽略）；既有 failover 时序测试（TestClusterKillLeaderWrite
+// Continues 等）与 quorum-mem/fsync 两档模式均不受影响。
 func raftConfig(id uint64, storage raft.Storage) *raft.Config {
 	return &raft.Config{
 		ID:              id,
@@ -221,6 +232,9 @@ func raftConfig(id uint64, storage raft.Storage) *raft.Config {
 		Logger:          &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)},
 		// 内核契约：follower 收到提案直接丢弃并返回错误，绝不转发给 leader
 		DisableProposalForwarding: true,
+		// 见 raftConfig 注释：预选阶段挡掉掉队节点的 term bump（安装攒满
+		// electionElapsed → 安装后立即竞选换主）
+		PreVote: true,
 	}
 }
 
