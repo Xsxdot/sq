@@ -143,6 +143,10 @@ fsync=sync 时，并发写入由 Pebble commit pipeline 合并 fsync（group com
       access_key: AK1
       secret_key: SK1
   ```
+- **加入既有集群（单机→多节点扩容）需种子日志已压缩**：新节点的追齐只有走
+  快照路径才能带上单机档的 FSM 存量数据；种子日志未压缩（写入量不足约
+  2×`log_retain_entries`，默认 10000）时新节点走日志重放，存量数据静默缺失。
+  扩容前请先让种子节点写入越过该量，运维指引见 B8.3。
 
 ## Admin API
 

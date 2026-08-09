@@ -348,7 +348,21 @@ func NewManager(o Options) (*Manager, error) {
 	peers := make([]raft.Peer, 0, len(o.Peers))
 	bootIDs := o.BootstrapVoters
 	if len(bootIDs) == 0 {
+		// 默认路径：map 键天然无重复，直接取确定性排序
 		bootIDs = sortedPeerIDs(o.Peers)
+	} else {
+		// BootstrapVoters 是外部传入的切片，可能含重复 id——去重后按
+		// id 升序（引导成员表需要确定性顺序，见 sortedPeerIDs；重复 id
+		// 会产生重复的 ConfChange 引导条目，raft 侧行为未定义）
+		uniq := make(map[uint64]struct{}, len(bootIDs))
+		for _, id := range bootIDs {
+			uniq[id] = struct{}{}
+		}
+		bootIDs = make([]uint64, 0, len(uniq))
+		for id := range uniq {
+			bootIDs = append(bootIDs, id)
+		}
+		sort.Slice(bootIDs, func(i, j int) bool { return bootIDs[i] < bootIDs[j] })
 	}
 	for _, id := range bootIDs {
 		if _, ok := o.Peers[id]; !ok {
@@ -1698,6 +1712,17 @@ func storeHasKeys(st *store.Store) (bool, error) {
 // 错位（该走 Rejoin 的走了 Join），必须显式报错指向 Rejoin，而不是让
 // 快照安装把数据悄悄清掉。
 //
+// 扩容前提（生产必读，运维指引见 B8.3）：新节点靠快照追齐的前提是
+// 种子日志已压缩到新节点起点（index 0）之下。日志未压缩时 raft 的
+// 追齐探针锚在「假想条目 index-1」（未压缩日志 term(0)=0 与空日志
+// follower 恰好匹配），新节点走**日志重放**——而单机档的 FSM 存量
+// 数据根本不在 raft 日志里（当时直写 FSM），重放带不过去、快照也不
+// 触发：种子写入量不足约 2×RetainEntries（默认 10000 → 约 2 万+ 条）
+// 就 Join 的扩容会**静默丢失**单机档存量数据（不是报错，是数据缺失）。
+// e2e 用 retain=1 + 多组 marker 把种子日志压过这一前提再 Join
+// （cluster_expand_test.go ②b 注释，逐条解释了判定路径）；生产扩容
+// 请先让种子写入越过该量、等截断循环把日志压住（约 30s 一轮）再 Join。
+//
 // 编排（与 Rejoin 的后半程同构，差别只在前置条件）：
 //  1. 校验数据目录为空——经 Options.Store 内容判定（零键 = 空）。Join
 //     签名不带 dataDir，目录句柄由调用方先 store.Open 后经 Store 传入，
@@ -1764,6 +1789,8 @@ func Join(ctx context.Context, o Options, seedPeers map[uint64]string) (*Manager
 	if err := prepareJoinPoll(ctx, lg, pollOpts); err != nil {
 		return nil, fmt.Errorf("cluster: 加入编排第 2 步 PrepareJoin: %w", err)
 	}
+	lg.Info("加入编排: 第 2 步 PrepareJoin 完成",
+		"node", o.NodeID, "groups", o.DataGroups+1, "duration", time.Since(start).Round(time.Millisecond))
 
 	// 第 3 步：NewManager 空白启动（NoBootstrap 强制置位，理由见函数
 	// 注释与 buildGroup fresh 分支——带成员表引导 = 快照永不触发）+ Start
