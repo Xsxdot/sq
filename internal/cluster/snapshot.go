@@ -140,6 +140,18 @@ func (r *snapRegistry) Release(id uint64) {
 	}
 }
 
+// WasCreated 判定 snapID 是否曾在本注册表分配过（id ≤ nextID）。
+//
+// snapID 单调自增、永不复用：Get(id) 未命中时据此区分「从未生成过」
+// （id 超出已分配空间，请求方持有陈旧描述符）与「已释放/已超时回收」
+// （TTL 过期是常见原因）——handleFetchSnapshot 的 Warn 日志用它。
+// nextID 只增不减，判定结果不随并发分配漂移。
+func (r *snapRegistry) WasCreated(id uint64) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return id <= r.nextID
+}
+
 // GCOnce 回收全部已过期（created+ttl ≤ now）的视图，返回回收数量。
 //
 // 视图泄漏是磁盘涨的元凶：持有视图期间 Pebble 不回收被覆盖的旧版本，

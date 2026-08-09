@@ -208,14 +208,23 @@ func NewManager(o Options) (*Manager, error) {
 	// 常量，生产可调值由 Task 8 的配置面接管。
 	m.snaps = newSnapRegistry(o.Store, snapRegistryDefaultTTL, lg)
 
-	// PrepareJoin handler 自装（batch③）：在任何注入的 ControlHandler
-	// 之前包一层——OpPrepareJoin 由 Manager 内部处理（重入编排协议面），
-	// 其余 op 转发给调用方注入的 handler；未注入时回「控制通道未装配」
-	// （保持 nil handler 的对端语义，probePeerAlive 依赖该错误形状）。
+	// PrepareJoin/FetchSnapshot handler 自装（batch③/④）：在任何注入的
+	// ControlHandler 之前包一层——OpPrepareJoin（重入编排协议面）与
+	// OpFetchSnapshot（快照分块拉取）都由 Manager 内部处理，其余 op
+	// 转发给调用方注入的 handler；未注入时回「控制通道未装配」（保持
+	// nil handler 的对端语义，probePeerAlive 依赖该错误形状）。
+	//
+	// 为什么这里只有 op 3/4 而没有 1/2：OpForwardAppend/OpForwardApply
+	// 需要 core 组件（复制器、消息追加与批次重放），由 main 的
+	// ControlHandler 装配（见 cmd/sq/main.go 的 controlHandler）；Manager
+	// 自装层刻意只处理不依赖 core 的集群内协议——这不是漏接。
 	userHandler := o.ControlHandler
 	m.controlHandler = func(op byte, payload []byte) ([]byte, error) {
-		if op == OpPrepareJoin {
+		switch op {
+		case OpPrepareJoin:
 			return m.handlePrepareJoin(payload)
+		case OpFetchSnapshot:
+			return m.handleFetchSnapshot(payload)
 		}
 		if userHandler == nil {
 			return nil, errControlUnassembled
@@ -823,6 +832,20 @@ func (m *Manager) Leader(g uint32) (nodeID uint64, ok bool) {
 	return id, id != 0
 }
 
+// AppliedIndex 返回指定组当前已 apply 到 FSM 的最高日志 index。
+//
+// 快照发送侧的位点锚：snaps.Create(g, index) 登记视图时声明「视图内容
+// = 该 index 时刻的 FSM 状态」（见 snapRegistry.Create 注释），调用方
+// 先等提案 apply 再注册，二者配对即一致视图。未知组号返回 0（调用方
+// 契约：只传有效组号）。
+func (m *Manager) AppliedIndex(g uint32) uint64 {
+	gr, ok := m.groups[g]
+	if !ok {
+		return 0
+	}
+	return gr.appliedIndex()
+}
+
 // Control 向指定节点发起一次控制通道 RPC（短连接，一次往返）。
 //
 // 生命周期：查 Peers 表拿地址 → 拨号 → 写请求帧（[op][payload]，
@@ -1060,6 +1083,122 @@ func (m *Manager) memberHas(g uint32, nodeID uint64) bool {
 	}
 	_, ok = st.Config.Learners[nodeID]
 	return ok
+}
+
+// snapshotChunkBytes 是 OpFetchSnapshot 单块的字节预算：emit 累计到该
+// 阈值即提前收口（游标 = 最后一个已发出的键）。默认 4MiB；Task 8 把
+// 它移入 Options 由配置面接管。
+const snapshotChunkBytes = 4 << 20
+
+// snapshotChunkKeys 是单块键数的兜底上限：正常块由字节预算
+// （snapshotChunkBytes）收口，键数预算只在极端小键场景（如全空值）
+// 下兜底，防止单块键数无界。scanGroupKeys 的 budget 参数必须为正，
+// 故传本常量。
+const snapshotChunkKeys = 1 << 20
+
+// errChunkBudgetHit 是 handleFetchSnapshot 的 emit 收口哨兵：块字节数
+// 已达 snapshotChunkBytes，提前结束本块枚举。必须与真实扫描错误（坏
+// 键/迭代器错误）区分——调用方用 errors.Is 判定后按「块满、游标续扫」
+// 处理，其余错误原样上抛（快照漏键 = 静默丢数据，不得吞）。
+var errChunkBudgetHit = errors.New("cluster: 快照块字节预算已满")
+
+// handleFetchSnapshot 处理 OpFetchSnapshot 控制请求（Manager 自装，
+// 见 NewManager 的 controlHandler）：按 snapID 取注册表里钉住的
+// ReadView，从游标键续扫组 g 的键族，分块返回。
+//
+// 请求：[4B BE 组][8B BE snapID][4B BE 游标键长][游标键]
+// 响应：[1B 是否结束(1=完)][4B BE 下一游标键长][下一游标键][块字节]
+//   - 块字节 = encodeChunk 输出（[4B 键长][键][4B 值长][值] 重复），
+//     接收方 decodeChunk 还原后逐键 Store.Apply
+//   - done=1 后不得再续拉；done=0 时以「下一游标键」发起下一块请求
+//
+// 块大小双阈值：字节预算 snapshotChunkBytes（4MiB）与传输帧上限
+// maxFrameLen（16MiB，transport.go）共同约束一块的体积。emit 累计到
+// 字节预算即提前收口（块最多 = 预算 + 一对把预算顶穿的键值）；单键值
+// 对的上界由 FSM 写路径约束——最大的值是消息体，上限 4MiB（见
+// core/produce 的 MaxBodySize，其余键族远小于此），因此最坏一块
+// ≈ 预算 + 单对超大键值 ≈ 8MiB，离 16MiB 帧上限还有一倍余量。即便
+// 未来出现超过单块预算的病理键值，本层也只多放进一块、不会突破帧
+// 上限；而超帧的响应会被传输层双端拒收（坏帧断连，见 readLoop），
+// 不会静默截断。
+//
+// 注册表 TTL 以创建时刻为基线（snapEntry.created），Get 不续期——拉取
+// 窗口超过 TTL 的慢视图会被 GCOnce 强制回收，对端拿到未知 snapID
+// 错误后以新描述符重试（快照整体拉取秒级完成，正常路径不触达）。
+//
+// 注意：
+//   - 本 handler 在传输层读循环内同步执行，纯读视图枚举、不阻塞；
+//     视图归注册表所有，本方法不 Release
+//   - 请求方身份由传输层 controlFrame 的「控制请求处理失败」Warn 补齐
+//     （带 remote）——handler 签名不带远端信息，两者在日志里按 snap_id
+//     配对
+func (m *Manager) handleFetchSnapshot(payload []byte) ([]byte, error) {
+	if len(payload) < 16 {
+		return nil, fmt.Errorf("cluster: FetchSnapshot 载荷须 ≥16B（组+snapID+游标长），收到 %d B", len(payload))
+	}
+	g := binary.BigEndian.Uint32(payload[:4])
+	id := binary.BigEndian.Uint64(payload[4:12])
+	cl := binary.BigEndian.Uint32(payload[12:16])
+	if uint32(len(payload)-16) < cl {
+		return nil, fmt.Errorf("cluster: FetchSnapshot 游标键长 %d 超出载荷 %d B", cl, len(payload)-16)
+	}
+	cursor := payload[16 : 16+cl]
+	if g > m.dataGroups {
+		return nil, fmt.Errorf("cluster: FetchSnapshot 组号 %d 越界（有效范围 [0, %d]）", g, m.dataGroups)
+	}
+	view, ok := m.snaps.Get(id)
+	if !ok {
+		// 区分「没生成过」与「已回收」：snapID 单调自增、永不复用，
+		// id ≤ nextID 说明曾分配过（已释放或 TTL 回收——过期是常见
+		// 原因），否则请求方拿到的是从未存在过的陈旧描述符
+		if m.snaps.WasCreated(id) {
+			m.lg.Warn("FetchSnapshot 未知 snapID：视图已释放或超时回收（TTL 过期是常见原因，对端应重试新快照）",
+				"g", g, "snap_id", id)
+		} else {
+			m.lg.Warn("FetchSnapshot 未知 snapID：从未生成过（请求方持有陈旧描述符）",
+				"g", g, "snap_id", id)
+		}
+		return nil, fmt.Errorf("cluster: FetchSnapshot 未知 snapID %d（组 %d）", id, g)
+	}
+	// 首块（游标为空）打 Info：一次快照传输的起止是排查追齐耗时的基本单位
+	if len(cursor) == 0 {
+		m.lg.Info("快照拉取开始", "g", g, "snap_id", id)
+	}
+	var pairs []kv
+	bytes := 0
+	emit := func(k, v []byte) error {
+		// 键值必须拷贝：扫描回调的底层内存仅回调期间有效（见
+		// store.ReadView.Scan 注释），encodeChunk 在扫描结束后才执行，
+		// 不能持有引用
+		pairs = append(pairs, kv{k: append([]byte(nil), k...), v: append([]byte(nil), v...)})
+		bytes += 8 + len(k) + len(v) // 8B = 块格式里的双长度头（见 encodeChunk）
+		if bytes >= snapshotChunkBytes {
+			return errChunkBudgetHit // 提前收口：游标由 scanGroupKeys 置为最后发出的键
+		}
+		return nil
+	}
+	next, done, err := scanGroupKeys(view, g, m.dataGroups, cursor, snapshotChunkKeys, emit)
+	if errors.Is(err, errChunkBudgetHit) {
+		done, err = false, nil // 块满而非扫描错误：按「块满、游标续扫」收口
+	}
+	if err != nil {
+		return nil, fmt.Errorf("cluster: FetchSnapshot 组 %d 枚举: %w", g, err)
+	}
+	chunk := encodeChunk(pairs)
+	resp := make([]byte, 0, 5+len(next)+len(chunk))
+	if done {
+		resp = append(resp, 1)
+	} else {
+		resp = append(resp, 0)
+	}
+	resp = binary.BigEndian.AppendUint32(resp, uint32(len(next)))
+	resp = append(resp, next...)
+	resp = append(resp, chunk...)
+	m.lg.Debug("快照块已发送", "g", g, "snap_id", id, "keys", len(pairs), "bytes", len(chunk), "done", done)
+	if done {
+		m.lg.Info("快照拉取完成", "g", g, "snap_id", id, "keys", len(pairs))
+	}
+	return resp, nil
 }
 
 // WipeForRejoin 清空整个数据目录，是 learner 重入的前置动作。

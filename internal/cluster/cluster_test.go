@@ -526,6 +526,9 @@ func TestControlOpRegistry(t *testing.T) {
 	if OpPrepareJoin != 3 {
 		t.Fatalf("OpPrepareJoin=%d; want 3（线协议黄金值）", OpPrepareJoin)
 	}
+	if OpFetchSnapshot != 4 {
+		t.Fatalf("OpFetchSnapshot=%d; want 4（线协议黄金值）", OpFetchSnapshot)
+	}
 }
 
 // TestClusterApplyAsyncOnFollowerReturnsErrNotLeader follower 上 ApplyAsync
@@ -1263,4 +1266,209 @@ func (tc *testCluster) waitVoter(t *testing.T, g uint32, nodeID uint64, timeout 
 		time.Sleep(50 * time.Millisecond)
 	}
 	t.Fatalf("组 %d: 节点 %d 未在 %v 内恢复 voter 身份", g, nodeID, timeout)
+}
+
+// ---- batch④ 快照链路 harness（startThreeNodeCluster）----
+
+// snapHarness 是快照链路场景测试的三节点 harness：nodes[i] 即节点 i+1
+// （index = nodeID-1），三节点经 127.0.0.1 随机端口真实 TCP 互联。
+//
+// 与 testCluster 的关系：testCluster 以 map[uint64]*Manager 组织、leaderOf
+// 返回节点 ID；本 harness 以切片组织、leaderOf 返回 *Manager——快照场景
+// 直接操作 Manager 的注册表与控制处理器，切片索引即节点序，读起来更直白。
+// 两者并存，既有测试不迁移。后续任务（分区/截断/重入）的 harness 原语
+// （partitionOff/healPartition/truncateNow 等）在本类型上扩展——peers 与
+// mode 已备好，重入类场景另需 dirs 表（届时按需补充）。
+type snapHarness struct {
+	nodes  []*Manager        // index = nodeID-1（节点 1..3）
+	stores []*store.Store    // 与 nodes 同序（清理用）
+	peers  map[uint64]string // 节点 id → raft 监听地址（分区用例备用）
+	mode   AckMode
+}
+
+// startThreeNodeCluster 起三节点快照链路 harness（真实 TCP）。
+//
+// 装配序与 newTestClusterN 相同：先预建 n 个监听收集地址再拼 Peers 表
+// （传输层按 Peers 拨号，必须先拿到全部地址），然后逐节点
+// store.Open(t.TempDir()/id) + NewManager（Listener 注入已建监听）+ Start。
+//
+// 清理经 t.Cleanup 注册（StopClean → 等 Done → 关 store）；stopAll 是
+// 显式停机入口——与 Cleanup 重叠安全（StopClean 幂等：cancel 与关通道
+// 幂等、干净关机标记重复写无害）。
+func startThreeNodeCluster(t *testing.T) *snapHarness {
+	t.Helper()
+	const n = 3
+	lstns := make([]net.Listener, 0, n)
+	peers := make(map[uint64]string, n)
+	for i := uint64(1); i <= n; i++ {
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("节点 %d 预建监听: %v", i, err)
+		}
+		lstns = append(lstns, ln)
+		peers[i] = ln.Addr().String()
+	}
+	h := &snapHarness{peers: peers, mode: AckQuorumMem}
+	for i := uint64(1); i <= n; i++ {
+		st, err := store.Open(fmt.Sprintf("%s/%d", t.TempDir(), i), false, testSlog(t))
+		if err != nil {
+			t.Fatalf("节点 %d 开 store: %v", i, err)
+		}
+		m, err := NewManager(Options{
+			NodeID:     i,
+			Peers:      peers,
+			Listener:   lstns[i-1],
+			DataGroups: 3,
+			Mode:       h.mode,
+			Store:      st,
+			Logger:     testSlog(t),
+		})
+		if err != nil {
+			t.Fatalf("节点 %d NewManager: %v", i, err)
+		}
+		m.Start(context.Background())
+		h.nodes = append(h.nodes, m)
+		h.stores = append(h.stores, st)
+	}
+	t.Cleanup(func() {
+		h.stopAll()
+		for _, m := range h.nodes {
+			select {
+			case <-m.Done():
+			case <-time.After(10 * time.Second):
+				t.Errorf("清理: 节点未在 10s 内完全退出")
+			}
+		}
+		for _, st := range h.stores {
+			if err := st.Close(); err != nil {
+				t.Logf("清理: store.Close: %v", err)
+			}
+		}
+	})
+	return h
+}
+
+// stopAll 显式停掉全部节点（StopClean）。幂等：t.Cleanup 的兜底清理会
+// 再调一次，cancel 幂等、done 通道已关闭、干净标记重复写无害。
+func (h *snapHarness) stopAll() {
+	for _, m := range h.nodes {
+		if err := m.StopClean(context.Background()); err != nil {
+			_ = err // 停机错误不吞测试主流程；细节归 Cleanup 日志
+		}
+	}
+}
+
+// leaderOf 返回组 g 当前 leader 的 Manager，带 WaitLeader 轮询语义
+// （任何节点自报 lead 且 lead 在 1..n 即作数，超时 Fatal）。
+func (h *snapHarness) leaderOf(t *testing.T, g uint32) *Manager {
+	t.Helper()
+	deadline := time.Now().Add(60 * time.Second)
+	for time.Now().Before(deadline) {
+		for _, m := range h.nodes {
+			if lead, ok := m.Leader(g); ok && lead != 0 && lead <= uint64(len(h.nodes)) {
+				return h.nodes[lead-1]
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("组 %d 在 60s 内未选出 leader", g)
+	return nil
+}
+
+// encodeFetchReq 编码 OpFetchSnapshot 请求：[4B BE 组][8B BE snapID]
+// [4B BE 游标键长][游标键]，全部大端（与 transport.go op 注册表注释
+// 同款布局）。
+func encodeFetchReq(g uint32, id uint64, cursor []byte) []byte {
+	req := make([]byte, 16+len(cursor))
+	binary.BigEndian.PutUint32(req[:4], g)
+	binary.BigEndian.PutUint64(req[4:12], id)
+	binary.BigEndian.PutUint32(req[12:16], uint32(len(cursor)))
+	copy(req[16:], cursor)
+	return req
+}
+
+// decodeFetchResp 解码 OpFetchSnapshot 响应：[1B 是否结束][4B BE 下一
+// 游标键长][下一游标键][块字节]。done=true 后不得再以 next 续拉；
+// 坏布局直接 Fatal（测试自证的线协议校验）。
+func decodeFetchResp(t *testing.T, resp []byte) (done bool, next []byte, chunk []byte) {
+	t.Helper()
+	if len(resp) < 5 {
+		t.Fatalf("FetchSnapshot 响应 %d B 过短（不足 1B 结束位 + 4B 游标长）", len(resp))
+	}
+	done = resp[0] == 1
+	nl := binary.BigEndian.Uint32(resp[1:5])
+	if uint32(len(resp)-5) < nl {
+		t.Fatalf("FetchSnapshot 响应游标键长 %d 超出剩余 %d B", nl, len(resp)-5)
+	}
+	next = resp[5 : 5+int(nl)]
+	chunk = resp[5+int(nl):]
+	return done, next, chunk
+}
+
+// TestFetchSnapshotStreamsGroupState 发送侧端到端：注册一份视图，
+// 经控制通道分块拉完，内容与视图一致且不含别组键。
+func TestFetchSnapshotStreamsGroupState(t *testing.T) {
+	h := startThreeNodeCluster(t) // 既有辅助
+	defer h.stopAll()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// 在组 0 写入若干全局键（经 leader 提案，三节点收敛）
+	leader := h.leaderOf(t, 0)
+	for i := 0; i < 50; i++ {
+		b := leader.Store().NewBatch()
+		if err := b.Set(store.TopicMetaKey(fmt.Sprintf("T%02d", i)), []byte("meta")); err != nil {
+			t.Fatal(err)
+		}
+		if err := leader.Propose(ctx, 0, b.Repr()); err != nil {
+			t.Fatal(err)
+		}
+		b.Close()
+	}
+
+	id, _ := leader.snaps.Create(0, leader.AppliedIndex(0))
+	defer leader.snaps.Release(id)
+
+	got := map[string]string{}
+	cursor := []byte(nil)
+	for i := 0; ; i++ {
+		if i > 200 {
+			t.Fatal("拉取不收敛（超过 200 块）")
+		}
+		resp, err := leader.handleFetchSnapshot(encodeFetchReq(0, id, cursor))
+		if err != nil {
+			t.Fatalf("第 %d 块: %v", i, err)
+		}
+		done, next, chunk := decodeFetchResp(t, resp)
+		pairs, err := decodeChunk(chunk)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, p := range pairs {
+			got[string(p.k)] = string(p.v)
+		}
+		if done {
+			break
+		}
+		cursor = next
+	}
+	if len(got) < 50 {
+		t.Fatalf("拉到 %d 个键; want ≥50（50 个 topic 元数据）", len(got))
+	}
+	for k := range got {
+		if !strings.HasPrefix(k, "meta/") && !strings.HasPrefix(k, "delay") &&
+			!strings.HasPrefix(k, "half") {
+			t.Fatalf("组 0 快照混入了非全局键 %q", k)
+		}
+	}
+}
+
+// TestFetchSnapshotRejectsUnknownID 过期/未知 snapID 必须显式报错，
+// 不能返回空块让接收方以为「拉完了」（那是静默的空状态安装）。
+func TestFetchSnapshotRejectsUnknownID(t *testing.T) {
+	h := startThreeNodeCluster(t)
+	defer h.stopAll()
+	if _, err := h.nodes[0].handleFetchSnapshot(encodeFetchReq(0, 99999, nil)); err == nil {
+		t.Fatal("未知 snapID 必须报错")
+	}
 }

@@ -82,6 +82,10 @@ const ControlGroup uint32 = 0xFFFFFFFF
 //   - OpPrepareJoin=3: payload=[8B BE nodeID]，响应=该节点完成
 //     Remove→AddLearner 的组号列表——learner 重入编排（Task 10
 //     PrepareJoin handler 消费）
+//   - OpFetchSnapshot=4: payload=[4B BE 组][8B BE snapID][4B BE 游标
+//     键长][游标键]，响应=[1B 是否结束][4B BE 下一游标键长][下一游标
+//     键][块字节]——按 snapID 分块拉取钉住的快照视图（Manager 内部
+//     handler 消费，见 handleFetchSnapshot）
 //
 // 定义在本包而非 replication：Task 10 的 PrepareJoin handler 在 cluster
 // 侧装配，而依赖方向是 replication→cluster——常量放集群侧才能被双方
@@ -91,6 +95,7 @@ const (
 	OpForwardAppend byte = 1
 	OpForwardApply  byte = 2
 	OpPrepareJoin   byte = 3
+	OpFetchSnapshot byte = 4
 )
 
 // envelope 发送队列中的一条待发消息：组号 + 消息指针。
