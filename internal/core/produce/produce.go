@@ -198,9 +198,17 @@ func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, 
 	// 同一次 fsync——这就是 group commit 在队列内生效的机制（吞吐从 1/fsync延迟
 	// 变为 合并深度/fsync延迟）。
 	//
-	// 为什么敢在 Wait 之前推进 qs.next：若后续 WaitSync 失败，说明 WAL sync 失败、
-	// Pebble 已进入不可恢复错误态，之后所有写入都会失败，进程只能重启；重启后
-	// 计数器与实际落盘由「同批原子提交」保证严格一致，内存里烧掉的 offset 无害。
+	// 为什么敢在 Wait 之前推进 qs.next：内存 offset 缓存烧掉无害——任何
+	// 让 Wait 失败的场景都不丢消息：
+	//   - 集群档提案失败（ErrNotLeader：提交期间领导权迁移）：本节点失去
+	//     leader 身份时 onLeaderChange 触发 InvalidateCounters 置
+	//     qs.loaded=false（I4 同步失效），后续读取从 store 重读实际状态，
+	//     绝不返回烧掉的 offset；
+	//   - 集群档 WaitSync 失败 ≠ Pebble 不可恢复：raft 副本仍持数据，
+	//     offset 分配是 leader-only 构造，本节点重启以 learner 追平即恢复；
+	//   - 单机档 Pebble 真坏（WAL sync 失败 = 不可恢复态）：进程只能重启，
+	//     重启后计数器与实际落盘由「同批原子提交」保证严格一致，内存里
+	//     烧掉的 offset 无害。
 	qs.next = off + 1
 	qs.loaded = true
 	qs.mu.Unlock()

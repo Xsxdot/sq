@@ -697,6 +697,14 @@ func (d *Deliverer) moveToDLQ(ctx context.Context, group, topic string, queueID 
 	var aerr error
 	if d.rt.IsLeader(dlqG) {
 		stored, aerr = d.pr.Append(ctx, dlq)
+		if aerr == nil {
+			// 本地路径日志与转发路径对称（字段对齐）：两条路径的死信
+			// 落点都要可追溯，只给转发路径打日志会让本地转入在排查时
+			// 显得「没发生」。
+			d.logger.Info("死信消息本地入队", "g", dlqG, "msg_id", dlq.ID, "dlq_topic", dlqTopic,
+				"origin_topic", topic, "origin_queue", queueID, "origin_offset", offset,
+				"queue", stored.QueueID, "offset", stored.Offset)
+		}
 	} else {
 		raw, eerr := core.EncodeMessage(dlq)
 		if eerr != nil {
@@ -715,7 +723,6 @@ func (d *Deliverer) moveToDLQ(ctx context.Context, group, topic string, queueID 
 	if aerr != nil {
 		return fmt.Errorf("消息转入 DLQ (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, aerr)
 	}
-	_ = stored // 坐标已入日志（本地路径 pr.Append 的返回值供调用方核对，转发路径只用于日志）
 	if d.afterAppendHook != nil {
 		d.afterAppendHook()
 	}
