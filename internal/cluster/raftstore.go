@@ -211,24 +211,40 @@ func (r *raftStore) Applied(g uint32) (uint64, error) {
 //   - cs: rn.ApplyConfChange 的返回值（raft 库算出的权威成员表）
 //   - applied: 本条 ConfChange 条目的 index
 func (r *raftStore) SaveConfState(g uint32, cs *raftpb.ConfState, applied uint64) error {
-	data, err := proto.Marshal(cs)
-	if err != nil {
-		return fmt.Errorf("raftstore SaveConfState 组 %d 编码: %w", g, err)
-	}
 	b := r.st.NewBatch()
-	if err := b.Set(confKey(g), data); err != nil {
+	if err := writeConfState(b, g, cs, applied); err != nil {
 		b.Close()
-		return fmt.Errorf("raftstore SaveConfState 组 %d 写成员表: %w", g, err)
-	}
-	if err := b.Set(appliedKey(g), store.PutU64(applied)); err != nil {
-		b.Close()
-		return fmt.Errorf("raftstore SaveConfState 组 %d 写 applied: %w", g, err)
+		return err
 	}
 	// 成员表是选举安全的根：Sync 落盘，不进 quorum-mem 的异步刷盘队列
 	if err := r.st.ApplyWith(b, true); err != nil {
 		return fmt.Errorf("raftstore SaveConfState 组 %d: %w", g, err)
 	}
 	r.lg.Info("成员表已持久化", "g", g, "voters", cs.GetVoters(), "learners", cs.GetLearners(), "applied", applied)
+	return nil
+}
+
+// writeConfState 把成员表与 applied 位点写入调用方给定的批次。
+//
+// 两个调用方共用同一份核心：
+//   - SaveConfState：自建批次 + Sync 提交（成员变更 apply 路径）
+//   - installSnapshot 第 5 步收口批次：applied、成员表、锚点、删安装
+//     标记四者必须同批原子落盘——「安装完成」的定义就是这一批的原子
+//     性，拆开提交的崩溃窗口里会出现「数据已装完、标记残留」的重启
+//     重装（见 snapinstall 的收口注释）
+//
+// 批内写成员表与 applied 两个键，失败时批次由调用方处理（Close）。
+func writeConfState(b *store.Batch, g uint32, cs *raftpb.ConfState, applied uint64) error {
+	data, err := proto.Marshal(cs)
+	if err != nil {
+		return fmt.Errorf("raftstore 组 %d 编码成员表: %w", g, err)
+	}
+	if err := b.Set(confKey(g), data); err != nil {
+		return fmt.Errorf("raftstore 组 %d 写成员表: %w", g, err)
+	}
+	if err := b.Set(appliedKey(g), store.PutU64(applied)); err != nil {
+		return fmt.Errorf("raftstore 组 %d 写 applied: %w", g, err)
+	}
 	return nil
 }
 
@@ -256,19 +272,35 @@ func (r *raftStore) LoadConfState(g uint32) (*raftpb.ConfState, bool, error) {
 // 「先 SaveSnapMeta（Sync）、后 TruncateLog」——反过来会在两次写之间
 // 留下「条目已删、锚点未落」的崩溃窗口，重启直接拒启。
 func (r *raftStore) SaveSnapMeta(g uint32, meta *raftpb.SnapshotMetadata) error {
-	data, err := proto.Marshal(meta)
-	if err != nil {
-		return fmt.Errorf("raftstore SaveSnapMeta 组 %d 编码: %w", g, err)
-	}
 	b := r.st.NewBatch()
-	if err := b.Set(snapKey(g), data); err != nil {
+	if err := writeSnapMeta(b, g, meta); err != nil {
 		b.Close()
-		return fmt.Errorf("raftstore SaveSnapMeta 组 %d: %w", g, err)
+		return err
 	}
 	if err := r.st.ApplyWith(b, true); err != nil {
 		return fmt.Errorf("raftstore SaveSnapMeta 组 %d: %w", g, err)
 	}
 	r.lg.Info("快照锚点已落盘", "g", g, "index", meta.GetIndex(), "term", meta.GetTerm())
+	return nil
+}
+
+// writeSnapMeta 把快照锚点写入调用方给定的批次。
+//
+// 两个调用方共用同一份核心：
+//   - SaveSnapMeta：自建批次 + Sync 提交（截断前置，Task 3）
+//   - installSnapshot 第 5 步收口批次：接收方安装的快照锚点必须与
+//     applied、成员表、删安装标记同批原子落盘——锚点单独提交会让
+//     「已装完、标记残留」的崩溃窗口被重启误判为完整状态
+//
+// 失败时批次由调用方处理（Close）。
+func writeSnapMeta(b *store.Batch, g uint32, meta *raftpb.SnapshotMetadata) error {
+	data, err := proto.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("raftstore 组 %d 编码快照元数据: %w", g, err)
+	}
+	if err := b.Set(snapKey(g), data); err != nil {
+		return fmt.Errorf("raftstore 组 %d 写快照元数据: %w", g, err)
+	}
 	return nil
 }
 

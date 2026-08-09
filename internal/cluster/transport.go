@@ -130,6 +130,11 @@ type transport struct {
 	connsMu sync.Mutex
 	conns   map[net.Conn]struct{} // 活动读连接，ctx 取消时统一关闭
 
+	// partitioned 是测试专用分区开关（setPartitioned，见其注释）：
+	// 置位期间本节点与集群双向不可达。生产路径恒为 false（atomic 读，
+	// 发送热路径零锁开销）。
+	partitioned atomic.Bool
+
 	wg sync.WaitGroup
 }
 
@@ -205,6 +210,9 @@ func (t *transport) Start(ctx context.Context) {
 //   - g: 数据组号，作为信封组号随帧传递，接收端原样交给 deliver
 //   - msgs: 待发送消息（指针切片，禁止值拷贝消息体）
 func (t *transport) Send(g uint32, msgs []*raftpb.Message) {
+	if t.partitioned.Load() {
+		return // 测试分区：整段丢弃出站消息（见 setPartitioned）
+	}
 	for _, m := range msgs {
 		to := m.GetTo()
 		q, ok := t.queues[to]
@@ -219,6 +227,18 @@ func (t *transport) Send(g uint32, msgs []*raftpb.Message) {
 			t.drops[to].Add(1) // 队列满：计数丢弃，等 raft 重试
 		}
 	}
+}
+
+// setPartitioned 测试专用：模拟本节点与集群整段网络分区——双向丢弃
+// （出站 Send 不入队、入站 readLoop 不 deliver），节点本身保持存活
+// （tick/选举照常）。恢复置 false 即立即恢复投递（连接从未断开）。
+//
+// 为什么双向：单向隔断时对端仍能收到本节点自增任期的竞选消息，每次
+// 竞选都把多数派 leader 打回 follower 一轮，分区期间多数派的写入会被
+// 反复打断；双向隔断让本节点在自己孤立的任期里空转，多数派不受干扰
+// （TestLaggingFollowerCatchesUpBySnapshot 的分区前提）。
+func (t *transport) setPartitioned(p bool) {
+	t.partitioned.Store(p)
 }
 
 // DropPeer 排空指定 peer 的发送队列并清零丢弃计数。
@@ -395,6 +415,12 @@ func (t *transport) readLoop(conn net.Conn) {
 			return
 		}
 		group := binary.BigEndian.Uint32(body[:4])
+		if t.partitioned.Load() {
+			// 测试分区：整段丢弃入站帧（raft 与控制帧一起丢，等价于
+			// 网络不可达；见 setPartitioned）。连接保持读消耗，对端
+			// 写不积压，恢复投递立即生效。
+			continue
+		}
 		if group == ControlGroup {
 			// 控制通道帧：不进 raft 消息流。请求/响应是短连接 RPC 的
 			// 一次往返——应答写回同一条连接后本循环退出（defer 关连接），

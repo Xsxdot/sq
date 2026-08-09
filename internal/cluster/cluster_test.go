@@ -24,9 +24,11 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"sort"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -1284,6 +1286,55 @@ type snapHarness struct {
 	stores []*store.Store    // 与 nodes 同序（清理用）
 	peers  map[uint64]string // 节点 id → raft 监听地址（分区用例备用）
 	mode   AckMode
+	logs   []*logCapture // 与 nodes 同序：countLog 的检索源（快照路径证据）
+}
+
+// logCapture 累积一个节点全部日志的格式化行（countLog 的检索源）。
+// 与 testWriter 并存：同一行既进 t.Log（失败可查）也进 capture。
+type logCapture struct {
+	mu    sync.Mutex
+	lines []string
+}
+
+// append 记录一行（原子；slog 每条记录一次 Write，见 captureWriter）。
+func (c *logCapture) append(line string) {
+	c.mu.Lock()
+	c.lines = append(c.lines, line)
+	c.mu.Unlock()
+}
+
+// count 返回包含 needle 的行数（快照路径证据：追平是否走了安装日志）。
+func (c *logCapture) count(needle string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, l := range c.lines {
+		if strings.Contains(l, needle) {
+			n++
+		}
+	}
+	return n
+}
+
+// captureWriter 把 slog 的格式化输出同时交给测试输出与 logCapture。
+// slog 的 TextHandler 每条记录一次 Write（go1.26 的 commonHandler 实现），
+// Write 收到的就是整行——逐行累积即「按行检索」。
+type captureWriter struct {
+	t   *testing.T
+	cap *logCapture
+}
+
+func (w captureWriter) Write(p []byte) (int, error) {
+	w.cap.append(string(p))
+	w.t.Log(string(p))
+	return len(p), nil
+}
+
+// newCaptureSlog 构造同时写 t.Log 与 logCapture 的 slog（节点级）。
+// Manager 与各组共享同一 handler 链（lg.With 派生），快照安装的关键
+// 日志一行不落。
+func newCaptureSlog(t *testing.T, cap *logCapture) *slog.Logger {
+	return slog.New(slog.NewTextHandler(&captureWriter{t: t, cap: cap}, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
 // startThreeNodeCluster 起三节点快照链路 harness（真实 TCP）。
@@ -1292,10 +1343,13 @@ type snapHarness struct {
 // （传输层按 Peers 拨号，必须先拿到全部地址），然后逐节点
 // store.Open(t.TempDir()/id) + NewManager（Listener 注入已建监听）+ Start。
 //
+// opts 是 Options 级注入（如 withRetainEntries(8) 逼出快照路径）——
+// 每个节点收到同一份注入，Logger 除外（节点级捕获日志器）。
+//
 // 清理经 t.Cleanup 注册（StopClean → 等 Done → 关 store）；stopAll 是
 // 显式停机入口——与 Cleanup 重叠安全（StopClean 幂等：cancel 与关通道
 // 幂等、干净关机标记重复写无害）。
-func startThreeNodeCluster(t *testing.T) *snapHarness {
+func startThreeNodeCluster(t *testing.T, opts ...func(*Options)) *snapHarness {
 	t.Helper()
 	const n = 3
 	lstns := make([]net.Listener, 0, n)
@@ -1314,15 +1368,21 @@ func startThreeNodeCluster(t *testing.T) *snapHarness {
 		if err != nil {
 			t.Fatalf("节点 %d 开 store: %v", i, err)
 		}
-		m, err := NewManager(Options{
+		cap := &logCapture{}
+		h.logs = append(h.logs, cap)
+		base := Options{
 			NodeID:     i,
 			Peers:      peers,
 			Listener:   lstns[i-1],
 			DataGroups: 3,
 			Mode:       h.mode,
 			Store:      st,
-			Logger:     testSlog(t),
-		})
+			Logger:     newCaptureSlog(t, cap),
+		}
+		for _, o := range opts {
+			o(&base)
+		}
+		m, err := NewManager(base)
 		if err != nil {
 			t.Fatalf("节点 %d NewManager: %v", i, err)
 		}
@@ -1373,6 +1433,98 @@ func (h *snapHarness) leaderOf(t *testing.T, g uint32) *Manager {
 	}
 	t.Fatalf("组 %d 在 60s 内未选出 leader", g)
 	return nil
+}
+
+// nonLeaderOf 返回组 g 当前非 leader 的一个节点（快照场景的落后方）。
+func (h *snapHarness) nonLeaderOf(t *testing.T, g uint32) *Manager {
+	t.Helper()
+	leader := h.leaderOf(t, g)
+	for _, m := range h.nodes {
+		if m != leader {
+			return m
+		}
+	}
+	t.Fatalf("组 %d 无非 leader 节点", g)
+	return nil
+}
+
+// partitionOff 把节点与集群整段隔断（双向丢消息，节点保持存活）。
+//
+// 实现：该节点自身传输层的分区开关（transport.setPartitioned）——
+// 出站消息不入队、入站消息不 deliver，等价于物理网络分区。为什么
+// 双向：单向隔断时对端仍能收到落后方的选举消息（其任期不断自增），
+// 每次竞选都会把 leader 打回 follower 一轮——200 条写入会被反复打断；
+// 双向隔断则落后方在自己孤立的任期里空转，多数派不受干扰。
+func (h *snapHarness) partitionOff(victim *Manager) {
+	victim.tr.setPartitioned(true)
+}
+
+// healPartition 恢复 partitionOff 的隔断（双向恢复投递）。
+func (h *snapHarness) healPartition(victim *Manager) {
+	victim.tr.setPartitioned(false)
+}
+
+// truncateNow 在组长节点上执行一次本地截断（Task 8 的 truncateOnce
+// 上线前的测试等价物）：SaveSnapMeta（锚点 = applied-retain，带 term
+// 与成员表）→ TruncateLog → mem.Compact，三步与生产的「先锚点后
+// 截断」顺序一致——截断之后日志起点越过落后方位点，raft 判定它只能
+// 靠 MsgSnap 追平。
+func (h *snapHarness) truncateNow(t *testing.T, g uint32) {
+	t.Helper()
+	leader := h.leaderOf(t, g)
+	gr := leader.groups[g]
+	applied := gr.appliedIndex()
+	retain := leader.retainEntries
+	if applied <= retain {
+		t.Fatalf("组 %d applied=%d 不足以截断（retain=%d）", g, applied, retain)
+	}
+	upto := applied - retain
+	term, err := gr.mem.Term(upto)
+	if err != nil {
+		t.Fatalf("组 %d 锚点位 %d 的 term 不可查: %v", g, upto, err)
+	}
+	idx, tm := upto, term
+	meta := &raftpb.SnapshotMetadata{Index: &idx, Term: &tm, ConfState: gr.confState.Load()}
+	if err := leader.rs.SaveSnapMeta(g, meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := leader.rs.TruncateLog(g, upto); err != nil {
+		t.Fatal(err)
+	}
+	if err := gr.mem.Compact(upto); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// countLog 统计节点 m 的捕获日志中含 needle 的行数（快照路径证据：
+// 「快照安装完成」出现 ≥1 次 = 追平确实走了快照安装）。
+func (h *snapHarness) countLog(m *Manager, needle string) int {
+	for i, node := range h.nodes {
+		if node == m {
+			return h.logs[i].count(needle)
+		}
+	}
+	return 0
+}
+
+// waitFor 轮询等待条件成立，超时 Fatal（快照场景的收敛判据用）。
+func waitFor(t *testing.T, timeout time.Duration, cond func() bool, msg string) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal(msg)
+}
+
+// withRetainEntries 注入截断循环的日志保留量（Options.RetainEntries，
+// 默认 10000）：缩小到个位数把落后方逼进快照路径（落后位点落在截断
+// 区间内，日志追齐不可能，只能 MsgSnap）。
+func withRetainEntries(n uint64) func(*Options) {
+	return func(o *Options) { o.RetainEntries = n }
 }
 
 // encodeFetchReq 编码 OpFetchSnapshot 请求：[4B BE 组][8B BE snapID]
@@ -1470,5 +1622,47 @@ func TestFetchSnapshotRejectsUnknownID(t *testing.T) {
 	defer h.stopAll()
 	if _, err := h.nodes[0].handleFetchSnapshot(encodeFetchReq(0, 99999, nil)); err == nil {
 		t.Fatal("未知 snapID 必须报错")
+	}
+}
+
+// TestLaggingFollowerCatchesUpBySnapshot 端到端：让一个 follower 停摆、
+// leader 写入并截断到它需要的位点之上、follower 回来 —— 必须靠快照追平。
+//
+// 场景时序（为什么截断在分区期间做）：落后方恢复后 raft 先尝试日志
+// 追齐（它的位点还在 leader 的日志区间内时，MsgApp 就够）；只有把
+// 日志截断到落后位点之上，「日志追齐不可能、只能 MsgSnap」才成立。
+// 追平判据是 FSM 数据（S199 可读）而非日志位点——快照路径的最终
+// 验收就是客户端数据完整。
+func TestLaggingFollowerCatchesUpBySnapshot(t *testing.T) {
+	h := startThreeNodeCluster(t, withRetainEntries(8)) // 极小保留量逼出快照路径
+	defer h.stopAll()
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	victim := h.nonLeaderOf(t, 0)
+	h.partitionOff(victim) // 既有辅助：断开该节点的传输层
+
+	leader := h.leaderOf(t, 0)
+	for i := 0; i < 200; i++ {
+		b := leader.Store().NewBatch()
+		if err := b.Set(store.TopicMetaKey(fmt.Sprintf("S%03d", i)), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		if err := leader.Propose(ctx, 0, b.Repr()); err != nil {
+			t.Fatal(err)
+		}
+		b.Close()
+	}
+	h.truncateNow(t, 0) // 触发一次截断循环
+
+	h.healPartition(victim)
+	// 追平判据：victim 上能读到最后一个键
+	waitFor(t, 60*time.Second, func() bool {
+		_, ok, _ := victim.Store().Get(store.TopicMetaKey("S199"))
+		return ok
+	}, "落后节点未在 60s 内经快照追平")
+
+	if n := h.countLog(victim, "快照安装完成"); n < 1 {
+		t.Fatal("追平未走快照路径（日志无「快照安装完成」）——测试前提失效")
 	}
 }

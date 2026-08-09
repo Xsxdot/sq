@@ -1,9 +1,15 @@
-// snapinstall.go 提供快照接收侧安装的存储侧工具：清空重来。
+// snapinstall.go 提供快照接收侧安装：拉块线格式与清空重来。
 //
 // 职责：
 //   - wipeGroupKeys：删除一个组在共享 store 里的全部 FSM 键——
 //     组 0 按连续前缀 DeleteRange 整段删；数据组逐键解析判哈希归属后
 //     只删本组键
+//   - encodeSnapFetchReq/decodeSnapFetchResp：OpFetchSnapshot 拉块的
+//     请求/响应线格式（生产侧编码；发送侧测试的 encodeFetchReq/
+//     decodeFetchResp 是 cluster_test.go 里的对等测试助手，互不复用）
+//
+// 安装主流程（installSnapshot 六步与收口批次）在 group.go，本文件只
+// 提供它用到的线格式与清空原语。
 //
 // 为什么先标记后清空（顺序即不变量，installSnapshot 第 2 步早于第 3 步）：
 // 安装中标记（raft/<g>/snapinstall，raftstore.MarkInstalling Sync 落盘）
@@ -22,6 +28,7 @@
 package cluster
 
 import (
+	"encoding/binary"
 	"fmt"
 	"log/slog"
 
@@ -32,6 +39,38 @@ import (
 // 锁定（无 logger 参数），解析失败中止的 Error 只能走包级 logger；
 // 与 snapStreamLog 同模式（生产装配把 handler 装在 slog.Default() 上）。
 var snapInstallLog = slog.Default().With("mod", "cluster.snapinstall")
+
+// encodeSnapFetchReq 编码 OpFetchSnapshot 拉块请求（installSnapshot
+// 第 4 步用）：[4B BE 组][8B BE snapID][4B BE 游标键长][游标键]，全部
+// 大端。首块游标为 nil（长度 0）；后续块以上一块响应的「下一游标键」
+// 续拉。与 manager.go handleFetchSnapshot 的解析侧唯一配对。
+func encodeSnapFetchReq(g uint32, snapID uint64, cursor []byte) []byte {
+	req := make([]byte, 16+len(cursor))
+	binary.BigEndian.PutUint32(req[:4], g)
+	binary.BigEndian.PutUint64(req[4:12], snapID)
+	binary.BigEndian.PutUint32(req[12:16], uint32(len(cursor)))
+	copy(req[16:], cursor)
+	return req
+}
+
+// decodeSnapFetchResp 解码 OpFetchSnapshot 拉块响应：[1B 是否结束][4B BE
+// 下一游标键长][下一游标键][块字节]。done=true 后不得再以 next 续拉。
+//
+// 坏布局必须报错而不是静默截断——截断一块 = 本组状态永久缺失一块，
+// 与快照枚举/清空的「中止绝不跳过」同一纪律。
+func decodeSnapFetchResp(resp []byte) (done bool, next, chunk []byte, err error) {
+	if len(resp) < 5 {
+		return false, nil, nil, fmt.Errorf("cluster: FetchSnapshot 响应 %d B 过短（不足 1B 结束位 + 4B 游标长）", len(resp))
+	}
+	done = resp[0] == 1
+	nl := binary.BigEndian.Uint32(resp[1:5])
+	if uint32(len(resp)-5) < nl {
+		return false, nil, nil, fmt.Errorf("cluster: FetchSnapshot 响应游标键长 %d 超出剩余 %d B", nl, len(resp)-5)
+	}
+	next = resp[5 : 5+int(nl)]
+	chunk = resp[5+int(nl):]
+	return done, next, chunk, nil
+}
 
 // wipeGroupKeys 删除组 g 在共享 store 里的全部 FSM 键（清空重来）。
 //

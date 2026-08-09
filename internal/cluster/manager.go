@@ -111,6 +111,11 @@ type Options struct {
 	// 注意：升 voter 循环与摊布循环共节拍，依赖 LeaderBalancerInterval
 	// 注入（≤0 时两者都不启动）；重入编排主体是 Rejoin。
 	AutoPromoteLearners bool
+
+	// RetainEntries 是截断循环的日志保留量（batch④，默认 10000；Task 8
+	// 的配置面接管）：落后 follower 的位点一旦落在截断点之下，日志追齐
+	// 不可能，只能靠 MsgSnap 快照追平。0 时按 defaultRetainEntries。
+	RetainEntries uint64
 }
 
 // Manager 是多组装配体：持有全部 raft 组、传输层与恢复判定。
@@ -153,10 +158,20 @@ type Manager struct {
 	// 循环与摊布循环共节拍（见 promoteLearners 注释）。
 	autoPromote bool
 
+	// retainEntries 是截断循环的日志保留量（Options.RetainEntries 透传，
+	// 0 按 defaultRetainEntries）：落后 follower 的位点一旦落在截断点
+	// 之下就只能靠 MsgSnap 追平（Task 7 的截断前置；Task 8 的
+	// truncateOnce 用它算截断点）。
+	retainEntries uint64
+
 	// prepareJoinMu 串行化本节点的 PrepareJoin 处理（见
 	// handlePrepareJoin 注释：并发提成员变更会被 raft 静默替换）。
 	prepareJoinMu sync.Mutex
 }
+
+// defaultRetainEntries 是 Options.RetainEntries 的默认值（0 即默认）：
+// 截断循环保留的日志条目数。生产值由 Task 8 的配置面接管。
+const defaultRetainEntries uint64 = 10000
 
 // NewManager 装配全部 raft 组并按磁盘状态判定恢复路径。
 //
@@ -185,6 +200,9 @@ func NewManager(o Options) (*Manager, error) {
 	if o.DataGroups == 0 {
 		o.DataGroups = 3
 	}
+	if o.RetainEntries == 0 {
+		o.RetainEntries = defaultRetainEntries
+	}
 	lg := o.Logger
 	if lg == nil {
 		lg = slog.Default()
@@ -201,6 +219,7 @@ func NewManager(o Options) (*Manager, error) {
 		onApplied:              o.OnApplied,
 		leaderBalancerInterval: o.LeaderBalancerInterval,
 		autoPromote:            o.AutoPromoteLearners,
+		retainEntries:          o.RetainEntries,
 		doneCh:                 make(chan struct{}),
 	}
 	m.rs = newRaftStore(o.Store, lg)
@@ -393,6 +412,23 @@ func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, e
 		if err != nil {
 			return nil, fmt.Errorf("cluster: 组 %d 读 applied: %w", g, err)
 		}
+		// 安装中标记存在 = 上次快照安装未完成，本组状态是半截的。
+		// 清空该组键族让 raft 重新发快照——半截状态当完整状态启动
+		// 会让本节点向客户端返回缺失的消息（静默丢数据）。
+		// 注意：LoadInstalling 必须在 Load 之后——日志回放与标记检查
+		// 都要基于同一份磁盘实况，且清空重来要覆盖刚读回的 applied。
+		if meta, installing, err := m.rs.LoadInstalling(g); err != nil {
+			return nil, err
+		} else if installing {
+			m.lg.Warn("发现未完成的快照安装，清空该组状态重来", "g", g, "index", meta.GetIndex())
+			if err := wipeGroupKeys(m.st, g, m.dataGroups); err != nil {
+				return nil, fmt.Errorf("cluster: 组 %d 清空重来: %w", g, err)
+			}
+			if err := m.rs.ResetGroupProgress(g); err != nil { // applied=0 + 删 snap 锚点 + 删标记
+				return nil, err
+			}
+			applied = 0
+		}
 	}
 	gr := newGroup(g, m.nodeID, storage, m.snaps, m.rs, m.st, m.send, m.mode, m.onLeaderChange, m.onApplied, m.lg)
 	// raft 节点在 newGroup 之后装配：Config.Storage 必须用包了快照生成
@@ -409,6 +445,11 @@ func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, e
 		rn = raft.StartNode(cfg, peers)
 	}
 	gr.rn = rn
+	// 快照接收侧装配（Task 7）：控制回调（拉块 RPC）与数据组数（清空
+	// 重来的哈希归属分母）由 Manager 注入——同 rn 的「newGroup 后装配」
+	// 模式（stg 依赖组内骨架就绪，control/groups 同理）。
+	gr.control = m.Control
+	gr.groups = m.dataGroups
 	// 重启重放跳过守卫：raft 从 applied+1 重投递，内存 applied 必须先
 	// 从磁盘位点填充，否则已 apply 的条目会被重放（Task 4 约定）；
 	// fresh 路径 applied=0，Store 无副作用
