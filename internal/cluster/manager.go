@@ -30,7 +30,6 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"hash/fnv"
 	"io"
 	"log/slog"
 	"net"
@@ -792,15 +791,10 @@ func (m *Manager) Store() *store.Store {
 // GroupForQueue 返回 topic+queueID 归属的数据组号（1..DataGroups）。
 //
 // 入盘契约，永不可变——变更即存量数据错组，黄金值测试锁死。
-// 算法：fnv1a(topic 字节 + 4B 大端 queueID) 对数据组数取模后偏移到
-// [1, DataGroups]；MetaGroup（0）不参与映射。
+// 哈希算法本体在包级函数 groupForQueue（snapshotstream 枚举与
+// wipeGroupKeys 复用，无需 Manager 实例）；本方法只注入数据组数。
 func (m *Manager) GroupForQueue(topic string, queueID uint32) uint32 {
-	h := fnv.New32a()
-	_, _ = h.Write([]byte(topic))
-	var buf [4]byte
-	binary.BigEndian.PutUint32(buf[:], queueID)
-	_, _ = h.Write(buf[:])
-	return 1 + h.Sum32()%m.dataGroups
+	return groupForQueue(topic, queueID, m.dataGroups)
 }
 
 // Propose 向指定组提交一条提案并阻塞直到它在本节点 apply 完成
