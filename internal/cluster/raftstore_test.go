@@ -57,11 +57,11 @@ func TestPersistLoadRoundTrip(t *testing.T) {
 	if err := rs.Persist(1, nil, []*raftpb.Entry{e(1, 1, 1)}, false); err != nil {
 		t.Fatal(err)
 	}
-	hs, ents, err := rs.Load(0)
+	hs, ents, _, err := rs.Load(0)
 	if err != nil || len(ents) != 2 || hs.GetCommit() != 1 {
 		t.Fatalf("组0 Load = hs.commit %d, %d 条, %v; want 1, 2, nil", hs.GetCommit(), len(ents), err)
 	}
-	if _, ents1, _ := rs.Load(1); len(ents1) != 1 || ents1[0].Data[0] != 1 {
+	if _, ents1, _, _ := rs.Load(1); len(ents1) != 1 || ents1[0].Data[0] != 1 {
 		t.Fatalf("组1 被组0 污染或缺失: %v", ents1)
 	}
 }
@@ -81,7 +81,7 @@ func TestPersistTruncatesConflictTail(t *testing.T) {
 	if err := rs.Persist(0, nil, []*raftpb.Entry{e(2, 2)}, true); err != nil { // 新任期覆盖 2，3 成幽灵
 		t.Fatal(err)
 	}
-	_, ents, err := rs.Load(0)
+	_, ents, _, err := rs.Load(0)
 	if err != nil || len(ents) != 2 || ents[1].GetTerm() != 2 {
 		t.Fatalf("覆盖后 Load = %d 条 (末条 term %d), %v; want 2 条、term 2", len(ents), ents[len(ents)-1].GetTerm(), err)
 	}
@@ -167,5 +167,77 @@ func TestConfStateSurvivesRestartWithoutEntries(t *testing.T) {
 	}
 	if _, ok, _ := rs.LoadConfState(8); ok {
 		t.Fatal("未写过的组不得返回成员表")
+	}
+}
+
+// TestTruncateLogKeepsSuffixAndSnapMeta 截断的两条不变量：
+// ① 截断点之后的条目一条不少；② 截断点的 {Index,Term} 必须留在
+// snap 元数据里——raft 重启要查 FirstIndex-1 的 term，查不到就拒启。
+func TestTruncateLogKeepsSuffixAndSnapMeta(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	var ents []*raftpb.Entry
+	for i := uint64(1); i <= 10; i++ {
+		idx, term := i, uint64(3)
+		ents = append(ents, &raftpb.Entry{Index: &idx, Term: &term, Data: []byte{byte(i)}})
+	}
+	commit := uint64(10)
+	if err := rs.Persist(1, &raftpb.HardState{Commit: &commit}, ents, true); err != nil {
+		t.Fatal(err)
+	}
+
+	idx, term := uint64(6), uint64(3)
+	meta := &raftpb.SnapshotMetadata{Index: &idx, Term: &term,
+		ConfState: &raftpb.ConfState{Voters: []uint64{1}}}
+	if err := rs.SaveSnapMeta(1, meta); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.TruncateLog(1, 6); err != nil {
+		t.Fatal(err)
+	}
+
+	_, got, gotMeta, err := rs.Load(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 4 || got[0].GetIndex() != 7 || got[3].GetIndex() != 10 {
+		t.Fatalf("截断后条目 = %d 条，首 %d 末 %d; want 4 条 [7,10]",
+			len(got), got[0].GetIndex(), got[len(got)-1].GetIndex())
+	}
+	if gotMeta == nil || gotMeta.GetIndex() != 6 || gotMeta.GetTerm() != 3 {
+		t.Fatalf("snap 元数据 = %+v; want index=6 term=3", gotMeta)
+	}
+	if len(gotMeta.GetConfState().GetVoters()) != 1 {
+		t.Fatalf("snap 元数据必须带成员表（重启 InitialState 用）: %+v", gotMeta.GetConfState())
+	}
+}
+
+// TestTruncateLogRejectsAboveSnapMeta 截断点不得越过已落盘的 snap 元数据：
+// 越过意味着 FirstIndex-1 的 term 无处可查，重启必然拒启。
+func TestTruncateLogRejectsAboveSnapMeta(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	idx, term := uint64(5), uint64(2)
+	if err := rs.SaveSnapMeta(1, &raftpb.SnapshotMetadata{Index: &idx, Term: &term}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.TruncateLog(1, 9); err == nil {
+		t.Fatal("截断点 9 > snap 元数据 index 5，必须被拒绝")
+	}
+}
+
+// TestTruncateLogIsIdempotent 重复截断到同一位点无害（周期截断会撞上）。
+func TestTruncateLogIsIdempotent(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	idx, term := uint64(3), uint64(1)
+	if err := rs.SaveSnapMeta(1, &raftpb.SnapshotMetadata{Index: &idx, Term: &term}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.TruncateLog(1, 3); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.TruncateLog(1, 3); err != nil {
+		t.Fatalf("重复截断必须无害: %v", err)
 	}
 }

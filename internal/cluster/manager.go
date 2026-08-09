@@ -280,22 +280,64 @@ func NewManager(o Options) (*Manager, error) {
 
 // buildGroup 构造单个 raft 组，按恢复路径分叉：
 //
-//   - clean：rs.Load 全量回放磁盘日志重建 MemoryStorage（快照元数据
-//     提供 ConfState 与起始位点——成员表优先读持久化值 LoadConfState，
-//     旧目录无该值时回退日志重放合成，见函数内注释），raft.RestartNode
-//     恢复，且 raftConfig.Applied = 磁盘 applied（raft 从 applied+1
-//     重投递，配合 group 的跳过逻辑双保险，见下述 seeding 注释）
+//   - clean：rs.Load 读回磁盘日志与快照锚点重建 MemoryStorage（锚点提供
+//     {Index, Term, ConfState} 与起始位点，日志被全量截断时也以此恢复；
+//     成员表优先读持久化值 LoadConfState，旧目录无该值时回退日志重放
+//     合成，见函数内注释），raft.RestartNode 恢复，且
+//     raftConfig.Applied = 磁盘 applied（raft 从 applied+1 重投递，
+//     配合 group 的跳过逻辑双保险，见下述 seeding 注释）
 //   - fresh：raft.StartNode 以引导成员表启动
 func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, error) {
 	storage := raft.NewMemoryStorage()
 	applied := uint64(0)
 	var rn raft.Node
 	if clean {
-		hs, ents, err := m.rs.Load(g)
+		hs, ents, snapMeta, err := m.rs.Load(g)
 		if err != nil {
 			return nil, fmt.Errorf("cluster: 组 %d 恢复读取: %w", g, err)
 		}
-		if len(ents) > 0 {
+		if snapMeta != nil {
+			// 截断过的组：锚点是权威位点与成员表来源——即使日志被全量
+			// 截断（len(ents)==0）也必须 ApplySnapshot，否则
+			// RestartNode 拿不到 ConfState（InitialState 只认快照）与
+			// 任期基线，节点以空成员表启动直接变哑（Task 2 遗留缺口）。
+			snapIndex, snapTerm := snapMeta.GetIndex(), snapMeta.GetTerm()
+			cs := snapMeta.GetConfState()
+			if len(cs.GetVoters()) == 0 {
+				// 锚点未带成员表：回退 Task 2 持久化成员表——那是
+				// ConfChange apply 时整表落盘的权威来源
+				persisted, ok, err := m.rs.LoadConfState(g)
+				if err != nil {
+					return nil, fmt.Errorf("cluster: 组 %d 读成员表: %w", g, err)
+				}
+				if !ok {
+					// 从未持久化过成员表（旧数据目录首次升级）：日志
+					// 若还有条目则重放合成，否则空表——截断过的组
+					// 必有持久化成员表，此分支实际不可达
+					cs, err = confStateFromEntries(ents, hs.GetCommit())
+					if err != nil {
+						return nil, fmt.Errorf("cluster: 组 %d 成员表合成: %w", g, err)
+					}
+					m.lg.Info("成员表由日志重放合成（旧数据目录首次升级）", "g", g,
+						"voters", cs.GetVoters(), "learners", cs.GetLearners())
+				} else {
+					cs = persisted
+				}
+			}
+			snap := &raftpb.Snapshot{Metadata: &raftpb.SnapshotMetadata{
+				Index:     &snapIndex,
+				Term:      &snapTerm,
+				ConfState: cs,
+			}}
+			if err := storage.ApplySnapshot(snap); err != nil {
+				return nil, fmt.Errorf("cluster: 组 %d 重放快照: %w", g, err)
+			}
+			if len(ents) > 0 {
+				if err := storage.Append(ents); err != nil {
+					return nil, fmt.Errorf("cluster: 组 %d 重放条目: %w", g, err)
+				}
+			}
+		} else if len(ents) > 0 {
 			first := ents[0]
 			snapIndex := first.GetIndex() - 1
 			// snapTerm 用首条条目的 term 近似「缺失条目 index-1 的 term」：

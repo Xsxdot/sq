@@ -11,10 +11,13 @@
 //   - 成员表的持久化（SaveConfState/LoadConfState）与重启恢复
 //     （Load + 干净关机判定）：成员表优先读持久化值，confStateFromEntries
 //     的日志重放合成仅作为旧数据目录的迁移路径
+//   - 快照锚点与日志截断（SaveSnapMeta/LoadSnapMeta/TruncateLog）：
+//     顺序契约恒为「先锚点后截断」——锚点 Sync 落盘是截断的前提，
+//     截断是范围删除；重启时锚点的 {Index, Term, ConfState} 就是
+//     MemoryStorage 快照的位点与成员表来源
 //   - 数据组数契约（EnsureGroups）与干净关机标记（Mark/ConsumeCleanShutdown）
 //
 // 边界：
-//   - 不做日志截断与快照（batch④）：日志无界增长，learner 追齐走全量重放
 //   - 不持有 pebble：一切写经 store 唯一写入口（NewBatch + ApplyWith），
 //     本层没有裸 db 句柄——B2 唯一写入口在集群层同样成立
 //   - applied 的写入两处：普通条目经 FSM apply 批次并进，ConfChange
@@ -28,6 +31,8 @@
 //	raft/<g>/hs                  → HardState protobuf
 //	raft/<g>/conf                → ConfState protobuf（成员表，ConfChange
 //	                               apply 时整表覆盖写，SaveConfState）
+//	raft/<g>/snap                → SnapshotMetadata protobuf（快照锚点，
+//	                               截断的前提，SaveSnapMeta Sync 落盘）
 //	raft/<g>/ent/<index 8B BE>   → Entry protobuf
 //	raft/<g>/applied             → uint64 BE applied index（普通条目经
 //	                               FSM 批次并进，ConfChange 与成员表同批）
@@ -54,6 +59,7 @@ const (
 	groupEntPrefixFmt = "raft/%d/ent/"
 	groupHsKeyFmt     = "raft/%d/hs"
 	groupConfFmt      = "raft/%d/conf"
+	groupSnapFmt      = "raft/%d/snap"
 	groupAppliedFmt   = "raft/%d/applied"
 )
 
@@ -123,26 +129,28 @@ func (r *raftStore) Persist(g uint32, hs *raftpb.HardState, ents []*raftpb.Entry
 	return nil
 }
 
-// Load 全量读回一组的 HardState 与全部日志条目（本批无截断，一条不落）。
+// Load 读回一组的 HardState、现存日志条目与快照元数据（截断锚点）。
 //
 // 返回：
 //   - hs: 从未持久化过时为空 HardState（raft.IsEmptyHardState 为真）
-//   - ents: 按 index 升序的全部条目，可能为空
+//   - ents: 按 index 升序的现存条目；截断过的组不含 ≤ 锚点 index 的
+//     条目（已被 TruncateLog 范围删除），可能为空（日志被全量截断）
+//   - snapMeta: 组的快照元数据（截断锚点）；从未截断过时为 nil
 //   - err: 读取或反序列化失败
 //
 // 注意：store.Scan 按 key 升序遍历，key 内 8B 大端 index 保证
 // 字节序=数值序，读回天然升序——spike 里兜底的显式 sort 在此可去。
 // 条目连续性由 raft 写入契约保证，本层不校验。
-func (r *raftStore) Load(g uint32) (*raftpb.HardState, []*raftpb.Entry, error) {
+func (r *raftStore) Load(g uint32) (*raftpb.HardState, []*raftpb.Entry, *raftpb.SnapshotMetadata, error) {
 	hs := &raftpb.HardState{}
 	hsData, ok, err := r.st.Get(hsKey(g))
 	if err != nil {
-		return nil, nil, fmt.Errorf("raftstore Load 组 %d 读 HardState: %w", g, err)
+		return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 读 HardState: %w", g, err)
 	}
 	if ok {
 		hs.Reset()
 		if err := proto.Unmarshal(hsData, hs); err != nil {
-			return nil, nil, fmt.Errorf("raftstore Load 组 %d 解码 HardState: %w", g, err)
+			return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 解码 HardState: %w", g, err)
 		}
 	}
 
@@ -160,11 +168,19 @@ func (r *raftStore) Load(g uint32) (*raftpb.HardState, []*raftpb.Entry, error) {
 			return true, nil
 		})
 	if err != nil {
-		return nil, nil, fmt.Errorf("raftstore Load 组 %d 扫描条目: %w", g, err)
+		return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 扫描条目: %w", g, err)
 	}
-	// 重启排障的第一行证据：组号、条目数、commit 位。
-	r.lg.Debug("raft 日志已读回", "g", g, "entries", len(ents), "commit", hs.GetCommit())
-	return hs, ents, nil
+
+	// 截断锚点与条目一并读回：buildGroup 用它在日志被全量截断时
+	// 恢复 MemoryStorage 的位点与成员表（见 buildGroup）。
+	snapMeta, _, err := r.LoadSnapMeta(g)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 读快照元数据: %w", g, err)
+	}
+	// 重启排障的第一行证据：组号、条目数、commit 位、锚点位。
+	r.lg.Debug("raft 日志已读回", "g", g, "entries", len(ents), "commit", hs.GetCommit(),
+		"snap", snapMeta.GetIndex())
+	return hs, ents, snapMeta, nil
 }
 
 // Applied 读取一组的已应用位点；从未写入过时返回 0。
@@ -227,6 +243,76 @@ func (r *raftStore) LoadConfState(g uint32) (*raftpb.ConfState, bool, error) {
 		return nil, false, fmt.Errorf("raftstore LoadConfState 组 %d 解码: %w", g, err)
 	}
 	return cs, true, nil
+}
+
+// SaveSnapMeta 持久化一组的快照元数据（截断锚点）。
+//
+// 元数据是截断的前提而非结果：raft 重启时用 FirstIndex-1 的 term 做
+// 任期比较，条目一旦删掉，那个 term 只能从这里查。因此顺序恒为
+// 「先 SaveSnapMeta（Sync）、后 TruncateLog」——反过来会在两次写之间
+// 留下「条目已删、锚点未落」的崩溃窗口，重启直接拒启。
+func (r *raftStore) SaveSnapMeta(g uint32, meta *raftpb.SnapshotMetadata) error {
+	data, err := proto.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("raftstore SaveSnapMeta 组 %d 编码: %w", g, err)
+	}
+	b := r.st.NewBatch()
+	if err := b.Set(snapKey(g), data); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore SaveSnapMeta 组 %d: %w", g, err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore SaveSnapMeta 组 %d: %w", g, err)
+	}
+	r.lg.Info("快照锚点已落盘", "g", g, "index", meta.GetIndex(), "term", meta.GetTerm())
+	return nil
+}
+
+// LoadSnapMeta 读回快照元数据；从未截断过时 ok=false。
+func (r *raftStore) LoadSnapMeta(g uint32) (*raftpb.SnapshotMetadata, bool, error) {
+	data, ok, err := r.st.Get(snapKey(g))
+	if err != nil {
+		return nil, false, fmt.Errorf("raftstore LoadSnapMeta 组 %d: %w", g, err)
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	meta := &raftpb.SnapshotMetadata{}
+	if err := proto.Unmarshal(data, meta); err != nil {
+		return nil, false, fmt.Errorf("raftstore LoadSnapMeta 组 %d 解码: %w", g, err)
+	}
+	return meta, true, nil
+}
+
+// TruncateLog 删除 index ≤ upto 的日志条目（Pebble range delete）。
+//
+// 前置：upto ≤ 已落盘 snap 元数据的 Index（锚点必须先落盘，见
+// SaveSnapMeta）。违反即报错拒绝执行——这是「先锚点后截断」顺序的
+// 编译期之外的运行期守卫。
+//
+// 幂等：重复截断到同一位点是 range delete 的无操作，周期截断会撞上。
+func (r *raftStore) TruncateLog(g uint32, upto uint64) error {
+	meta, ok, err := r.LoadSnapMeta(g)
+	if err != nil {
+		return err
+	}
+	if !ok || meta.GetIndex() < upto {
+		// 截断是「日志为什么变小了」的唯一解释，拒绝必须带锚点与请求位点
+		r.lg.Error("截断点越过快照锚点，拒绝执行", "g", g, "upto", upto,
+			"anchor_ok", ok, "anchor_index", meta.GetIndex())
+		return fmt.Errorf("raftstore TruncateLog 组 %d: 截断点 %d 越过快照锚点（锚点存在=%v, index=%d）——必须先 SaveSnapMeta",
+			g, upto, ok, meta.GetIndex())
+	}
+	b := r.st.NewBatch()
+	if err := b.DeleteRange(entKey(g, 0), entKey(g, upto+1)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore TruncateLog 组 %d 删条目(≤%d): %w", g, upto, err)
+	}
+	if err := r.st.ApplyWith(b, false); err != nil { // 截断丢了只是白留日志，无需 fsync
+		return fmt.Errorf("raftstore TruncateLog 组 %d: %w", g, err)
+	}
+	r.lg.Info("raft 日志已截断", "g", g, "upto", upto)
+	return nil
 }
 
 // EnsureGroups 校验数据组数与磁盘记录一致。
@@ -420,6 +506,12 @@ func appliedKey(g uint32) []byte {
 // （SaveConfState），单个固定键天然覆盖语义。
 func confKey(g uint32) []byte {
 	return []byte(fmt.Sprintf(groupConfFmt, g))
+}
+
+// snapKey 返回一组的快照锚点固定键。截断前整表覆盖写（SaveSnapMeta），
+// 单个固定键天然覆盖语义。
+func snapKey(g uint32) []byte {
+	return []byte(fmt.Sprintf(groupSnapFmt, g))
 }
 
 // putU32BE 大端编码 4 字节（组数/节点 ID 等 uint32 字段用；8B 用 store.PutU64）。
