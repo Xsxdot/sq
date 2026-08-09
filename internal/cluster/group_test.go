@@ -9,6 +9,7 @@ package cluster
 import (
 	"context"
 	"encoding/binary"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -73,6 +74,21 @@ func mustApplied(t *testing.T, rs *raftStore, g uint32) uint64 {
 		t.Fatalf("rs.Applied(%d): %v", g, err)
 	}
 	return idx
+}
+
+// newTestGroupWithHook 构造一个注入 OnLeaderChange 钩子的单节点自选举组
+// （成员表仅自身，同 startSingleNodeGroup 的装配方式），但不启动 run
+// 循环——钩子闭包通常捕获尚未赋值的 gr 变量，run 必须由调用方在
+// gr 赋值之后再启动（钩子触发前 gr 必然已赋值，无竞争）。
+func newTestGroupWithHook(t *testing.T, hook func(g uint32, leader uint64, isSelf bool)) *group {
+	t.Helper()
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	storage := raft.NewMemoryStorage()
+	gr := newGroup(0, 1, storage, nil, rs, st, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, hook, nil, testSlog(t))
+	rn := raft.StartNode(raftConfig(1, gr.stg), []raft.Peer{{ID: 1}})
+	gr.rn = rn
+	return gr
 }
 
 // TestGroupSingleNodeProposeApply 单节点单组最小闭环：propose 的批次
@@ -214,5 +230,43 @@ func TestGroupStepAfterDoneDoesNotBlock(t *testing.T) {
 	case <-done:
 	case <-time.After(1 * time.Second):
 		t.Fatal("step 在组退出后阻塞——违反不阻塞契约")
+	}
+}
+
+// TestLeaderVisibleOnlyAfterHookCompletes batch③ 评审 m1：
+// gr.lead.Store 早于 notifyLeaderChange，中间还隔着一条日志——
+// 这段窗口里 IsLeader 已放行而计数器缓存尚未失效，并发 Append
+// 会用陈旧 offset 覆写已 quorum 提交的消息。
+// 屏障要求：钩子跑完之前 IsLeader 必须仍为 false。
+func TestLeaderVisibleOnlyAfterHookCompletes(t *testing.T) {
+	var sawLeaderInsideHook atomic.Bool
+	var gr *group
+	hook := func(g uint32, leader uint64, isSelf bool) {
+		if !isSelf {
+			return
+		}
+		// 钩子执行期间，对外可见的 leader 身份必须还没生效
+		if gr.isLeader() {
+			sawLeaderInsideHook.Store(true)
+		}
+	}
+	gr = newTestGroupWithHook(t, hook) // 辅助：单节点组 + 注入钩子
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	go gr.run(ctx)
+	// 清理顺序同 startSingleNodeGroup：先注册等 done、后注册 cancel
+	// （LIFO 先 cancel 后等待）。必须等 run 完全退出——否则 run 可能
+	// 仍在 apply 时，openClusterTestStore 的关库清理已执行（pebble: closed）。
+	t.Cleanup(func() {
+		select {
+		case <-gr.done():
+		case <-time.After(5 * time.Second):
+			t.Error("group did not shut down within 5s")
+		}
+	})
+	t.Cleanup(cancel)
+	waitFor(t, 5*time.Second, gr.isLeader, "单节点组未当选")
+	if sawLeaderInsideHook.Load() {
+		t.Fatal("钩子执行期间 IsLeader 已返回 true——写屏障失效，"+
+			"并发 Append 会在计数器失效前拿到陈旧 offset")
 	}
 }

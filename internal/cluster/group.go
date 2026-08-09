@@ -99,6 +99,10 @@ type group struct {
 	inbox   chan *raftpb.Message
 	applied atomic.Uint64 // 已 apply 的最高条目 index（重启重放幂等的基础）
 	lead    atomic.Uint64 // 当前 leader 节点 ID，SoftState 变化时更新
+	// lastTerm 是最近一次非空 HardState 的 term 缓存（currentTerm 的
+	// 数据源）：HardState 只在有变化的那一轮非空，直接读
+	// rd.HardState.GetTerm() 在空轮次恒为 0——详见 currentTerm 注释
+	lastTerm atomic.Uint64
 
 	// confState 是当前成员表（rn.ApplyConfChange 的返回值，ConfChange
 	// apply 时同步更新）。重启时由 newGroup 从持久化值初始化（见
@@ -286,6 +290,9 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	}
 	if !raft.IsEmptyHardState(rd.HardState) {
 		_ = gr.mem.SetHardState(rd.HardState)
+		// 缓存本轮的 term（currentTerm 的数据源）：空 HardState 的轮次
+		// 不进这里，lastTerm 因此永远停留在「最近一次真实任期」
+		gr.lastTerm.Store(rd.HardState.GetTerm())
 	}
 	_ = gr.mem.Append(rd.Entries)
 	// 2. 发送 Messages：经注入的 send 回调外发（transport 发送永不
@@ -293,9 +300,14 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	gr.send(gr.g, rd.Messages)
 	// leader 变更观测：SoftState 变化是切换的第一信号（当选与失联都在此）
 	if rd.SoftState != nil {
-		gr.lead.Store(rd.SoftState.Lead)
-		gr.lg.Info("组 leader 变更", "lead", rd.SoftState.Lead, "term", rd.HardState.GetTerm())
+		// 顺序即屏障（batch③ 评审 m1）：先跑钩子（同步失效计数器缓存），
+		// 再让 lead.Store 把 leader 身份对外可见。反过来会留下
+		// 「IsLeader 已放行、缓存尚未失效」的窗口，并发 Append 拿到
+		// 陈旧 offset 覆写已 quorum 提交的消息。日志同样挪到 Store 之后，
+		// 别让一次 stdout 写入撑大窗口。
 		gr.notifyLeaderChange(rd.SoftState.Lead)
+		gr.lead.Store(rd.SoftState.Lead)
+		gr.lg.Info("组 leader 变更", "lead", rd.SoftState.Lead, "term", gr.currentTerm())
 	}
 	// 3. CommittedEntries apply
 	// 本轮回合的成员变更登记：Advance 后再通知（见循环外注释），
@@ -890,6 +902,20 @@ func (gr *group) leader() uint64 {
 // isLeader 返回本节点当前是否为 leader。
 func (gr *group) isLeader() bool {
 	return gr.lead.Load() == gr.selfID
+}
+
+// currentTerm 返回最近一次非空 HardState 缓存的 term（leader 变更
+// 日志取它，而非 rd.HardState.GetTerm()）。
+//
+// 为什么不能直接读 rd.HardState.GetTerm()：HardState 只在 term/commit/
+// vote 任一有变化的那一轮非空，其余轮次是空结构体、GetTerm() 恒为 0
+// ——而 leader 变更（SoftState 变化）恰恰常常与 HardState 变化不在
+// 同一轮（当选那一轮 SoftState 先变、HardState 下一轮才落盘），直接
+// 取值会在日志里打出 term=0，误导排查（backlog「首轮 leader 日志
+// term=0」）。lastTerm 在 HardState 非空的那一轮更新（见 handleReady），
+// 是「最近真实任期」的准确缓存。
+func (gr *group) currentTerm() uint64 {
+	return gr.lastTerm.Load()
 }
 
 // appliedIndex 返回已 apply 到 FSM 的最高条目 index。
