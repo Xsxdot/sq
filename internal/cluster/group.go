@@ -64,15 +64,19 @@ var ErrNotLeader = errors.New("cluster: 本节点不是该组 leader，提案被
 // group 是一个 raft 组运行体：tick 驱动选举/心跳，Ready 循环执行
 // 「持久化 → 发送 → apply → Advance」契约，FSM 为共享 store。
 type group struct {
-	g       uint32
-	rn      raft.Node
-	storage *raft.MemoryStorage // raft 库读取日志的易失视图
-	rs      *raftStore          // 日志的共库持久层
-	st      *store.Store        // 共享 store：FSM apply 的唯一落点
-	send    func(g uint32, msgs []*raftpb.Message)
-	mode    AckMode
-	lg      *slog.Logger
-	selfID  uint64 // 本节点 ID：构造时从 rn.Status() 取一次，isLeader 比较用
+	g  uint32
+	rn raft.Node // 由装配方在 newGroup 之后创建并赋值（Config.Storage 要包了快照生成器的 stg）
+	// 日志存储双记账（Task 4）：mem 是 raft 库读写日志的易失视图
+	// （Append/SetHardState/Compact），stg 是包在 mem 外的 raft.Storage
+	// 包装——raft 经它读日志，Snapshot() 由 groupStorage 现场生成
+	mem    *raft.MemoryStorage
+	stg    raft.Storage
+	rs     *raftStore   // 日志的共库持久层
+	st     *store.Store // 共享 store：FSM apply 的唯一落点
+	send   func(g uint32, msgs []*raftpb.Message)
+	mode   AckMode
+	lg     *slog.Logger
+	selfID uint64 // 本节点 ID：newGroup 装配参数，isLeader 比较与快照描述符 leader 字段用
 
 	// 装配钩子（nil 安全，见 notifyLeaderChange/notifyApplied 的契约注释）：
 	// 在 Ready 循环内同步触发，不得阻塞；重活由装配代码自行 dispatch。
@@ -91,6 +95,12 @@ type group struct {
 	// newGroup）；Task 4 的 Storage.Snapshot() 现场取用它生成快照。
 	confState atomic.Pointer[raftpb.ConfState]
 
+	// applyMu 串行化「写 FSM 批次 + 推 applied」临界区与快照生成
+	// （Task 4）：groupStorage.Snapshot() 在同一把锁内读 applied 与建
+	// ReadView，视图内容恰好对应该位点。持锁时间必须短——只覆盖批
+	// 提交 + Store(applied)，apply 路径绝不可在锁内阻塞等待。
+	applyMu sync.Mutex
+
 	doneCh chan struct{} // run 循环完全退出后关闭，测试/调用方同步用
 
 	// waiter 双命名空间（终审观察项①）：普通提案与成员变更的 id 共用
@@ -108,8 +118,10 @@ type group struct {
 //
 // 参数：
 //   - g: 数据组号
-//   - rn: 已用 StartNode 启动的 raft 节点
+//   - selfID: 本节点 ID（装配方传入；也写进快照描述符的 leader 字段）
 //   - storage: raft 库要求的易失存储视图（重启恢复时由 Manager 回放日志）
+//   - snaps: 快照注册表（Manager 每个实例一份，全组共享；nil 时按默认
+//     TTL 自建，单组单元测试路径用）
 //   - rs: 日志持久层（同一 store 库）
 //   - st: 共享 store，FSM apply 的唯一落点
 //   - send: 消息外发回调（Manager 里接 transport 并短路本节点，Task 5）
@@ -119,15 +131,16 @@ type group struct {
 //   - lg: 结构化日志（nil 时退化为 slog.Default）
 //
 // 返回：
-//   - 就绪的 *group（未启动）
-func newGroup(g uint32, rn raft.Node, storage *raft.MemoryStorage, rs *raftStore, st *store.Store, send func(g uint32, msgs []*raftpb.Message), mode AckMode, onLeaderChange func(g uint32, leader uint64, isSelf bool), onApplied func(g uint32, repr []byte), lg *slog.Logger) *group {
+//   - 就绪的 *group（rn 尚未赋值——装配方须以 gr.stg 建 raft.Config、
+//     创建 raft.Node 后回填 gr.rn）
+func newGroup(g uint32, selfID uint64, storage *raft.MemoryStorage, snaps *snapRegistry, rs *raftStore, st *store.Store, send func(g uint32, msgs []*raftpb.Message), mode AckMode, onLeaderChange func(g uint32, leader uint64, isSelf bool), onApplied func(g uint32, repr []byte), lg *slog.Logger) *group {
 	if lg == nil {
 		lg = slog.Default()
 	}
 	gr := &group{
 		g:              g,
-		rn:             rn,
-		storage:        storage,
+		selfID:         selfID,
+		mem:            storage,
 		rs:             rs,
 		st:             st,
 		send:           send,
@@ -135,7 +148,6 @@ func newGroup(g uint32, rn raft.Node, storage *raft.MemoryStorage, rs *raftStore
 		onLeaderChange: onLeaderChange,
 		onApplied:      onApplied,
 		lg:             lg.With("mod", "group", "g", g),
-		selfID:         rn.Status().ID,
 		inbox:          make(chan *raftpb.Message, 1024),
 		propWaiters:    make(map[uint64]chan struct{}),
 		ccWaiters:      make(map[uint64]chan struct{}),
@@ -158,17 +170,33 @@ func newGroup(g uint32, rn raft.Node, storage *raft.MemoryStorage, rs *raftStore
 			gr.confState.Store(cs)
 		}
 	}
+	// 快照包装（Task 4）：raft 的 Config.Storage 用包在 mem 外的 stg——
+	// raft 给落后 follower 发 MsgSnap 时调用的是 groupStorage.Snapshot()
+	// 的现场生成逻辑，而不是 MemoryStorage 的预置快照。stg 引用组内
+	// atomics（applied/confState）与 applyMu，只能在本函数末尾、组骨架
+	// 就绪后创建；raft.Node 的创建因此推迟到 newGroup 之后（装配方做）。
+	reg := snaps
+	if reg == nil {
+		// 未注入注册表的路径（单组单元测试）：按默认 TTL 自建一个，
+		// 保证 Snapshot() 的 reg 永不为空
+		reg = newSnapRegistry(gr.st, snapRegistryDefaultTTL, gr.lg)
+	}
+	gr.stg = newGroupStorage(g, storage, reg, &gr.applied, &gr.confState, gr.selfID, &gr.applyMu, gr.lg)
 	return gr
 }
 
 // raftConfig 构造共享的 raft 配置：tick 参数、单消息/在途日志上限、
 // 丢弃日志器（raft 库自身日志噪音大，关键节点由我们的 slog 承担）。
 //
+// storage 为 raft.Storage 接口：装配方传入包了快照生成器的 stg——
+// raft 经它读日志，需要给落后 follower 发 MsgSnap 时调用它的
+// Snapshot() 现场生成（Task 4）。
+//
 // DisableProposalForwarding 是内核契约：follower 上的 Propose 必须
 // 报错（batch③ 据此翻译成客户端可重试码），不静默转发——默认行为会
 // 把提案转发给 leader 并假成功，且任意字节载荷经转发进入日志后在
 // apply 时炸 FSM（batch④ 集成测试抓到的缺口，见 TestClusterProposeOnFollowerFails）。
-func raftConfig(id uint64, storage *raft.MemoryStorage) *raft.Config {
+func raftConfig(id uint64, storage raft.Storage) *raft.Config {
 	return &raft.Config{
 		ID:              id,
 		ElectionTick:    10,
@@ -229,9 +257,9 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 		panic(err)
 	}
 	if !raft.IsEmptyHardState(rd.HardState) {
-		_ = gr.storage.SetHardState(rd.HardState)
+		_ = gr.mem.SetHardState(rd.HardState)
 	}
-	_ = gr.storage.Append(rd.Entries)
+	_ = gr.mem.Append(rd.Entries)
 	// 2. 发送 Messages：经注入的 send 回调外发（transport 发送永不
 	//    阻塞——满则丢，raft 心跳重试兜底，Task 3 契约）
 	gr.send(gr.g, rd.Messages)
@@ -394,11 +422,18 @@ func (gr *group) applyEntry(index uint64, data []byte) {
 	}
 	// FSM 数据与 applied 位点同批提交。apply 总是 NoSync：持久性由
 	// raft 日志与后台批量刷盘承担（spec §5），不另起 fsync。
+	// 「批提交 + 推 applied」在 applyMu 临界区内（Task 4）：快照生成在
+	// 同一把锁内读 applied 并建 ReadView，二者互斥——视图内容恰好对
+	// 应该位点，不会出现「快照声称包含它其实没有的数据」。持锁时间
+	// 只有一次批提交，无任何等待。
+	gr.applyMu.Lock()
 	if err := gr.st.ApplyWith(b, false); err != nil {
+		gr.applyMu.Unlock()
 		gr.lg.Error("FSM apply 失败，组停摆", "index", index, "err", err)
 		panic(err)
 	}
 	gr.applied.Store(index)
+	gr.applyMu.Unlock()
 	gr.notifyApplied(data)
 }
 

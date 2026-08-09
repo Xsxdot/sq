@@ -124,8 +124,9 @@ type Manager struct {
 	rs         *raftStore
 	lg         *slog.Logger
 	groups     map[uint32]*group
-	ln         net.Listener // 本节点监听：NewManager 持有，Start 移交传输层
-	tr         *transport   // Start 时装配；send 回调运行时取值，必已就绪
+	snaps      *snapRegistry // 快照注册表（Task 4）：全组共享一份，组 Storage.Snapshot() 现场登记 ReadView
+	ln         net.Listener  // 本节点监听：NewManager 持有，Start 移交传输层
+	tr         *transport    // Start 时装配；send 回调运行时取值，必已就绪
 
 	// 装配钩子（Options 透传，nil 安全）：每个组共享同一份，契约见
 	// Options 字段注释（Ready 循环内同步触发，不得阻塞）
@@ -204,6 +205,9 @@ func NewManager(o Options) (*Manager, error) {
 		doneCh:                 make(chan struct{}),
 	}
 	m.rs = newRaftStore(o.Store, lg)
+	// 快照注册表：每个 Manager 一份，全组共享（Task 4）。TTL 用默认
+	// 常量，生产可调值由 Task 8 的配置面接管。
+	m.snaps = newSnapRegistry(o.Store, snapRegistryDefaultTTL, lg)
 
 	// PrepareJoin handler 自装（batch③）：在任何注入的 ControlHandler
 	// 之前包一层——OpPrepareJoin 由 Manager 内部处理（重入编排协议面），
@@ -290,7 +294,6 @@ func NewManager(o Options) (*Manager, error) {
 func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, error) {
 	storage := raft.NewMemoryStorage()
 	applied := uint64(0)
-	var rn raft.Node
 	if clean {
 		hs, ents, snapMeta, err := m.rs.Load(g)
 		if err != nil {
@@ -382,13 +385,22 @@ func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, e
 		if err != nil {
 			return nil, fmt.Errorf("cluster: 组 %d 读 applied: %w", g, err)
 		}
-		cfg := raftConfig(m.nodeID, storage)
+	}
+	gr := newGroup(g, m.nodeID, storage, m.snaps, m.rs, m.st, m.send, m.mode, m.onLeaderChange, m.onApplied, m.lg)
+	// raft 节点在 newGroup 之后装配：Config.Storage 必须用包了快照生成
+	// 器的 stg——raft 给落后 follower 发 MsgSnap 时调用的是
+	// groupStorage.Snapshot() 的现场生成，而非 MemoryStorage 的预置快照；
+	// 而 stg 引用组内 atomics（applied/confState/applyMu），只能在组骨架
+	// 就绪后创建（见 newGroup 注释）。
+	cfg := raftConfig(m.nodeID, gr.stg)
+	var rn raft.Node
+	if clean {
 		cfg.Applied = applied
 		rn = raft.RestartNode(cfg)
 	} else {
-		rn = raft.StartNode(raftConfig(m.nodeID, storage), peers)
+		rn = raft.StartNode(cfg, peers)
 	}
-	gr := newGroup(g, rn, storage, m.rs, m.st, m.send, m.mode, m.onLeaderChange, m.onApplied, m.lg)
+	gr.rn = rn
 	// 重启重放跳过守卫：raft 从 applied+1 重投递，内存 applied 必须先
 	// 从磁盘位点填充，否则已 apply 的条目会被重放（Task 4 约定）；
 	// fresh 路径 applied=0，Store 无副作用
@@ -649,7 +661,7 @@ func (m *Manager) promoteLearners(g uint32) {
 	// 先取 lastIndex 锚点再取 Status：Status 里的 Match 只会比锚点
 	// 更新——若反过来，锚点后移会让「已追上旧锚点」的 learner 被
 	// 误判为追平（少收一两条新条目），提前升 voter
-	lastIndex, err := gr.storage.LastIndex()
+	lastIndex, err := gr.stg.LastIndex()
 	if err != nil {
 		// MemoryStorage 的 LastIndex 在正常路径不可达错误（无快照时
 		// 退化为 0），防御性跳过本轮

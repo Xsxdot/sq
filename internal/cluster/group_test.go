@@ -24,9 +24,12 @@ import (
 func startSingleNodeGroup(t *testing.T, g uint32, rs *raftStore, st *store.Store, mode AckMode) *group {
 	t.Helper()
 	storage := raft.NewMemoryStorage()
-	rn := raft.StartNode(raftConfig(1, storage), []raft.Peer{{ID: 1}})
+	gr := newGroup(g, 1, storage, nil, rs, st, func(uint32, []*raftpb.Message) {}, mode, nil, nil, testSlog(t))
+	// raft 节点在 newGroup 之后装配（Config.Storage 用包了快照生成器
+	// 的 gr.stg，见 newGroup 注释），回填 gr.rn 后启动
+	rn := raft.StartNode(raftConfig(1, gr.stg), []raft.Peer{{ID: 1}})
+	gr.rn = rn
 	ctx, cancel := context.WithCancel(context.Background())
-	gr := newGroup(g, rn, storage, rs, st, func(uint32, []*raftpb.Message) {}, mode, nil, nil, testSlog(t))
 	go gr.run(ctx)
 	// 先注册等 done、后注册 cancel：LIFO 保证 cancel 先于等待执行，
 	// 否则等待会在取消前启动，组永远不会退出。
@@ -46,9 +49,10 @@ func startSingleNodeGroup(t *testing.T, g uint32, rs *raftStore, st *store.Store
 func startLoneGroupOfThree(t *testing.T, g uint32, rs *raftStore, st *store.Store) *group {
 	t.Helper()
 	storage := raft.NewMemoryStorage()
-	rn := raft.StartNode(raftConfig(1, storage), []raft.Peer{{ID: 1}, {ID: 2}, {ID: 3}})
+	gr := newGroup(g, 1, storage, nil, rs, st, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, nil, nil, testSlog(t))
+	rn := raft.StartNode(raftConfig(1, gr.stg), []raft.Peer{{ID: 1}, {ID: 2}, {ID: 3}})
+	gr.rn = rn
 	ctx, cancel := context.WithCancel(context.Background())
-	gr := newGroup(g, rn, storage, rs, st, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, nil, nil, testSlog(t))
 	go gr.run(ctx)
 	t.Cleanup(func() {
 		select {
@@ -149,8 +153,9 @@ func TestProposalWaiterScopedToProposer(t *testing.T) {
 	// nextID 时间戳种子：newGroup 后计数器必须远离 0（重启回零是
 	// 跨节点碰撞的第二条路径，由种子 + 提案者校验双保险覆盖）
 	storage := raft.NewMemoryStorage()
-	rn := raft.StartNode(raftConfig(1, storage), []raft.Peer{{ID: 1}})
-	gr := newGroup(0, rn, storage, nil, nil, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, nil, nil, testSlog(t))
+	gr := newGroup(0, 1, storage, nil, nil, nil, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, nil, nil, testSlog(t))
+	rn := raft.StartNode(raftConfig(1, gr.stg), []raft.Peer{{ID: 1}})
+	gr.rn = rn
 	if gr.nextID.Load() == 0 {
 		t.Fatal("nextID 应为时间戳种子（非零）——重启后计数器不得回零")
 	}
@@ -186,9 +191,10 @@ func TestGroupStepAfterDoneDoesNotBlock(t *testing.T) {
 	st := openClusterTestStore(t)
 	rs := newRaftStore(st, testSlog(t))
 	storage := raft.NewMemoryStorage()
-	rn := raft.StartNode(raftConfig(1, storage), []raft.Peer{{ID: 1}})
+	gr := newGroup(0, 1, storage, nil, rs, st, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, nil, nil, testSlog(t))
+	rn := raft.StartNode(raftConfig(1, gr.stg), []raft.Peer{{ID: 1}})
+	gr.rn = rn
 	ctx, cancel := context.WithCancel(context.Background())
-	gr := newGroup(0, rn, storage, rs, st, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, nil, nil, testSlog(t))
 	go gr.run(ctx)
 	cancel()
 	select {
