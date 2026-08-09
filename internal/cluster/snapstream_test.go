@@ -10,6 +10,7 @@
 package cluster
 
 import (
+	"fmt"
 	"testing"
 
 	"github.com/xushixin/sq/internal/store"
@@ -141,5 +142,95 @@ func TestChunkRoundTrip(t *testing.T) {
 	}
 	if _, err := decodeChunk([]byte{0, 0, 0, 9, 'x'}); err == nil {
 		t.Fatal("坏块（声称长度超出剩余字节）必须报错")
+	}
+}
+
+// TestScanGroupKeysMultiFamilyMultiBlockConverges 多键族 + 多块续扫收敛
+// （C1 回归测试）：数据组同时存在 msg/ 与 cursor/ 两个键族，单块
+// budget 装不下全部键，跨块续扫必须做到每键恰好一次——不漏、不重、
+// 不多，并终止于 done。
+//
+// 修复前 groupKeyRanges 对数据组按字面序返回区间（msg/ 在首），但
+// 字节序是 alloc/ cursor/ inflight/ keyidx/ msg/——「区间按字节序
+// 升序」的续扫前提对数据组不成立：从 msg/ 续扫到字节序更小的 cursor/
+// 段时游标回跳，cursor/ 整族被跳过（静默漏发）。修复后区间按字节序
+// 重排，游标单调推进，跨块必然收敛。
+func TestScanGroupKeysMultiFamilyMultiBlockConverges(t *testing.T) {
+	const groups = uint32(3)
+	const g = uint32(1) // 数据组 1；种子按哈希归属筛选，键天然只进本组
+	st := openClusterTestStore(t)
+
+	// 种多键族数据：325 个 msg 键 + 65 个 cursor 键，全部归属组 g。
+	// 队列→组是散布哈希，循环扫描队列号只挑归属 == g 的写，凑够数量。
+	var want []string
+	b := st.NewBatch()
+	for q, n := uint32(0), 0; n < 325; q++ {
+		if groupForQueue("T", q, groups) != g {
+			continue
+		}
+		k := store.MsgKey("T", q, 1)
+		want = append(want, string(k))
+		if err := b.Set(k, []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		n++
+	}
+	for q, n := uint32(0), 0; n < 65; q++ {
+		if groupForQueue("U", q, groups) != g {
+			continue
+		}
+		k := store.CursorKey("cg", "U", q)
+		want = append(want, string(k))
+		if err := b.Set(k, []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		n++
+	}
+	if err := st.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	view := st.NewReadView()
+	defer view.Close()
+
+	for _, budget := range []int{100, 4} { // 100：多块常规；4：贴边界极小预算
+		t.Run(fmt.Sprintf("budget%d", budget), func(t *testing.T) {
+			got := map[string]int{}
+			from := []byte(nil)
+			for blocks := 0; ; blocks++ {
+				next, done, err := scanGroupKeys(view, g, groups, from, budget, func(k, _ []byte) error {
+					got[string(k)]++
+					return nil
+				})
+				if err != nil {
+					t.Fatal(err)
+				}
+				if done {
+					break
+				}
+				if blocks == 499 {
+					t.Fatal("500 块未收敛到 done：续扫游标不单调推进")
+				}
+				from = next
+			}
+			// 不漏：种子键必须全部出现
+			for _, k := range want {
+				if got[k] == 0 {
+					t.Fatalf("漏键 %q（续扫跳段把字节序更小的键族吞了）", k)
+				}
+			}
+			// 不重：每个键恰好出现一次
+			for k, n := range got {
+				if n > 1 {
+					t.Fatalf("键 %q 被重发 %d 次（游标回跳重扫）", k, n)
+				}
+				kg, perr := keyGroupOf([]byte(k), groups)
+				if perr != nil {
+					t.Fatalf("组 %d 枚举混入不可解析键 %q: %v", g, k, perr)
+				}
+				if kg != g {
+					t.Fatalf("组 %d 枚举混入别组键 %q（归属 %d）", g, k, kg)
+				}
+			}
+		})
 	}
 }

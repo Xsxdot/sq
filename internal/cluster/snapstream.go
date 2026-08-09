@@ -24,6 +24,8 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"sort"
+	"strings"
 
 	"github.com/xushixin/sq/internal/store"
 )
@@ -50,6 +52,14 @@ type keyRange struct {
 	upper []byte
 }
 
+// keyRanges 实现 sort.Interface：按 lower 字节序升序，供 groupKeyRanges
+// 排序与 IsSorted 断言复用（续扫单调性的强制不变量，见 groupKeyRanges）。
+type keyRanges []keyRange
+
+func (r keyRanges) Len() int           { return len(r) }
+func (r keyRanges) Less(i, j int) bool { return bytes.Compare(r[i].lower, r[j].lower) < 0 }
+func (r keyRanges) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
+
 // groupKeyRanges 返回组 g 的键扫描区间集。
 //
 // 组 0 是全局键族：meta/、delay/、half/、halfidx/ 连续前缀 + delayalloc
@@ -58,8 +68,15 @@ type keyRange struct {
 // 与 raft/（日志区，不是 FSM，接收方自己落盘日志）。
 //
 // 数据组（g>0）是五段前缀区间，归属过滤由 scanGroupKeys 逐键完成
-// （见文件头注释：哈希散布，不能整段搬）。区间按字节序升序排列，
-// 保证 from 游标续扫时「本范围扫完才进下一段」的推进方向单调。
+// （见文件头注释：哈希散布，不能整段搬）。区间统一按字节序升序排列：
+// 组 0 的全局前缀字面序即字节序（排序是恒等变换）；数据组的五段前缀
+// 则必须重排为 alloc/ cursor/ inflight/ keyidx/ msg/——字面序 msg/
+// 在首，若按字面序扫描，from 游标跨段后跳回字节序更小的键族，续扫
+// 推进不单调：要么整族静默漏掉，要么整族反复重扫、永无 done。
+//
+// 排序完成后立即断言 enforce：这是 scanGroupKeys 游标推进规则的前提，
+// 不能只靠注释承诺——未来键族前缀改名（如 msg/ → message/）破坏字节序
+// 时，在快照路径上以最小代价 panic，而不是静默重发/丢键。
 func groupKeyRanges(g uint32) []keyRange {
 	meta := [][]byte{[]byte("delay/"), []byte("delayalloc"), []byte("half/"), []byte("halfidx/"), []byte("meta/")}
 	if g == MetaGroup {
@@ -67,6 +84,8 @@ func groupKeyRanges(g uint32) []keyRange {
 		for _, lower := range meta {
 			ranges = append(ranges, keyRange{lower: lower, upper: store.PrefixUpperBound(lower)})
 		}
+		sort.Sort(keyRanges(ranges))
+		assertRangesSorted(g, ranges)
 		return ranges
 	}
 	data := [][]byte{[]byte(msgPrefix), []byte(allocPrefix), []byte(keyIdxPrefix), []byte(cursorPrefix), []byte(inflightPrefix)}
@@ -74,7 +93,23 @@ func groupKeyRanges(g uint32) []keyRange {
 	for _, lower := range data {
 		ranges = append(ranges, keyRange{lower: lower, upper: store.PrefixUpperBound(lower)})
 	}
+	sort.Sort(keyRanges(ranges))
+	assertRangesSorted(g, ranges)
 	return ranges
+}
+
+// assertRangesSorted 断言区间集已按 lower 字节序升序，乱序即 panic。
+// 续扫单调性是 scanGroupKeys 全部游标推进规则的前提，破坏它 = 静默
+// 漏发/死循环，比快照生成失败严重得多，因此用 panic 而不是 error。
+func assertRangesSorted(g uint32, ranges []keyRange) {
+	if sort.IsSorted(keyRanges(ranges)) {
+		return
+	}
+	lowers := make([]string, 0, len(ranges))
+	for _, r := range ranges {
+		lowers = append(lowers, fmt.Sprintf("%q", r.lower))
+	}
+	panic(fmt.Sprintf("cluster: 组 %d 键区间未按字节序升序排列: [%s]", g, strings.Join(lowers, " ")))
 }
 
 // groupForQueue 计算 topic+queueID 归属的数据组号（1..groups）。
