@@ -35,6 +35,7 @@ import (
 	"testing"
 	"time"
 
+	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
 	"github.com/xushixin/sq/internal/core"
@@ -1285,8 +1286,10 @@ func (tc *testCluster) waitVoter(t *testing.T, g uint32, nodeID uint64, timeout 
 type snapHarness struct {
 	nodes  []*Manager        // index = nodeID-1（节点 1..3）
 	stores []*store.Store    // 与 nodes 同序（清理用）
+	dirs   []string          // 与 nodes 同序：原地重启（关 store → 同目录重开）用
 	peers  map[uint64]string // 节点 id → raft 监听地址（分区用例备用）
 	mode   AckMode
+	retain uint64 // 节点截断保留量（Options.RetainEntries 透传，重启时复刻）
 	logs   []*logCapture // 与 nodes 同序：countLog 的检索源（快照路径证据）
 }
 
@@ -1365,12 +1368,14 @@ func startThreeNodeCluster(t *testing.T, opts ...func(*Options)) *snapHarness {
 	}
 	h := &snapHarness{peers: peers, mode: AckQuorumMem}
 	for i := uint64(1); i <= n; i++ {
-		st, err := store.Open(fmt.Sprintf("%s/%d", t.TempDir(), i), false, testSlog(t))
+		dir := fmt.Sprintf("%s/%d", t.TempDir(), i)
+		st, err := store.Open(dir, false, testSlog(t))
 		if err != nil {
 			t.Fatalf("节点 %d 开 store: %v", i, err)
 		}
 		cap := &logCapture{}
 		h.logs = append(h.logs, cap)
+		h.dirs = append(h.dirs, dir)
 		base := Options{
 			NodeID:     i,
 			Peers:      peers,
@@ -1383,6 +1388,7 @@ func startThreeNodeCluster(t *testing.T, opts ...func(*Options)) *snapHarness {
 		for _, o := range opts {
 			o(&base)
 		}
+		h.retain = base.RetainEntries
 		m, err := NewManager(base)
 		if err != nil {
 			t.Fatalf("节点 %d NewManager: %v", i, err)
@@ -1423,6 +1429,77 @@ func (h *snapHarness) stopAll() {
 			_ = err // 停机错误不吞测试主流程；细节归 Cleanup 日志
 		}
 	}
+}
+
+// stopNodeClean 把单个节点原地干净停机并关闭其 store（重启测试用）。
+// 停机 = 全机件退出 + 干净关机标记落盘；关 store 释放 pebble 文件锁，
+// 之后才能同目录重开。
+func (h *snapHarness) stopNodeClean(t *testing.T, idx int) {
+	t.Helper()
+	m := h.nodes[idx]
+	if err := m.StopClean(context.Background()); err != nil {
+		t.Fatalf("节点 %d 干净停机: %v", m.nodeID, err)
+	}
+	select {
+	case <-m.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatalf("节点 %d 未在 10s 内完全退出", m.nodeID)
+	}
+	if err := h.stores[idx].Close(); err != nil {
+		t.Fatalf("节点 %d 关 store: %v", m.nodeID, err)
+	}
+}
+
+// startNode 在已停机节点的目录上原地重建节点（同目录重开 store +
+// NewManager + Start），并替换 harness 里的节点/store/日志引用。
+//
+// 为什么监听复用原地址：传输层对端按 Peers 表地址拨号，重启后地址变
+// 了对端永远拨不通；同地址重绑依赖 Go 监听默认 SO_REUSEADDR（旧连接
+// 断开后端口立即可重绑）。
+//
+// 注意：新 Manager 的传输层从零开始（无分区状态）——调用方按需自行
+// 处理分区语义。opts 是 Options 级注入（如重新注入 RetainEntries）。
+func (h *snapHarness) startNode(t *testing.T, idx int, opts ...func(*Options)) *Manager {
+	t.Helper()
+	nodeID := uint64(idx + 1)
+	ln, err := net.Listen("tcp", h.peers[nodeID])
+	if err != nil {
+		t.Fatalf("节点 %d 重绑监听 %s: %v", nodeID, h.peers[nodeID], err)
+	}
+	st, err := store.Open(h.dirs[idx], false, testSlog(t))
+	if err != nil {
+		t.Fatalf("节点 %d 重开 store: %v", nodeID, err)
+	}
+	cap := &logCapture{}
+	base := Options{
+		NodeID:        nodeID,
+		Peers:         h.peers,
+		Listener:      ln,
+		DataGroups:    3,
+		Mode:          h.mode,
+		Store:         st,
+		Logger:        newCaptureSlog(t, cap),
+		RetainEntries: h.retain,
+	}
+	for _, o := range opts {
+		o(&base)
+	}
+	m, err := NewManager(base)
+	if err != nil {
+		t.Fatalf("节点 %d 重启 NewManager: %v", nodeID, err)
+	}
+	m.Start(context.Background())
+	h.nodes[idx] = m
+	h.stores[idx] = st
+	h.logs[idx] = cap
+	return m
+}
+
+// restartNodeClean 原地干净重启节点：stopNodeClean + startNode 一次完成。
+func (h *snapHarness) restartNodeClean(t *testing.T, idx int, opts ...func(*Options)) *Manager {
+	t.Helper()
+	h.stopNodeClean(t, idx)
+	return h.startNode(t, idx, opts...)
 }
 
 // leaderOf 返回组 g 当前 leader 的 Manager，带 WaitLeader 轮询语义
@@ -1670,6 +1747,188 @@ func TestLaggingFollowerCatchesUpBySnapshot(t *testing.T) {
 		_, ok, _ := victim.Store().Get(store.TopicMetaKey("S199"))
 		return ok && h.countLog(victim, "快照安装完成") >= 1
 	}, "落后节点未在 60s 内经快照追平（数据可见或「快照安装完成」日志缺失）")
+}
+
+// TestInstallingMarkerRestartClearsRaftLog（C1 修复）安装中标记重启必须
+// 把本组 raft 日志与 HardState 一并清空：重启后 firstIndex=1，leader
+// 的探测一路回退到日志起点，只能全量重放或发快照——两条路径都完整，
+// 杜绝「半截状态当完整状态启动」的静默丢段。
+//
+// 磁盘实况的复现（与 C1 描述逐条对应）：
+//   - R1 批先写入并等 victim 追平：此刻 X 的日志覆盖 1..P1（P1=54），
+//     FSM 含全部 R1 键
+//   - 隔断 X；leader 写 R2 批（55..104）并把日志截断到 96——X 落在
+//     截断点之下，只能靠快照追平（对应 C1 的「开始一次快照安装」）
+//   - 在 X 上直接制造安装中崩溃痕迹：MarkInstalling（安装第 2 步的
+//     标记）+ wipeGroupKeys（第 3 步的 FSM 清空），然后干净关机——
+//     模拟滚动重启中途关机的半截状态
+//   - X 停机期间在盘上制造 C1 前提「日志被截断在锚点 A1」：
+//     SaveSnapMeta(A1 = P1-8) + TruncateLog(A1)，X 的日志只剩
+//     A1+1..P1，状态 1..A1 只在 FSM 侧存在过（对应 C1 的「raft log
+//     truncated at anchor A」）
+//   - 杀掉旧 leader 后重启 X：处理 X 追平的是新 leader，它不知道 X
+//     的日志起点，只能靠探测从头摸起——正是 C1 描述里「换人后探测锚
+//     在 A+1..P 上撞车、永不发快照」的缺口场景
+//
+// 断言：
+//   - X 重启瞬间（NewManager 返回后、Start 前）日志必须全空：ents 空、
+//     HardState 空、无锚点、applied=0、firstIndex=1——这是修复的判定面
+//   - X 最终收敛到完整状态：锚点之前的 R1 键（R1_00/R1_10/R1_41，即
+//     C1 的静默丢失键）与停机后的 R2 批全部可读
+//   - 换人后的集群继续正常服务：新 leader 再写 R3 批，X 追平
+//
+// 修复前本测试失败于「R1_00 不在 X 上」：旧代码只清 applied 不动日志，
+// A1+1..P1 原样保留，新 leader 探测锚在 P1 上撞车、只流式重放 P1+1..，
+// X 的 FSM 永久缺 1..A1（R1 键全部丢失）。
+func TestInstallingMarkerRestartClearsRaftLog(t *testing.T) {
+	h := startThreeNodeCluster(t, withRetainEntries(8))
+	defer h.stopAll()
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	victim := h.nonLeaderOf(t, 0)
+	vi := int(victim.nodeID - 1)
+	leader := h.leaderOf(t, 0)
+	// 第三个节点：日志从未被截断，锚点 term 与换人后的选举都靠它
+	var other *Manager
+	for _, m := range h.nodes {
+		if m != victim && m != leader {
+			other = m
+		}
+	}
+	if other == nil {
+		t.Fatal("测试前提不成立：需要既非 leader 也非 victim 的第三个节点")
+	}
+
+	// R1 批（条目 5..54）：victim 追平后其日志覆盖 1..54
+	for i := 0; i < 50; i++ {
+		b := leader.Store().NewBatch()
+		if err := b.Set(store.TopicMetaKey(fmt.Sprintf("R1_%02d", i)), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		if err := leader.Propose(ctx, 0, b.Repr()); err != nil {
+			t.Fatal(err)
+		}
+		b.Close()
+	}
+	waitFor(t, 30*time.Second, func() bool {
+		_, ok, _ := victim.Store().Get(store.TopicMetaKey("R1_49"))
+		return ok
+	}, "victim 未追平 R1 批")
+
+	// 隔断 X，记下其位点（隔断期间不再推进），leader 写 R2 批并截断到
+	// X 的位点之上——X 只能靠快照追平
+	h.partitionOff(victim)
+	xApplied := victim.AppliedIndex(0)
+	for i := 0; i < 50; i++ {
+		b := leader.Store().NewBatch()
+		if err := b.Set(store.TopicMetaKey(fmt.Sprintf("R2_%02d", i)), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		if err := leader.Propose(ctx, 0, b.Repr()); err != nil {
+			t.Fatal(err)
+		}
+		b.Close()
+	}
+	h.truncateNow(t, 0)
+
+	// 制造安装中崩溃痕迹：标记（安装第 2 步，Sync）+ FSM 清空（第 3 步）
+	idx, tm := xApplied, victim.groups[0].currentTerm()
+	if err := victim.rs.MarkInstalling(0, &raftpb.SnapshotMetadata{Index: &idx, Term: &tm}); err != nil {
+		t.Fatal(err)
+	}
+	if err := wipeGroupKeys(victim.Store(), 0, victim.dataGroups); err != nil {
+		t.Fatal(err)
+	}
+	h.stopNodeClean(t, vi)
+
+	// 停机期间制造 C1 前提「日志被截断在锚点 A1」：X 的日志只剩
+	// A1+1..P1。锚点 index 与截断循环同形（applied - retain），term
+	// 取未截断节点日志里的真实 term（leader 的日志已截到 96，查不到）。
+	a1 := xApplied - uint64(8)
+	a1Term, err := other.groups[0].mem.Term(a1)
+	if err != nil {
+		t.Fatalf("锚点位 %d 的 term 不可查: %v", a1, err)
+	}
+	stX, err := store.Open(h.dirs[vi], false, testSlog(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	rsX := newRaftStore(stX, testSlog(t))
+	aidx, atm := a1, a1Term
+	if err := rsX.SaveSnapMeta(0, &raftpb.SnapshotMetadata{
+		Index: &aidx, Term: &atm, ConfState: victim.groups[0].confState.Load(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rsX.TruncateLog(0, a1); err != nil {
+		t.Fatal(err)
+	}
+	if err := stX.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 换人：杀掉旧 leader（X 停机期间集群无 quorum，X 一重启即可重选）。
+	// 这样处理 X 追平的是新 leader——C1 的缺口正发生在「换人后」。
+	leader.kill()
+	select {
+	case <-leader.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("旧 leader 未在 10s 内完全退出")
+	}
+
+	// 原地干净重启 X
+	x := h.startNode(t, vi)
+
+	// 核心断言（修复的判定面）：重启瞬间日志必须全空——NewManager 返回
+	// 后、Start 之前检查：buildGroup 已完成清空，run 循环还没起，无竞态
+	hs, ents, snapMeta, err := x.rs.Load(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 0 || snapMeta != nil || !raft.IsEmptyHardState(hs) {
+		t.Fatalf("安装中标记重启后日志应全空: ents=%d 锚点存在=%v HardState空=%v",
+			len(ents), snapMeta != nil, raft.IsEmptyHardState(hs))
+	}
+	if ap, err := x.rs.Applied(0); err != nil || ap != 0 {
+		t.Fatalf("安装中标记重启后 applied 应为 0: %d err=%v", ap, err)
+	}
+	if f, err := x.groups[0].stg.FirstIndex(); err != nil || f != 1 {
+		t.Fatalf("安装中标记重启后 firstIndex 应为 1（日志未清空）: %d err=%v", f, err)
+	}
+
+	// 收敛断言：X 在新 leader 任期内追平到完整状态。R2_49 是停机前集群
+	// 最后写入的键，它可见即全量重放/快照已完成
+	waitFor(t, 60*time.Second, func() bool {
+		_, ok, _ := x.Store().Get(store.TopicMetaKey("R2_49"))
+		return ok
+	}, "重启后的 X 未在新 leader 任期内收敛（R2_49 缺失）")
+	// C1 静默丢段键：锚点之前的 R1 状态必须完整到达（修复前这些键永久缺失）
+	for _, k := range []string{"R1_00", "R1_10", "R1_41", "R1_49"} {
+		if _, ok, _ := x.Store().Get(store.TopicMetaKey(k)); !ok {
+			t.Fatalf("C1 静默丢段：X 上缺少锚点之前的键 %s——安装中标记重启后日志未被清空", k)
+		}
+	}
+
+	// 换人后的集群继续服务：新 leader 再写 R3 批，X 追平
+	waitFor(t, 60*time.Second, func() bool {
+		l, ok := other.Leader(0)
+		return ok && l == other.nodeID
+	}, "other 未在 60s 内当选为新 leader")
+	for i := 0; i < 10; i++ {
+		b := other.Store().NewBatch()
+		if err := b.Set(store.TopicMetaKey(fmt.Sprintf("R3_%02d", i)), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		if err := other.Propose(ctx, 0, b.Repr()); err != nil {
+			t.Fatalf("新 leader 续写 R3: %v", err)
+		}
+		b.Close()
+	}
+	waitFor(t, 30*time.Second, func() bool {
+		_, ok, _ := x.Store().Get(store.TopicMetaKey("R3_09"))
+		return ok
+	}, "X 未追平新 leader 的 R3 批")
 }
 
 // TestTruncateOnceRespectsLeaderMinMatch leader 截断的安全下界：

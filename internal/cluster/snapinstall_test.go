@@ -14,6 +14,7 @@ package cluster
 import (
 	"testing"
 
+	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
 	"github.com/xushixin/sq/internal/store"
@@ -160,6 +161,13 @@ func TestResetGroupProgressClearsAnchorAndMarker(t *testing.T) {
 	if err := rs.MarkInstalling(1, &raftpb.SnapshotMetadata{Index: &idx, Term: &term}); err != nil {
 		t.Fatal(err)
 	}
+	// C1 前提：半截日志 + HardState 也必须在盘上（只清 applied 的旧实现
+	// 会让重启带着 A+1.. 日志 + applied=0 启动，重放进被清空的 FSM）
+	commit := uint64(10)
+	if err := rs.Persist(1, &raftpb.HardState{Term: &term, Vote: &term, Commit: &commit},
+		[]*raftpb.Entry{{Term: &term, Index: &idx}}, true); err != nil {
+		t.Fatal(err)
+	}
 	if err := rs.ResetGroupProgress(1); err != nil {
 		t.Fatal(err)
 	}
@@ -171,5 +179,13 @@ func TestResetGroupProgressClearsAnchorAndMarker(t *testing.T) {
 	}
 	if _, ok, _ := rs.LoadInstalling(1); ok {
 		t.Fatal("安装中标记应被删除")
+	}
+	hs, ents, snapMeta, err := rs.Load(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 0 || snapMeta != nil || !raft.IsEmptyHardState(hs) {
+		t.Fatalf("重置后日志与 HardState 应全空: ents=%d 锚点存在=%v HardState空=%v",
+			len(ents), snapMeta != nil, raft.IsEmptyHardState(hs))
 	}
 }

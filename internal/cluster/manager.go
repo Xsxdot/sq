@@ -505,21 +505,32 @@ func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, e
 			return nil, fmt.Errorf("cluster: 组 %d 读 applied: %w", g, err)
 		}
 		// 安装中标记存在 = 上次快照安装未完成，本组状态是半截的。
-		// 清空该组键族让 raft 重新发快照——半截状态当完整状态启动
-		// 会让本节点向客户端返回缺失的消息（静默丢数据）。
+		// 清空该组键族让 raft 重新发快照/全量重放——半截状态当完整状态
+		// 启动会让本节点向客户端返回缺失的消息（静默丢数据）。
 		// 注意：LoadInstalling 必须在 Load 之后——日志回放与标记检查
 		// 都要基于同一份磁盘实况，且清空重来要覆盖刚读回的 applied。
 		if meta, installing, err := m.rs.LoadInstalling(g); err != nil {
 			return nil, err
 		} else if installing {
-			m.lg.Warn("发现未完成的快照安装，清空该组状态重来", "g", g, "index", meta.GetIndex())
+			m.lg.Warn("发现未完成的快照安装，清空该组全部状态重来", "g", g, "index", meta.GetIndex())
 			if err := wipeGroupKeys(m.st, g, m.dataGroups); err != nil {
 				return nil, fmt.Errorf("cluster: 组 %d 清空重来: %w", g, err)
 			}
-			if err := m.rs.ResetGroupProgress(g); err != nil { // applied=0 + 删 snap 锚点 + 删标记
+			// 完整重置契约（C1）：ResetGroupProgress 把 applied、锚点、
+			// 标记、全部日志条目、HardState 一并清空（单批 Sync）——只清
+			// applied 的旧行为 = 重启后带着半截日志（锚点 A 之后的部分）
+			// + HardState 启动，raft 从 A+1 重放进被清空的 FSM，状态
+			// 1..A 永久丢失且 raft 不知情；leader 换人后探测锚在 A+1..P
+			// 上撞车、永不发快照——C1 静默丢段。
+			if err := m.rs.ResetGroupProgress(g); err != nil {
 				return nil, err
 			}
 			applied = 0
+			// 上面从旧磁盘状态 seed 的 mem（锚点快照 + 条目 + HardState）
+			// 随日志清空一并作废：换全新空存储启动（firstIndex=1），
+			// leader 的探测一路回退到日志起点，只能全量重放或发快照，
+			// 两条路径都完整——杜绝静默丢段。
+			storage = raft.NewMemoryStorage()
 		}
 	}
 	gr := newGroup(g, m.nodeID, storage, m.snaps, m.rs, m.st, m.send, m.mode, m.onLeaderChange, m.onApplied, m.lg)

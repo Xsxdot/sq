@@ -368,12 +368,28 @@ func (r *raftStore) LoadInstalling(g uint32) (*raftpb.SnapshotMetadata, bool, er
 }
 
 // ResetGroupProgress 把一组的进度整体重置：applied=0 + 删快照锚点 +
-// 删安装中标记，单批 Sync 落盘。
+// 删安装中标记 + 删全部日志条目 + 删 HardState，单批 Sync 落盘。
+//
+// 契约（C1 修复后）：本组状态半截，全部重来——日志与 HardState 清空后，
+// 重启的节点以空日志启动（firstIndex=1），leader 的探测只能全量重放
+// （完整）或发快照（完整），两条路径都完整。只清 applied 不动日志会把
+// 半截日志（锚点 A 之后的部分）当完整日志启动：raft 从 A+1 重放进被
+// 清空的 FSM，状态 1..A 永久丢失且 raft 不知情，leader 换人后探测锚
+// 在 A+1..P 上撞车、永不发快照——静默丢段。
 //
 // 何时用：buildGroup 启动时发现安装中标记 → wipeGroupKeys 清掉该组
 // FSM 键后调用——半截状态必须整体归零（applied=0 让 raft 从 1 重投递、
 // 锚点删除让 TruncateLog 的守卫重新放行、标记删除让「安装已完成」的
-// 判定不再成立），残留任何一个都会让重启路径把半截状态当完整状态。
+// 判定不再成立、日志与 HardState 删除让日志起点回到 1），残留任何一个
+// 都会让重启路径把半截状态当完整状态。
+//
+// 同步性：整个批次 Sync 提交——「删标记」与「删日志」必须原子：若
+// 标记先落而日志未落，崩溃后重启见不到标记、却带着 applied=0 + 半截
+// 日志启动，恰是 C1 的静默丢段形态。单批 Sync 让两者同生共死。
+//
+// 注意：成员表键（raft/<g>/conf）刻意不删——重启后经全量重放或快照
+// 自然重建（ConfChange 条目 apply 时整表覆盖写），删除反而让重启节点
+// 在收到第一个条目前没有成员表可用。
 func (r *raftStore) ResetGroupProgress(g uint32) error {
 	b := r.st.NewBatch()
 	if err := b.Set(appliedKey(g), store.PutU64(0)); err != nil {
@@ -388,10 +404,22 @@ func (r *raftStore) ResetGroupProgress(g uint32) error {
 		b.Close()
 		return fmt.Errorf("raftstore ResetGroupProgress 组 %d 删安装标记: %w", g, err)
 	}
+	// 删全部日志条目：空日志启动 → firstIndex=1 → leader 只能全量重放
+	// 或发快照（见方法注释的契约）
+	if err := b.DeleteRange(entKey(g, 0), store.PrefixUpperBound(entPrefix(g))); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ResetGroupProgress 组 %d 删日志条目: %w", g, err)
+	}
+	// 删 HardState：term/vote/commit 一并归零，重启节点以空 HardState
+	// 启动（term=0 直接接受 leader 的任期），不残留半截提交位点
+	if err := b.Delete(hsKey(g)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ResetGroupProgress 组 %d 删 HardState: %w", g, err)
+	}
 	if err := r.st.ApplyWith(b, true); err != nil {
 		return fmt.Errorf("raftstore ResetGroupProgress 组 %d: %w", g, err)
 	}
-	r.lg.Warn("组进度已重置（applied=0、锚点与安装标记已删）", "g", g)
+	r.lg.Warn("组进度已整体重置（applied=0、锚点/标记/日志/HardState 已删，重启后 firstIndex=1）", "g", g)
 	return nil
 }
 

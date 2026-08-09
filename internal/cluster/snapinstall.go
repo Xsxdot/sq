@@ -22,7 +22,8 @@
 //   - 不含 raft/ 日志区键（日志归 raft 层，wipe 不碰）与 metric/
 //     （本地不复制键族，与快照枚举同纪律）
 //   - 不做安装主流程（installSnapshot 六步与收口批次，Task 7 part B）；
-//     applied/锚点/成员表由 raftStore.ResetGroupProgress 重置
+//     applied/锚点/标记/日志/HardState 由 raftStore.ResetGroupProgress
+//     整体重置（成员表键 raft/<g>/conf 刻意保留，重放或快照时重建）
 //   - 键归属判定复用 snapstream.go 的 groupKeyRanges/keyGroupOf——
 //     清空与枚举必须同一份解析与同一套归属规则，分叉即漏清/误清
 package cluster
