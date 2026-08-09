@@ -8,8 +8,11 @@ package cluster
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
+	"io"
 	"net"
+	"strings"
 	"testing"
 	"time"
 
@@ -26,7 +29,7 @@ func TestTransportDeliverAcrossNodes(t *testing.T) {
 		return newTransport(self, ln, map[uint64]string{peerID: peerAddr},
 			func(g uint32, m *raftpb.Message) {
 				got <- fmt.Sprintf("g%d:from%d:to%d", g, m.GetFrom(), m.GetTo())
-			}, testSlog(t))
+			}, nil, testSlog(t))
 	}
 	t1 := mk(1, ln1, 2, ln2.Addr().String())
 	t2 := mk(2, ln2, 1, ln1.Addr().String())
@@ -52,7 +55,7 @@ func TestTransportDeliverAcrossNodes(t *testing.T) {
 func TestTransportDropsWhenPeerDown(t *testing.T) {
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	tr := newTransport(1, ln, map[uint64]string{2: "127.0.0.1:1"}, // 1 端口必拒
-		func(uint32, *raftpb.Message) {}, testSlog(t))
+		func(uint32, *raftpb.Message) {}, nil, testSlog(t))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	tr.Start(ctx)
@@ -79,7 +82,7 @@ func TestTransportDropsWhenPeerDown(t *testing.T) {
 func TestTransportDropPeerDrainsQueue(t *testing.T) {
 	ln, _ := net.Listen("tcp", "127.0.0.1:0")
 	tr := newTransport(1, ln, map[uint64]string{2: "127.0.0.1:1"}, // 1 端口必拒：无连接，消息全积压
-		func(uint32, *raftpb.Message) {}, testSlog(t))
+		func(uint32, *raftpb.Message) {}, nil, testSlog(t))
 	from, to := uint64(1), uint64(2)
 	typ := raftpb.MsgHeartbeat
 	// 远超队列容量（4096）：既攒出积压又真正触发在途丢弃——drops 计数
@@ -113,7 +116,7 @@ func TestTransportUnregistersClosedConns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tr := newTransport(1, ln, nil, func(uint32, *raftpb.Message) {}, testSlog(t))
+	tr := newTransport(1, ln, nil, func(uint32, *raftpb.Message) {}, nil, testSlog(t))
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	tr.Start(ctx)
@@ -151,4 +154,104 @@ func TestTransportUnregistersClosedConns(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+}
+
+// TestTransportControlFrames 传输层控制通道的承重测试：ControlGroup
+// 帧不进 deliver（raft 消息流）、handler 应答写回同一条连接；nil
+// handler 时对端收到「控制通道未装配」错误帧。
+func TestTransportControlFrames(t *testing.T) {
+	// 场景 1：handler 回显——请求 op=7 payload="ping"，响应帧 op
+	// 最高位置 1（0x87）、payload 首字节 0（成功）、余下为应答
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	delivered := make(chan struct{})
+	tr := newTransport(1, ln, nil,
+		func(uint32, *raftpb.Message) { close(delivered) },
+		func(op byte, payload []byte) ([]byte, error) {
+			return append([]byte("echo:"), payload...), nil
+		}, testSlog(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr.Start(ctx)
+	conn, err := net.Dial("tcp", ln.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	req := append([]byte{7}, []byte("ping")...)
+	if _, err := conn.Write(encodeFrame(nil, ControlGroup, req)); err != nil {
+		t.Fatal(err)
+	}
+	respOp, status, resp, err := readControlResponse(t, conn)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if respOp != 7|0x80 {
+		t.Fatalf("响应 op=0x%x; want 0x%x（最高位应置 1 表响应）", respOp, 7|0x80)
+	}
+	if status != 0 {
+		t.Fatalf("响应状态字节 = %d; want 0（成功）", status)
+	}
+	if string(resp) != "echo:ping" {
+		t.Fatalf("应答 %q; want %q", resp, "echo:ping")
+	}
+	select {
+	case <-delivered:
+		t.Fatal("控制帧被投递给了 deliver——应只走 handler，不进 raft 消息流")
+	case <-time.After(500 * time.Millisecond):
+	}
+
+	// 场景 2：nil handler 回「控制通道未装配」错误帧（状态字节 1）
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tr2 := newTransport(1, ln2, nil,
+		func(uint32, *raftpb.Message) {}, nil, testSlog(t))
+	ctx2, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	tr2.Start(ctx2)
+	conn2, err := net.Dial("tcp", ln2.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn2.Close()
+	if _, err := conn2.Write(encodeFrame(nil, ControlGroup, []byte{3, 'x'})); err != nil {
+		t.Fatal(err)
+	}
+	respOp2, status2, resp2, err := readControlResponse(t, conn2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if respOp2 != 3|0x80 {
+		t.Fatalf("错误帧 op=0x%x; want 0x%x", respOp2, 3|0x80)
+	}
+	if status2 != 1 {
+		t.Fatalf("错误帧状态字节 = %d; want 1（失败）", status2)
+	}
+	if !strings.Contains(string(resp2), "控制通道未装配") {
+		t.Fatalf("错误帧文本 %q; want 含「控制通道未装配」", resp2)
+	}
+}
+
+// readControlResponse 在同一连接上读一帧控制响应：返回 op（含响应
+// 位）、状态字节与应答 payload。帧布局同请求：[4B 帧长][4B 组号]
+// [1B op][payload]，组号已在调用侧语境（控制通道）中确认。
+func readControlResponse(t *testing.T, conn net.Conn) (op, status byte, payload []byte, err error) {
+	t.Helper()
+	header := make([]byte, 4)
+	if _, err = io.ReadFull(conn, header); err != nil {
+		return
+	}
+	frameLen := binary.BigEndian.Uint32(header)
+	if frameLen < 5 {
+		return 0, 0, nil, fmt.Errorf("帧长 %d 过短（控制帧至少 5 字节）", frameLen)
+	}
+	body := make([]byte, int(frameLen))
+	if _, err = io.ReadFull(conn, body); err != nil {
+		return
+	}
+	return body[4], body[5], body[6:], nil
 }

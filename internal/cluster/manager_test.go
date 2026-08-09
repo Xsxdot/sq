@@ -11,12 +11,39 @@ package cluster
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net"
 	"testing"
 	"time"
 
+	"go.etcd.io/raft/v3"
+
 	"github.com/xushixin/sq/internal/store"
 )
+
+// TestManagerStatusExposesRaftState Status(g) 透传 rn.Status()：Task 10
+// 学习者进度监控依赖它读 Progress/IsLearner；此处锁死基本契约（组号
+// 非法 ok=false、单节点自选举后报告 leader）。
+func TestManagerStatusExposesRaftState(t *testing.T) {
+	dir := t.TempDir()
+	_, m := startSoloManager(t, dir, AckQuorumMem)
+	if _, ok := m.Status(99); ok {
+		t.Fatal("Status(99) 应 ok=false（组号越界）")
+	}
+	// 单节点自选举约 1s：轮询直到 Status 报告本节点为 leader
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		st, ok := m.Status(MetaGroup)
+		if !ok {
+			t.Fatal("Status(MetaGroup) 应 ok=true")
+		}
+		if st.RaftState == raft.StateLeader {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("单节点组未在 30s 内自选举为 leader")
+}
 
 // TestGroupForQueueStable 队列→组映射是入盘契约，黄金值锁死：任何改动
 // fnv 输入编码的重构都会在这里炸出来，而不是让存量数据错组。
@@ -158,4 +185,40 @@ func startSoloManager(t *testing.T, dir string, mode AckMode) (*store.Store, *Ma
 		}
 	})
 	return st, m
+}
+
+// TestListenAddrBindsSeparateFromPeersAdvertised 评审 I5 回归：Peers 里的
+// 地址是**拨号通告**地址（NAT/容器下为外网可达地址，本机绑定必失败），
+// 本节点绑定必须走 ListenAddr——两者分离时 NewManager 按 ListenAddr
+// 绑定成功，而不是去绑通告地址。
+//
+// 模拟：Peers[1] 填一个不可绑定的外网通告地址（192.0.2.1 是保留文档
+// 网段，任何机器都不属于它），ListenAddr 用本机随机端口——若实现错误地
+// 按 Peers 绑定会立刻失败；按 ListenAddr 绑定则成功。
+func TestListenAddrBindsSeparateFromPeersAdvertised(t *testing.T) {
+	st := mustOpenStore(t, t.TempDir())
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	ln.Close() // 只借用端口号：NewManager 要自己绑 ListenAddr
+	port := ln.Addr().(*net.TCPAddr).Port
+	m, err := NewManager(Options{
+		NodeID:     1,
+		Peers:      map[uint64]string{1: "192.0.2.1:9091"}, // 通告地址：不可本地绑定
+		ListenAddr: fmt.Sprintf("127.0.0.1:%d", port),      // 绑定地址：本机
+		DataGroups: 3,
+		Mode:       AckQuorumMem,
+		Store:      st,
+		Logger:     testSlog(t),
+	})
+	if err != nil {
+		t.Fatalf("NewManager 应按 ListenAddr 绑定成功，得到 %v", err)
+	}
+	// 确认绑定端口确实是 ListenAddr 的端口（而不是通告地址的）
+	if got := m.ln.Addr().String(); got != fmt.Sprintf("127.0.0.1:%d", port) {
+		t.Fatalf("监听地址应为 ListenAddr %s，实际 %s", fmt.Sprintf("127.0.0.1:%d", port), got)
+	}
+	// 未 Start（NewManager 即完成绑定）：直接关监听器收尾，不走 kill
+	m.ln.Close()
 }

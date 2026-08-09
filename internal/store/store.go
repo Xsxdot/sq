@@ -13,12 +13,14 @@
 package store
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"log/slog"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/batchrepr"
 )
 
 // OnApplyObserve 若非 nil，每次 Apply 成功提交后以提交耗时（含 fsync）回调，
@@ -104,13 +106,52 @@ func (b *Batch) Repr() []byte { return b.b.Repr() }
 
 // NewBatchFromRepr 从复制来的批次字节重建类型化批次——follower 盲 apply
 // 的唯一入口。坏字节在此报错，不进 Apply。
+//
+// 注意：内部必须先拷贝 data 再交给 pebble 的 SetRepr——SetRepr 是
+// 零拷贝接管（b.data 直接指向传入切片），而本方法返回的批次在
+// ApplyWith 提交后会 Close 回收到 Pebble 的 batch sync.Pool，池中批次
+// 连同 b.data 一起被下一次 NewBatch 复用。若直接传调用方的切片：
+//   - applyEntry 传的是 raft 日志条目自身的 Data 缓冲（protobuf 反序列
+//     化后 cap > len，Set 追加是原地写），条目字节与池中批次共享同一
+//     块内存；
+//   - 之后任何一组 raftstore.Persist 复用该池中批次写 raft/<g>/hs 等
+//     键，就会原地覆盖 raft 日志条目在 MemoryStorage 里的内容，把日志
+//     写花（三节点 e2e 复现的「raft/1/hs 混入 FSM 批次」损坏，apply 时
+//     panic）。
+//
+// 拷贝成本是每 apply 一次 memcpy，相对批次解析与提交可忽略。
 func (s *Store) NewBatchFromRepr(data []byte) (*Batch, error) {
 	nb := s.db.NewBatch()
-	if err := nb.SetRepr(data); err != nil {
+	if err := nb.SetRepr(append([]byte(nil), data...)); err != nil {
 		// 批次已废弃，按 Apply 失败同款约定丢给 GC（见 Apply 注释）
 		return nil, fmt.Errorf("store NewBatchFromRepr: %w", err)
 	}
 	return &Batch{b: nb}, nil
+}
+
+// BatchTouchesPrefix 判定复制批次字节中是否存在以 prefix 开头的键——只遍历
+// 键、不解码值。是 meta 缓存重载钩子的判定件：follower 盲 apply 前用它判断
+// 批次是否触及 meta/ 键族，命中才值得触发整表 Reload。
+//
+// 实现：batchrepr.Reader 逐条解出 (kind, ukey, value)，对 Set/Delete 等带键
+// 条目取 ukey 判前缀即可；坏字节在此报错（与 NewBatchFromRepr 同边界）。
+func BatchTouchesPrefix(repr []byte, prefix []byte) (bool, error) {
+	r := batchrepr.Read(repr)
+	if r == nil {
+		return false, nil
+	}
+	for {
+		_, ukey, _, ok, err := r.Next()
+		if err != nil {
+			return false, fmt.Errorf("store BatchTouchesPrefix 解析批次: %w", err)
+		}
+		if !ok {
+			return false, nil
+		}
+		if bytes.HasPrefix(ukey, prefix) {
+			return true, nil
+		}
+	}
 }
 
 // ApplyWith 与 Apply 同语义，但本次刷盘由 sync 参数显式决定，不看全局

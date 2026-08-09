@@ -18,6 +18,8 @@ package cluster
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
 	"io"
 	"log"
 	"log/slog"
@@ -52,6 +54,13 @@ func (m AckMode) String() string {
 	return "ack-quorum-fsync"
 }
 
+// ErrNotLeader 表示本节点不是指定组的当前 leader，提案被拒绝。
+//
+// 协议面据此翻译成客户端可重试码（Task 9 的 Code_HA_NOT_AVAILABLE）：
+// 收到本错误后应先经 Manager.Leader(g) 找到当前 leader 再重试，而不是
+// 原地死等。可被 errors.Is 识别。
+var ErrNotLeader = errors.New("cluster: 本节点不是该组 leader，提案被拒绝")
+
 // group 是一个 raft 组运行体：tick 驱动选举/心跳，Ready 循环执行
 // 「持久化 → 发送 → apply → Advance」契约，FSM 为共享 store。
 type group struct {
@@ -64,6 +73,11 @@ type group struct {
 	mode    AckMode
 	lg      *slog.Logger
 	selfID  uint64 // 本节点 ID：构造时从 rn.Status() 取一次，isLeader 比较用
+
+	// 装配钩子（nil 安全，见 notifyLeaderChange/notifyApplied 的契约注释）：
+	// 在 Ready 循环内同步触发，不得阻塞；重活由装配代码自行 dispatch。
+	onLeaderChange func(g uint32, leader uint64, isSelf bool)
+	onApplied      func(g uint32, repr []byte)
 
 	// v3 的 raftpb.Message 是 protobuf-go v2 生成，内部嵌入互斥锁
 	// （protoimpl.MessageState）。消息全链路用指针传递，避免按值拷贝
@@ -95,28 +109,32 @@ type group struct {
 //   - st: 共享 store，FSM apply 的唯一落点
 //   - send: 消息外发回调（Manager 里接 transport 并短路本节点，Task 5）
 //   - mode: 确认档位，见 AckMode
+//   - onLeaderChange: leader 变更钩子（可选，nil 安全）
+//   - onApplied: 条目 apply 钩子（可选，nil 安全）
 //   - lg: 结构化日志（nil 时退化为 slog.Default）
 //
 // 返回：
 //   - 就绪的 *group（未启动）
-func newGroup(g uint32, rn raft.Node, storage *raft.MemoryStorage, rs *raftStore, st *store.Store, send func(g uint32, msgs []*raftpb.Message), mode AckMode, lg *slog.Logger) *group {
+func newGroup(g uint32, rn raft.Node, storage *raft.MemoryStorage, rs *raftStore, st *store.Store, send func(g uint32, msgs []*raftpb.Message), mode AckMode, onLeaderChange func(g uint32, leader uint64, isSelf bool), onApplied func(g uint32, repr []byte), lg *slog.Logger) *group {
 	if lg == nil {
 		lg = slog.Default()
 	}
 	gr := &group{
-		g:           g,
-		rn:          rn,
-		storage:     storage,
-		rs:          rs,
-		st:          st,
-		send:        send,
-		mode:        mode,
-		lg:          lg.With("mod", "group", "g", g),
-		selfID:      rn.Status().ID,
-		inbox:       make(chan *raftpb.Message, 1024),
-		propWaiters: make(map[uint64]chan struct{}),
-		ccWaiters:   make(map[uint64]chan struct{}),
-		doneCh:      make(chan struct{}),
+		g:              g,
+		rn:             rn,
+		storage:        storage,
+		rs:             rs,
+		st:             st,
+		send:           send,
+		mode:           mode,
+		onLeaderChange: onLeaderChange,
+		onApplied:      onApplied,
+		lg:             lg.With("mod", "group", "g", g),
+		selfID:         rn.Status().ID,
+		inbox:          make(chan *raftpb.Message, 1024),
+		propWaiters:    make(map[uint64]chan struct{}),
+		ccWaiters:      make(map[uint64]chan struct{}),
+		doneCh:         make(chan struct{}),
 	}
 	// 提案 id 用时间戳做种子（终审 R4）：干净重启后计数器从远离旧值
 	// 的位置继续，配合条目头的提案者校验双保险——旧进程的等待者已随
@@ -204,6 +222,7 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	if rd.SoftState != nil {
 		gr.lead.Store(rd.SoftState.Lead)
 		gr.lg.Info("组 leader 变更", "lead", rd.SoftState.Lead, "term", rd.HardState.GetTerm())
+		gr.notifyLeaderChange(rd.SoftState.Lead)
 	}
 	// 3. CommittedEntries apply
 	// 本轮回合的成员变更登记：Advance 后再通知（见循环外注释），
@@ -256,6 +275,10 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 			var data []byte
 			if len(ent.Data) > 16 {
 				data = ent.Data[16:]
+			}
+			if len(ent.Data) > 0 && len(ent.Data) <= 16 {
+				gr.lg.Warn("疑似损坏条目：普通条目数据 ≤16B 无批次载荷", "index", ent.GetIndex(),
+					"len", len(ent.Data), "head", fmt.Sprintf("%x", ent.Data))
 			}
 			gr.applyEntry(ent.GetIndex(), data)
 			if id, ok := proposalWaiter(ent.Data, gr.selfID); ok {
@@ -321,7 +344,11 @@ func (gr *group) applyEntry(index uint64, data []byte) {
 		b = gr.st.NewBatch()
 	}
 	if err != nil {
-		gr.lg.Error("FSM 批次重建失败，组停摆", "index", index, "err", err)
+		// 坏批次字节是严重的数据完整性问题，panic 前把载荷头与长度留痕
+		// （完整 dump 离线解码在排查时按需补充；日志头 64B 已足够定位
+		// 损坏形态，如混入的 raftstore 键族）
+		gr.lg.Error("FSM 批次重建失败，组停摆", "index", index, "len", len(data),
+			"first64", fmt.Sprintf("%x", data[:min(len(data), 64)]), "err", err)
 		panic(err)
 	}
 	if err := b.Set(appliedKey(gr.g), store.PutU64(index)); err != nil {
@@ -336,6 +363,30 @@ func (gr *group) applyEntry(index uint64, data []byte) {
 		panic(err)
 	}
 	gr.applied.Store(index)
+	gr.notifyApplied(data)
+}
+
+// notifyLeaderChange 触发 OnLeaderChange 装配钩子（nil 安全）。
+//
+// 钩子契约：本方法在 Ready 循环内同步执行——钩子不得阻塞（阻塞即卡死
+// 该组全部 tick/消息/apply 处理），重活由装配代码自行 dispatch 到独立
+// goroutine；钩子 panic 不恢复，按 apply-panic 同策略传播（钩子由本仓库
+// 装配代码注入，panic 即 bug）。
+func (gr *group) notifyLeaderChange(leader uint64) {
+	if gr.onLeaderChange != nil {
+		gr.onLeaderChange(gr.g, leader, leader == gr.selfID)
+	}
+}
+
+// notifyApplied 触发 OnApplied 装配钩子（nil 安全）。
+//
+// 钩子契约同 notifyLeaderChange：不得阻塞 Ready 循环，重活自行 dispatch；
+// 且不得保留 data 引用——Ready 循环结束后条目标缓冲可能被 raft 复用，
+// 需保留时必须自行拷贝。
+func (gr *group) notifyApplied(data []byte) {
+	if gr.onApplied != nil {
+		gr.onApplied(gr.g, data)
+	}
 }
 
 // propose 提交一条提案并阻塞直到它在本节点 apply 完成。
@@ -347,6 +398,16 @@ func (gr *group) applyEntry(index uint64, data []byte) {
 // 实现：分配自增提案 id → 注册 waiter（propWaiters）→ 提案者与 id
 // 各 8B 大端前置到批次字节前 → rn.Propose → 等 waiter 通知或 ctx 超时。
 //
+// 非 leader 的提案路径（ErrNotLeader，见 raftConfig 的
+// DisableProposalForwarding 契约）：
+//   - 已知 leader 是他人：入口快速失败，不等 raft 静默丢弃
+//   - leader 未知（选举进行中，lead=0）：不在此拒绝——本节点可能即将
+//     当选，raft 的 Propose 会阻塞至 leader 产生再处理（单节点/启动
+//     窗口期靠它保住读己之写，见 node.go run 循环的 propc 门闩）
+//   - raft 层丢弃（ErrProposalDropped）：包装 ErrNotLeader 返回
+//   - 等待超时且期间 leader 已变更：同样归入 ErrNotLeader——未提交的
+//     低任期条目会被新 leader 追齐时截断，提案已丢
+//
 // 参数：
 //   - ctx: 控制等待；超时/取消后 waiter 被移除（条目可能仍会被提交，
 //     调用方已放弃等待，apply 时 notify 找不到它即可）
@@ -354,8 +415,19 @@ func (gr *group) applyEntry(index uint64, data []byte) {
 //
 // 返回：
 //   - nil：条目已 apply
-//   - error：Propose 失败或 ctx 超时/取消（调用方带上下文处理）
+//   - error：Propose 失败、ctx 超时/取消，或 ErrNotLeader（调用方带
+//     上下文处理，协议面按可重试码翻译）
 func (gr *group) propose(ctx context.Context, batchRepr []byte) error {
+	// 快速失败：已探明 leader 是他人（follower 提案在 DisableProposal
+	// Forwarding 下必被丢弃），立即返回 ErrNotLeader 让客户端经
+	// Leader(g) 重试——等待 raft 处理周期或等到超时都是客户端不可
+	// 接受的失败模式。高频场景（客户端错发是常态不是异常）记 Debug。
+	if lead := gr.leader(); lead != 0 && lead != gr.selfID {
+		gr.lg.Debug("提案被拒：本节点非 leader", "lead", lead)
+		return gr.notLeaderErr()
+	}
+	// 超时判定基线：等待期间 leader 变更 = 提案可能已被新任期截断丢弃
+	leadAtEntry := gr.leader()
 	id := gr.nextID.Add(1)
 	ch := make(chan struct{})
 	gr.mu.Lock()
@@ -373,6 +445,12 @@ func (gr *group) propose(ctx context.Context, batchRepr []byte) error {
 
 	if err := gr.rn.Propose(ctx, data); err != nil {
 		gr.removeWaiter(gr.propWaiters, id)
+		// follower 提案被 raft 丢弃（DisableProposalForwarding）——
+		// 归入 ErrNotLeader，客户端据此重试；其余错误（ctx 超期等）
+		// 原样返回
+		if errors.Is(err, raft.ErrProposalDropped) {
+			return gr.notLeaderErr()
+		}
 		return err
 	}
 	select {
@@ -384,9 +462,22 @@ func (gr *group) propose(ctx context.Context, batchRepr []byte) error {
 		// waiter 防泄漏（测试断言超时后 map 为空），后续 apply 时
 		// notify 找不到它即可
 		gr.removeWaiter(gr.propWaiters, id)
+		// 等待期间 leader 已变更：未提交条目在新 leader 追齐时被截断，
+		// 提案已丢——归入 ErrNotLeader 让客户端重试，而非当作不可重试
+		// 的 deadline；leader 未变（如仍是我方但无 quorum）时条目仍
+		// 可能提交，保持 ctx.Err()
+		if cur := gr.leader(); cur != leadAtEntry && cur != gr.selfID {
+			return gr.notLeaderErr()
+		}
 		gr.lg.Debug("propose 等待超时", "id", id, "err", ctx.Err())
 		return ctx.Err()
 	}
+}
+
+// notLeaderErr 构造带组号与当前 leader 上下文的 ErrNotLeader 包装错误，
+// 调用方日志/协议面可据此定位重试目标。
+func (gr *group) notLeaderErr() error {
+	return fmt.Errorf("%w: 组 %d 当前 leader=%d", ErrNotLeader, gr.g, gr.leader())
 }
 
 // proposeConfChange 提出一条成员变更并阻塞直到它被 apply 到本节点。
@@ -398,6 +489,11 @@ func (gr *group) propose(ctx context.Context, batchRepr []byte) error {
 // 放进 V2 的 Context 透传字段，apply 时只有本节点发起的变更才通知
 // （终审 R4：跨节点 id 碰撞不得假成功）。
 //
+// 非 leader 路径与 propose 同契约（ErrNotLeader）：raft 的
+// ProposeConfChange 不等待 raft 结果（node.go stepWithWaitOption
+// wait=false），follower 上的变更被静默丢弃、waiter 只能靠超时兜底
+// ——入口快速失败与超时归类因此比 propose 更关键。
+//
 // 参数：
 //   - ctx: 控制等待；超时/取消后 waiter 被移除（条目可能仍会被提交）
 //   - typ: 变更类型（ConfChangeAddNode/ConfChangeRemoveNode/
@@ -406,8 +502,15 @@ func (gr *group) propose(ctx context.Context, batchRepr []byte) error {
 //
 // 返回：
 //   - nil：成员变更已 apply
-//   - error：ProposeConfChange 失败或 ctx 超时/取消
+//   - error：ProposeConfChange 失败、ctx 超时/取消，或 ErrNotLeader
 func (gr *group) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeType, nodeID uint64) error {
+	// 快速失败：同 propose——follower 的成员变更会被 raft 静默丢弃，
+	// 等待只能以超时收场，那是客户端不可接受的失败模式
+	if lead := gr.leader(); lead != 0 && lead != gr.selfID {
+		gr.lg.Debug("成员变更被拒：本节点非 leader", "lead", lead)
+		return gr.notLeaderErr()
+	}
+	leadAtEntry := gr.leader()
 	// 提案 id 与 ConfChange.Id 共用同一个 nextID 计数器：单节点内
 	// 原子自增不可能碰撞；双命名空间下同一 id 跨条目种类也不会误唤
 	id := gr.nextID.Add(1)
@@ -430,6 +533,9 @@ func (gr *group) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTyp
 	binary.BigEndian.PutUint64(v2.Context[8:16], id)
 	if err := gr.rn.ProposeConfChange(ctx, v2); err != nil {
 		gr.removeWaiter(gr.ccWaiters, id)
+		if errors.Is(err, raft.ErrProposalDropped) {
+			return gr.notLeaderErr()
+		}
 		return err
 	}
 	select {
@@ -438,6 +544,12 @@ func (gr *group) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTyp
 		return nil
 	case <-ctx.Done():
 		gr.removeWaiter(gr.ccWaiters, id)
+		// 同 propose 的超时归类：等待期间 leader 已变更（含 raft 静默
+		// 丢弃的 follower 变更——对端当选后我方才知道 leader 换了人，
+		// 此时变更必然没进日志），归入 ErrNotLeader
+		if cur := gr.leader(); cur != leadAtEntry && cur != gr.selfID {
+			return gr.notLeaderErr()
+		}
 		gr.lg.Debug("成员变更等待超时", "id", id, "err", ctx.Err())
 		return ctx.Err()
 	}

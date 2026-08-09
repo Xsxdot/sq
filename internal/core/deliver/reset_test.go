@@ -22,7 +22,7 @@ func TestResetCursorRewindsAndClearsInflight(t *testing.T) {
 	if got, _ := f.dl.Receive(context.Background(), "g", "t-reset", 0, 2, time.Minute, 0, nil); len(got) != 0 {
 		t.Fatalf("未过期不应重投，得到 %d 条", len(got))
 	}
-	if err := f.dl.ResetCursor("g", "t-reset", 0, 0); err != nil {
+	if err := f.dl.ResetCursor(context.Background(), "g", "t-reset", 0, 0); err != nil {
 		t.Fatal(err)
 	}
 	got, err = f.dl.Receive(context.Background(), "g", "t-reset", 0, 2, time.Minute, 0, nil)
@@ -40,7 +40,7 @@ func TestResetCursorForwardSkips(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t-skip", "m-0")
 	f.send(t, "t-skip", "m-1")
-	if err := f.dl.ResetCursor("g", "t-skip", 0, 1); err != nil {
+	if err := f.dl.ResetCursor(context.Background(), "g", "t-skip", 0, 1); err != nil {
 		t.Fatal(err)
 	}
 	got, err := f.dl.Receive(context.Background(), "g", "t-skip", 0, 2, time.Minute, 0, nil)

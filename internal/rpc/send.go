@@ -30,6 +30,24 @@ import (
 // "整批任一条失败即整体失败"这句话在字面上和效果上一致：失败就是真的什么
 // 都没写。
 func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*pb.SendMessageResponse, error) {
+	// 入口快速失败：本节点对 topic 的任一队列组都不是 leader（整机处在
+	// 选举窗口或分区）时，整批消息的提案都注定被拒——与其等批次构造 +
+	// 编解码完成后才在提案处失败，不如入口就拒，省一次批次构造。
+	//
+	// 为什么必须查「任一队列组」而不是用队列 0 作代理：多组集群里
+	// topic 的队列摊布在多个组上（GroupForQueue 入盘映射），本节点
+	// 可能是队列 1/3/5 所在组的 leader 却不是队列 0 所在组的 leader——
+	// 只查队列 0 会把能服务的节点误拒（SDK 拿到 HA_NOT_AVAILABLE 后
+	// 隔离该端点、重试预算烧在错误的候选上，三节点 e2e 实测发送失败）。
+	// 探针只做「本节点明确不是写主人」的粗筛，单组误判（探针放行但
+	// propose 的 rr 选到别组队列）由 propose 的 ErrNotLeader 映射兜底。
+	if msgs := req.GetMessages(); len(msgs) > 0 {
+		if topic := msgs[0].GetTopic().GetName(); !s.leadsAnyQueueGroup(topic) {
+			s.logger.Debug("SendMessage 快速失败：本节点非该 topic 任一队列组 leader", "topic", topic)
+			return &pb.SendMessageResponse{Status: errStatus(pb.Code_HA_NOT_AVAILABLE,
+				"本节点不是该 topic 队列的当前 leader，请向 leader 节点重试")}, nil
+		}
+	}
 	// 磁盘水位拒写保读（spec §7）：只拦生产者写入，消费链路（Receive/Ack）不受影响
 	if s.writeBlocked != nil && s.writeBlocked.Load() {
 		s.logger.Warn("磁盘水位超限，拒绝写入", "messages", len(req.GetMessages()))
@@ -81,7 +99,7 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 	// 已禁止批内混入事务/延时/FIFO）；含特殊消息的多条请求走下方逐条回退
 	// 路径，行为与历史版本完全一致。
 	if batchable(msgs) {
-		stored, err := s.pr.AppendBatch(msgs)
+		stored, err := s.pr.AppendBatch(ctx, msgs)
 		if err != nil {
 			s.logger.Warn("SendMessage 批量写入失败", "topic", msgs[0].Topic, "count", len(msgs), "err", err)
 			return &pb.SendMessageResponse{
@@ -118,13 +136,13 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 			// 半消息进暂存区：无队列无 offset（entry.Offset 回 0），
 			// TransactionId 必须回填——SDK 的 transactionImpl 靠它发起
 			// Commit/RollBack，漏了它整个事务 API 在客户端侧无法收尾
-			stored, txID, err = s.tx.Stage(m)
+			stored, txID, err = s.tx.Stage(ctx, m)
 		case m.DeliverAtMs > 0:
 			// 延时消息进暂存区（未分配 offset，entry 里 Offset 回 0——SDK 的
 			// SendReceipt 只消费 MessageId，offset 字段对延时场景无意义）
-			stored, err = s.pr.AppendDelay(m)
+			stored, err = s.pr.AppendDelay(ctx, m)
 		default:
-			stored, err = s.pr.Append(m)
+			stored, err = s.pr.Append(ctx, m)
 		}
 		if err != nil {
 			// Append 内部会调用 meta.EnsureTopic，因此它的失败同样分"客户端输入
@@ -184,7 +202,7 @@ func (s *Server) toCoreMessage(pm *pb.Message) (*core.Message, *pb.Status) {
 			return nil, errStatus(pb.Code_ILLEGAL_DELIVERY_TIME, "DELAY 消息缺少 delivery_timestamp")
 		}
 		// 延时与顺序不可组合（M4）：SDK 两者都设时按组判定标 FIFO（上面的
-		// 分支拒绝），裸客户端标 DELAY 带组同样拒绝——到期搬运经 AppendWith
+		// 分支拒绝），裸客户端标 DELAY 带组同样拒绝——到期搬运经 Append
 		// 重新入队，无法承诺组内相对顺序。
 		if sp.GetMessageGroup() != "" {
 			return nil, errStatus(pb.Code_MESSAGE_PROPERTY_CONFLICT_WITH_TYPE,

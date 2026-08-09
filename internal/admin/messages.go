@@ -129,7 +129,7 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 		s.httpError(w, http.StatusBadRequest, "delay_ms 与 message_group 不能同时指定")
 		return
 	}
-	if _, err := s.mt.EnsureTopic(req.Topic); err != nil {
+	if _, err := s.mt.EnsureTopic(r.Context(), req.Topic); err != nil {
 		s.httpError(w, http.StatusBadRequest, "topic 不可用: %v", err)
 		return
 	}
@@ -142,9 +142,9 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 	var err error
 	if req.DelayMs > 0 {
 		m.DeliverAtMs = now + req.DelayMs
-		m, err = s.pr.AppendDelay(m)
+		m, err = s.pr.AppendDelay(r.Context(), m)
 	} else {
-		m, err = s.pr.Append(m)
+		m, err = s.pr.Append(r.Context(), m)
 	}
 	if err != nil {
 		s.logger.Error("admin 测试消息发送失败", "topic", req.Topic,
@@ -199,7 +199,7 @@ func (s *Server) handleDLQResend(w http.ResponseWriter, r *http.Request) {
 		s.httpError(w, http.StatusUnprocessableEntity, "死信缺少 sq-origin-topic 溯源属性，无法定位原 topic")
 		return
 	}
-	if _, err := s.mt.EnsureTopic(origin); err != nil {
+	if _, err := s.mt.EnsureTopic(r.Context(), origin); err != nil {
 		s.httpError(w, http.StatusBadRequest, "原 topic %s 不可用: %v", origin, err)
 		return
 	}
@@ -209,7 +209,7 @@ func (s *Server) handleDLQResend(w http.ResponseWriter, r *http.Request) {
 		ID: m.ID, Topic: origin, Tag: m.Tag, Keys: m.Keys,
 		Properties: m.Properties, Body: m.Body, BornAtMs: m.BornAtMs, BornHost: m.BornHost,
 	}
-	resend, err = s.pr.Append(resend)
+	resend, err = s.pr.Append(r.Context(), resend)
 	if err != nil {
 		s.logger.Error("admin 死信重发失败", "group", group, "origin", origin, "err", err)
 		s.httpError(w, http.StatusInternalServerError, "%v", err)

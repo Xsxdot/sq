@@ -23,6 +23,7 @@ import (
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -55,12 +56,14 @@ func TestSoakE2E(t *testing.T) {
 		t.Fatalf("store: %v", err)
 	}
 	defer st.Close()
-	mt, err := meta.New(st, true, 16, 16, slog.Default())
+	rep := replication.NewStandalone(st)
+	rt := replication.StandaloneRouter{}
+	mt, err := meta.New(rep, rt, st, true, 16, 16, slog.Default())
 	if err != nil {
 		t.Fatalf("meta: %v", err)
 	}
-	pr := produce.New(st, mt, slog.Default())
-	dl := New(st, mt, pr, slog.Default())
+	pr := produce.New(rep, rt, st, mt, slog.Default())
+	dl := New(rep, rt, st, mt, pr, slog.Default())
 	logger := slog.Default().With("mod", "soak-e2e")
 	logger.Info("soak-e2e 开始", "duration", dur.String(), "dir", dir,
 		"queues", 16, "producers", 64, "consumers", 16)
@@ -81,7 +84,7 @@ func TestSoakE2E(t *testing.T) {
 					return
 				default:
 				}
-				if _, err := pr.Append(&core.Message{Topic: "t-soak-e2e", Body: body}); err != nil {
+				if _, err := pr.Append(context.Background(), &core.Message{Topic: "t-soak-e2e", Body: body}); err != nil {
 					t.Errorf("Append: %v", err)
 					return
 				}
@@ -114,7 +117,7 @@ func TestSoakE2E(t *testing.T) {
 				for i, m := range msgs {
 					entries[i] = AckEntry{Offset: m.Offset, Attempt: m.DeliveryAttempt}
 				}
-				results, err := dl.AckBatch("g-soak", "t-soak-e2e", q, entries)
+				results, err := dl.AckBatch(context.Background(), "g-soak", "t-soak-e2e", q, entries)
 				if err != nil {
 					t.Errorf("AckBatch q=%d: %v", q, err)
 					return

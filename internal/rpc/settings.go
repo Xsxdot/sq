@@ -41,21 +41,37 @@ const (
 	// 与官方 SDK 的默认值一致，避免协商后反而放大/收紧客户端的重试面。
 	backoffMaxAttempts = 3
 
+	// backoffMaxCluster 集群档的退避封顶与尝试次数。
+	// 依据：选举窗口实测 1.5s 量级，单机档默认的 1s×3 次恰好可能全部落在
+	// 窗口内——每次重试都被 HA_NOT_AVAILABLE 弹回，3 次烧完还没等到 leader；
+	// 3s 封顶 × 5 次（100ms→200ms→400ms→800ms→3s）累计覆盖约 4.5s，
+	// 足够跨过窗口。
+	backoffMaxCluster         = 3 * time.Second
+	backoffMaxAttemptsCluster = 5
+
 	// pushReceiveBatchSize 下发给 push 消费者的单次取件条数建议值。
 	// M1 只验证 SimpleConsumer（批量大小由它自己在请求里带），这个字段是
 	// push 消费者才会读的，给一个与 ReceiveMessage 默认批量同量级的值即可。
 	pushReceiveBatchSize int32 = 32
 )
 
-// defaultBackoffPolicy 服务端下发的重试退避策略：100ms 起步、每次 ×2、封顶 1s，
-// 最多尝试 3 次。发布端把它用于发送失败重试，订阅端把它用于消费失败后的重投间隔。
-func defaultBackoffPolicy() *pb.RetryPolicy {
+// backoffPolicy 服务端下发的重试退避策略，按部署形态分档：
+//   - 单机档：100ms 起步、每次 ×2、封顶 1s，最多尝试 3 次
+//   - 集群档：同上倍率，封顶 3s、最多 5 次——选举窗口实测 1.5s 量级，
+//     单机档的 1s×3 次恰好可能全部落在窗口内（见常量注释）
+//
+// 发布端把它用于发送失败重试，订阅端把它用于消费失败后的重投间隔。
+func (s *Server) backoffPolicy() *pb.RetryPolicy {
+	max, attempts := backoffMax, backoffMaxAttempts
+	if s.cfg.ClusterEnabled() {
+		max, attempts = backoffMaxCluster, backoffMaxAttemptsCluster
+	}
 	return &pb.RetryPolicy{
-		MaxAttempts: backoffMaxAttempts,
+		MaxAttempts: int32(attempts),
 		Strategy: &pb.RetryPolicy_ExponentialBackoff{
 			ExponentialBackoff: &pb.ExponentialBackoff{
 				Initial:    durationpb.New(backoffInitial),
-				Max:        durationpb.New(backoffMax),
+				Max:        durationpb.New(max),
 				Multiplier: backoffMultiplier,
 			},
 		},
@@ -77,7 +93,7 @@ func (s *Server) negotiateSettings(client *pb.Settings) *pb.Settings {
 	out := &pb.Settings{
 		ClientType:     &ct,
 		AccessPoint:    s.endpoints(),
-		BackoffPolicy:  defaultBackoffPolicy(),
+		BackoffPolicy:  s.backoffPolicy(),
 		RequestTimeout: client.GetRequestTimeout(),
 		UserAgent:      client.GetUserAgent(),
 	}

@@ -6,7 +6,8 @@
 //     并在此注入自包含的 receipt handle（见 receipt.go）
 //   - AckMessage/ChangeInvisibleDuration：解出 handle 后转发给
 //     deliver.Deliverer，把 (bool,error) 结果映射为协议 Status
-//   - QueryAssignment：单机版路由查询，复用 QueryRoute 的 messageQueues
+//   - QueryAssignment：路由查询，复用 QueryRoute 的 messageQueues（集群档
+//     经 RouteView 把队列指向各 leader，行为与 QueryRoute 一致）
 //
 // 边界：
 //   - Tag 过滤支持 "*" / 单 tag / "a || b"，SQL92 属性过滤计划 v1.1
@@ -29,6 +30,7 @@ import (
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
+	"github.com/xushixin/sq/internal/replication"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
@@ -56,6 +58,18 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 	mq := req.GetMessageQueue()
 	topic := mq.GetTopic().GetName()
 	queueID := uint32(mq.GetId())
+
+	// 入口快速失败：本节点不是该队列 leader 时，长轮询没有任何意义——
+	// follower 上 deliver.Receive 会照常等待，20s 后回 MESSAGE_NOT_FOUND，
+	// 消费者停在一条死路由上毫无线索（leader 已迁走的场景），直到 rebalance
+	// 或人工干预。HA_NOT_AVAILABLE（选码论证见 QueryRoute 的分支注释）让
+	// SDK 立即换节点重试。
+	if !s.rv.SelfIsLeader(topic, queueID) {
+		s.logger.Debug("ReceiveMessage 快速失败：本节点非该队列 leader", "group", group, "topic", topic, "queue", queueID)
+		return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
+			Status: errStatus(pb.Code_HA_NOT_AVAILABLE, "本节点不是该队列当前 leader，请向 leader 节点重试"),
+		}})
+	}
 
 	// TAG 表达式解析（M2）：支持 "*" / 单 tag / "a || b"。SQL92 → v1.1。
 	var filter *deliver.TagFilter
@@ -117,12 +131,22 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 		//     stream 的底层 ctx 已经失效，不再尝试 Send 一个 status 帧
 		//     （大概率也会失败），直接把 ctx 的错误原样返回给 gRPC 框架，
 		//     由它按标准方式结束这个流。
+		//   - replication.ErrNotLeader：长轮询期间领导权迁移（入口探针放行
+		//     后 leader 换手，EnsureGroup/receiveOnce 的提案被拒）——「问错
+		//     节点」不是服务端故障，映射 HA_NOT_AVAILABLE 让 SDK 换节点重试
+		//     （选码论证同 QueryRoute 分支注释）。Debug 级别：迁移窗口内
+		//     会被高频触发。
 		//   - 其余：真正的服务端内部故障，维持原有 INTERNAL_SERVER_ERROR + Error 日志。
 		switch {
 		case errors.Is(err, meta.ErrBadName):
 			s.logger.Warn("ReceiveMessage 拒绝：消费组名字非法", "group", group, "topic", topic, "queue", queueID, "err", err)
 			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
 				Status: errStatus(pb.Code_ILLEGAL_CONSUMER_GROUP, err.Error()),
+			}})
+		case errors.Is(err, replication.ErrNotLeader):
+			s.logger.Debug("ReceiveMessage 失败：本节点非该组 leader（长轮询期间领导权迁移）", "group", group, "topic", topic, "queue", queueID, "err", err)
+			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
+				Status: errStatus(pb.Code_HA_NOT_AVAILABLE, err.Error()),
 			}})
 		case errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded):
 			s.logger.Debug("ReceiveMessage 结束：客户端取消或等待超时", "group", group, "topic", topic, "queue", queueID, "err", err)
@@ -367,8 +391,24 @@ func (s *Server) AckMessage(ctx context.Context, req *pb.AckMessageRequest) (*pb
 		for j, sl := range slots {
 			acks[j] = deliver.AckEntry{Offset: sl.offset, Attempt: sl.attempt}
 		}
-		results, err := s.dl.AckBatch(k.group, k.topic, k.q, acks)
+		results, err := s.dl.AckBatch(ctx, k.group, k.topic, k.q, acks)
 		if err != nil {
+			// ErrNotLeader（本节点不再是该组 leader，如 leader 刚迁移）与
+			// 存储故障性质不同：前者是「问错节点」，映射 HA_NOT_AVAILABLE
+			// 让 SDK 换节点重试（选码论证见 QueryRoute 分支注释）；后者才是
+			// 真·服务端故障。Debug 级别：leader 迁移窗口内会被高频触发。
+			if errors.Is(err, replication.ErrNotLeader) {
+				s.logger.Debug("批量 ack 失败：本节点非该组 leader", "group", k.group, "topic", k.topic,
+					"queue", k.q, "count", len(slots), "err", err)
+				for _, sl := range slots {
+					entries[sl.idx] = &pb.AckMessageResultEntry{
+						Status:        errStatus(pb.Code_HA_NOT_AVAILABLE, err.Error()),
+						MessageId:     sl.e.GetMessageId(),
+						ReceiptHandle: sl.e.GetReceiptHandle(),
+					}
+				}
+				continue
+			}
 			// 存储故障：该组整体失败（AckBatch 单 Batch 原子，不存在部分生效），
 			// 客户端对这些 entry 重试即可
 			s.logger.Error("批量 ack 失败", "group", k.group, "topic", k.topic,
@@ -434,8 +474,14 @@ func (s *Server) ChangeInvisibleDuration(ctx context.Context, req *pb.ChangeInvi
 		s.logger.Warn("改不可见时长 handle 非法", "handle", truncateForLog(req.GetReceiptHandle()), "err", err)
 		return &pb.ChangeInvisibleDurationResponse{Status: errStatus(pb.Code_INVALID_RECEIPT_HANDLE, err.Error())}, nil
 	}
-	ok, err := s.dl.ChangeInvisible(g, topic, q, off, attempt, req.GetInvisibleDuration().AsDuration())
+	ok, err := s.dl.ChangeInvisible(ctx, g, topic, q, off, attempt, req.GetInvisibleDuration().AsDuration())
 	if err != nil {
+		// ErrNotLeader 与存储故障分性质映射，理由同 AckMessage 的批量失败分支
+		if errors.Is(err, replication.ErrNotLeader) {
+			s.logger.Debug("改不可见时长失败：本节点非该组 leader", "group", g, "topic", topic,
+				"queue", q, "offset", off, "attempt", attempt, "err", err)
+			return &pb.ChangeInvisibleDurationResponse{Status: errStatus(pb.Code_HA_NOT_AVAILABLE, err.Error())}, nil
+		}
 		s.logger.Error("改不可见时长失败", "group", g, "topic", topic, "queue", q, "offset", off, "attempt", attempt, "err", err)
 		return &pb.ChangeInvisibleDurationResponse{Status: errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error())}, nil
 	}
@@ -446,15 +492,21 @@ func (s *Server) ChangeInvisibleDuration(ctx context.Context, req *pb.ChangeInvi
 	return &pb.ChangeInvisibleDurationResponse{Status: okStatus(), ReceiptHandle: req.GetReceiptHandle()}, nil
 }
 
-// QueryAssignment 单机版：全部队列归属本节点，直接复用 messageQueues。
-// EnsureTopic 失败按性质分类，规则见 server.go 的 topicErrStatus。
+// QueryAssignment 全部队列经 RouteView 指向其 leader（单机形态即本节点）。
+// EnsureTopic 失败按性质分类，规则见 server.go 的 topicErrStatus；队列
+// leader 未知（选举窗口）时整包 HA_NOT_AVAILABLE，行为与 QueryRoute 一致。
 func (s *Server) QueryAssignment(ctx context.Context, req *pb.QueryAssignmentRequest) (*pb.QueryAssignmentResponse, error) {
 	name := req.GetTopic().GetName()
-	tc, err := s.mt.EnsureTopic(name)
+	tc, err := s.mt.EnsureTopic(ctx, name)
 	if err != nil {
 		return &pb.QueryAssignmentResponse{Status: s.topicErrStatus("QueryAssignment", name, err)}, nil
 	}
-	qs := s.messageQueues(tc, req.GetTopic())
+	qs, err := s.messageQueues(tc, req.GetTopic())
+	if err != nil {
+		s.logger.Warn("QueryAssignment 拒答：部分队列所属组尚无 leader（选举窗口）", "topic", name,
+			"group", req.GetGroup().GetName(), "err", err)
+		return &pb.QueryAssignmentResponse{Status: errStatus(pb.Code_HA_NOT_AVAILABLE, err.Error())}, nil
+	}
 	asgs := make([]*pb.Assignment, 0, len(qs))
 	for _, mq := range qs {
 		asgs = append(asgs, &pb.Assignment{MessageQueue: mq})

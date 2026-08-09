@@ -11,6 +11,12 @@
 //   - msg 能按 offset 边界 DeleteRange（队列内 StoreAtMs 随 offset 单调）；
 //     keyidx 按 key 排序，只能全扫按嵌入 storeMs 逐条删——中小规模可接受，
 //     量级上来后的优化（时间副索引）留给真实瓶颈出现时
+//
+// 组归属（batch③）：msg/ 与 keyidx/ 键族归所属队列组——purgeQueue 先查
+// rt.IsLeader(g) 再动手，非 leader 队列跳过（各组 leader 各扫各的，摊布语义
+// 见 Task 8 说明）；purgeKeyIdx 按 key 内 queueID 分桶、每桶一个批次，只处理
+// 本节点 leader 的桶。Run 层另有「本趟 0 队列可处理」的 Debug 日志——本
+// 节点未 lead 任何组时的空转观测面（摊布稳态下是常态，启动期可定位问题）。
 package retention
 
 import (
@@ -22,6 +28,7 @@ import (
 
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 	"github.com/xushixin/sq/internal/sysinfo"
 )
@@ -31,6 +38,8 @@ const maxPurgePerQueue = 10000
 
 // Manager 过期清理任务。单 goroutine 运行（Run），Pass 可单独调用（测试/未来 Admin 触发）。
 type Manager struct {
+	rep      replication.Replicator
+	rt       replication.Router
 	st       *store.Store
 	mt       *meta.Meta
 	interval time.Duration
@@ -47,27 +56,42 @@ type Manager struct {
 // New 构造清理任务。
 //
 // 参数：
+//   - rep/rt: 复制抽象与组路由视图（单机档传 replication.NewStandalone(st)
+//     与 StandaloneRouter{}，集群档由 main 装配）——按队列组提交清理批次、
+//     只清本节点 leader 的组
 //   - interval: 扫描间隔（config.RetentionInterval()）
 //   - dataDir/watermarkPct/writeBlocked: 磁盘水位保护三件套；
 //     watermarkPct<=0 或 writeBlocked 为 nil 时水位检查禁用
-func New(st *store.Store, mt *meta.Meta, interval time.Duration, dataDir string,
-	watermarkPct int, writeBlocked *atomic.Bool, logger *slog.Logger) *Manager {
-	return &Manager{st: st, mt: mt, interval: interval, dataDir: dataDir,
+func New(rep replication.Replicator, rt replication.Router, st *store.Store, mt *meta.Meta,
+	interval time.Duration, dataDir string, watermarkPct int, writeBlocked *atomic.Bool,
+	logger *slog.Logger) *Manager {
+	return &Manager{rep: rep, rt: rt, st: st, mt: mt, interval: interval, dataDir: dataDir,
 		watermarkPct: watermarkPct, writeBlocked: writeBlocked, logger: logger.With("mod", "retention")}
 }
 
 // Run 阻塞运行清理循环：启动即跑一趟，此后每 interval 一趟；ctx 取消即返回。
 // 调用方（main）负责放入独立 goroutine 并在停机时先取消再关 store。
+//
+// 门控说明：retention 没有「meta leader 才跑」的整趟门——数据组分散在
+// 各节点，每个节点都清自己 lead 的队列（purgeQueue 逐队列判 lead）；
+// checkDisk 也无条件执行（本地磁盘水位是本节点的事实，与组 leadership
+// 无关，拒写保护不能等 leader 产生才生效）。Run 层只补「本趟 0 队列
+// 可处理」的 Debug 观测（见下方注释）。
 func (m *Manager) Run(ctx context.Context) {
 	m.logger.Info("retention 任务启动", "interval", m.interval.String())
 	t := time.NewTicker(m.interval)
 	defer t.Stop()
 	for {
 		m.checkDisk()
-		if n, err := m.Pass(); err != nil {
+		if n, proc, err := m.Pass(ctx); err != nil {
 			m.logger.Error("retention 清理失败", "err", err)
 		} else if n > 0 {
 			m.logger.Info("retention 清理完成", "purged_msgs", n)
+		} else if proc == 0 {
+			// 本趟 0 队列可处理：本节点未 lead 任何队列组，清理由各组
+			// leader 承担——摊布稳态下每节点只清自己的组，这是常态；
+			// 但启动窗口/leader 变更期看到它，可定位「为什么没清」。
+			m.logger.Debug("本趟 0 队列可处理——本节点未 lead 任何队列组")
 		}
 		select {
 		case <-ctx.Done():
@@ -107,31 +131,51 @@ func (m *Manager) checkDisk() {
 	}
 }
 
-// Pass 执行一趟全量清理，返回清掉的消息条数（keyidx 条目不计入）。
-func (m *Manager) Pass() (int, error) {
+// Pass 执行一趟全量清理。
+//
+// 返回：
+//   - purged: 清掉的消息条数（keyidx 条目不计入）
+//   - processable: 本趟可处理的队列数（其组由本节点 lead）——Run 层
+//     据此判定「本趟 0 队列可处理」的空转形态
+//   - err: 错误信息
+func (m *Manager) Pass(ctx context.Context) (purged int, processable int, err error) {
 	now := time.Now().UnixMilli()
-	total := 0
 	for _, tc := range m.mt.Topics() {
 		cutoff := now - tc.EffectiveRetention().Milliseconds()
 		for q := uint32(0); q < tc.Queues; q++ {
-			n, err := m.purgeQueue(tc.Name, q, cutoff)
-			if err != nil {
-				return total, fmt.Errorf("清理 %s/q%d: %w", tc.Name, q, err)
+			n, led, perr := m.purgeQueue(ctx, tc.Name, q, cutoff)
+			if perr != nil {
+				return purged, processable, fmt.Errorf("清理 %s/q%d: %w", tc.Name, q, perr)
 			}
-			total += n
+			purged += n
+			if led {
+				processable++
+			}
 		}
-		if err := m.purgeKeyIdx(tc.Name, cutoff); err != nil {
-			return total, fmt.Errorf("清理 keyidx %s: %w", tc.Name, err)
+		if err := m.purgeKeyIdx(ctx, tc.Name, cutoff); err != nil {
+			return purged, processable, fmt.Errorf("清理 keyidx %s: %w", tc.Name, err)
 		}
 	}
-	return total, nil
+	return purged, processable, nil
 }
 
 // purgeQueue 找到 [队首, 首条未过期) 边界并 DeleteRange 整段删除。
 // 队列内消息按 offset 追加写入、StoreAtMs 单调不减，扫到首条未过期即可停。
 // 注：单调性假设可能被时钟回跳（NTP 校时）短暂打破——被回跳越过停止边界的
 // 过期消息会在后续趟次被清掉，只有延迟、不丢消息。
-func (m *Manager) purgeQueue(topic string, q uint32, cutoff int64) (int, error) {
+//
+// 返回（清理条数, 是否本节点可处理（该队列组由本节点 lead）, 错误）：
+// 可处理标志供 Pass 统计 processable——非 leader 队列跳过是摊布语义
+// 的常态（各组 leader 各扫各的），不算错误。
+//
+// 集群档只清本节点 leader 的队列：各组 leader 各扫各的（摊布语义见 Task 8
+// 说明），非 leader 队列跳过——清理批次归该队列组，非 leader 提交会报
+// ErrNotLeader，跳过优于报错重试。
+func (m *Manager) purgeQueue(ctx context.Context, topic string, q uint32, cutoff int64) (int, bool, error) {
+	g := m.rt.GroupForQueue(topic, q)
+	if !m.rt.IsLeader(g) {
+		return 0, false, nil
+	}
 	pfx := store.MsgQueuePrefix(topic, q)
 	var boundary uint64
 	found := 0
@@ -148,55 +192,102 @@ func (m *Manager) purgeQueue(topic string, q uint32, cutoff int64) (int, error) 
 		return true, nil
 	})
 	if err != nil {
-		return 0, err
+		return 0, true, err
 	}
 	if found == 0 {
-		return 0, nil
+		return 0, true, nil
 	}
 	b := m.st.NewBatch()
 	// DeleteRange 从 offset 0 起：此前趟次已删的区间为空集，重复覆盖无害
 	b.DeleteRange(store.MsgKey(topic, q, 0), store.MsgKey(topic, q, boundary))
-	if err := m.st.Apply(b); err != nil {
-		return 0, fmt.Errorf("DeleteRange 提交: %w", err)
+	if err := m.rep.Apply(ctx, g, b); err != nil {
+		return 0, true, fmt.Errorf("DeleteRange 提交: %w", err)
 	}
 	if found == maxPurgePerQueue {
 		m.logger.Info("retention 达单趟上限，剩余留待下趟", "topic", topic, "queue", q)
 	}
 	m.logger.Debug("retention 清理队列", "topic", topic, "queue", q, "purged", found, "boundary", boundary)
-	return found, nil
+	return found, true, nil
 }
 
 // purgeKeyIdx 清理 topic 下 storeMs < cutoff 的索引条目（全扫逐删，见文件头边界说明）。
-func (m *Manager) purgeKeyIdx(topic string, cutoff int64) error {
+//
+// 集群档按 key 内 queueID 分桶：keyidx 键归消息所属队列的组，同桶（同队列）
+// 的删除合成一个批次、只提交本节点 leader 的桶——非 leader 桶跳过，由该组
+// leader 的趟次清理（摊布语义同 purgeQueue）。
+func (m *Manager) purgeKeyIdx(ctx context.Context, topic string, cutoff int64) error {
 	pfx := store.KeyIdxTopicPrefix(topic)
-	b := m.st.NewBatch()
+	// 桶 = queueID → 待删 key 的批次。扫描回调内不能开写事务（迭代器与写入
+	// 交错会破坏迭代），批次在回调内暂存、扫描结束后统一提交。
+	// 解析用 ParseKeyIdxKey（一次拿 storeMs 判 cutoff + queueID 分桶）；
+	// ParseKeyIdxQueueID 的同类职责由 adminops 的只分桶场景使用。
+	buckets := map[uint32]*store.Batch{}
+	counts := map[uint32]int{}
 	n := 0
 	err := m.st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) {
-		_, _, ms, _, _, perr := store.ParseKeyIdxKey(k)
+		_, _, ms, qid, _, perr := store.ParseKeyIdxKey(k)
 		if perr != nil {
 			return false, perr
 		}
 		if ms < cutoff {
+			b, ok := buckets[qid]
+			if !ok {
+				b = m.st.NewBatch()
+				buckets[qid] = b
+			}
 			b.Delete(k) // Batch 编码时即拷贝 key，回调切片可直接用
+			counts[qid]++
 			n++
 		}
 		return n < maxPurgePerQueue, nil
 	})
 	if err != nil {
-		b.Close()
+		for _, b := range buckets {
+			b.Close()
+		}
 		return err
 	}
 	if n == 0 {
-		b.Close()
+		for _, b := range buckets {
+			b.Close()
+		}
 		return nil
 	}
-	if err := m.st.Apply(b); err != nil {
-		return fmt.Errorf("索引删除提交: %w", err)
+	applied := 0
+	total := 0
+	// open 跟踪仍未 Close 的桶：已提交的桶被 rep.Apply 消费并 Close
+	//（Replicator 契约负责其生命周期）、非 leader 跳过的桶已自行 Close，
+	// 两者都从 open 摘除——错误路径只回收仍 open 的桶，避免对已消费
+	// 批次二次 Close（与 pebble 批次池别名同类的手续疏漏，I6）。
+	open := make(map[uint32]*store.Batch, len(buckets))
+	for qid, b := range buckets {
+		open[qid] = b
+	}
+	for qid, b := range buckets {
+		g := m.rt.GroupForQueue(topic, qid)
+		if !m.rt.IsLeader(g) {
+			b.Close() // 未提交而放弃的批次必须自行回收
+			delete(open, qid)
+			continue
+		}
+		if err := m.rep.Apply(ctx, g, b); err != nil {
+			// 当前失败桶按 store 契约丢给 GC（Apply 失败不得 Close，见
+			// store.Apply 注释）；其余仍 open 的桶自行回收
+			for oq, ob := range open {
+				if oq != qid {
+					ob.Close()
+				}
+			}
+			return fmt.Errorf("索引删除提交: %w", err)
+		}
+		delete(open, qid) // 已提交：批次归 Apply 处置
+		applied++
+		total += counts[qid]
 	}
 	if n == maxPurgePerQueue {
 		// 与 purgeQueue 同样的上限语义：n 触顶说明还有未扫描条目，剩余留待下趟
 		m.logger.Info("retention 索引达单趟上限，剩余留待下趟", "topic", topic)
 	}
-	m.logger.Debug("retention 清理索引", "topic", topic, "purged_idx", n)
+	m.logger.Info("retention 清理索引", "topic", topic, "buckets", applied, "purged_idx", total)
 	return nil
 }

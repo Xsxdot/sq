@@ -2,13 +2,24 @@
 package txn
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"testing"
 	"time"
 
 	"github.com/xushixin/sq/internal/core"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
+
+// fixedLeaderRouter 可编程 Router：IsLeader 按字段返回（leader-only 门控单测用）。
+// 不实现 Forwarder——门控拦截后转发分支不可达，nil fwd 不会解引用。
+type fixedLeaderRouter struct{ leader bool }
+
+func (r fixedLeaderRouter) GroupForQueue(string, uint32) uint32 { return 0 }
+func (r fixedLeaderRouter) MetaGroup() uint32                   { return 0 }
+func (r fixedLeaderRouter) IsLeader(uint32) bool                { return r.leader }
 
 // fakeNotifier 记录收到的回查请求，可编程返回值。
 type fakeNotifier struct {
@@ -25,7 +36,7 @@ func (f *fakeNotifier) RecoverOrphan(m *core.Message, txID string) bool {
 // 正常 Stage 首查在 30s 后，测试等不起，手法同 delay_test 直写暂存区）。
 func stageOverdue(t *testing.T, f *fixture, topic string) string {
 	t.Helper()
-	m, txID, err := f.mgr.Stage(msg(topic))
+	m, txID, err := f.mgr.Stage(context.Background(), msg(topic))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -76,11 +87,42 @@ func mustUnmarshal(t *testing.T, raw []byte, v any) {
 	}
 }
 
+// TestPassGatedByMetaLeadership 非 meta leader 时 Pass 有到期半消息也不
+// 回查（返回 0，条目原样保留，不下发）；恒 true 照常——half/ 键族归 meta
+// 组，回查的改期/丢弃都是 meta 组写入，必须 leader-only。
+func TestPassGatedByMetaLeadership(t *testing.T) {
+	f := newFixture(t, 30*time.Second, 15)
+	txID := stageOverdue(t, f, "t-gate")
+	rep := replication.NewStandalone(f.st)
+	n := &fakeNotifier{send: true}
+	// 恒 false：有到期半消息也不回查
+	mgr := New(rep, fixedLeaderRouter{leader: false}, f.st, f.pr, f.mt, 30*time.Second, 15, slog.Default())
+	sent, err := mgr.Pass(context.Background(), n)
+	if err != nil || sent != 0 {
+		t.Fatalf("非 leader Pass: sent=%d err=%v; want 0,nil", sent, err)
+	}
+	if len(n.got) != 0 {
+		t.Fatalf("非 leader 不应下发回查: %v", n.got)
+	}
+	if f.halfCount(t) != 1 {
+		t.Fatalf("非 leader 时到期半消息不应被处理: %d", f.halfCount(t))
+	}
+	// 恒 true：照常回查改期
+	mgr = New(rep, fixedLeaderRouter{leader: true}, f.st, f.pr, f.mt, 30*time.Second, 15, slog.Default())
+	sent, err = mgr.Pass(context.Background(), n)
+	if err != nil || sent != 1 {
+		t.Fatalf("leader Pass: sent=%d err=%v; want 1,nil", sent, err)
+	}
+	if len(n.got) != 1 || n.got[0] != txID {
+		t.Fatalf("leader 应下发回查: %v", n.got)
+	}
+}
+
 func TestPassSendsRecoverAndReschedules(t *testing.T) {
 	f := newFixture(t, 30*time.Second, 15)
 	txID := stageOverdue(t, f, "t-check")
 	n := &fakeNotifier{send: true}
-	sent, err := f.mgr.Pass(n)
+	sent, err := f.mgr.Pass(context.Background(), n)
 	if err != nil || sent != 1 {
 		t.Fatalf("Pass: sent=%d err=%v", sent, err)
 	}
@@ -108,7 +150,7 @@ func TestPassReschedulesEvenWhenNoProducerOnline(t *testing.T) {
 	f := newFixture(t, 30*time.Second, 15)
 	txID := stageOverdue(t, f, "t-check")
 	n := &fakeNotifier{send: false}
-	if _, err := f.mgr.Pass(n); err != nil {
+	if _, err := f.mgr.Pass(context.Background(), n); err != nil {
 		t.Fatal(err)
 	}
 	refRaw, _, _ := f.st.Get(store.HalfIdxKey(txID))
@@ -124,7 +166,7 @@ func TestPassDropsAfterMaxChecks(t *testing.T) {
 	txID := stageOverdue(t, f, "t-drop")
 	n := &fakeNotifier{send: true}
 	for i := 0; i < 3; i++ {
-		if _, err := f.mgr.Pass(n); err != nil {
+		if _, err := f.mgr.Pass(context.Background(), n); err != nil {
 			t.Fatal(err)
 		}
 		// 先查再改写：本条已超限丢弃时（halfCount==0）条目已不存在，
@@ -150,11 +192,11 @@ func TestPassSkipsEntryEndedInBetween(t *testing.T) {
 	// 不能凭已收集的旧键复活已决断的事务
 	f := newFixture(t, 30*time.Second, 15)
 	txID := stageOverdue(t, f, "t-race")
-	if found, _ := f.mgr.End(txID, true); !found {
+	if found, _ := f.mgr.End(context.Background(), txID, true); !found {
 		t.Fatal("End 失败")
 	}
 	n := &fakeNotifier{send: true}
-	sent, err := f.mgr.Pass(n)
+	sent, err := f.mgr.Pass(context.Background(), n)
 	if err != nil || sent != 0 || len(n.got) != 0 {
 		t.Fatalf("已决断事务被回查: sent=%d got=%v err=%v", sent, n.got, err)
 	}
@@ -176,7 +218,7 @@ func TestPassDeletesBadHalfKeyAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := &fakeNotifier{send: true}
-	sent, err := f.mgr.Pass(n)
+	sent, err := f.mgr.Pass(context.Background(), n)
 	if err != nil || sent != 2 {
 		t.Fatalf("Pass: sent=%d err=%v（坏 key 1 条 + 健康 1 条均计入 handled）", sent, err)
 	}
@@ -211,7 +253,7 @@ func TestPassDeletesCorruptHalfIdxAndContinues(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := &fakeNotifier{send: true}
-	sent, err := f.mgr.Pass(n)
+	sent, err := f.mgr.Pass(context.Background(), n)
 	if err != nil || sent != 1 {
 		t.Fatalf("Pass: sent=%d err=%v（坏 halfidx 条目计入 handled）", sent, err)
 	}
@@ -251,7 +293,7 @@ func TestPassDeletesCorruptValueWithMissingIdx(t *testing.T) {
 		t.Fatal(err)
 	}
 	n := &fakeNotifier{send: true}
-	sent, err := f.mgr.Pass(n)
+	sent, err := f.mgr.Pass(context.Background(), n)
 	if err != nil || sent != 1 {
 		t.Fatalf("Pass: sent=%d err=%v（坏条目计入 handled，不报错）", sent, err)
 	}

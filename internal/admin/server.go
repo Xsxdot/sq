@@ -25,6 +25,7 @@ import (
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
 	"github.com/xushixin/sq/internal/metrics"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 	"github.com/xushixin/sq/internal/sysinfo"
 )
@@ -37,6 +38,9 @@ type ConnCounter interface {
 
 // Server Admin HTTP 服务。
 type Server struct {
+	rep      replication.Replicator
+	rt       replication.Router
+	fwd      replication.Forwarder // 跨节点转发（集群档）；单机档 nil——IsLeader 恒真永不解引用
 	st       *store.Store
 	mt       *meta.Meta
 	pr       *produce.Producer
@@ -59,10 +63,16 @@ type Server struct {
 // sp 为 nil 时时序/总账端点返回 503（采样器未启用，不返回误导性的空数据）；
 // sys 为 nil 时 /admin/system 同理返回 503；conns 为 nil 时总览的
 // connections 回 0（测试构造等未装配场景，管理面不因缺读数来源而报错）。
-func New(st *store.Store, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer,
+//
+// rep/rt/fwd 供 adminops 的成片清理按组路由/转发：单机档传
+// replication.NewStandalone(st)、StandaloneRouter{} 与 nil fwd（IsLeader
+// 恒真，转发分支不可达）；集群档由 main 装配。
+func New(rep replication.Replicator, rt replication.Router, fwd replication.Forwarder,
+	st *store.Store, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer,
 	username, password string, sys *sysinfo.Reporter, sp *metrics.Sampler,
 	reg *prometheus.Registry, conns ConnCounter, logger *slog.Logger) *Server {
 	s := &Server{
+		rep: rep, rt: rt, fwd: fwd,
 		st: st, mt: mt, pr: pr, dl: dl,
 		username: username, password: password, sys: sys, sp: sp,
 		conns:  conns,

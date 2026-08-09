@@ -85,7 +85,8 @@ const (
 	brokerStopBudget = 5 * time.Second
 )
 
-// brokerBinary 由 TestMain 编译出来的 sq 可执行文件路径，全部用例共用。
+// brokerBinary 由 TestMain 编译（或按 SQ_E2E_BROKER 环境变量复用）出来的
+// sq 可执行文件路径，全部用例共用。
 var brokerBinary string
 
 // TestMain 准备两类进程级前置条件，再运行全部用例。
@@ -100,6 +101,8 @@ var brokerBinary string
 //     默认 true）。sq 监听的是明文 gRPC，不关掉握手会直接失败。
 //
 // sq 侧：把 cmd/sq 编译成临时二进制，供各用例起独立 broker 进程使用。
+// 设置 SQ_E2E_BROKER 可跳过编译、直接复用该路径的二进制——交叉编译的
+// 远端跑测入口（Linux 真机无 Go 工具链时，用 macOS 交叉编译的产物）。
 func TestMain(m *testing.M) {
 	logRoot, err := os.MkdirTemp("", "sq-e2e-rmq-log-")
 	if err != nil {
@@ -110,21 +113,29 @@ func TestMain(m *testing.M) {
 	rmq.ResetLogger()
 	rmq.EnableSsl = false
 
-	buildDir, err := os.MkdirTemp("", "sq-e2e-bin-")
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "创建构建临时目录失败: %v\n", err)
-		os.Exit(1)
-	}
-	brokerBinary = filepath.Join(buildDir, "sq")
-	if out, err := buildBroker(brokerBinary); err != nil {
-		fmt.Fprintf(os.Stderr, "编译 sq 失败: %v\n%s\n", err, out)
-		os.RemoveAll(buildDir)
-		os.RemoveAll(logRoot)
-		os.Exit(1)
+	if prebuilt := os.Getenv("SQ_E2E_BROKER"); prebuilt != "" {
+		if _, err := os.Stat(prebuilt); err != nil {
+			fmt.Fprintf(os.Stderr, "SQ_E2E_BROKER=%s 不可用: %v\n", prebuilt, err)
+			os.Exit(1)
+		}
+		brokerBinary = prebuilt
+	} else {
+		buildDir, err := os.MkdirTemp("", "sq-e2e-bin-")
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "创建构建临时目录失败: %v\n", err)
+			os.Exit(1)
+		}
+		brokerBinary = filepath.Join(buildDir, "sq")
+		if out, err := buildBroker(brokerBinary); err != nil {
+			fmt.Fprintf(os.Stderr, "编译 sq 失败: %v\n%s\n", err, out)
+			os.RemoveAll(buildDir)
+			os.RemoveAll(logRoot)
+			os.Exit(1)
+		}
+		defer os.RemoveAll(buildDir)
 	}
 
 	code := m.Run()
-	os.RemoveAll(buildDir)
 	os.RemoveAll(logRoot)
 	os.Exit(code)
 }

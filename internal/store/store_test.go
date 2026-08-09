@@ -284,3 +284,55 @@ func TestApplyWithOverridesSync(t *testing.T) {
 		t.Fatal("ApplyWith 提交后应可读")
 	}
 }
+
+// TestBatchTouchesPrefix 验证复制批次字节的键前缀判定：follower 侧盲 apply
+// 前用它判断批次是否触及某键族（如 meta/），是 meta 缓存重载钩子的判定件。
+func TestBatchTouchesPrefix(t *testing.T) {
+	st := openTestStore(t, t.TempDir())
+	defer st.Close()
+	b := st.NewBatch()
+	_ = b.Set([]byte("msg/t/0/1"), []byte("v"))
+	_ = b.Set([]byte("meta/topic/t"), []byte("v"))
+	repr := append([]byte(nil), b.Repr()...)
+	_ = b.Close()
+	if ok, _ := BatchTouchesPrefix(repr, []byte("meta/")); !ok {
+		t.Fatal("应命中 meta/ 前缀")
+	}
+	if ok, _ := BatchTouchesPrefix(repr, []byte("half/")); ok {
+		t.Fatal("不应命中 half/")
+	}
+}
+
+// TestNewBatchFromReprOwnsCopy 回归验证 NewBatchFromRepr 必须拷贝输入字节：
+// pebble 的 SetRepr 是零拷贝接管（b.data 直接指向传入切片），而批次在
+// ApplyWith 提交后会 Close 回收到 batch sync.Pool，池中批次连同 b.data
+// 一起被下一次 NewBatch 复用。若直接传调用方的切片，重建批次与调用方
+// 共享同一块内存——集群 apply 路径传的是 raft 日志条目自身的 Data 缓冲，
+// 之后任何 raftstore.Persist 复用池中批次就会原地覆盖日志条目，把日志
+// 写花（三节点 e2e 复现的损坏，见 store.go NewBatchFromRepr 注释）。
+//
+// 本测试：重建批次后再修改源字节，验证批次内容不受影响（拷贝成立）。
+func TestNewBatchFromReprOwnsCopy(t *testing.T) {
+	st := openTestStore(t, t.TempDir())
+	defer st.Close()
+	b := st.NewBatch()
+	_ = b.Set([]byte("k1"), []byte("v1"))
+	repr := append([]byte(nil), b.Repr()...)
+	_ = b.Close()
+
+	rb, err := st.NewBatchFromRepr(repr)
+	if err != nil {
+		t.Fatalf("NewBatchFromRepr: %v", err)
+	}
+	// 篡改源字节：若批次与源共享缓冲，apply 出的会是篡改后的内容
+	for i := range repr {
+		repr[i] = 0xAA
+	}
+	if err := st.Apply(rb); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	v, ok, err := st.Get([]byte("k1"))
+	if err != nil || !ok || string(v) != "v1" {
+		t.Fatalf("Get 应读到原始值 v1，got %q ok=%v err=%v", v, ok, err)
+	}
+}

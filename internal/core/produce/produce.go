@@ -13,6 +13,7 @@
 package produce
 
 import (
+	"context"
 	"fmt"
 	"hash/fnv"
 	"log/slog"
@@ -21,6 +22,7 @@ import (
 
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -39,6 +41,8 @@ type queueState struct {
 // Producer 写入引擎。并发安全。
 type Producer struct {
 	st     *store.Store
+	rep    replication.Replicator
+	rt     replication.Router
 	mt     *meta.Meta
 	logger *slog.Logger
 
@@ -58,27 +62,56 @@ type Producer struct {
 }
 
 // New 构造 Producer。offset 缓存懒加载（首写某队列时读一次 alloc/ key）。
-func New(st *store.Store, mt *meta.Meta, logger *slog.Logger) *Producer {
+//
+// rep/rt 为复制抽象与组路由视图：单机档传 replication.NewStandalone(st)
+// 与 StandaloneRouter{}，集群档由 main 装配。
+func New(rep replication.Replicator, rt replication.Router, st *store.Store,
+	mt *meta.Meta, logger *slog.Logger) *Producer {
 	return &Producer{
-		st: st, mt: mt, logger: logger.With("mod", "produce"),
+		st: st, rep: rep, rt: rt, mt: mt, logger: logger.With("mod", "produce"),
 		qstates: map[string]*queueState{}, rr: map[string]uint32{}, wakers: map[string]chan struct{}{},
 	}
 }
 
 func qkey(topic string, q uint32) string { return fmt.Sprintf("%s/%d", topic, q) }
 
-// AppendWith 在 Append 基础上，把 extra 组装的额外写操作并入同一原子批次。
+// InvalidateCounters 使全部 offset/seq 计数缓存失效（集群档组 leader 变更时
+// 由 OnLeaderChange 钩子触发；单机档无变更事件，正常不会调用）。
 //
-// 用途：DLQ 转入（写死信消息 + 删源 inflight）、M3 延时转正（写消息 + 删 delay
-// 条目）等「消息写入必须与另一处状态变更同生共死」的场景。extra 可为 nil。
+// 为什么必须失效：offset 计数器只在所属组的 leader 上权威——follower 节点
+// 的 alloc/ 值可能滞后（复制在途）；本节点重新当选 leader 时，若沿用旧内存
+// 值（重新当选前跟随期间可能已落后多笔写），会出现重复分配（内存值高于盘上
+// 多数派事实）或跳号（内存值低于多数派事实）。置 loaded=false 后，重新当选
+// 后的第一笔写强制从 alloc/ 重读——复制保证盘上是多数派事实，重读即回到
+// 权威值。seq（delay）计数器同理。
+func (p *Producer) InvalidateCounters() {
+	p.mu.Lock()
+	for _, qs := range p.qstates {
+		qs.mu.Lock()
+		qs.loaded = false
+		qs.mu.Unlock()
+	}
+	p.mu.Unlock()
+	p.delayMu.Lock()
+	p.delayLoaded = false
+	p.delayMu.Unlock()
+	p.logger.Info("leader 变更，offset 缓存失效")
+}
+
+// Append 写入一条普通消息（spec §5 流程 1）：队列选择、offset 分配、消息与
+// alloc 计数器 + Keys 索引同一 Batch 原子提交，fsync 完成后唤醒长轮询。
+// 本方法是本 Producer 唯一的普通消息追加入口（AppendDelay 为延时专用入口）。
 //
-// 注意：extra 只应操作与本消息无键冲突的 key；extra 内不得再调用本 Producer
-// 的任何方法（p.mu 与 queueState.mu 均不可重入）。
-func (p *Producer) AppendWith(m *core.Message, extra func(b *store.Batch)) (*core.Message, error) {
+// 注意：消息追加只保证本消息语义域内原子；跨语义域的关联写（DLQ 转入、延时
+// 转正、事务提交时的来源删除）由调用方以两段式完成（先 Append 写目标，后独立
+// 批次删来源）——单机单批原子在集群多 raft 组下不可表达，本方法不再提供
+// 跨域注入点。调用方不得在持有本 Producer 任何锁的临界区内调用本方法
+// （p.mu 与 queueState.mu 均不可重入）。
+func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, error) {
 	if len(m.Body) == 0 || len(m.Body) > MaxBodySize {
 		return nil, fmt.Errorf("消息体大小非法: %d（上限 %d）", len(m.Body), MaxBodySize)
 	}
-	tc, err := p.mt.EnsureTopic(m.Topic)
+	tc, err := p.mt.EnsureTopic(ctx, m.Topic)
 	if err != nil {
 		return nil, err
 	}
@@ -97,8 +130,24 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *store.Batch)) (*cor
 		h.Write([]byte(m.MessageGroup))
 		m.QueueID = h.Sum32() % tc.Queues
 	} else {
-		m.QueueID = p.rr[m.Topic] % tc.Queues
+		// 普通消息轮询选队。集群档多组摊布下，rr 落在哪条队列决定了提案
+		// 进哪个 raft 组——offset 分配是 leader-only 构造（Task 8 不变量），
+		// 本节点只该写自己 lead 的组。逐条尝试直到选中本节点 lead 组的
+		// 队列；全部不命中（探针放行后理论不可达）返回 ErrNotLeader，
+		// 由 SDK 换节点重试（三节点 e2e 实测：盲目 rr 会让单节点反复
+		// 提案到自己不 lead 的组，SDK 重试预算 5 次可能耗尽）。
+		for i := uint32(0); i < tc.Queues; i++ {
+			q := (p.rr[m.Topic] + i) % tc.Queues
+			if p.rt.IsLeader(p.rt.GroupForQueue(m.Topic, q)) {
+				m.QueueID = q
+				break
+			}
+		}
 		p.rr[m.Topic]++
+		if !p.rt.IsLeader(p.rt.GroupForQueue(m.Topic, m.QueueID)) {
+			p.mu.Unlock()
+			return nil, fmt.Errorf("%w: topic %s 本节点未 lead 任何队列组", replication.ErrNotLeader, m.Topic)
+		}
 	}
 	k := qkey(m.Topic, m.QueueID)
 	qs, ok := p.qstates[k]
@@ -110,6 +159,8 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *store.Batch)) (*cor
 
 	// 段 2（qs.mu）：offset 分配 + 编码 + 落盘。同队列串行（offset 顺序 ==
 	// 落盘顺序，FIFO 根基），跨队列并行（group commit 合并 fsync）。
+	// 组号 g 必须在此锁内、offset 分配之后计算——QueueID 到此刻才确定，
+	// GroupForQueue 是「队列→组」的入盘映射（Task 4 约定），提前算会错组。
 	qs.mu.Lock()
 	off, err := qs.nextOffsetLocked(p.st, m.Topic, m.QueueID)
 	if err != nil {
@@ -136,10 +187,8 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *store.Batch)) (*cor
 		}
 		b.Set(store.KeyIdxKey(m.Topic, key, m.StoreAtMs, m.QueueID, m.Offset), nil)
 	}
-	if extra != nil {
-		extra(b)
-	}
-	pending, err := p.st.ApplyAsync(b)
+	g := p.rt.GroupForQueue(m.Topic, m.QueueID)
+	pending, err := p.rep.ApplyAsync(ctx, g, b)
 	if err != nil {
 		qs.mu.Unlock()
 		return nil, fmt.Errorf("写入消息 %s (topic=%s q=%d off=%d): %w", m.ID, m.Topic, m.QueueID, m.Offset, err)
@@ -149,9 +198,17 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *store.Batch)) (*cor
 	// 同一次 fsync——这就是 group commit 在队列内生效的机制（吞吐从 1/fsync延迟
 	// 变为 合并深度/fsync延迟）。
 	//
-	// 为什么敢在 Wait 之前推进 qs.next：若后续 WaitSync 失败，说明 WAL sync 失败、
-	// Pebble 已进入不可恢复错误态，之后所有写入都会失败，进程只能重启；重启后
-	// 计数器与实际落盘由「同批原子提交」保证严格一致，内存里烧掉的 offset 无害。
+	// 为什么敢在 Wait 之前推进 qs.next：内存 offset 缓存烧掉无害——任何
+	// 让 Wait 失败的场景都不丢消息：
+	//   - 集群档提案失败（ErrNotLeader：提交期间领导权迁移）：本节点失去
+	//     leader 身份时 onLeaderChange 触发 InvalidateCounters 置
+	//     qs.loaded=false（I4 同步失效），后续读取从 store 重读实际状态，
+	//     绝不返回烧掉的 offset；
+	//   - 集群档 WaitSync 失败 ≠ Pebble 不可恢复：raft 副本仍持数据，
+	//     offset 分配是 leader-only 构造，本节点重启以 learner 追平即恢复；
+	//   - 单机档 Pebble 真坏（WAL sync 失败 = 不可恢复态）：进程只能重启，
+	//     重启后计数器与实际落盘由「同批原子提交」保证严格一致，内存里
+	//     烧掉的 offset 无害。
 	qs.next = off + 1
 	qs.loaded = true
 	qs.mu.Unlock()
@@ -176,7 +233,7 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *store.Batch)) (*cor
 // AppendDelay 将延时消息写入 delay/ 暂存区（spec §5 流程 3 前半）。
 //
 // 参数：m.DeliverAtMs 必须 >0（协议层已保证 DELAY 消息带 delivery_timestamp，
-// <=0 属编程错误直接报错）。到期时间已过（<=now）时直通 AppendWith 立即投递：
+// <=0 属编程错误直接报错）。到期时间已过（<=now）时直通 Append 立即投递：
 // 语义上"到期的延时消息"就是普通消息，绕道暂存区再被调度器搬回来只是
 // 多一次读写放大，结果完全相同。
 //
@@ -185,7 +242,7 @@ func (p *Producer) AppendWith(m *core.Message, extra func(b *store.Batch)) (*cor
 //
 // 原子性：delay 条目与 seq 计数器同一 Batch 提交，理由与 Append 的
 // offset 计数器完全相同（崩溃后计数器与已写条目严格一致，seq 绝不复用）。
-func (p *Producer) AppendDelay(m *core.Message) (*core.Message, error) {
+func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (*core.Message, error) {
 	if m.DeliverAtMs <= 0 {
 		return nil, fmt.Errorf("AppendDelay 要求 DeliverAtMs>0，得到 %d", m.DeliverAtMs)
 	}
@@ -194,11 +251,11 @@ func (p *Producer) AppendDelay(m *core.Message) (*core.Message, error) {
 	}
 	// 写入时就确认 topic 存在（autoCreate 时创建）：错误要在发送端立刻暴露，
 	// 不能等到几小时后到期移入时才发现 topic 不存在、消息无处可去。
-	if _, err := p.mt.EnsureTopic(m.Topic); err != nil {
+	if _, err := p.mt.EnsureTopic(ctx, m.Topic); err != nil {
 		return nil, err
 	}
 	if m.DeliverAtMs <= time.Now().UnixMilli() {
-		return p.AppendWith(m, nil)
+		return p.Append(ctx, m)
 	}
 	if m.ID == "" {
 		m.ID = core.NewMessageID()
@@ -220,13 +277,15 @@ func (p *Producer) AppendDelay(m *core.Message) (*core.Message, error) {
 	b := p.st.NewBatch()
 	b.Set(store.DelayKey(m.DeliverAtMs, seq), raw)
 	b.Set(store.DelayAllocKey(), store.PutU64(seq+1))
-	pending, err := p.st.ApplyAsync(b)
+	// 延时暂存区键族归元数据组（delay/ 与队列无关，无 GroupForQueue 映射）
+	g := p.rt.MetaGroup()
+	pending, err := p.rep.ApplyAsync(ctx, g, b)
 	if err != nil {
 		p.delayMu.Unlock()
 		return nil, fmt.Errorf("写入延时消息 %s (topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
 	}
 	// 定序成功即推进 seq 缓存并解锁：并发的延时写入随即进锁定序，与本条共享
-	// 同一次 fsync（拆分提交，与 AppendWith 的 qs.next 同款）。提前推进的安全性
+	// 同一次 fsync（拆分提交，与 Append 的 qs.next 同款）。提前推进的安全性
 	// 论证也相同：WaitSync 失败 == WAL sync 失败 == Pebble 不可恢复错误态，
 	// 重启后 seq 计数器与条目由同批原子提交保证一致，内存里烧掉的 seq 无害。
 	p.delayNext = seq + 1
@@ -258,9 +317,6 @@ func (p *Producer) nextDelaySeqLocked() (uint64, error) {
 	return store.GetU64(v), nil
 }
 
-// Append 写入一条普通消息（M1 签名保持不变）。
-func (p *Producer) Append(m *core.Message) (*core.Message, error) { return p.AppendWith(m, nil) }
-
 // AppendBatch 将同一 topic 的一批普通消息整批落入同一队列：连续 offset 段
 // [off, off+N)、单个 Pebble Batch、一次 fsync，整批原子——要么全部落盘要么
 // 全部不落，比逐条 Append 的「第 N 条失败前 N-1 条无法撤回」语义更强。
@@ -274,7 +330,7 @@ func (p *Producer) Append(m *core.Message) (*core.Message, error) { return p.App
 //
 // 注意：整批绑定单一队列与 RocketMQ batch 绑定单 MessageQueue 的语义一致；
 // 批与批之间仍按轮询换队列，长期负载均衡不受影响。
-func (p *Producer) AppendBatch(msgs []*core.Message) ([]*core.Message, error) {
+func (p *Producer) AppendBatch(ctx context.Context, msgs []*core.Message) ([]*core.Message, error) {
 	if len(msgs) == 0 {
 		return nil, fmt.Errorf("AppendBatch 要求至少一条消息")
 	}
@@ -290,7 +346,7 @@ func (p *Producer) AppendBatch(msgs []*core.Message) ([]*core.Message, error) {
 			return nil, fmt.Errorf("消息体大小非法: %d（上限 %d）", len(m.Body), MaxBodySize)
 		}
 	}
-	tc, err := p.mt.EnsureTopic(topic)
+	tc, err := p.mt.EnsureTopic(ctx, topic)
 	if err != nil {
 		return nil, err
 	}
@@ -306,9 +362,23 @@ func (p *Producer) AppendBatch(msgs []*core.Message) ([]*core.Message, error) {
 	}
 
 	// 段 1（p.mu）：整批一次队列选择——批内同队列是一次 fsync 与整批原子的前提。
+	// 集群档多组摊布下必须只选本节点 lead 组的队列（offset 分配是
+	// leader-only 构造，理由同 Append 段 1 注释）；全部不命中返回
+	// ErrNotLeader 由 SDK 换节点重试。
 	p.mu.Lock()
-	qid := p.rr[topic] % tc.Queues
+	qid := uint32(0)
+	for i := uint32(0); i < tc.Queues; i++ {
+		q := (p.rr[topic] + i) % tc.Queues
+		if p.rt.IsLeader(p.rt.GroupForQueue(topic, q)) {
+			qid = q
+			break
+		}
+	}
 	p.rr[topic]++
+	if !p.rt.IsLeader(p.rt.GroupForQueue(topic, qid)) {
+		p.mu.Unlock()
+		return nil, fmt.Errorf("%w: topic %s 本节点未 lead 任何队列组", replication.ErrNotLeader, topic)
+	}
 	k := qkey(topic, qid)
 	qs, ok := p.qstates[k]
 	if !ok {
@@ -317,7 +387,8 @@ func (p *Producer) AppendBatch(msgs []*core.Message) ([]*core.Message, error) {
 	}
 	p.mu.Unlock()
 
-	// 段 2（qs.mu）：连续 offset 段分配 + 编码 + 单批定序。
+	// 段 2（qs.mu）：连续 offset 段分配 + 编码 + 单批定序。组号 g 同
+	// Append：锁内、qid 分配后计算（队列→组映射此时才可判定）。
 	qs.mu.Lock()
 	off, err := qs.nextOffsetLocked(p.st, topic, qid)
 	if err != nil {
@@ -338,19 +409,20 @@ func (p *Producer) AppendBatch(msgs []*core.Message) ([]*core.Message, error) {
 		b.Set(store.MsgKey(topic, qid, m.Offset), raw)
 		for _, key := range m.Keys {
 			if key == "" {
-				continue // 空 key 无检索意义（与 AppendWith 同款防御）
+				continue // 空 key 无检索意义（与 Append 同款防御）
 			}
 			b.Set(store.KeyIdxKey(topic, key, m.StoreAtMs, qid, m.Offset), nil)
 		}
 	}
 	// alloc 计数器一次写到 off+N，与全部消息同批原子（语义红线 3 的批量形态）
 	b.Set(store.AllocKey(topic, qid), store.PutU64(off+uint64(len(msgs))))
-	pending, err := p.st.ApplyAsync(b)
+	g := p.rt.GroupForQueue(topic, qid)
+	pending, err := p.rep.ApplyAsync(ctx, g, b)
 	if err != nil {
 		qs.mu.Unlock()
 		return nil, fmt.Errorf("批量写入 %d 条 (topic=%s q=%d off=%d): %w", len(msgs), topic, qid, off, err)
 	}
-	// 提前推进的理由与 AppendWith 完全相同（见其注释）
+	// 提前推进的理由与 Append 完全相同（见其注释）
 	qs.next = off + uint64(len(msgs))
 	qs.loaded = true
 	qs.mu.Unlock()

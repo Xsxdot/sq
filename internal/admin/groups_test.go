@@ -15,7 +15,7 @@ func TestGroupProgressAndResetCursor(t *testing.T) {
 	s, _, mt, pr, dl, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	for i := 0; i < 3; i++ {
-		if _, err := pr.Append(&core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+		if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -81,10 +81,10 @@ func TestGroupProgressAndResetCursor(t *testing.T) {
 func TestGroupResetCursorQueueOutOfRange(t *testing.T) {
 	s, _, mt, _, _, _ := newTestServer(t, "", "")
 	h := s.Handler()
-	if _, err := mt.CreateTopic("t1", 1); err != nil {
+	if _, err := mt.CreateTopic(context.Background(), "t1", 1); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := mt.EnsureGroup("g1"); err != nil {
+	if _, err := mt.EnsureGroup(context.Background(), "g1"); err != nil {
 		t.Fatal(err)
 	}
 	// 1 队列 topic 上重置 queue_id=99 → 400

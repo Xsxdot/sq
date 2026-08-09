@@ -25,10 +25,13 @@ import (
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
 	"github.com/xushixin/sq/internal/core/txn"
+	"github.com/xushixin/sq/internal/replication"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
-const brokerName = "sq0" // 单机版固定 broker 名；v2 集群时改为节点标识
+// errNoLeader 表示某队列所属组尚无 leader（选举窗口）：路由查询整体拒答
+// HA_NOT_AVAILABLE，由 SDK 换节点重问（见 QueryRoute 该分支的选码论证）。
+var errNoLeader = errors.New("队列所属组尚无 leader（选举窗口）")
 
 // Server 协议适配层，实现 pb.MessagingServiceServer。
 // 内嵌 UnimplementedMessagingServiceServer：M1 未实现的 RPC（PullMessage、
@@ -37,6 +40,7 @@ const brokerName = "sq0" // 单机版固定 broker 名；v2 集群时改为节�
 type Server struct {
 	pb.UnimplementedMessagingServiceServer
 	cfg          *config.Config
+	rv           RouteView
 	mt           *meta.Meta
 	pr           *produce.Producer
 	dl           *deliver.Deliverer
@@ -58,9 +62,12 @@ type Server struct {
 	doneOnce sync.Once
 }
 
-// New 构造协议适配层。五个依赖各自服务于一组 RPC：cfg 提供对外通告地址与
-// 协商参数，mt 管 topic/group 注册表（QueryRoute/Heartbeat/QueryAssignment），
-// pr 是写路径（SendMessage），dl 是 POP 消费路径
+// New 构造协议适配层。六个依赖各自服务于一组 RPC：cfg 提供对外通告地址与
+// 协商参数，rv 是队列归属视图——QueryRoute/QueryAssignment 把每条队列指向
+// 其所属组 leader、SendMessage/ReceiveMessage 在 follower 上快速失败
+// （单机装配传 StaticRouteView(cfg)，集群装配见 cmd/sq），mt 管
+// topic/group 注册表（QueryRoute/Heartbeat/QueryAssignment），pr 是写路径
+// （SendMessage），dl 是 POP 消费路径
 // （ReceiveMessage/AckMessage/ChangeInvisibleDuration），tx 是事务管理器
 // （M6）：SendMessage 把 TRANSACTION 半消息交给它暂存，EndTransaction 由它
 // 决断；writeBlocked 是磁盘水位拒写开关（spec §7，由 retention 循环每趟更新），
@@ -69,9 +76,9 @@ type Server struct {
 // 可被轻易伪造，即失去防伪造保护（而非验签必失败），正常装配不允许传入 nil。
 // sessions 是 Telemetry 会话注册表
 // （M6 事务回查通道与连接数口径，本 task 自建，不依赖外部注入）。
-func New(cfg *config.Config, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, tx *txn.Manager, writeBlocked *atomic.Bool, handleSecret []byte, logger *slog.Logger) *Server {
+func New(cfg *config.Config, rv RouteView, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, tx *txn.Manager, writeBlocked *atomic.Bool, handleSecret []byte, logger *slog.Logger) *Server {
 	return &Server{
-		cfg: cfg, mt: mt, pr: pr, dl: dl, tx: tx, writeBlocked: writeBlocked, handleSecret: handleSecret, logger: logger.With("mod", "rpc"),
+		cfg: cfg, rv: rv, mt: mt, pr: pr, dl: dl, tx: tx, writeBlocked: writeBlocked, handleSecret: handleSecret, logger: logger.With("mod", "rpc"),
 		done:     make(chan struct{}),
 		sessions: newSessions(),
 	}
@@ -102,6 +109,28 @@ func (s *Server) Shutdown() {
 // Register 把 Server 挂载到 gRPC server 上。
 func (s *Server) Register(gs *grpc.Server) { pb.RegisterMessagingServiceServer(gs, s) }
 
+// leadsAnyQueueGroup 本节点是否是 topic 任一队列所属组的 leader。
+//
+// SendMessage 入口快速失败的判定件：topic 的队列摊布在多个组上，只要
+// 本节点 lead 其中任一队列的组，就存在「rr 选到本节点组」的可能——此时
+// 不能入口拒（propose 的 ErrNotLeader 才是兜底）；只有本节点对全部队列
+// 组都不是 leader（选举窗口/分区）才快速失败。
+//
+// topic 未注册（autoCreate 即将创建）时按 meta 组判定：创建写归 meta
+// 组（topic 注册本身），本节点不是 meta leader 则创建注定失败。
+func (s *Server) leadsAnyQueueGroup(topic string) bool {
+	tc, ok := s.mt.GetTopic(topic)
+	if !ok {
+		return s.rv.MetaIsLeader()
+	}
+	for q := uint32(0); q < tc.Queues; q++ {
+		if s.rv.SelfIsLeader(topic, q) {
+			return true
+		}
+	}
+	return false
+}
+
 // okStatus 构造成功状态。
 func okStatus() *pb.Status { return &pb.Status{Code: pb.Code_OK, Message: "ok"} }
 
@@ -124,6 +153,13 @@ func errStatus(code pb.Code, msg string) *pb.Status { return &pb.Status{Code: co
 // broker 会为每次重试各打一条 Error 日志。反过来，把内部故障报成"你的输入非法"
 // 同样有害——那会让一个本该重试就能恢复的瞬时错误被客户端当成永久失败放弃。
 //
+// 第三类失败是 replication.ErrNotLeader（本节点不是该队列所属组的 leader）：
+// 它不是「服务端坏了」，而是「问错节点了」——协议层对它的回答是
+// HA_NOT_AVAILABLE，语义分工是：INTERNAL_SERVER_ERROR = 这节点坏了，修我；
+// HA_NOT_AVAILABLE = 这节点没坏，但你该去问/发给 leader（完整选码论证见
+// QueryRoute 的 HA_NOT_AVAILABLE 分支）。日志用 Debug：选举窗口内每次写都
+// 会被 leader 之外的节点弹回，高频路径不值得打 Warn。
+//
 // extra 是追加到日志上的额外键值对（如 SendMessage 的 msg_id），只影响日志，
 // 不影响返回的 Status。
 func (s *Server) topicErrStatus(rpcName, topic string, err error, extra ...any) *pb.Status {
@@ -135,6 +171,9 @@ func (s *Server) topicErrStatus(rpcName, topic string, err error, extra ...any) 
 	case errors.Is(err, meta.ErrTopicNotFound):
 		s.logger.Warn("topic 不存在且未开启自动创建", args...)
 		return errStatus(pb.Code_TOPIC_NOT_FOUND, err.Error())
+	case errors.Is(err, replication.ErrNotLeader):
+		s.logger.Debug("本节点不是该队列 leader，按 HA_NOT_AVAILABLE 拒答", args...)
+		return errStatus(pb.Code_HA_NOT_AVAILABLE, err.Error())
 	default:
 		s.logger.Error("服务端内部错误", args...)
 		return errStatus(pb.Code_INTERNAL_SERVER_ERROR, err.Error())
@@ -152,15 +191,29 @@ func (s *Server) endpoints() *pb.Endpoints {
 	}
 }
 
-// messageQueues 把 topic 配置展开为路由队列表。
-func (s *Server) messageQueues(tc meta.TopicConfig, topic *pb.Resource) []*pb.MessageQueue {
+// messageQueues 把 topic 配置展开为路由队列表：每条队列经 RouteView 指向其
+// 所属组当前 leader 的对外通告地址（单机形态恒指向本节点自身，行为与 v1
+// 逐字节一致）。队列 leader 未知（选举窗口）时返回 errNoLeader——整个路由
+// 查询报 HA_NOT_AVAILABLE，由 SDK 换节点重问（见 QueryRoute 该分支注释）。
+func (s *Server) messageQueues(tc meta.TopicConfig, topic *pb.Resource) ([]*pb.MessageQueue, error) {
 	qs := make([]*pb.MessageQueue, 0, tc.Queues)
 	for i := uint32(0); i < tc.Queues; i++ {
+		host, port, brokerName, ok := s.rv.QueueEndpoint(topic.GetName(), i)
+		if !ok {
+			return nil, fmt.Errorf("%w: topic %s queue %d", errNoLeader, topic.GetName(), i)
+		}
 		qs = append(qs, &pb.MessageQueue{
 			Topic:      topic,
 			Id:         int32(i),
 			Permission: pb.Permission_READ_WRITE,
-			Broker:     &pb.Broker{Name: brokerName, Id: 0, Endpoints: s.endpoints()},
+			Broker: &pb.Broker{
+				Name: brokerName,
+				Id:   0,
+				Endpoints: &pb.Endpoints{
+					Scheme:    pb.AddressScheme_IPv4,
+					Addresses: []*pb.Address{{Host: host, Port: port}},
+				},
+			},
 			AcceptMessageTypes: []pb.MessageType{
 				pb.MessageType_NORMAL,
 				// M3 起接受延时消息。不能漏：SDK 开着 ValidateMessageType，
@@ -176,7 +229,7 @@ func (s *Server) messageQueues(tc meta.TopicConfig, topic *pb.Resource) []*pb.Me
 			},
 		})
 	}
-	return qs
+	return qs, nil
 }
 
 // QueryRoute 返回 topic 路由。autoCreate 开启时未知 topic 在此自动创建——
@@ -184,12 +237,36 @@ func (s *Server) messageQueues(tc meta.TopicConfig, topic *pb.Resource) []*pb.Me
 // EnsureTopic 的失败按性质分类，规则见 topicErrStatus。
 func (s *Server) QueryRoute(ctx context.Context, req *pb.QueryRouteRequest) (*pb.QueryRouteResponse, error) {
 	name := req.GetTopic().GetName()
-	tc, err := s.mt.EnsureTopic(name)
+	tc, err := s.mt.EnsureTopic(ctx, name)
 	if err != nil {
 		return &pb.QueryRouteResponse{Status: s.topicErrStatus("QueryRoute", name, err)}, nil
 	}
+	qs, err := s.messageQueues(tc, req.GetTopic())
+	if err != nil {
+		// 队列 leader 未知（选举窗口）时整包拒答。
+		//
+		// 为什么用 HA_NOT_AVAILABLE（50002，协议 doc 语义「高可用复制层
+		// 不可用」）而不是 INTERNAL_SERVER_ERROR / MESSAGE_NOT_FOUND /
+		// TOO_MANY_REQUESTS：
+		//   - 官方 SDK 对**任意非 OK 码**的处理是立即重试 + 隔离本端点 +
+		//     轮换候选队列（producer.go 的 isRpcErr 分支，200 行附近），
+		//     3 次尝试跨 3 个候选队列足以撞上选举完成后给出完整路由的健康
+		//     节点——所以这里报什么非 OK 码都行，但必须选一个语义诚实、且
+		//     不在 SDK 特殊分支里的；
+		//   - MESSAGE_NOT_FOUND 被 push 消费者当「没新消息」走流控退避
+		//     （process_queue.go 的 isNoNewMessage 分支），TOO_MANY_REQUESTS
+		//     触发限流语义——两者都有特殊分支，占用它们等于把「问错节点」
+		//     伪装成别的故障，误导客户端；
+		//   - INTERNAL_SERVER_ERROR 语义是「服务端坏了，按退避重试」，会
+		//     让客户端把整轮重试烧在同一个还在选举的节点上，且运维看日志
+		//     会以为节点故障（其实是正常的选举窗口）。
+		// 而 HA_NOT_AVAILABLE 字面即「高可用复制层不可用」，与「该组还没
+		// 选出 leader」一一对应。
+		s.logger.Warn("QueryRoute 拒答：部分队列所属组尚无 leader（选举窗口）", "topic", name, "err", err)
+		return &pb.QueryRouteResponse{Status: errStatus(pb.Code_HA_NOT_AVAILABLE, err.Error())}, nil
+	}
 	s.logger.Debug("QueryRoute", "topic", name, "queues", tc.Queues)
-	return &pb.QueryRouteResponse{Status: okStatus(), MessageQueues: s.messageQueues(tc, req.GetTopic())}, nil
+	return &pb.QueryRouteResponse{Status: okStatus(), MessageQueues: qs}, nil
 }
 
 // Heartbeat 客户端保活；携带消费组名时顺带注册该组（消费组首次出现即注册，
@@ -201,7 +278,7 @@ func (s *Server) QueryRoute(ctx context.Context, req *pb.QueryRouteRequest) (*pb
 // 是服务端内部故障，报成客户端输入错误会误导客户端停止本该重试的请求。
 func (s *Server) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (*pb.HeartbeatResponse, error) {
 	if g := req.GetGroup().GetName(); g != "" {
-		if _, err := s.mt.EnsureGroup(g); err != nil {
+		if _, err := s.mt.EnsureGroup(ctx, g); err != nil {
 			if errors.Is(err, meta.ErrBadName) {
 				s.logger.Warn("Heartbeat 注册消费组失败：名字非法", "group", g, "err", err)
 				return &pb.HeartbeatResponse{Status: errStatus(pb.Code_ILLEGAL_CONSUMER_GROUP, err.Error())}, nil

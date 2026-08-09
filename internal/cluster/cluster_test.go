@@ -3,8 +3,9 @@
 // 职责：
 //   - testCluster harness：三节点（各自 store + Manager）经 127.0.0.1
 //     随机端口的真实 TCP 互联，提供 leader 发现/摘除/收敛轮询原语
-//   - 四个端到端场景：复制收敛（全组）、kill-leader 切换续写、
-//     follower 提案拒绝、不干净节点 learner 重入
+//   - 六个端到端场景：复制收敛（全组）、kill-leader 切换续写、
+//     follower 提案拒绝、不干净节点 learner 重入、转发原语
+//     （Task 4）线路与收敛、控制通道 RPC
 //
 // 边界：
 //   - 只覆盖三节点、AckQuorumMem 档；单节点/其它档位归 manager_test
@@ -12,22 +13,28 @@
 //     规范实现）；本文件是 batch④ 场景测试的 seedbed
 //   - 不直接 import internal/replication：它反向 import 本包，内测
 //     文件引用即 "import cycle not allowed in test"（编译器拒绝）；
-//     场景经 clusterReplicator（同语义薄包装）走同一条 Propose 路径
+//     场景经 clusterReplicator（同语义薄包装）走同一条 Propose 路径；
+//     replication 包自身的转发原语（NewCluster.ForwardAppend 等）由
+//     replication_test.go 用 solo Manager 直测
 package cluster
 
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"sort"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
 	"go.etcd.io/raft/v3/raftpb"
 
+	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -48,6 +55,26 @@ func (r clusterReplicator) Apply(ctx context.Context, g uint32, b *store.Batch) 
 		return fmt.Errorf("回收批次: %w", err)
 	}
 	return r.m.Propose(ctx, g, repr)
+}
+
+// shimPending 是 clusterReplicator.ApplyAsync 的返回类型：与
+// replication.Pending 同语义（恰好一次 Wait）。
+type shimPending chan error
+
+// Wait 读一次结果 channel（恰好一次语义，与 replication.chanPending 同）。
+func (p shimPending) Wait() error { return <-p }
+
+// ApplyAsync 与 replication.Cluster.ApplyAsync 同语义（shim 契约见
+// clusterReplicator 注释）：拷贝 repr、Close 批次、goroutine 内 Propose，
+// Wait 阻塞到本节点 apply 完成。
+func (r clusterReplicator) ApplyAsync(ctx context.Context, g uint32, b *store.Batch) (shimPending, error) {
+	repr := append([]byte(nil), b.Repr()...)
+	if err := b.Close(); err != nil {
+		return nil, fmt.Errorf("回收批次: %w", err)
+	}
+	ch := make(chan error, 1)
+	go func() { ch <- r.m.Propose(ctx, g, repr) }()
+	return shimPending(ch), nil
 }
 
 // TestClusterReplicateAllGroups 三节点起全 4 组；经 Replicator 往 meta 组
@@ -108,6 +135,132 @@ func TestClusterProposeOnFollowerFails(t *testing.T) {
 	}
 }
 
+// TestProposeOnFollowerReturnsErrNotLeader follower 上 Propose 必须报
+// ErrNotLeader（可被 errors.Is 识别）——协议面据此翻译可重试码。
+func TestProposeOnFollowerReturnsErrNotLeader(t *testing.T) {
+	tc := newTestCluster(t, AckQuorumMem)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	lead := tc.leaderOf(t, 1)
+	var follower uint64
+	for id := range tc.mgrs {
+		if id != lead {
+			follower = id
+			break
+		}
+	}
+	err := tc.mgrs[follower].Propose(ctx, 1, []byte("x"))
+	if !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("follower Propose 应返回 ErrNotLeader，得到: %v", err)
+	}
+}
+
+// TestOnAppliedHookFires 每个节点 apply 提案后钩子必须携带组号与原始
+// repr 触发：leader 写一条 meta 组提案，断言 3 个节点都收到
+// (g=0, repr 相同)。
+func TestOnAppliedHookFires(t *testing.T) {
+	// 注入 OnApplied 钩子启用收集器：harness 把钩子逐节点包裹进
+	// appliedChs（见 newTestClusterOpts 注释），raw 钩子为占位，断言走
+	// 收集器 channel
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{OnApplied: func(g uint32, repr []byte) {}})
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	lead := tc.leaderOf(t, MetaGroup)
+	b := tc.stores[lead].NewBatch()
+	key := "meta/topic/hook-fires"
+	if err := b.Set([]byte(key), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	repr := append([]byte(nil), b.Repr()...)
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := tc.mgrs[lead].Propose(ctx, MetaGroup, repr); err != nil {
+		t.Fatalf("meta 组提案: %v", err)
+	}
+	for id := range tc.mgrs {
+		tc.waitAppliedEvt(t, id, MetaGroup, repr, 30*time.Second)
+	}
+}
+
+// TestOnLeaderChangeHookFiresOnFailover kill leader 后，存活节点必须收到
+// isSelf=true 的 OnLeaderChange 回调：新 leader 在自己当选的 SoftState
+// 分支触发（leader 字段为新 leader 自身）。
+func TestOnLeaderChangeHookFiresOnFailover(t *testing.T) {
+	// 同 OnApplied 收集器用法：注入钩子启用 leaderChs，断言走 channel
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{OnLeaderChange: func(g uint32, leader uint64, isSelf bool) {}})
+	old := tc.leaderOf(t, 1)
+	tc.kill(t, old)
+	evt := tc.waitLeaderChangeIsSelf(t, 1, old, 60*time.Second)
+	if got := tc.leaderOfExcluding(t, 1, old); got != evt.leader {
+		t.Fatalf("回调报告的 leader=%d 与 leaderOfExcluding 报告的 %d 不一致", evt.leader, got)
+	}
+}
+
+// TestLeaderSpreadConverges 三节点四组，任由初始选举集中，摊布循环应在
+// 数个周期内把 leader 分布收敛到 preferred（组 g → sortedPeers[g % n]）。
+func TestLeaderSpreadConverges(t *testing.T) {
+	tc := newTestCluster(t, AckQuorumMem) // harness 注入 balancer 间隔 200ms
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if tc.leadersMatchPreferred(t) {
+			return
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	t.Fatal("leader 摊布未收敛到 preferred 分布")
+}
+
+// TestLeaderChangeFiresExactlyOncePerGroup 钩子时序断言：摊布收敛后每个
+// 组的现任 leader 恰好收到一次 isSelf=true（获得 leadership 时触发一次，
+// 不多不漏），其余节点至多一次（初始选举赢家若被摊布转走也触发过）。
+// 这是 Task 11 InvalidateCounters 接线（isSelf==true 时失效计数器）的
+// 时机前提：多次触发会让计数器被无谓失效。
+func TestLeaderChangeFiresExactlyOncePerGroup(t *testing.T) {
+	// 注入占位钩子启用收集器（newTestClusterOpts 见 harness 注释）
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{OnLeaderChange: func(g uint32, leader uint64, isSelf bool) {}})
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		if tc.leadersMatchPreferred(t) {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	// 收敛后等最后的钩子事件入队：lead 原子先于钩子更新（handleReady
+	// 先 Store 再 notify），最后一场转移的当选事件可能晚于收敛观测
+	time.Sleep(time.Second)
+	drain := func(ch chan leaderEvt) map[uint32]int {
+		m := map[uint32]int{}
+		for {
+			select {
+			case evt := <-ch:
+				if evt.isSelf {
+					m[evt.g]++
+				}
+			default:
+				return m
+			}
+		}
+	}
+	counts := make(map[uint64]map[uint32]int, len(tc.mgrs)) // 节点 → 组 → isSelf=true 计数
+	for id, ch := range tc.leaderChs {
+		counts[id] = drain(ch)
+	}
+	for g := uint32(0); g <= tc.dataGroups; g++ {
+		pref := tc.preferredOf(g)
+		for id := range tc.mgrs {
+			got := counts[id][g]
+			if id == pref {
+				if got != 1 {
+					t.Fatalf("组 %d 的 preferred 节点 %d 收到 %d 次 isSelf=true; want 恰好 1", g, id, got)
+				}
+			} else if got > 1 {
+				t.Fatalf("组 %d 节点 %d 收到 %d 次 isSelf=true; want ≤1", g, id, got)
+			}
+		}
+	}
+}
+
 // TestClusterUncleanNodeRejoinsAsLearner 断电节点经 WipeForRejoin +
 // harness 编排（存活 leader Remove→AddLearner→追平→AddNode）回归，
 // 已 commit 数据一条不丢——spike Task 5 流程在真实存储/传输上的复现。
@@ -140,6 +293,411 @@ func TestClusterUncleanNodeRejoinsAsLearner(t *testing.T) {
 	tc.waitConverged(t, []string{"meta/topic/t0000", "meta/topic/t0099", "meta/topic/t0100", "meta/topic/t0199"}, 60*time.Second)
 }
 
+// TestClusterAutoRejoin 断电节点调用 cluster.Rejoin 一个入口完成全部编排：
+// 存活 leader 收 PrepareJoin 自动 Remove→AddLearner；节点 fresh 启动追平后
+// 由 AutoPromoteLearners 循环自动升 voter；最终三节点数据收敛且 victim 是
+// 全组 voter。原手工编排测试保留（行为规范不动）。
+func TestClusterAutoRejoin(t *testing.T) {
+	// AutoPromoteLearners 注入到全节点：升 voter 是 leader 侧循环的活
+	// （learner 不 lead 组），victim 自己的 Manager 也带上（无妨）
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{AutoPromoteLearners: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+	lead := tc.leaderOf(t, MetaGroup)
+	writeN := func(from, n int) { // 经 meta 组写 n 键
+		for i := from; i < from+n; i++ {
+			b := tc.stores[tc.leaderOf(t, MetaGroup)].NewBatch()
+			_ = b.Set([]byte(fmt.Sprintf("meta/topic/t%04d", i)), []byte("v"))
+			if err := (clusterReplicator{tc.mgrs[tc.leaderOf(t, MetaGroup)]}).Apply(ctx, MetaGroup, b); err != nil {
+				t.Fatalf("写 %d: %v", i, err)
+			}
+		}
+	}
+	writeN(0, 100)
+	var victim uint64
+	for id := range tc.mgrs {
+		if id != lead {
+			victim = id
+			break
+		}
+	}
+	tc.kill(t, victim) // 不写标记 = 断电
+	writeN(100, 100)   // 2/3 照常
+
+	// Rejoin 前置（六步之 1）：调用方负责关旧 store——pebble 持有目录
+	// 句柄，不关闭 WipeForRejoin 清不掉（Rejoin 文档注释的调用方职责）
+	if err := tc.stores[victim].Close(); err != nil {
+		t.Fatalf("节点 %d 关闭旧 store: %v", victim, err)
+	}
+	m, err := Rejoin(ctx, Options{
+		NodeID:                 victim,
+		Peers:                  tc.peers,
+		DataGroups:             tc.dataGroups,
+		Mode:                   tc.mode,
+		Logger:                 testSlog(t),
+		LeaderBalancerInterval: tc.balancerInterval,
+		AutoPromoteLearners:    true,
+	}, tc.dirs[victim])
+	if err != nil {
+		t.Fatalf("Rejoin(%d): %v", victim, err)
+	}
+	tc.stores[victim] = m.st
+	tc.mgrs[victim] = m
+	tc.killed[victim] = false // 恢复存活：清理期按正常节点 StopClean
+	t.Logf("节点 %d 已经 Rejoin 自动编排恢复（dir=%s）", victim, tc.dirs[victim])
+
+	// 数据收敛：断电前后写入的 200 键全部存在且一致（盲 apply 的观测面）
+	tc.waitConverged(t, []string{"meta/topic/t0000", "meta/topic/t0099", "meta/topic/t0100", "meta/topic/t0199"}, 60*time.Second)
+
+	// 自动升 voter：AutoPromoteLearners 循环在追平后把 victim 升回
+	// 全组 voter——轮询 Status 断言 victim 在每组成员表的 voters 侧
+	for g := uint32(0); g <= tc.dataGroups; g++ {
+		tc.waitVoterInConfig(t, g, victim, 60*time.Second)
+	}
+}
+
+// waitVoterInConfig 轮询全部存活节点的 Status：组 g 的成员表把 nodeID
+// 列为 voter（Status.Config.Voters 即 ConfState 的运行时形态，[0] 为
+// incoming 侧）。超时 Fatal。
+func (tc *testCluster) waitVoterInConfig(t *testing.T, g uint32, nodeID uint64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for id, m := range tc.mgrs {
+			if tc.killed[id] {
+				continue
+			}
+			st, ok := m.Status(g)
+			if !ok {
+				continue
+			}
+			if _, ok := st.Config.Voters[0][nodeID]; ok {
+				t.Logf("组 %d: 节点 %d 已是 voter（节点 %d 的成员表）", g, nodeID, id)
+				return
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("组 %d: 节点 %d 未在 %v 内成为 voter", g, nodeID, timeout)
+}
+
+// TestSingleNodeUncleanRestartRejoins 单节点集群（peers 只有自己）断电后
+// 调用 cluster.Rejoin 必须快速成功——评审 Critical 1 回归：prepareJoinPoll
+// 对唯一 peer 跳过轮询自己，need 集合永不消减，裸走 30s 超时失败，节点
+// 拒绝重启（单节点是受支持的形态：config 校验放行 peers:1，sq.example.yaml
+// 有文档；而 kill -9 正是 Rejoin 存在意义的场景）。修复后单节点跳过
+// PrepareJoin 编排（无对端可编排，Wipe + fresh 启动即完整恢复）。
+//
+// 断言：Rejoin 在远小于 30s 内成功（超时是修复前的失败形态），节点恢复
+// 后重新成为全部组 leader（fresh 启动 + 单节点立即当选）。
+func TestSingleNodeUncleanRestartRejoins(t *testing.T) {
+	tc := newTestClusterN(t, AckQuorumMem, Options{}, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	// 先写几键证明集群健康（断电前有数据）
+	for i := 0; i < 10; i++ {
+		b := tc.stores[1].NewBatch()
+		_ = b.Set([]byte(fmt.Sprintf("meta/topic/single%04d", i)), []byte("v"))
+		if err := (clusterReplicator{tc.mgrs[1]}).Apply(ctx, MetaGroup, b); err != nil {
+			t.Fatalf("写 %d: %v", i, err)
+		}
+	}
+	tc.kill(t, 1) // 不写标记 = 断电
+
+	// Rejoin 前置（六步之 1）：调用方负责关旧 store
+	if err := tc.stores[1].Close(); err != nil {
+		t.Fatalf("节点 1 关闭旧 store: %v", err)
+	}
+	start := time.Now()
+	m, err := Rejoin(ctx, Options{
+		NodeID:                 1,
+		Peers:                  tc.peers,
+		DataGroups:             tc.dataGroups,
+		Mode:                   tc.mode,
+		Logger:                 testSlog(t),
+		LeaderBalancerInterval: tc.balancerInterval,
+		AutoPromoteLearners:    true,
+	}, tc.dirs[1])
+	if err != nil {
+		t.Fatalf("Rejoin(单节点): %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > 15*time.Second {
+		t.Fatalf("单节点 Rejoin 耗时 %v，超过 15s——疑似走了 PrepareJoin 30s 超时路径", elapsed)
+	}
+	t.Logf("单节点 Rejoin 完成（%v，无 PrepareJoin 超时）", time.Since(start).Round(time.Millisecond))
+	tc.stores[1] = m.st
+	tc.mgrs[1] = m
+	tc.killed[1] = false // 恢复存活：清理期按正常节点 StopClean
+
+	// 恢复后重新成为全部组 leader（fresh 单节点即刻当选）
+	for g := uint32(0); g <= tc.dataGroups; g++ {
+		tc.waitLeader(t, g, 1, 30*time.Second)
+	}
+	t.Logf("单节点断电恢复完成：全组 leader 复归节点 1")
+}
+
+// waitLeader 轮询节点 id 的 Leader(g) 直到报告 lead==nodeID（或超时
+// Fatal）。单节点恢复场景用：节点必须重新成为各组 leader 才算恢复。
+func (tc *testCluster) waitLeader(t *testing.T, g uint32, nodeID uint64, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if lead, ok := tc.mgrs[nodeID].Leader(g); ok && lead == nodeID {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("组 %d: 节点 %d 未在 %v 内成为 leader", g, nodeID, timeout)
+}
+
+// TestControlRoundTrip 节点 A 经 Manager.Control 调 B 的控制通道：
+// B 的 ControlHandler 收到 op/payload 并应答，A 取回应答；handler
+// 报错时 A 收到带错误文本的 error；未知节点与超大 payload 在发送
+// 侧直接拒绝（不发起连接）。
+func TestControlRoundTrip(t *testing.T) {
+	// 双节点 harness（控制通道是点对点 RPC，无需多数派语义）：
+	// B 注入 ControlHandler——op=7 回显 payload、op=8 报错，并把
+	// 每次调用推进 got 供断言「B 确实收到了」
+	got := make(chan struct {
+		op      byte
+		payload []byte
+	}, 8)
+	handler := func(op byte, payload []byte) ([]byte, error) {
+		got <- struct {
+			op      byte
+			payload []byte
+		}{op, append([]byte(nil), payload...)}
+		switch op {
+		case 7:
+			return append([]byte(nil), payload...), nil
+		case 8:
+			return nil, errors.New("handler-boom")
+		default:
+			return nil, fmt.Errorf("unexpected op %d", op)
+		}
+	}
+	tc := newTestClusterN(t, AckQuorumMem, Options{ControlHandler: handler}, 2)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	a := tc.mgrs[1]
+
+	// 成功路径：A 调 B 得回显，且 B 的 handler 确实收到 op=7 payload="ping"
+	resp, err := a.Control(ctx, 2, 7, []byte("ping"))
+	if err != nil {
+		t.Fatalf("Control 成功路径: %v", err)
+	}
+	if string(resp) != "ping" {
+		t.Fatalf("应答 %q; want %q", resp, "ping")
+	}
+	evt := <-got
+	if evt.op != 7 || string(evt.payload) != "ping" {
+		t.Fatalf("B 的 handler 收到 op=%d payload=%q; want op=7 payload=\"ping\"", evt.op, evt.payload)
+	}
+
+	// 错误路径：B 的 handler 返回 error，A 侧错误必须带该文本
+	if _, err := a.Control(ctx, 2, 8, []byte("x")); err == nil || !strings.Contains(err.Error(), "handler-boom") {
+		t.Fatalf("错误路径 err=%v; want 含 handler-boom", err)
+	}
+	evt = <-got
+	if evt.op != 8 {
+		t.Fatalf("B 的 handler 收到 op=%d; want 8", evt.op)
+	}
+
+	// 未知节点：Peers 表无此节点，发送侧直接报错
+	if _, err := a.Control(ctx, 99, 1, nil); err == nil {
+		t.Fatal("未知节点 Control 应报错，得到 nil")
+	}
+
+	// 超大 payload（16MiB 帧上限）：发送侧直接拒绝，不发起连接
+	if _, err := a.Control(ctx, 2, 9, make([]byte, maxFrameLen)); err == nil {
+		t.Fatal("超大 payload 应被发送侧拒绝，得到 nil")
+	}
+}
+
+// TestControlOpRegistry 控制通道 op 注册表是跨节点线协议：帧里只有 1B
+// op，取值被未来版本引用——改动即协议不兼容，锁死黄金值。
+func TestControlOpRegistry(t *testing.T) {
+	if OpForwardAppend != 1 {
+		t.Fatalf("OpForwardAppend=%d; want 1（线协议黄金值）", OpForwardAppend)
+	}
+	if OpForwardApply != 2 {
+		t.Fatalf("OpForwardApply=%d; want 2（线协议黄金值）", OpForwardApply)
+	}
+	if OpPrepareJoin != 3 {
+		t.Fatalf("OpPrepareJoin=%d; want 3（线协议黄金值）", OpPrepareJoin)
+	}
+}
+
+// TestClusterApplyAsyncOnFollowerReturnsErrNotLeader follower 上 ApplyAsync
+// 的等待必须带回 ErrNotLeader（错误经 goroutine+channel 到 Wait 不丢失）
+// ——协议面据此翻译可重试码。与 TestProposeOnFollowerReturnsErrNotLeader
+// 同一条 Propose 快速失败路径，差别在异步拆分的传播面。
+func TestClusterApplyAsyncOnFollowerReturnsErrNotLeader(t *testing.T) {
+	tc := newTestCluster(t, AckQuorumMem)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	lead := tc.leaderOf(t, 1)
+	var follower uint64
+	for id := range tc.mgrs {
+		if id != lead {
+			follower = id
+			break
+		}
+	}
+	b := tc.stores[follower].NewBatch()
+	_ = b.Set([]byte("msg/it/async-follower"), []byte("v"))
+	p, err := (clusterReplicator{tc.mgrs[follower]}).ApplyAsync(ctx, 1, b)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := p.Wait(); !errors.Is(err, ErrNotLeader) {
+		t.Fatalf("follower ApplyAsync.Wait 应返回 ErrNotLeader，得到: %v", err)
+	}
+}
+
+// TestClusterForwardAppendWire 用假 handler 测 ForwardAppend 线路：follower
+// 经 Manager.Control 发 op=OpForwardAppend、payload=[4B BE g][EncodeMessage
+// 字节] 给 leader；假 handler 校验载荷并回 [4B BE queueID][8B BE offset]，
+// 发起方校验响应布局。真 produce 栈接线在 Task 11 e2e 覆盖。
+func TestClusterForwardAppendWire(t *testing.T) {
+	// 假 produce 栈：校验载荷布局（[4B g][msgRaw]）后回 leader 侧坐标
+	got := make(chan struct {
+		op      byte
+		payload []byte
+	}, 4)
+	handler := func(op byte, payload []byte) ([]byte, error) {
+		got <- struct {
+			op      byte
+			payload []byte
+		}{op, append([]byte(nil), payload...)}
+		switch op {
+		case OpForwardAppend:
+			if len(payload) < 4 {
+				return nil, fmt.Errorf("ForwardAppend 载荷过短: %d", len(payload))
+			}
+			resp := make([]byte, 12)
+			binary.BigEndian.PutUint32(resp[:4], 9)
+			binary.BigEndian.PutUint64(resp[4:], 1234)
+			return resp, nil
+		default:
+			return nil, fmt.Errorf("unexpected op %d", op)
+		}
+	}
+	tc := newTestClusterN(t, AckQuorumMem, Options{ControlHandler: handler}, 2)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	lead := tc.leaderOf(t, 1)
+	var follower uint64
+	for id := range tc.mgrs {
+		if id != lead {
+			follower = id
+			break
+		}
+	}
+	raw, err := core.EncodeMessage(&core.Message{ID: "FWD1", Topic: "orders", Body: []byte("x")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 4+len(raw))
+	binary.BigEndian.PutUint32(payload[:4], 1)
+	copy(payload[4:], raw)
+	resp, err := tc.mgrs[follower].Control(ctx, lead, OpForwardAppend, payload)
+	if err != nil {
+		t.Fatalf("ForwardAppend 线路: %v", err)
+	}
+	if len(resp) != 12 {
+		t.Fatalf("响应 %d B; want 12（[4B queueID][8B offset]）", len(resp))
+	}
+	if qid := binary.BigEndian.Uint32(resp[:4]); qid != 9 {
+		t.Fatalf("queueID=%d; want 9", qid)
+	}
+	if off := binary.BigEndian.Uint64(resp[4:]); off != 1234 {
+		t.Fatalf("offset=%d; want 1234", off)
+	}
+	evt := <-got
+	if evt.op != OpForwardAppend || !bytes.Equal(evt.payload, payload) {
+		t.Fatalf("leader handler 收到 op=%d payload=%v; want op=%d payload=%v", evt.op, evt.payload, OpForwardAppend, payload)
+	}
+}
+
+// TestClusterForwardApplyConverges follower 把构造无关删除批次（纯
+// Delete）的 repr 经 op=OpForwardApply 转发给 leader，leader 侧假 produce
+// 栈（dispatch goroutine，遵守 handler 不阻塞契约）把 repr 提进本组
+// Propose——与 Task 11 的 ControlHandler 装配同形——三节点删除收敛。
+func TestClusterForwardApplyConverges(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	// 假 produce 栈：收到请求即 dispatch 提案。self 是接收节点（= 发起
+	// 方按 Leader(g) 寻址的目标 leader）的 Manager——handler 共享给全部
+	// 节点、不知道自己的 node id，测试在选主后经 atomic 注入
+	var self atomic.Pointer[Manager]
+	proposeErr := make(chan error, 1)
+	handler := func(op byte, payload []byte) ([]byte, error) {
+		if op != OpForwardApply {
+			return nil, fmt.Errorf("unexpected op %d", op)
+		}
+		if len(payload) < 4 {
+			return nil, fmt.Errorf("ForwardApply 载荷过短: %d", len(payload))
+		}
+		g := binary.BigEndian.Uint32(payload[:4])
+		repr := append([]byte(nil), payload[4:]...) // 拷贝：跨 goroutine 持有
+		go func() { proposeErr <- self.Load().Propose(ctx, g, repr) }()
+		return nil, nil
+	}
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{ControlHandler: handler})
+	lead := tc.leaderOf(t, 1)
+	self.Store(tc.mgrs[lead])
+	// 先让键在三节点可见（删除才可观测）
+	b := tc.stores[lead].NewBatch()
+	_ = b.Set([]byte("msg/it/fwd-del"), []byte("v"))
+	if err := (clusterReplicator{tc.mgrs[lead]}).Apply(ctx, 1, b); err != nil {
+		t.Fatal(err)
+	}
+	tc.waitConverged(t, []string{"msg/it/fwd-del"}, 30*time.Second)
+	// follower 构造纯 Delete 批次并转发给 leader 提案
+	var follower uint64
+	for id := range tc.mgrs {
+		if id != lead {
+			follower = id
+			break
+		}
+	}
+	del := tc.stores[follower].NewBatch()
+	if err := del.Delete([]byte("msg/it/fwd-del")); err != nil {
+		t.Fatal(err)
+	}
+	payload := make([]byte, 4+len(del.Repr()))
+	binary.BigEndian.PutUint32(payload[:4], 1)
+	copy(payload[4:], del.Repr())
+	_ = del.Close() // repr 已取出，批次回收失败不挡转发（同 Cluster.Apply 契约）
+	if _, err := tc.mgrs[follower].Control(ctx, lead, OpForwardApply, payload); err != nil {
+		t.Fatalf("ForwardApply 线路: %v", err)
+	}
+	// 提案成功（handler dispatch 的 goroutine 回传）后再等三节点删除收敛
+	select {
+	case err := <-proposeErr:
+		if err != nil {
+			t.Fatalf("leader 侧提案: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("leader 侧提案未返回")
+	}
+	tc.waitAbsent(t, tc.aliveIDs(), []string{"msg/it/fwd-del"}, 30*time.Second)
+}
+
+// appliedEvt 是 OnApplied 钩子收集器的事件：组号 + 原始批次 repr。
+type appliedEvt struct {
+	g    uint32
+	repr []byte
+}
+
+// leaderEvt 是 OnLeaderChange 钩子收集器的事件：组号 + 新 leader + 是否自身。
+type leaderEvt struct {
+	g      uint32
+	leader uint64
+	isSelf bool
+}
+
 // testCluster 是三节点测试集群：每个节点一条独立数据目录、store 与
 // Manager，经 127.0.0.1 随机端口的真实 TCP 互联。
 //
@@ -153,11 +711,29 @@ type testCluster struct {
 	killed     map[uint64]bool         // 已 kill（模拟断电）的节点
 	dataGroups uint32
 	mode       AckMode
+
+	// 钩子收集器（newTestClusterOpts 注入对应钩子时才会创建）：钩子签名
+	// 不带节点 id，harness 逐节点包裹闭包把事件分流进各节点 channel
+	appliedChs map[uint64]chan appliedEvt // 节点 → OnApplied 事件流
+	leaderChs  map[uint64]chan leaderEvt  // 节点 → OnLeaderChange 事件流
+
+	balancerInterval time.Duration // 摊布循环周期（harness 注入，见 newTestClusterN）
 }
 
-// newTestCluster 起三节点集群（真实 TCP）。
+// newTestCluster 起三节点集群（真实 TCP），不带钩子注入。
+func newTestCluster(t *testing.T, mode AckMode) *testCluster {
+	return newTestClusterN(t, mode, Options{}, 3)
+}
+
+// newTestClusterOpts 起三节点集群（真实 TCP），并支持注入装配钩子。
 //
-// 装配序：先 net.Listen ×3 收集地址再拼 Peers 表——解拨号先有鸡还是
+// hookOpts 只消费 OnLeaderChange/OnApplied/ControlHandler 三个字段：
+// 对应钩子非 nil 时，harness 为每个节点挂上包裹闭包——把事件推进该
+// 节点的收集器 channel（appliedChs/leaderChs），再转发给注入的 raw
+// 钩子。钩子签名不带节点 id，逐节点 channel 分流是测试断言「三节点
+// 都收到」的观测面。
+//
+// 装配序：先 net.Listen ×n 收集地址再拼 Peers 表——解拨号先有鸡还是
 // 先有蛋（传输层按 Peers 拨号，必须拿到全部地址后才能建 Manager），
 // 然后逐节点 store.Open(t.TempDir()/id) + NewManager（Listener 注入
 // 已建监听）+ Start。
@@ -165,12 +741,26 @@ type testCluster struct {
 // 清理按逆序注册：StopClean 存活节点 → 等全部 Done → 关 store。
 // kill 过的节点跳过 StopClean（运行 ctx 已取消）；rejoin 过的节点
 // 已重置 killed 标记，按存活节点正常收尾（stores/mgrs 指向新实例）。
-func newTestCluster(t *testing.T, mode AckMode) *testCluster {
+func newTestClusterOpts(t *testing.T, mode AckMode, hookOpts Options) *testCluster {
+	return newTestClusterN(t, mode, hookOpts, 3)
+}
+
+// newTestClusterN 同 newTestClusterOpts，但节点数可配：控制通道等
+// 无需多数派语义的测试用双节点即可，避免三节点无谓的选举开销。
+func newTestClusterN(t *testing.T, mode AckMode, hookOpts Options, n uint64) *testCluster {
 	t.Helper()
-	// 1. 先建三个监听器收集地址，再拼 Peers 表
-	lstns := make([]net.Listener, 0, 3)
-	peers := make(map[uint64]string, 3)
-	for i := uint64(1); i <= 3; i++ {
+	// 摊布循环默认注入 200ms 周期（brief 约定「harness 注入 balancer
+	// 间隔 200ms」）：摊布只在「本节点连续 lead 某组 ≥3 个周期」后才
+	// 发起转移（见 StartLeaderBalancer 注释）——不会打断测试的读写
+	// 窗口，因此全量场景套件统一跑在摊布语义下，TestLeaderSpreadConverges
+	// 无需任何特殊装配。
+	if hookOpts.LeaderBalancerInterval <= 0 {
+		hookOpts.LeaderBalancerInterval = 200 * time.Millisecond
+	}
+	// 1. 先建 n 个监听器收集地址，再拼 Peers 表
+	lstns := make([]net.Listener, 0, n)
+	peers := make(map[uint64]string, n)
+	for i := uint64(1); i <= n; i++ {
 		ln, err := net.Listen("tcp", "127.0.0.1:0")
 		if err != nil {
 			t.Fatalf("节点 %d 预建监听: %v", i, err)
@@ -179,30 +769,66 @@ func newTestCluster(t *testing.T, mode AckMode) *testCluster {
 		peers[i] = ln.Addr().String()
 	}
 	tc := &testCluster{
-		dirs:       make(map[uint64]string, 3),
-		stores:     make(map[uint64]*store.Store, 3),
-		mgrs:       make(map[uint64]*Manager, 3),
-		peers:      peers,
-		killed:     make(map[uint64]bool, 3),
-		dataGroups: 3,
-		mode:       mode,
+		dirs:             make(map[uint64]string, n),
+		stores:           make(map[uint64]*store.Store, n),
+		mgrs:             make(map[uint64]*Manager, n),
+		peers:            peers,
+		killed:           make(map[uint64]bool, n),
+		dataGroups:       3,
+		mode:             mode,
+		balancerInterval: hookOpts.LeaderBalancerInterval,
+	}
+	if hookOpts.OnApplied != nil {
+		tc.appliedChs = make(map[uint64]chan appliedEvt, n)
+	}
+	if hookOpts.OnLeaderChange != nil {
+		tc.leaderChs = make(map[uint64]chan leaderEvt, n)
 	}
 	// 2. 逐节点开 store + NewManager + Start（节点目录 = t.TempDir()/id，
 	//    WipeForRejoin 只需清节点目录，父目录保留）
-	for i := uint64(1); i <= 3; i++ {
+	for i := uint64(1); i <= n; i++ {
 		dir := fmt.Sprintf("%s/%d", t.TempDir(), i)
 		st, err := store.Open(dir, false, testSlog(t))
 		if err != nil {
 			t.Fatalf("节点 %d 开 store: %v", i, err)
 		}
+		// 逐节点钩子包裹闭包：事件推进收集器（缓冲 64——正常场景每节点
+		// 每次选举/每条提案各 1 条，远低于容量；测试不消费也不阻塞
+		// Ready 循环），再转发 raw 钩子
+		var onLC func(g uint32, leader uint64, isSelf bool)
+		if hookOpts.OnLeaderChange != nil {
+			raw := hookOpts.OnLeaderChange
+			tc.leaderChs[i] = make(chan leaderEvt, 64)
+			onLC = func(g uint32, leader uint64, isSelf bool) {
+				tc.leaderChs[i] <- leaderEvt{g: g, leader: leader, isSelf: isSelf}
+				raw(g, leader, isSelf)
+			}
+		}
+		var onApplied func(g uint32, repr []byte)
+		if hookOpts.OnApplied != nil {
+			raw := hookOpts.OnApplied
+			tc.appliedChs[i] = make(chan appliedEvt, 64)
+			onApplied = func(g uint32, repr []byte) {
+				// 拷贝：钩子契约禁止保留 repr（Ready 循环缓冲复用），
+				// 收集器跨协程持有必须深拷贝
+				repr = append([]byte(nil), repr...)
+				tc.appliedChs[i] <- appliedEvt{g: g, repr: repr}
+				raw(g, repr)
+			}
+		}
 		m, err := NewManager(Options{
-			NodeID:     i,
-			Peers:      peers,
-			Listener:   lstns[i-1], // 注入预建监听：Peers 地址与监听一一对应
-			DataGroups: 3,
-			Mode:       mode,
-			Store:      st,
-			Logger:     testSlog(t),
+			NodeID:                 i,
+			Peers:                  peers,
+			Listener:               lstns[i-1], // 注入预建监听：Peers 地址与监听一一对应
+			DataGroups:             3,
+			Mode:                   mode,
+			Store:                  st,
+			Logger:                 testSlog(t),
+			OnLeaderChange:         onLC,
+			OnApplied:              onApplied,
+			ControlHandler:         hookOpts.ControlHandler,
+			LeaderBalancerInterval: hookOpts.LeaderBalancerInterval,
+			AutoPromoteLearners:    hookOpts.AutoPromoteLearners,
 		})
 		if err != nil {
 			t.Fatalf("节点 %d NewManager: %v", i, err)
@@ -289,6 +915,75 @@ func (tc *testCluster) leaderOfExcluding(t *testing.T, g uint32, exclude uint64)
 	return 0
 }
 
+// preferredOf 返回组 g 的 preferred leader 节点：sortedPeerIDs(peers)[g % n]。
+func (tc *testCluster) preferredOf(g uint32) uint64 {
+	ids := make([]uint64, 0, len(tc.mgrs))
+	for id := range tc.mgrs {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids[g%uint32(len(ids))]
+}
+
+// leadersMatchPreferred 判定全部组 leader 分布已收敛到 preferred：每组的
+// preferred 节点自报为该组 leader（摊布循环收敛的观测面）。
+func (tc *testCluster) leadersMatchPreferred(t *testing.T) bool {
+	t.Helper()
+	for g := uint32(0); g <= tc.dataGroups; g++ {
+		pref := tc.preferredOf(g)
+		if lead, ok := tc.mgrs[pref].Leader(g); !ok || lead != pref {
+			return false
+		}
+	}
+	return true
+}
+
+// waitAppliedEvt 轮询指定节点的 OnApplied 收集器，直到收到组 g 上
+// repr 匹配的事件（不匹配事件丢弃：startup 空条目等噪声），超时 Fatal。
+func (tc *testCluster) waitAppliedEvt(t *testing.T, id uint64, g uint32, repr []byte, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		select {
+		case evt := <-tc.appliedChs[id]:
+			if evt.g == g && bytes.Equal(evt.repr, repr) {
+				t.Logf("节点 %d 已收到组 %d 的 OnApplied 事件（repr %d B）", id, g, len(repr))
+				return
+			}
+		default:
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
+	t.Fatalf("节点 %d 未在 %v 内收到组 %d 的 OnApplied 事件", id, timeout, g)
+}
+
+// waitLeaderChangeIsSelf 轮询全部存活节点的 OnLeaderChange 收集器，直到
+// 某节点收到组 g 上 isSelf=true 且 leader≠exclude 的事件（kill-leader 后
+// 新 leader 的当选回调），返回该事件。启动期旧 leader 的 isSelf 事件以
+// leader==exclude 过滤——回调是「新 leader 已产生」的确定性观测面。
+func (tc *testCluster) waitLeaderChangeIsSelf(t *testing.T, g uint32, exclude uint64, timeout time.Duration) leaderEvt {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		for id, ch := range tc.leaderChs {
+			if tc.killed[id] {
+				continue
+			}
+			select {
+			case evt := <-ch:
+				if evt.g == g && evt.isSelf && evt.leader != exclude {
+					t.Logf("节点 %d 收到组 %d 当选回调: leader=%d isSelf=true", id, g, evt.leader)
+					return evt
+				}
+			default:
+			}
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatalf("组 %d: 存活节点未在 %v 内收到 isSelf=true 的 leader 变更回调（排除旧 leader %d）", g, timeout, exclude)
+	return leaderEvt{}
+}
+
 // kill 模拟节点断电：测试后门 m.kill()（取消运行 ctx，不写干净关机
 // 标记）+ 记入 killed 集，并等 Done 确认全部机件（含后台刷盘
 // goroutine）完全退出——后续关 store/WipeForRejoin 才能安全操作。
@@ -372,6 +1067,47 @@ func (tc *testCluster) converged(ids []uint64, keys []string) bool {
 	return true
 }
 
+// waitAbsent 轮询给定节点集合：全部 keys 均不可读（删除批次收敛的
+// 观测面），超时 Fatal 附仍持有键的节点。
+func (tc *testCluster) waitAbsent(t *testing.T, ids []uint64, keys []string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if tc.absent(ids, keys) {
+			t.Logf("删除收敛: 节点 %v 上 %d 键全部消失", ids, len(keys))
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	// 超时：逐节点列出仍持有的键，附排障上下文
+	var sb strings.Builder
+	fmt.Fprintf(&sb, "节点 %v 上 %d 键未在 %v 内删除:\n", ids, len(keys), timeout)
+	for _, id := range ids {
+		var still []string
+		for _, k := range keys {
+			_, ok, err := tc.stores[id].Get([]byte(k))
+			if err != nil || ok {
+				still = append(still, k)
+			}
+		}
+		fmt.Fprintf(&sb, "  节点 %d: 仍有 %v\n", id, still)
+	}
+	t.Fatal(sb.String())
+}
+
+// absent 判定给定节点集合上全部 keys 均已不可读。
+func (tc *testCluster) absent(ids []uint64, keys []string) bool {
+	for _, k := range keys {
+		for _, id := range ids {
+			_, ok, err := tc.stores[id].Get([]byte(k))
+			if err != nil || ok {
+				return false
+			}
+		}
+	}
+	return true
+}
+
 // rejoinAsLearner 把断电节点（已 kill、store 已停）以 learner 身份
 // 重新接回集群——spike restartAsLearner 流程（Task 5）在真实存储/
 // 传输上的复现，逐步骤 t.Logf 供观测（batch④ 场景测试依赖的观测面）。
@@ -446,13 +1182,14 @@ func (tc *testCluster) rejoinAsLearner(t *testing.T, ctx context.Context, victim
 		t.Fatalf("节点 %d 重开 store: %v", victim, err)
 	}
 	m, err := NewManager(Options{
-		NodeID:     victim,
-		Peers:      tc.peers,
-		Listener:   ln,
-		DataGroups: tc.dataGroups,
-		Mode:       tc.mode,
-		Store:      st,
-		Logger:     testSlog(t),
+		NodeID:                 victim,
+		Peers:                  tc.peers,
+		Listener:               ln,
+		DataGroups:             tc.dataGroups,
+		Mode:                   tc.mode,
+		Store:                  st,
+		Logger:                 testSlog(t),
+		LeaderBalancerInterval: tc.balancerInterval,
 	})
 	if errors.Is(err, ErrUncleanShutdown) {
 		t.Fatalf("节点 %d WipeForRejoin 后仍报 ErrUncleanShutdown——fresh 路径判定错误", victim)

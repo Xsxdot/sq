@@ -16,6 +16,7 @@ import (
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
 	"github.com/xushixin/sq/internal/metrics"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 	"github.com/xushixin/sq/internal/sysinfo"
 )
@@ -35,17 +36,19 @@ func newTestServerWithConns(t *testing.T, user, pass string, conns ConnCounter) 
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	rep := replication.NewStandalone(st)
+	rt := replication.StandaloneRouter{}
+	mt, err := meta.New(rep, rt, st, true, 1, 16, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
-	pr := produce.New(st, mt, slog.Default())
-	dl := deliver.New(st, mt, pr, slog.Default())
+	pr := produce.New(rep, rt, st, mt, slog.Default())
+	dl := deliver.New(rep, rt, st, mt, pr, slog.Default())
 	sp := metrics.NewSampler(st, mt, time.Hour, slog.Default())
 	// sys 与 /metrics 的系统 Collector、/admin/system 共用同一个
 	// sysinfo.Reporter（数据目录用独立临时目录，不影响 store 所在目录）
 	sys := sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default())
-	s := New(st, mt, pr, dl, user, pass, sys, sp, metrics.NewRegistry(st, mt, sys, nil, nil, slog.Default()), conns, slog.Default())
+	s := New(rep, rt, nil, st, mt, pr, dl, user, pass, sys, sp, metrics.NewRegistry(st, mt, sys, nil, nil, slog.Default()), conns, slog.Default())
 	return s, st, mt, pr, dl, sp
 }
 
@@ -58,14 +61,16 @@ func newTestServerNoSampler(t *testing.T, user, pass string) (*Server, *store.St
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	rep := replication.NewStandalone(st)
+	rt := replication.StandaloneRouter{}
+	mt, err := meta.New(rep, rt, st, true, 1, 16, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
-	pr := produce.New(st, mt, slog.Default())
-	dl := deliver.New(st, mt, pr, slog.Default())
+	pr := produce.New(rep, rt, st, mt, slog.Default())
+	dl := deliver.New(rep, rt, st, mt, pr, slog.Default())
 	sys := sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default())
-	s := New(st, mt, pr, dl, user, pass, sys, nil, metrics.NewRegistry(st, mt, sys, nil, nil, slog.Default()), nil, slog.Default())
+	s := New(rep, rt, nil, st, mt, pr, dl, user, pass, sys, nil, metrics.NewRegistry(st, mt, sys, nil, nil, slog.Default()), nil, slog.Default())
 	return s, st, mt, pr, dl, nil
 }
 

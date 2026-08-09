@@ -98,6 +98,34 @@ func TestParseKeyIdxKeyRejectsGarbage(t *testing.T) {
 	}
 }
 
+// TestParseKeyIdxQueueIDRoundTrip 构造 key → 解析 queueID → 相等
+// （retention/adminops 分桶的解析路径，含 key 内 '/' 的尾部定长解析）。
+func TestParseKeyIdxQueueIDRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		qid uint32
+		key string
+	}{
+		{0, "a"},
+		{3, "oid-1"},
+		{255, "含斜杠的 key/a/b"},
+		{4294967295, "max"},
+	} {
+		k := KeyIdxKey("orders", tc.key, 1700000000123, tc.qid, 42)
+		got, err := ParseKeyIdxQueueID(k)
+		if err != nil || got != tc.qid {
+			t.Fatalf("ParseKeyIdxQueueID(%q) = %d, %v; want %d", k, got, err, tc.qid)
+		}
+	}
+}
+
+func TestParseKeyIdxQueueIDRejectsGarbage(t *testing.T) {
+	for _, bad := range [][]byte{[]byte("keyidx/"), []byte("keyidx/t/short"), []byte("msg/t/x"), []byte("keyidx/t/k/12345")} {
+		if _, err := ParseKeyIdxQueueID(bad); err == nil {
+			t.Fatalf("应拒绝非法 key %q", bad)
+		}
+	}
+}
+
 func TestDelayKeyRoundTrip(t *testing.T) {
 	k := DelayKey(1700000000123, 42)
 	due, seq, err := ParseDelayKey(k)
@@ -162,6 +190,33 @@ func TestCursorKeyRoundTrip(t *testing.T) {
 	}
 	if !bytes.HasPrefix(InflightKey("g1", "t1", 0, 0), InflightAllPrefix()) {
 		t.Fatal("InflightAllPrefix 应是 InflightKey 的前缀")
+	}
+}
+
+// TestParseCursorTopicQueueRoundTrip 构造 cursor key → 解析 (topic,qid) →
+// 相等（adminops 按队列分桶的解析路径）。
+func TestParseCursorTopicQueueRoundTrip(t *testing.T) {
+	for _, tc := range []struct {
+		topic string
+		qid   uint32
+	}{
+		{"t1", 0},
+		{"orders", 7},
+		{"t-255", 4294967295},
+	} {
+		k := CursorKey("g1", tc.topic, tc.qid)
+		gotTopic, gotQid, err := ParseCursorTopicQueue(k)
+		if err != nil || gotTopic != tc.topic || gotQid != tc.qid {
+			t.Fatalf("ParseCursorTopicQueue(%q) = %q, %d, %v; want %q, %d", k, gotTopic, gotQid, err, tc.topic, tc.qid)
+		}
+	}
+}
+
+func TestParseCursorTopicQueueRejectsGarbage(t *testing.T) {
+	for _, bad := range [][]byte{[]byte("cursor/"), []byte("cursor/g/t"), []byte("cursor/g/t/1"), []byte("cursor/g/t/123456789"), []byte("msg/g/t")} {
+		if _, _, err := ParseCursorTopicQueue(bad); err == nil {
+			t.Fatalf("应拒绝非法 key %q", bad)
+		}
 	}
 }
 

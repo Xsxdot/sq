@@ -12,6 +12,7 @@
 package deliver
 
 import (
+	"context"
 	"log/slog"
 	"sync/atomic"
 	"testing"
@@ -20,6 +21,7 @@ import (
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/xushixin/sq/internal/replication"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -33,12 +35,14 @@ func newBenchDeliverer(b *testing.B, n int) *Deliverer {
 		b.Fatalf("store: %v", err)
 	}
 	b.Cleanup(func() { st.Close() })
-	mt, err := meta.New(st, true, 1, 16, slog.Default())
+	rep := replication.NewStandalone(st)
+	rt := replication.StandaloneRouter{}
+	mt, err := meta.New(rep, rt, st, true, 1, 16, slog.Default())
 	if err != nil {
 		b.Fatalf("meta: %v", err)
 	}
-	pr := produce.New(st, mt, slog.Default())
-	d := New(st, mt, pr, slog.Default())
+	pr := produce.New(rep, rt, st, mt, slog.Default())
+	d := New(rep, rt, st, mt, pr, slog.Default())
 	exp := time.Now().Add(time.Hour).UnixMilli()
 	const chunk = 4096 // 分块提交，避免单个超大 Batch 撑爆内存
 	for lo := 0; lo < n; lo += chunk {
@@ -68,7 +72,7 @@ func BenchmarkAckParallel(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			off := next.Add(1) - 1
-			ok, err := d.Ack("g-bench", "t-ack", 0, off, 1)
+			ok, err := d.Ack(context.Background(), "g-bench", "t-ack", 0, off, 1)
 			if err != nil || !ok {
 				b.Fatalf("ack off=%d: ok=%v err=%v", off, ok, err)
 			}
@@ -89,7 +93,7 @@ func BenchmarkAckBatch32(b *testing.B) {
 			for i := range entries {
 				entries[i] = AckEntry{Offset: base + uint64(i), Attempt: 1}
 			}
-			results, err := d.AckBatch("g-bench", "t-ack", 0, entries)
+			results, err := d.AckBatch(context.Background(), "g-bench", "t-ack", 0, entries)
 			if err != nil {
 				b.Fatalf("AckBatch: %v", err)
 			}
