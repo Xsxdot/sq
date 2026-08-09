@@ -282,12 +282,19 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 		err := gr.installSnapshot(ctx, rd.Snapshot)
 		stop()
 		if err != nil {
-			// 安装失败不 panic：标记仍在盘上，本轮放弃后 raft 会重发
-			// MsgSnap 重来；重启则由 buildGroup 的标记检查清空重来。
-			gr.lg.Error("快照安装失败，本轮放弃（raft 将重发）", "g", gr.g,
+			// 安装失败是不可恢复状态：绝不能 Advance 后静默续跑——
+			// Advance 把 MsgStorageAppendResp（携带快照）步进给 raft
+			// 内核，内核的 appliedSnap 即刻把快照标记为已持久化已应用
+			// （vendored raft.go 的 MsgStorageAppendResp 分支：
+			// stableSnapTo + appliedTo），raft 从此不再重发 MsgSnap；而
+			// 磁盘上仍是安装中标记 + 半截数据、内存侧 MemoryStorage 从未
+			// 更新——三方分叉、永不收敛。按 Persist/applyEntry 同策略
+			// fail-stop panic：进程死亡由上层重启接管，重启时 buildGroup
+			// 的安装中标记检查清空重来。标记第 2 步先于任何数据写入，
+			// 失败必在盘上；keepTicking 已由上方 stop() 收敛。
+			gr.lg.Error("快照安装失败，组停摆", "g", gr.g,
 				"index", rd.Snapshot.Metadata.GetIndex(), "err", err)
-			gr.rn.Advance()
-			return
+			panic(err)
 		}
 	}
 	// 1. 持久化：HardState + Entries 单批原子（rs.Persist），sync 与否
@@ -496,11 +503,15 @@ func (gr *group) keepTicking() (stop func()) {
 // snap 必须为指针：v3.7 的 raftpb.Snapshot 内嵌互斥锁
 // （protoimpl.MessageState），按值传递触发 vet copylocks。
 //
-// 失败语义：任一步失败返回错误，handleReady 记录后 Advance 放弃本轮
-// ——标记仍在盘上（第 2 步起的任何失败），raft 会重发 MsgSnap 重来，
-// 重启则由 buildGroup 的标记检查清空重来。安装失败不 panic：与
-// applyEntry 不同，快照数据来自对端而非本节点日志，失败不构成
-// 「状态机与日志分叉」，重试与清空重来都是安全收敛路径。
+// 失败语义：任一步失败返回错误，handleReady 按 fail-stop 策略 panic
+// （进程死亡由上层重启接管）。为什么不能「放弃本轮等 raft 重发」：
+// Advance 会把携带快照的 MsgStorageAppendResp 步进给 raft 内核，内核
+// 的 appliedSnap（stableSnapTo + appliedTo）把快照标记为已持久化已
+// 应用，raft 不会重发 MsgSnap——静默续跑是内存/磁盘/raft 三方分叉的
+// 永久卡死（vendored raft.go MsgStorageAppendResp 分支）。panic 后
+// 重启由 buildGroup 的安装中标记检查清空重来：标记（第 2 步，Sync）
+// 先于任何数据写入，失败必然发生在第 2 步之后、收口批次删标记之前，
+// 标记恒在盘上，清空重来永远成立。
 func (gr *group) installSnapshot(ctx context.Context, snap *raftpb.Snapshot) error {
 	// 第 1 步：解析描述符 → (snapID, leader, index)
 	meta := snap.GetMetadata()

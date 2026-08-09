@@ -9,6 +9,9 @@ package cluster
 import (
 	"context"
 	"encoding/binary"
+	"errors"
+	"fmt"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -282,6 +285,85 @@ func TestLeaderVisibleOnlyAfterHookCompletes(t *testing.T) {
 	if sawLeaderInsideHook.Load() {
 		t.Fatal("钩子执行期间 IsLeader 已返回 true——写屏障失效，"+
 			"并发 Append 会在计数器失效前拿到陈旧 offset")
+	}
+}
+
+// TestInstallSnapshotFailurePanicsAndKeepsMarker（I1 修复）快照安装失败
+// 必须 fail-stop panic，且安装中标记仍留在盘上：
+//
+//   - 为什么 panic 而不是「Advance 放弃本轮等 raft 重发」：Advance 把
+//     MsgStorageAppendResp（携带快照）步进给 raft 内核，内核的
+//     appliedSnap（stableSnapTo + appliedTo）把快照标记为已持久化已
+//     应用，raft 不会重发 MsgSnap——静默续跑 = 内存（MemoryStorage 未
+//     更新）/磁盘（半截数据）/raft（自以为已到快照位点）三方分叉，
+//     永久卡死。panic 让进程死亡、由上层重启接管（与 Persist/applyEntry
+//     同策略）；重启时 buildGroup 的标记检查据此清空重来。
+//   - 为什么标记必然在盘上：installSnapshot 第 2 步 MarkInstalling
+//     （Sync）先于任何数据写入，本测试在拉块（第 4 步）注入必败回调，
+//     失败发生在删标记的收口批次（第 5 步）之前——标记必须仍在。
+//   - 为什么直接调 handleReady 而非走 run 循环：panic 发生在 run
+//     goroutine 内时测试进程无法 recover（goroutine 的 panic 不可跨
+//     协程捕获）；handleReady 是 panic 的抛出处，直接在测试协程调用
+//     即可捕获断言，生产行为不变（run 循环原样抛出）。
+//
+// 断言：panic 确实发生（且是安装第 4 步的拉块错误）、标记在位点
+// 100 仍在盘上、内存侧未推进（mem 无快照、applied 仍为 0）——三方
+// 分叉里「raft 已标记快照应用」的一面因 panic 而未发生。
+func TestInstallSnapshotFailurePanicsAndKeepsMarker(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	storage := raft.NewMemoryStorage()
+	gr := newGroup(0, 1, storage, nil, rs, st, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, nil, nil, testSlog(t))
+	rn := raft.StartNode(raftConfig(1, gr.stg), []raft.Peer{{ID: 1}})
+	gr.rn = rn
+	// StartNode 起了 raft 节点 goroutine：keepTicking 的 Tick 需要活节点，
+	// 本测试不跑 run，必须显式停（Stop 幂等、阻塞到 goroutine 退出）。
+	defer rn.Stop()
+	// 注入拉块必败的 control 回调（模拟对端不可达）：安装第 4 步第一块
+	// 即失败，走 fail-stop panic 路径。
+	gr.control = func(ctx context.Context, nodeID uint64, op byte, payload []byte) ([]byte, error) {
+		return nil, errors.New("注入的拉块失败（模拟对端不可达）")
+	}
+
+	idx, tm := uint64(100), uint64(2)
+	snap := &raftpb.Snapshot{
+		Data: encodeSnapDescriptor(snapDescriptor{ID: 7, Leader: 1, Index: idx}),
+		Metadata: &raftpb.SnapshotMetadata{
+			Index: &idx, Term: &tm, ConfState: &raftpb.ConfState{},
+		},
+	}
+	rd := raft.Ready{Snapshot: snap}
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		gr.handleReady(context.Background(), rd)
+	}()
+	if recovered == nil {
+		t.Fatal("快照安装失败必须 panic（fail-stop）——raft 已把快照视为持久化，静默续跑是内存/磁盘/raft 三方分叉")
+	}
+	if msg := fmt.Sprint(recovered); !strings.Contains(msg, "快照安装第 4 步 拉块失败") {
+		t.Fatalf("panic 载荷应是安装第 4 步的拉块错误，得到: %v", recovered)
+	}
+	// 标记必须在盘上（第 2 步先于任何数据写入，失败必在删标记之前）——
+	// 重启的 buildGroup 检查据此清空重来
+	meta, ok, err := rs.LoadInstalling(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !ok {
+		t.Fatal("安装失败后安装中标记必须仍在盘上（重启清空重来的依据）")
+	}
+	if meta.GetIndex() != idx {
+		t.Fatalf("标记位点 %d != 快照位点 %d", meta.GetIndex(), idx)
+	}
+	// 内存侧不得推进：mem 未被 ApplySnapshot、applied 仍为 0——「raft
+	// 自以为到快照位点」的分叉面必须未发生（panic 在 Advance 之前）
+	if f, err := gr.mem.FirstIndex(); err != nil || f != 1 {
+		t.Fatalf("安装失败后 mem.FirstIndex 应为 1（mem 未应用快照）: %d err=%v", f, err)
+	}
+	if gr.applied.Load() != 0 {
+		t.Fatalf("安装失败后 applied 应为 0，得到 %d", gr.applied.Load())
 	}
 }
 
