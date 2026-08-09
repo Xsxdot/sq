@@ -33,6 +33,9 @@
 //	                               apply 时整表覆盖写，SaveConfState）
 //	raft/<g>/snap                → SnapshotMetadata protobuf（快照锚点，
 //	                               截断的前提，SaveSnapMeta Sync 落盘）
+//	raft/<g>/snapinstall         → SnapshotMetadata protobuf（快照安装中
+//	                               标记，先于任何数据写入落盘；存在即上次
+//	                               安装未收口，MarkInstalling/ResetGroupProgress）
 //	raft/<g>/ent/<index 8B BE>   → Entry protobuf
 //	raft/<g>/applied             → uint64 BE applied index（普通条目经
 //	                               FSM 批次并进，ConfChange 与成员表同批）
@@ -54,13 +57,14 @@ import (
 // 后跟 '/' 定界——任意两位组号的键序严格分离（"1/" < "10/…"），
 // 前缀扫描不会跨组串扰。
 const (
-	groupsKey         = "raft/groups"
-	cleanShutdownKey  = "raft/clean_shutdown"
-	groupEntPrefixFmt = "raft/%d/ent/"
-	groupHsKeyFmt     = "raft/%d/hs"
-	groupConfFmt      = "raft/%d/conf"
-	groupSnapFmt      = "raft/%d/snap"
-	groupAppliedFmt   = "raft/%d/applied"
+	groupsKey           = "raft/groups"
+	cleanShutdownKey    = "raft/clean_shutdown"
+	groupEntPrefixFmt   = "raft/%d/ent/"
+	groupHsKeyFmt       = "raft/%d/hs"
+	groupConfFmt        = "raft/%d/conf"
+	groupSnapFmt        = "raft/%d/snap"
+	groupSnapInstallFmt = "raft/%d/snapinstall"
+	groupAppliedFmt     = "raft/%d/applied"
 )
 
 // raftStore 是 raft 日志的共库持久层。
@@ -282,6 +286,95 @@ func (r *raftStore) LoadSnapMeta(g uint32) (*raftpb.SnapshotMetadata, bool, erro
 		return nil, false, fmt.Errorf("raftstore LoadSnapMeta 组 %d 解码: %w", g, err)
 	}
 	return meta, true, nil
+}
+
+// MarkInstalling 写入一组的快照安装中标记并 Sync 落盘。
+//
+// 顺序不变量：标记必须先于任何快照数据写入（installSnapshot 第 2 步
+// 早于第 3 步清空）——反过来（先清空后标记）的崩溃窗口里，磁盘上是
+// 「已清空、无标记」= 静默空状态，重启会把它当完整状态启动，客户端
+// 读到的消息永久缺失。先标记后清空则崩溃只留下「有标记」的半截状态，
+// 重启经 buildGroup 的标记检查清空重来。
+//
+// 标记值是本次要安装的快照元数据（{Index, Term, ConfState}）——
+// 重启的 Warn 日志用 Index 说明「装到一半的位点」。
+func (r *raftStore) MarkInstalling(g uint32, meta *raftpb.SnapshotMetadata) error {
+	data, err := proto.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("raftstore MarkInstalling 组 %d 编码: %w", g, err)
+	}
+	b := r.st.NewBatch()
+	if err := b.Set(snapInstallKey(g), data); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore MarkInstalling 组 %d 写标记: %w", g, err)
+	}
+	// 标记是崩溃判定的唯一依据：Sync 落盘，任何崩溃窗口都见得到它
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore MarkInstalling 组 %d: %w", g, err)
+	}
+	r.lg.Info("快照安装标记已落盘", "g", g, "index", meta.GetIndex(), "term", meta.GetTerm())
+	return nil
+}
+
+// LoadInstalling 读回一组的快照安装中标记；无标记时 ok=false。
+//
+// 标记损坏必须报错而不是返回「无标记」——静默当作未安装 = 把半截状态
+// 当完整状态启动（见 MarkInstalling 的顺序不变量）。
+func (r *raftStore) LoadInstalling(g uint32) (*raftpb.SnapshotMetadata, bool, error) {
+	data, ok, err := r.st.Get(snapInstallKey(g))
+	if err != nil {
+		return nil, false, fmt.Errorf("raftstore LoadInstalling 组 %d: %w", g, err)
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	meta := &raftpb.SnapshotMetadata{}
+	if err := proto.Unmarshal(data, meta); err != nil {
+		return nil, false, fmt.Errorf("raftstore LoadInstalling 组 %d 解码: %w", g, err)
+	}
+	return meta, true, nil
+}
+
+// ResetGroupProgress 把一组的进度整体重置：applied=0 + 删快照锚点 +
+// 删安装中标记，单批 Sync 落盘。
+//
+// 何时用：buildGroup 启动时发现安装中标记 → wipeGroupKeys 清掉该组
+// FSM 键后调用——半截状态必须整体归零（applied=0 让 raft 从 1 重投递、
+// 锚点删除让 TruncateLog 的守卫重新放行、标记删除让「安装已完成」的
+// 判定不再成立），残留任何一个都会让重启路径把半截状态当完整状态。
+func (r *raftStore) ResetGroupProgress(g uint32) error {
+	b := r.st.NewBatch()
+	if err := b.Set(appliedKey(g), store.PutU64(0)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ResetGroupProgress 组 %d 写 applied=0: %w", g, err)
+	}
+	if err := b.Delete(snapKey(g)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ResetGroupProgress 组 %d 删快照锚点: %w", g, err)
+	}
+	if err := b.Delete(snapInstallKey(g)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ResetGroupProgress 组 %d 删安装标记: %w", g, err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore ResetGroupProgress 组 %d: %w", g, err)
+	}
+	r.lg.Warn("组进度已重置（applied=0、锚点与安装标记已删）", "g", g)
+	return nil
+}
+
+// deleteInstallingKey 在调用方给定的批次内删除一组的安装中标记。
+//
+// 为什么做成 batch 方法而不是导出裸键：安装完成的定义是「applied、
+// 成员表、锚点、删标记四者同批原子落盘」（installSnapshot 收口批次），
+// 标记删除必须与其它三项同一批次——收口批次一旦分开提交，崩溃窗口里
+// 就会出现「数据已装完、标记残留」的重启重装。方法签名收一个批次，
+// 调用方只能把删除并入某个批次，拆不出单独提交。
+func deleteInstallingKey(b *store.Batch, g uint32) error {
+	if err := b.Delete(snapInstallKey(g)); err != nil {
+		return fmt.Errorf("raftstore 删组 %d 安装标记: %w", g, err)
+	}
+	return nil
 }
 
 // TruncateLog 删除 index ≤ upto 的日志条目（Pebble range delete）。
@@ -512,6 +605,13 @@ func confKey(g uint32) []byte {
 // 单个固定键天然覆盖语义。
 func snapKey(g uint32) []byte {
 	return []byte(fmt.Sprintf(groupSnapFmt, g))
+}
+
+// snapInstallKey 返回一组的快照安装中标记固定键。存在即上次安装未
+// 收口（MarkInstalling 写、ResetGroupProgress/收口批次删），覆盖语义
+// 与 snapKey 相同——重装时直接覆盖旧标记。
+func snapInstallKey(g uint32) []byte {
+	return []byte(fmt.Sprintf(groupSnapInstallFmt, g))
 }
 
 // putU32BE 大端编码 4 字节（组数/节点 ID 等 uint32 字段用；8B 用 store.PutU64）。
