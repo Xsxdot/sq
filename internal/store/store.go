@@ -4,6 +4,7 @@
 //   - 使用 Pebble LSM 树提供持久化 KV 存储，支持批量操作与范围扫描
 //   - 通过单一 Apply 入口保证所有写操作原子性，为未来 Raft 复制预留设计空间
 //   - 提供 Get 和 Scan 查询接口，负责错误包装与内存管理
+//   - 提供一致性只读视图（ReadView）供快照发送侧钉住某一时刻状态
 //
 // 边界：
 //   - Get/Apply/Scan 热路径不打日志：语义级日志由调用方（core）负责，
@@ -17,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
@@ -275,4 +277,75 @@ func (s *Store) Scan(lower, upper []byte, limit int, fn func(k, v []byte) (bool,
 		}
 	}
 	return it.Error()
+}
+
+// ReadView 是 store 的一致性只读视图：建立瞬间之后的写入一律不可见。
+//
+// 用途：raft 快照发送侧要把「index 时刻的 FSM 状态」流式发给对端，
+// 而 FSM 仍在前进——视图把那一瞬间钉住，无需停写。
+//
+// 注意：
+//   - 持有视图会阻止 Pebble 回收被覆盖的旧版本，长期不关会撑大磁盘。
+//     调用方必须限时持有（快照注册表按 TTL 回收，见 cluster/snapshot.go）。
+//   - Close 幂等；Close 之后一切读取返回错误，不静默返回空。
+type ReadView struct {
+	snap   *pebble.Snapshot
+	closed atomic.Bool
+}
+
+// NewReadView 建立一致性只读视图。调用方负责 Close。
+func (s *Store) NewReadView() *ReadView {
+	return &ReadView{snap: s.db.NewSnapshot()}
+}
+
+// Get 从视图读一个键；语义与 Store.Get 相同（不存在时 ok=false）。
+func (v *ReadView) Get(key []byte) ([]byte, bool, error) {
+	if v.closed.Load() {
+		return nil, false, errors.New("store: 读视图已关闭")
+	}
+	val, closer, err := v.snap.Get(key)
+	if errors.Is(err, pebble.ErrNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("store 读视图 Get %q: %w", key, err)
+	}
+	out := append([]byte(nil), val...)
+	if err := closer.Close(); err != nil {
+		return nil, false, fmt.Errorf("store 读视图 Get 释放 %q: %w", key, err)
+	}
+	return out, true, nil
+}
+
+// Scan 在视图内按键升序遍历 [lower, upper)；语义与 Store.Scan 一致
+// （fn 返回 false 提前停止，limit>0 时限量）。
+func (v *ReadView) Scan(lower, upper []byte, limit int, fn func(k, val []byte) (bool, error)) error {
+	if v.closed.Load() {
+		return errors.New("store: 读视图已关闭")
+	}
+	it, err := v.snap.NewIter(&pebble.IterOptions{LowerBound: lower, UpperBound: upper})
+	if err != nil {
+		return fmt.Errorf("store 读视图 Scan 建迭代器: %w", err)
+	}
+	defer it.Close()
+	n := 0
+	for it.First(); it.Valid(); it.Next() {
+		cont, ferr := fn(it.Key(), it.Value())
+		if ferr != nil {
+			return ferr
+		}
+		n++
+		if !cont || (limit > 0 && n >= limit) {
+			break
+		}
+	}
+	return it.Error()
+}
+
+// Close 释放视图（幂等）。
+func (v *ReadView) Close() error {
+	if v.closed.Swap(true) {
+		return nil
+	}
+	return v.snap.Close()
 }
