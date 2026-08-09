@@ -168,11 +168,16 @@ func soloOptions(t *testing.T, st *store.Store, dir string, mode AckMode) Option
 // startSoloManager 打开（或复用）dir 下的 store 并启动单成员 Manager；
 // NewManager 返回错误（含 ErrUncleanShutdown）在此直接失败。测试结束后
 // 自动 kill 并等待完全退出，防止 goroutine 泄漏到后续清理（LIFO：kill
-// 先于 mustOpenStore 的 store 关闭注册）。
-func startSoloManager(t *testing.T, dir string, mode AckMode) (*store.Store, *Manager) {
+// 先于 mustOpenStore 的 store 关闭注册）。opts 为 Options 级注入
+// （如 withRetainEntries(n)）。
+func startSoloManager(t *testing.T, dir string, mode AckMode, opts ...func(*Options)) (*store.Store, *Manager) {
 	t.Helper()
 	st := mustOpenStore(t, dir)
-	m, err := NewManager(soloOptions(t, st, dir, mode))
+	o := soloOptions(t, st, dir, mode)
+	for _, fn := range opts {
+		fn(&o)
+	}
+	m, err := NewManager(o)
 	if err != nil {
 		t.Fatalf("NewManager: %v", err)
 	}
@@ -198,10 +203,10 @@ type singleNodeManagerHarness struct {
 // startSingleNodeManager 启动单节点 Manager 并返回测试句柄，供
 // TestConfChangeAdvancesPersistedApplied 等端到端场景使用。与
 // startSoloManager 同 Options 模式（Peers 仅自己、数据组默认 3），
-// 测试结束自动 kill 并等待完全退出。
-func startSingleNodeManager(t *testing.T) *singleNodeManagerHarness {
+// 测试结束自动 kill 并等待完全退出。opts 为 Options 级注入。
+func startSingleNodeManager(t *testing.T, opts ...func(*Options)) *singleNodeManagerHarness {
 	t.Helper()
-	_, m := startSoloManager(t, t.TempDir(), AckQuorumMem)
+	_, m := startSoloManager(t, t.TempDir(), AckQuorumMem, opts...)
 	return &singleNodeManagerHarness{m: m}
 }
 

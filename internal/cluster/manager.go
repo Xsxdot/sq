@@ -116,6 +116,20 @@ type Options struct {
 	// 的配置面接管）：落后 follower 的位点一旦落在截断点之下，日志追齐
 	// 不可能，只能靠 MsgSnap 快照追平。0 时按 defaultRetainEntries。
 	RetainEntries uint64
+
+	// TruncateInterval 是周期截断循环的执行间隔（batch④，默认 30s；0
+	// 按 defaultTruncateInterval）：每周期对全部组评估一次日志截断——
+	// 保留量之外的已 apply 前缀落锚点后删除（截断点计算见
+	// truncateOnce 注释）。生产由 main 注入（config cluster.
+	// truncate_interval）。
+	TruncateInterval time.Duration
+
+	// SnapshotChunkBytes 是 OpFetchSnapshot 单块的字节预算（batch④，
+	// 默认 4MiB；0 按 defaultSnapshotChunkBytes）：emit 累计到该阈值
+	// 即提前收口（游标 = 最后一个已发出的键）。必须小于传输层帧上限
+	// maxFrameLen（16MiB）——上界由配置面校验保证（见 config.go 的
+	// snapshot_chunk_bytes 校验）。
+	SnapshotChunkBytes int
 }
 
 // Manager 是多组装配体：持有全部 raft 组、传输层与恢复判定。
@@ -164,6 +178,18 @@ type Manager struct {
 	// truncateOnce 用它算截断点）。
 	retainEntries uint64
 
+	// 截断循环（batch④）：truncateInterval 来自 Options（0 按默认 30s）；
+	// runCtx 是 Start 设置的运行上下文——循环随集群停机一并退出；
+	// truncateLoopOnce 保证重复启动只起一个循环（与 balancerOnce 同
+	// 模式）。
+	truncateInterval time.Duration
+	truncateLoopOnce  sync.Once
+
+	// snapshotChunkBytes 是快照分块的字节预算（Options.SnapshotChunkBytes
+	// 透传，0 按 defaultSnapshotChunkBytes）：handleFetchSnapshot 用它做
+	// emit 收口阈值。
+	snapshotChunkBytes int
+
 	// prepareJoinMu 串行化本节点的 PrepareJoin 处理（见
 	// handlePrepareJoin 注释：并发提成员变更会被 raft 静默替换）。
 	prepareJoinMu sync.Mutex
@@ -172,6 +198,14 @@ type Manager struct {
 // defaultRetainEntries 是 Options.RetainEntries 的默认值（0 即默认）：
 // 截断循环保留的日志条目数。生产值由 Task 8 的配置面接管。
 const defaultRetainEntries uint64 = 10000
+
+// defaultTruncateInterval 是 Options.TruncateInterval 的默认值（0 即
+// 默认）：周期截断循环的执行间隔，30s 一轮 × 全组。
+const defaultTruncateInterval = 30 * time.Second
+
+// defaultSnapshotChunkBytes 是 Options.SnapshotChunkBytes 的默认值
+// （0 即默认）：快照单块字节预算 4MiB。
+const defaultSnapshotChunkBytes = 4 << 20
 
 // NewManager 装配全部 raft 组并按磁盘状态判定恢复路径。
 //
@@ -203,6 +237,12 @@ func NewManager(o Options) (*Manager, error) {
 	if o.RetainEntries == 0 {
 		o.RetainEntries = defaultRetainEntries
 	}
+	if o.TruncateInterval == 0 {
+		o.TruncateInterval = defaultTruncateInterval
+	}
+	if o.SnapshotChunkBytes == 0 {
+		o.SnapshotChunkBytes = defaultSnapshotChunkBytes
+	}
 	lg := o.Logger
 	if lg == nil {
 		lg = slog.Default()
@@ -220,6 +260,8 @@ func NewManager(o Options) (*Manager, error) {
 		leaderBalancerInterval: o.LeaderBalancerInterval,
 		autoPromote:            o.AutoPromoteLearners,
 		retainEntries:          o.RetainEntries,
+		truncateInterval:       o.TruncateInterval,
+		snapshotChunkBytes:     o.SnapshotChunkBytes,
 		doneCh:                 make(chan struct{}),
 	}
 	m.rs = newRaftStore(o.Store, lg)
@@ -545,6 +587,14 @@ func (m *Manager) Start(ctx context.Context) {
 	// leader 摊布循环（Options 注入周期，≤0 不启动）：纯控制面，独立
 	// goroutine，不参与 Done 观察（停机时随 runCtx 取消退出，不阻塞）
 	m.StartLeaderBalancer(m.leaderBalancerInterval)
+	// 截断循环（Options 注入周期，≤0 不启动；默认 30s）：随 Start 拉起、
+	// 随 runCtx 取消退出——纯后台维护，不参与 Done 观察（与摊布循环同
+	// 模式，停机时随集群退出，不阻塞 Done）
+	m.truncateLoopOnce.Do(func() {
+		if m.truncateInterval > 0 {
+			go m.truncateLoop(m.runCtx, m.truncateInterval)
+		}
+	})
 	// Done 观察者：全部组退出且 flusher 停止后关闭 doneCh
 	go func() {
 		for _, gr := range m.groups {
@@ -733,6 +783,89 @@ func (m *Manager) promoteLearners(g uint32) {
 			continue
 		}
 		m.lg.Info("自动升 voter", "g", g, "node", id, "match", pr.Match, "lastIndex", lastIndex)
+	}
+}
+
+// truncateOnce 对一组执行一次截断评估与执行。
+//
+// 截断点计算（三重下界取最小，再减保留量）：
+//   - 本节点 applied：不能截掉还没 apply 的条目；
+//   - leader 额外取 min(Progress.Match)：不能截掉最慢 follower 还要的条目。
+//     这不是正确性开关（有快照兜底），而是性能纪律——截过头会把一次
+//     心跳级追齐放大成整组状态传输（Global Constraints）；
+//   - 减 RetainEntries：留一段余量给刚落后一点点的 follower。
+//
+// 执行顺序固定为「先落锚点（Sync）→ 再删盘上条目 → 最后压内存视图」：
+// 任一步崩溃都停在「锚点已落、条目还在」的安全态（多留日志无害，重启
+// 时锚点提供起始位点，见 buildGroup 注释）。空转（无事可做）不写盘也
+// 不打日志——周期循环 30s 一轮 × 全组，空转刷日志就是噪声。
+//
+// 返回：实际截断到的位点与是否真的执行了截断（无事可做时 done=false）。
+func (m *Manager) truncateOnce(g uint32) (uint64, bool) {
+	gr, ok := m.groups[g]
+	if !ok {
+		return 0, false
+	}
+	upto := gr.applied.Load()
+	leader := false
+	if st, ok := m.Status(g); ok && st.RaftState == raft.StateLeader {
+		leader = true
+		for id, pr := range st.Progress {
+			if id != m.nodeID && pr.Match < upto {
+				upto = pr.Match
+			}
+		}
+	}
+	if upto <= m.retainEntries {
+		return 0, false
+	}
+	upto -= m.retainEntries
+	first, err := gr.stg.FirstIndex()
+	if err != nil || upto < first {
+		return 0, false // 已经截到这儿了，空转
+	}
+	term, err := gr.stg.Term(upto)
+	if err != nil {
+		m.lg.Warn("截断放弃：位点 term 不可查", "g", g, "upto", upto, "err", err)
+		return 0, false
+	}
+	idx, tm := upto, term
+	meta := &raftpb.SnapshotMetadata{Index: &idx, Term: &tm, ConfState: gr.confState.Load()}
+	if err := m.rs.SaveSnapMeta(g, meta); err != nil {
+		m.lg.Error("截断放弃：锚点落盘失败", "g", g, "upto", upto, "err", err)
+		return 0, false
+	}
+	if err := m.rs.TruncateLog(g, upto); err != nil {
+		m.lg.Error("截断放弃：删条目失败", "g", g, "upto", upto, "err", err)
+		return 0, false
+	}
+	if err := gr.mem.Compact(upto); err != nil && !errors.Is(err, raft.ErrCompacted) {
+		m.lg.Warn("内存日志视图压缩失败（盘上已截断，下次重启自愈）", "g", g, "upto", upto, "err", err)
+	}
+	m.lg.Info("日志截断执行", "g", g, "upto", upto, "deleted", upto-first+1, "leader", leader)
+	return upto, true
+}
+
+// truncateLoop 是截断循环本体：每 interval 对全部组执行一次截断评估
+// （truncateOnce，保留量之内空转，见 truncateOnce 注释）。ctx 取消即
+// 退出。
+//
+// 为什么是周期循环而非在写路径里顺带截断：截断是低频后台维护（默认
+// 30s 一轮），写路径里每批多做一次 SaveSnapMeta（Sync 落盘）会吃掉
+// 组提交延迟；循环把截断与提案路径彻底分离，单点控制节奏，也便于
+// 统一从配置面调间隔。
+func (m *Manager) truncateLoop(ctx context.Context, interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			for g := uint32(0); g < m.Groups(); g++ {
+				m.truncateOnce(g)
+			}
+		}
 	}
 }
 
@@ -1126,19 +1259,14 @@ func (m *Manager) memberHas(g uint32, nodeID uint64) bool {
 	return ok
 }
 
-// snapshotChunkBytes 是 OpFetchSnapshot 单块的字节预算：emit 累计到该
-// 阈值即提前收口（游标 = 最后一个已发出的键）。默认 4MiB；Task 8 把
-// 它移入 Options 由配置面接管。
-const snapshotChunkBytes = 4 << 20
-
 // snapshotChunkKeys 是单块键数的兜底上限：正常块由字节预算
-// （snapshotChunkBytes）收口，键数预算只在极端小键场景（如全空值）
-// 下兜底，防止单块键数无界。scanGroupKeys 的 budget 参数必须为正，
-// 故传本常量。
+// （Options.SnapshotChunkBytes）收口，键数预算只在极端小键场景（如
+// 全空值）下兜底，防止单块键数无界。scanGroupKeys 的 budget 参数必须
+// 为正，故传本常量。
 const snapshotChunkKeys = 1 << 20
 
 // errChunkBudgetHit 是 handleFetchSnapshot 的 emit 收口哨兵：块字节数
-// 已达 snapshotChunkBytes，提前结束本块枚举。必须与真实扫描错误（坏
+// 已达字节预算（Options.SnapshotChunkBytes），提前结束本块枚举。必须与真实扫描错误（坏
 // 键/迭代器错误）区分——调用方用 errors.Is 判定后按「块满、游标续扫」
 // 处理，其余错误原样上抛（快照漏键 = 静默丢数据，不得吞）。
 var errChunkBudgetHit = errors.New("cluster: 快照块字节预算已满")
@@ -1153,15 +1281,16 @@ var errChunkBudgetHit = errors.New("cluster: 快照块字节预算已满")
 //     接收方 decodeChunk 还原后逐键 Store.Apply
 //   - done=1 后不得再续拉；done=0 时以「下一游标键」发起下一块请求
 //
-// 块大小双阈值：字节预算 snapshotChunkBytes（4MiB）与传输帧上限
-// maxFrameLen（16MiB，transport.go）共同约束一块的体积。emit 累计到
-// 字节预算即提前收口（块最多 = 预算 + 一对把预算顶穿的键值）；单键值
-// 对的上界由 FSM 写路径约束——最大的值是消息体，上限 4MiB（见
-// core/produce 的 MaxBodySize，其余键族远小于此），因此最坏一块
-// ≈ 预算 + 单对超大键值 ≈ 8MiB，离 16MiB 帧上限还有一倍余量。即便
-// 未来出现超过单块预算的病理键值，本层也只多放进一块、不会突破帧
-// 上限；而超帧的响应会被传输层双端拒收（坏帧断连，见 readLoop），
-// 不会静默截断。
+// 块大小双阈值：字节预算 m.snapshotChunkBytes（默认 4MiB，
+// Options.SnapshotChunkBytes 配置）与传输帧上限 maxFrameLen（16MiB，
+// transport.go）共同约束一块的体积。emit 累计到字节预算即提前收口
+// （块最多 = 预算 + 一对把预算顶穿的键值）；单键值对的上界由 FSM 写
+// 路径约束——最大的值是消息体，上限 4MiB（见 core/produce 的
+// MaxBodySize，其余键族远小于此），默认预算下最坏一块 ≈ 4MiB + 4MiB
+// ≈ 8MiB，离 16MiB 帧上限还有一倍余量（配置面把预算上界钉在 16MiB
+// 之下，见 config.go 的 snapshot_chunk_bytes 校验）。即便未来出现超过
+// 单块预算的病理键值，本层也只多放进一块、不会突破帧上限；而超帧的
+// 响应会被传输层双端拒收（坏帧断连，见 readLoop），不会静默截断。
 //
 // 注册表 TTL 以创建时刻为基线（snapEntry.created），Get 不续期——拉取
 // 窗口超过 TTL 的慢视图会被 GCOnce 强制回收，对端拿到未知 snapID
@@ -1213,7 +1342,7 @@ func (m *Manager) handleFetchSnapshot(payload []byte) ([]byte, error) {
 		// 不能持有引用
 		pairs = append(pairs, kv{k: append([]byte(nil), k...), v: append([]byte(nil), v...)})
 		bytes += 8 + len(k) + len(v) // 8B = 块格式里的双长度头（见 encodeChunk）
-		if bytes >= snapshotChunkBytes {
+		if bytes >= m.snapshotChunkBytes {
 			return errChunkBudgetHit // 提前收口：游标由 scanGroupKeys 置为最后发出的键
 		}
 		return nil

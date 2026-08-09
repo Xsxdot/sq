@@ -242,6 +242,9 @@ func run() error {
 			Logger:                 logger,
 			LeaderBalancerInterval: leaderBalanceInterval,
 			AutoPromoteLearners:    true, // 重入自愈的最后一环：追平后自动升 voter
+			RetainEntries:          cc.LogRetainEntries,
+			TruncateInterval:       cc.TruncateInterval,
+			SnapshotChunkBytes:     cc.SnapshotChunkBytes,
 			OnApplied:              onApplied,
 			OnLeaderChange:         onLeaderChange,
 			ControlHandler:         controlHandler,

@@ -463,3 +463,58 @@ cluster:
 		t.Fatal("AdvertiseOf(99) 应返回 ok=false")
 	}
 }
+
+// loadClusterConfig 从 YAML 文档加载配置并断言成功：文档原样写入
+// （cluster 段自带完整结构），Load 后返回配置。
+func loadClusterConfig(t *testing.T, yamlBody string) *Config {
+	t.Helper()
+	cfg, err := loadYAML(t, yamlBody)
+	if err != nil {
+		t.Fatalf("Load 集群配置: %v", err)
+	}
+	return cfg
+}
+
+// loadClusterConfigErr 把 2 空格缩进的 cluster 段字段片段嵌入一个最小
+// 合法集群配置后 Load，返回 (cfg, err)——上界校验类用例只关心 err。
+func loadClusterConfigErr(t *testing.T, fragment string) (*Config, error) {
+	t.Helper()
+	body := "cluster:\n  node_id: 1\n  raft_listen: \":9081\"\n  peers:\n    - {id: 1, raft_addr: \"127.0.0.1:9081\", advertise_host: \"127.0.0.1\", advertise_port: 8081}\n" + fragment
+	return loadYAML(t, body)
+}
+
+// loadYAML 把配置体写入临时文件后 Load。
+func loadYAML(t *testing.T, body string) (*Config, error) {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return Load(p)
+}
+
+// TestClusterTruncationConfigDefaults 截断循环与快照分块三项配置的默认
+// 值与上界校验：缺省即 10000/30s/4MiB；分块必须 < 16MiB 传输层帧上限，
+// 否则整份快照永远发不出去。
+func TestClusterTruncationConfigDefaults(t *testing.T) {
+	cfg := loadClusterConfig(t, `
+cluster:
+  node_id: 1
+  raft_listen: ":9081"
+  peers:
+    - {id: 1, raft_addr: "127.0.0.1:9081", advertise_host: "127.0.0.1", advertise_port: 8081}
+`)
+	if cfg.Cluster.LogRetainEntries != 10000 {
+		t.Fatalf("log_retain_entries 默认 = %d; want 10000", cfg.Cluster.LogRetainEntries)
+	}
+	if cfg.Cluster.TruncateInterval != 30*time.Second {
+		t.Fatalf("truncate_interval 默认 = %v; want 30s", cfg.Cluster.TruncateInterval)
+	}
+	if cfg.Cluster.SnapshotChunkBytes != 4<<20 {
+		t.Fatalf("snapshot_chunk_bytes 默认 = %d; want 4MiB", cfg.Cluster.SnapshotChunkBytes)
+	}
+	// 上界守卫：分块必须小于传输层帧上限，否则整份快照永远发不出去
+	if _, err := loadClusterConfigErr(t, "  snapshot_chunk_bytes: 33554432\n"); err == nil {
+		t.Fatal("分块大小超过 16MiB 帧上限必须被拒绝")
+	}
+}

@@ -25,6 +25,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"net"
 	"sort"
 	"strings"
@@ -1664,5 +1665,61 @@ func TestLaggingFollowerCatchesUpBySnapshot(t *testing.T) {
 
 	if n := h.countLog(victim, "快照安装完成"); n < 1 {
 		t.Fatal("追平未走快照路径（日志无「快照安装完成」）——测试前提失效")
+	}
+}
+
+// TestTruncateOnceRespectsLeaderMinMatch leader 截断的安全下界：
+// 不得截到最慢 follower 的 Match 之下——那会把一次心跳级追齐
+// 放大成整组状态传输。
+func TestTruncateOnceRespectsLeaderMinMatch(t *testing.T) {
+	h := startThreeNodeCluster(t, withRetainEntries(2))
+	defer h.stopAll()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	leader := h.leaderOf(t, 0)
+	victim := h.nonLeaderOf(t, 0)
+
+	// 先等 victim 追平选举后的位点（bootstrap 成员变更 + 新 leader 的
+	// 空条目，Match=4）再隔断：minMatch 的下界由此确定——partition 瞬间
+	// 若 victim 的 ack 还在路上，leader 侧 Match 是未定值（0/4），测试
+	// 会在「截不截」的边界上抖动。
+	waitFor(t, 30*time.Second, func() bool {
+		st, _ := leader.Status(0)
+		return st.Progress[victim.nodeID].Match >= 2
+	}, "victim 未追平选举位点")
+	h.partitionOff(victim)
+	for i := 0; i < 100; i++ {
+		b := leader.Store().NewBatch()
+		if err := b.Set(store.TopicMetaKey(fmt.Sprintf("K%03d", i)), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		if err := leader.Propose(ctx, 0, b.Repr()); err != nil {
+			t.Fatal(err)
+		}
+		b.Close()
+	}
+	upto, done := leader.truncateOnce(0)
+	if !done {
+		t.Fatal("应执行一次截断")
+	}
+	st, _ := leader.Status(0)
+	minMatch := uint64(math.MaxUint64)
+	for id, pr := range st.Progress {
+		if id != leader.nodeID && pr.Match < minMatch {
+			minMatch = pr.Match
+		}
+	}
+	if upto > minMatch {
+		t.Fatalf("截断到 %d 越过了最慢 follower 的 Match %d——安全下界失效", upto, minMatch)
+	}
+	h.healPartition(victim)
+}
+
+// TestTruncateOnceNoopWhenNothingToDrop 保留量之内不该动手
+// （周期循环每 30s 触发一次，空转不许写盘、不许刷日志）。
+func TestTruncateOnceNoopWhenNothingToDrop(t *testing.T) {
+	h := startSingleNodeManager(t, withRetainEntries(10000))
+	if _, done := h.m.truncateOnce(0); done {
+		t.Fatal("条目数远小于保留量时不应截断")
 	}
 }

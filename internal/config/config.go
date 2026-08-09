@@ -73,6 +73,19 @@ type Config struct {
 	Cluster *ClusterConfig `yaml:"cluster"`
 }
 
+// MaxClusterSnapshotChunkBytes 是快照分块的上界（16MiB，传输层帧上限）：
+// 分块 ≥ 帧上限时整份快照永远发不出去（超帧响应被双端拒收），启动即挡。
+const MaxClusterSnapshotChunkBytes = 16 << 20
+
+// 集群档截断循环与快照分块的默认值（batch④）：与 cluster.Options 的
+// 默认常量保持一致（defaultRetainEntries/defaultTruncateInterval/
+// defaultSnapshotChunkBytes）。
+const (
+	defaultClusterLogRetainEntries   = 10000
+	defaultClusterTruncateInterval   = 30 * time.Second
+	defaultClusterSnapshotChunkBytes = 4 << 20
+)
+
 // ClusterConfig 集群模式配置段；nil = 单机模式。段一旦出现即集群模式，
 // 全部字段按集群语义严格校验（见 Load 末尾校验链）。
 type ClusterConfig struct {
@@ -81,6 +94,18 @@ type ClusterConfig struct {
 	DataGroups uint32        `yaml:"data_groups"` // 数据组数；首启持久化后不可变，改配置不改盘上事实（cluster.EnsureGroups 拒启）
 	Ack        string        `yaml:"ack"`         // 确认档位：quorum-mem|quorum-fsync；缺省 quorum-mem（spec §2.2 复制确认+异步刷盘）
 	Peers      []ClusterPeer `yaml:"peers"`       // 成员表（含本节点）；1 个 = 单机→单节点集群升级形态
+	// LogRetainEntries 周期截断的日志保留量（log_retain_entries，默认
+	// 10000）：落后 follower 位点落在截断点之下就只能靠快照追平。
+	// 0 = 未填，按默认。
+	LogRetainEntries uint64 `yaml:"log_retain_entries"`
+	// TruncateInterval 周期截断循环的执行间隔（truncate_interval，默认
+	// 30s，Go duration 格式）：每周期对全部组评估一次日志截断。
+	// 0 = 未填，按默认。
+	TruncateInterval time.Duration `yaml:"truncate_interval"`
+	// SnapshotChunkBytes 快照拉取的单个分块字节预算（snapshot_chunk_bytes，
+	// 默认 4MiB）：必须 < 16MiB 传输层帧上限，否则整份快照永远发不出去。
+	// 0 = 未填，按默认。
+	SnapshotChunkBytes int `yaml:"snapshot_chunk_bytes"`
 }
 
 // ClusterPeer 成员表里一个节点的描述。
@@ -218,6 +243,30 @@ func Load(path string) (*Config, error) {
 		}
 		if cc.Ack == "" {
 			cc.Ack = "quorum-mem"
+		}
+		// 截断/分块档默认值：yaml 标量无法区分「显式 0/空串」与「未填」，
+		// 一律按未填给默认值（与 DataGroups/Ack 同款语义），再做范围校验。
+		if cc.LogRetainEntries == 0 {
+			cc.LogRetainEntries = defaultClusterLogRetainEntries
+		}
+		if cc.TruncateInterval == 0 {
+			cc.TruncateInterval = defaultClusterTruncateInterval
+		}
+		// 负间隔是笔误（time.NewTicker 对非正周期直接 panic，跑起来才炸
+		// 比启动时挡住更难排查），启动即挡。
+		if cc.TruncateInterval < 0 {
+			return nil, fmt.Errorf("配置 cluster.truncate_interval 须为正 duration（如 30s），得到 %s", cc.TruncateInterval)
+		}
+		if cc.SnapshotChunkBytes == 0 {
+			cc.SnapshotChunkBytes = defaultClusterSnapshotChunkBytes
+		}
+		// 上界 16MiB（传输层帧上限，见 cluster/transport.go 的 maxFrameLen）：
+		// 分块 ≥ 帧上限时整份快照永远发不出去——超帧的响应被传输层双端
+		// 拒收（坏帧断连），拉取永远卡在同一个块上。配置笔误启动即挡，
+		// 不能等运行时靠断连重试「发现」。
+		if cc.SnapshotChunkBytes < 1 || cc.SnapshotChunkBytes >= MaxClusterSnapshotChunkBytes {
+			return nil, fmt.Errorf("配置 cluster.snapshot_chunk_bytes 须在 [1,%d)（必须 < 16MiB 传输层帧上限），得到 %d",
+				MaxClusterSnapshotChunkBytes, cc.SnapshotChunkBytes)
 		}
 		if cc.RaftListen == "" {
 			return nil, fmt.Errorf("配置 cluster.raft_listen 不能为空（集群模式必须声明 raft 监听地址）")
