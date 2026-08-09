@@ -627,9 +627,11 @@ type ccApplied struct {
 // quorum-fsync 档跟随 raft 的 MustSync 判定（raft.MustSync）：
 // 「本轮有条目」或「term/vote 有变化」才要求同步落盘——term/vote/条目
 // 是对外确认前必须 durable 的持久态（raft 契约）。commit-only 的
-// HardState 轮（提交位点推进、无新条目）不再白刷一次盘：那些条目已随
-// 上一轮同步落盘，commit 位点可在 NoSync 写入后由后台刷盘兜底，
-// 崩溃后由日志重放重新推导，不违反「已确认条目不丢」。
+// HardState 轮（提交位点推进、无新条目）不再白刷一次盘：commit 位点的
+// NoSync 写入由下一轮条目的 fsync 顺带落盘（共享同一 WAL 的 Pebble
+// 批次追加式累积）；本档不存在后台刷盘 goroutine 兜底（flusher 仅
+// quorum-mem 档启动）。崩溃后 commit/applied 位点由日志重放重新推导
+// （单节点重提交路径 + 幂等重 apply），不违反「已确认条目不丢」。
 // 旧判定「有条目或有 HardState 就刷」把 commit 轮也 fsync，每提案
 // 多一次盘。
 // 基准证据（BenchmarkProposeQuorumFsync，单节点 quorum-fsync 串行
