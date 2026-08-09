@@ -17,7 +17,8 @@ import (
 
 // openClusterTestStore 打开临时目录下的测试 store，随测试结束自动关闭。
 // 后续任务的测试文件复用本 helper，保证集群层测试共享同一套打开方式。
-func openClusterTestStore(t *testing.T) *store.Store {
+// 参数用 testing.TB（测试与基准共用；BenchmarkProposeQuorumFsync 复用）。
+func openClusterTestStore(t testing.TB) *store.Store {
 	t.Helper()
 	st, err := store.Open(t.TempDir(), false, testSlog(t))
 	if err != nil {
@@ -29,11 +30,11 @@ func openClusterTestStore(t *testing.T) *store.Store {
 
 // testSlog 返回写往测试输出的 slog，便于失败时直接看到节点日志。
 // testWriter 移植自 spike/raftshell/node_test.go。
-func testSlog(t *testing.T) *slog.Logger {
+func testSlog(t testing.TB) *slog.Logger {
 	return slog.New(slog.NewTextHandler(testWriter{t}, &slog.HandlerOptions{Level: slog.LevelDebug}))
 }
 
-type testWriter struct{ t *testing.T }
+type testWriter struct{ t testing.TB }
 
 func (w testWriter) Write(p []byte) (int, error) {
 	w.t.Log(string(p))

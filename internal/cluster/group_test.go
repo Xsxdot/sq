@@ -22,7 +22,8 @@ import (
 // startSingleNodeGroup 启动一个自选举单节点组（成员表仅自身），
 // 组运行于测试生命周期内，t.Cleanup 负责取消并等待 run 退出。
 // send 回调为空函数：单节点无外发需求。
-func startSingleNodeGroup(t *testing.T, g uint32, rs *raftStore, st *store.Store, mode AckMode) *group {
+// 参数用 testing.TB：测试与基准共用（BenchmarkProposeQuorumFsync 复用）。
+func startSingleNodeGroup(t testing.TB, g uint32, rs *raftStore, st *store.Store, mode AckMode) *group {
 	t.Helper()
 	storage := raft.NewMemoryStorage()
 	gr := newGroup(g, 1, storage, nil, rs, st, func(uint32, []*raftpb.Message) {}, mode, nil, nil, testSlog(t))
@@ -30,6 +31,11 @@ func startSingleNodeGroup(t *testing.T, g uint32, rs *raftStore, st *store.Store
 	// 的 gr.stg，见 newGroup 注释），回填 gr.rn 后启动
 	rn := raft.StartNode(raftConfig(1, gr.stg), []raft.Peer{{ID: 1}})
 	gr.rn = rn
+	// raft.StartNode 起了 raft 节点 goroutine（node.run），组退出不会
+	// 自动停它——-race 下是稳定的 goroutine 泄漏，必须显式 Stop
+	// （Stop 幂等、阻塞到该 goroutine 退出，见 node.Stop 注释）。
+	// 注册序（LIFO 执行）：cancel → 等 run 退出 → rn.Stop。
+	t.Cleanup(rn.Stop)
 	ctx, cancel := context.WithCancel(context.Background())
 	go gr.run(ctx)
 	// 先注册等 done、后注册 cancel：LIFO 保证 cancel 先于等待执行，
@@ -47,12 +53,14 @@ func startSingleNodeGroup(t *testing.T, g uint32, rs *raftStore, st *store.Store
 
 // startLoneGroupOfThree 成员表为 {1,2,3} 但只启动节点 1：永无 quorum，
 // 选举与提交都无法完成——超时类测试的地基。
-func startLoneGroupOfThree(t *testing.T, g uint32, rs *raftStore, st *store.Store) *group {
+func startLoneGroupOfThree(t testing.TB, g uint32, rs *raftStore, st *store.Store) *group {
 	t.Helper()
 	storage := raft.NewMemoryStorage()
 	gr := newGroup(g, 1, storage, nil, rs, st, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, nil, nil, testSlog(t))
 	rn := raft.StartNode(raftConfig(1, gr.stg), []raft.Peer{{ID: 1}, {ID: 2}, {ID: 3}})
 	gr.rn = rn
+	// 同 startSingleNodeGroup：raft 节点 goroutine 必须显式 Stop
+	t.Cleanup(rn.Stop)
 	ctx, cancel := context.WithCancel(context.Background())
 	go gr.run(ctx)
 	t.Cleanup(func() {
@@ -88,6 +96,10 @@ func newTestGroupWithHook(t *testing.T, hook func(g uint32, leader uint64, isSel
 	gr := newGroup(0, 1, storage, nil, rs, st, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, hook, nil, testSlog(t))
 	rn := raft.StartNode(raftConfig(1, gr.stg), []raft.Peer{{ID: 1}})
 	gr.rn = rn
+	// 同 startSingleNodeGroup：raft 节点 goroutine 必须显式 Stop。
+	// run 由调用方启动；本 helper 先注册（LIFO 后执行），停节点一定
+	// 发生在调用方注册的「cancel → 等 run 退出」之后。
+	t.Cleanup(rn.Stop)
 	return gr
 }
 
@@ -172,6 +184,7 @@ func TestProposalWaiterScopedToProposer(t *testing.T) {
 	gr := newGroup(0, 1, storage, nil, nil, nil, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, nil, nil, testSlog(t))
 	rn := raft.StartNode(raftConfig(1, gr.stg), []raft.Peer{{ID: 1}})
 	gr.rn = rn
+	defer rn.Stop() // StartNode 起了 raft 节点 goroutine，本测试不跑 run，必须显式停
 	if gr.nextID.Load() == 0 {
 		t.Fatal("nextID 应为时间戳种子（非零）——重启后计数器不得回零")
 	}
@@ -210,6 +223,7 @@ func TestGroupStepAfterDoneDoesNotBlock(t *testing.T) {
 	gr := newGroup(0, 1, storage, nil, rs, st, func(uint32, []*raftpb.Message) {}, AckQuorumFsync, nil, nil, testSlog(t))
 	rn := raft.StartNode(raftConfig(1, gr.stg), []raft.Peer{{ID: 1}})
 	gr.rn = rn
+	defer rn.Stop() // StartNode 起了 raft 节点 goroutine，必须显式停
 	ctx, cancel := context.WithCancel(context.Background())
 	go gr.run(ctx)
 	cancel()
@@ -268,5 +282,43 @@ func TestLeaderVisibleOnlyAfterHookCompletes(t *testing.T) {
 	if sawLeaderInsideHook.Load() {
 		t.Fatal("钩子执行期间 IsLeader 已返回 true——写屏障失效，"+
 			"并发 Append 会在计数器失效前拿到陈旧 offset")
+	}
+}
+
+// BenchmarkProposeQuorumFsync 度量 quorum-fsync 档下单节点组的串行提案
+// 吞吐（batch④ Task 9 MustSync 改动的基准证据）。
+//
+// 为什么要用这个形态：每个提案在单节点 leader 上产生两个 Ready 轮次——
+// 条目轮（新条目，raft 要求同步落盘）与随后的 commit-only HardState 轮
+// （Advance 内自 ack 触发 maybeCommit，提交位点推进但 term/vote/条目都
+// 没变）。旧判定「有条目或有 HardState 就刷」在 commit 轮白刷一次盘；
+// raft 的 MustSync 判定（raft.MustSync：ents!=0 || term/vote 变化）在
+// 该轮为 false，可省掉这次 fsync。改前/改后数字对比记入 commit message。
+func BenchmarkProposeQuorumFsync(b *testing.B) {
+	st := openClusterTestStore(b)
+	rs := newRaftStore(st, testSlog(b))
+	gr := startSingleNodeGroup(b, 0, rs, st, AckQuorumFsync)
+	deadline := time.Now().Add(5 * time.Second)
+	for !gr.isLeader() {
+		if time.Now().After(deadline) {
+			b.Fatal("单节点组未当选")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	// 提案载荷复用同一份批次字节：真实路径每条消息一个批次，基准只关心
+	// 持久化/提案往返成本，同键覆写让 FSM 应用保持最廉价形态
+	batch := st.NewBatch()
+	if err := batch.Set([]byte("bench/q/0/m"), []byte("payload")); err != nil {
+		b.Fatal(err)
+	}
+	repr := append([]byte(nil), batch.Repr()...)
+	if err := batch.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		if err := gr.propose(context.Background(), repr); err != nil {
+			b.Fatal(err)
+		}
 	}
 }

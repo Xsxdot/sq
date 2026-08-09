@@ -200,10 +200,13 @@ func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, 
 	//
 	// 为什么敢在 Wait 之前推进 qs.next：内存 offset 缓存烧掉无害——任何
 	// 让 Wait 失败的场景都不丢消息：
-	//   - 集群档提案失败（ErrNotLeader：提交期间领导权迁移）：本节点失去
-	//     leader 身份时 onLeaderChange 触发 InvalidateCounters 置
-	//     qs.loaded=false（I4 同步失效），后续读取从 store 重读实际状态，
-	//     绝不返回烧掉的 offset；
+	//   - 集群档提案失败（ErrNotLeader：提交期间领导权迁移）：offset
+	//     缓存的失效只发生在重新当选时——onLeaderChange 的 isSelf==true
+	//     分支触发 InvalidateCounters 置 qs.loaded=false（I4 同步失效）；
+	//     非 leader 期间提案必然被 ErrNotLeader 拒，不存在「缓存已烧、
+	//     却返回成功」的路径；重获 leadership 的窗口已由 group.go 的
+	//     顺序屏障关闭（OnLeaderChange 钩子先于 IsLeader 对外可见），
+	//     后续读取从 store 重读实际状态，绝不返回烧掉的 offset；
 	//   - 集群档 WaitSync 失败 ≠ Pebble 不可恢复：raft 副本仍持数据，
 	//     offset 分配是 leader-only 构造，本节点重启以 learner 追平即恢复；
 	//   - 单机档 Pebble 真坏（WAL sync 失败 = 不可恢复态）：进程只能重启，

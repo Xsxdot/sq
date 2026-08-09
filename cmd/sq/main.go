@@ -203,20 +203,17 @@ func run() error {
 		// ForwardAppend 分支：解码消息 → pr.Append（本节点必为目标组
 		// leader——发起方按 Leader(g) 寻址；错发时 Append 内的 propose
 		// 自然报 ErrNotLeader 随控制帧回传）。ForwardApply 分支：重建
-		// 批次 → rep.Apply 提案（构造无关批次，跨节点重放安全）。
+		// 批次 → cl.Apply 提案（构造无关批次，跨节点重放安全）。
 		//
-		// 注意：这里必须判**具体指针**（repPtr/stPtr 的 Load 结果）再传入
-		// 接口参数——atomic.Pointer 未 Store 时 Load 返回的是
-		// (*replication.Cluster)(nil)，带类型描述符的 nil 传入接口后
-		// rep == nil 判空失效（typed-nil 穿透接口判空），rep.Apply 会在
-		// transport readLoop goroutine 里 nil 解引用 panic、无 recover、
-		// 整进程崩。窗口真实：m.Start 之后、repPtr.Store(cl) 之前（等
-		// meta leader 期间）本节点可当选任意数据组 leader，I3 修复后
-		// meta 写全走 ForwardApply，滚动重启对端流量完全可能打进窗口。
-		// stPtr 一并挪进同一守卫：Rejoin 内部 Start 与 stPtr.Store 之间
-		// 旧 store 已关闭、新实例未就位，同样不能放行。装配窗口语义：
-		// 转发失败 → 调用方（对端 producer）重试或报错，与「装配中」
-		// 原有语义一致。
+		// 注意：装配窗口（m.Start 之后、repPtr/stPtr 未 Store）内必须
+		// 在此拦下——handleForwardApply 已改收具体指针（内部 cl == nil
+		// 判空真实生效，评审 m2），但 stPtr 的 typed-nil 若放行会在
+		// NewBatchFromRepr 处 nil 解引用 panic、无 recover、整进程崩。
+		// 窗口真实：m.Start 之后、repPtr.Store(cl) 之前（等 meta leader
+		// 期间）本节点可当选任意数据组 leader，I3 修复后 meta 写全走
+		// ForwardApply，滚动重启对端流量完全可能打进窗口。
+		// 装配窗口语义：转发失败 → 调用方（对端 producer）重试或报错，
+		// 与「装配中」原有语义一致。
 		controlHandler := func(op byte, payload []byte) ([]byte, error) {
 			switch op {
 			case cluster.OpForwardAppend:
@@ -600,9 +597,11 @@ func handleForwardAppend(payload []byte, pr *produce.Producer) ([]byte, error) {
 //
 // 注意：批次重建失败（坏字节）即拒绝——apply 路径不允许任何静默降级，
 // 与 group.applyEntry 的失败哲学一致。提交失败（含 ErrNotLeader）随
-// 控制帧错误文本回传调用方。
-func handleForwardApply(payload []byte, st *store.Store, rep replication.Replicator) ([]byte, error) {
-	if rep == nil {
+// 控制帧错误文本回传调用方。形参收具体指针 *replication.Cluster（与
+// handleForwardAppend 的 *produce.Producer 同形）——cl == nil 判空
+// 真实生效（评审 m2：接口参数下 typed-nil 会穿透判空，判了等于没判）。
+func handleForwardApply(payload []byte, st *store.Store, cl *replication.Cluster) ([]byte, error) {
+	if cl == nil {
 		return nil, errors.New("转发处理器未就绪（装配中）")
 	}
 	if len(payload) < 4 {
@@ -615,7 +614,7 @@ func handleForwardApply(payload []byte, st *store.Store, rep replication.Replica
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), forwardOpTimeout)
 	defer cancel()
-	if err := rep.Apply(ctx, g, b); err != nil {
+	if err := cl.Apply(ctx, g, b); err != nil {
 		return nil, err
 	}
 	return nil, nil

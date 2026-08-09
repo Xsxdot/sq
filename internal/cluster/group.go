@@ -279,7 +279,7 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	// 1. 持久化：HardState + Entries 单批原子（rs.Persist），sync 与否
 	//    由确认档位逐轮判定；MemoryStorage 是 raft 库读取日志的视图，
 	//    必须与持久层同步推进（双记账）。
-	if err := gr.rs.Persist(gr.g, rd.HardState, rd.Entries, gr.syncPersist(rd.HardState, rd.Entries)); err != nil {
+	if err := gr.rs.Persist(gr.g, rd.HardState, rd.Entries, gr.syncPersist(rd)); err != nil {
 		// 持久化失败 = 内存日志与磁盘分叉：崩溃后本节点已确认的条目
 		// 会消失，与 applyEntry 的失败同属「日志/状态与多数派分叉」的
 		// 不可恢复类。统一走 panic——进程死亡由上层重启接管（走不干净
@@ -624,11 +624,20 @@ type ccApplied struct {
 
 // syncPersist 判定本轮 Ready 持久化是否带 fsync。
 //
-// quorum-fsync 档且本轮确有落盘内容（有条目或 HardState 非空）时才
-// Sync——无事可写时白刷一次盘没有意义；quorum-mem 档永不 Sync
-// （NoSync 落盘 + Manager 层后台批量 fsync 兜底）。
-func (gr *group) syncPersist(hs *raftpb.HardState, ents []*raftpb.Entry) bool {
-	return gr.mode == AckQuorumFsync && (len(ents) > 0 || !raft.IsEmptyHardState(hs))
+// quorum-fsync 档跟随 raft 的 MustSync 判定（raft.MustSync）：
+// 「本轮有条目」或「term/vote 有变化」才要求同步落盘——term/vote/条目
+// 是对外确认前必须 durable 的持久态（raft 契约）。commit-only 的
+// HardState 轮（提交位点推进、无新条目）不再白刷一次盘：那些条目已随
+// 上一轮同步落盘，commit 位点可在 NoSync 写入后由后台刷盘兜底，
+// 崩溃后由日志重放重新推导，不违反「已确认条目不丢」。
+// 旧判定「有条目或有 HardState 就刷」把 commit 轮也 fsync，每提案
+// 多一次盘。
+// 基准证据（BenchmarkProposeQuorumFsync，单节点 quorum-fsync 串行
+// 提案吞吐，-benchtime 3s ×5 取中位）：改前 ~8.4ms/op（≈119 ops/s）
+// → 改后 ~4.1ms/op（≈245 ops/s），约 2.06 倍——每提案省一次 fsync。
+// quorum-mem 档永不 Sync（NoSync 落盘 + Manager 层后台批量 fsync 兜底）。
+func (gr *group) syncPersist(rd raft.Ready) bool {
+	return gr.mode == AckQuorumFsync && rd.MustSync
 }
 
 // applyEntry 把一条普通条目应用到 FSM：applied 位点与 FSM 数据在
