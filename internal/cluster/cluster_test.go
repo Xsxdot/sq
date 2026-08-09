@@ -1400,6 +1400,12 @@ func startThreeNodeCluster(t *testing.T, opts ...func(*Options)) *snapHarness {
 				t.Errorf("清理: 节点未在 10s 内完全退出")
 			}
 		}
+		// 强制回收各节点注册表里的快照视图：测试结束远早于默认 TTL
+		// （5min），不回收的话 store.Close 会报「leaked snapshots」噪声；
+		// 远未来 now 让 GCOnce 一次全量回收（幂等，Close 安全）。
+		for _, m := range h.nodes {
+			m.snaps.GCOnce(time.Now().Add(time.Hour))
+		}
 		for _, st := range h.stores {
 			if err := st.Close(); err != nil {
 				t.Logf("清理: store.Close: %v", err)
@@ -1657,15 +1663,13 @@ func TestLaggingFollowerCatchesUpBySnapshot(t *testing.T) {
 	h.truncateNow(t, 0) // 触发一次截断循环
 
 	h.healPartition(victim)
-	// 追平判据：victim 上能读到最后一个键
+	// 追平判据：victim 上能读到最后一个键，且「快照安装完成」日志已落
+	// （安装分两步：数据先落、内存侧 Apply 完成才打 Info，只查数据会把
+	// 断言竞态到完成日志之前）。
 	waitFor(t, 60*time.Second, func() bool {
 		_, ok, _ := victim.Store().Get(store.TopicMetaKey("S199"))
-		return ok
-	}, "落后节点未在 60s 内经快照追平")
-
-	if n := h.countLog(victim, "快照安装完成"); n < 1 {
-		t.Fatal("追平未走快照路径（日志无「快照安装完成」）——测试前提失效")
-	}
+		return ok && h.countLog(victim, "快照安装完成") >= 1
+	}, "落后节点未在 60s 内经快照追平（数据可见或「快照安装完成」日志缺失）")
 }
 
 // TestTruncateOnceRespectsLeaderMinMatch leader 截断的安全下界：

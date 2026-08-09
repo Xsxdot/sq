@@ -865,6 +865,10 @@ func (m *Manager) truncateLoop(ctx context.Context, interval time.Duration) {
 			for g := uint32(0); g < m.Groups(); g++ {
 				m.truncateOnce(g)
 			}
+			// 快照视图注册表 GC：视图不关会阻止 Pebble 回收被覆盖的旧版本
+			// （磁盘膨胀），必须周期强制回收；循环节奏即 GC 心跳——默认
+			// TTL 5min ≈ 10 个 tick 后视图才被回收。
+			m.snaps.GCOnce(time.Now())
 		}
 	}
 }
