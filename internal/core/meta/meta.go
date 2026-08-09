@@ -101,6 +101,7 @@ type Meta struct {
 	st                 *store.Store
 	rep                replication.Replicator
 	rt                 replication.Router
+	fwd                replication.Forwarder // 跨节点转发（集群档）；单机档 nil——IsLeader 恒真，转发分支不可达
 	autoCreate         bool
 	defaultQueues      uint32
 	defaultMaxAttempts int32
@@ -115,14 +116,18 @@ type Meta struct {
 // defaultMaxAttempts<=0 时使用 DefaultMaxAttempts（防御配置层漏校验）。
 //
 // rep/rt 为复制抽象与组路由视图：单机档传 replication.NewStandalone(st)
-// 与 StandaloneRouter{}，集群档由 main 装配。
+// 与 StandaloneRouter{}，集群档由 main 装配。fwd 从 rt 断言取得——集群档
+// 的 rt 即 *replication.Cluster（同时实现 Forwarder），单机档的
+// StandaloneRouter 不实现 Forwarder，断言得 nil；单机 IsLeader 恒真，
+// 转发分支不可达，nil 不会解引用（与 txn/delay/deliver 同款）。
 func New(rep replication.Replicator, rt replication.Router, st *store.Store,
 	autoCreate bool, defaultQueues uint32, defaultMaxAttempts int32, logger *slog.Logger) (*Meta, error) {
 	if defaultMaxAttempts <= 0 {
 		defaultMaxAttempts = DefaultMaxAttempts
 	}
+	fwd, _ := rt.(replication.Forwarder)
 	m := &Meta{
-		st: st, rep: rep, rt: rt, autoCreate: autoCreate, defaultQueues: defaultQueues, defaultMaxAttempts: defaultMaxAttempts,
+		st: st, rep: rep, rt: rt, fwd: fwd, autoCreate: autoCreate, defaultQueues: defaultQueues, defaultMaxAttempts: defaultMaxAttempts,
 		logger: logger.With("mod", "meta"),
 	}
 	if err := m.loadLocked(); err != nil {
@@ -220,9 +225,13 @@ func (m *Meta) CreateTopic(ctx context.Context, name string, queues uint32) (Top
 	raw, _ := json.Marshal(tc)
 	b := m.st.NewBatch()
 	b.Set(store.TopicMetaKey(name), raw)
-	// 经 Replicator 提交：leader 路径落盘成功后更新内存缓存即时可见；
-	// follower 的盲 apply 不碰缓存，靠 OnApplied→Reload（装配见 main）
-	if err := m.rep.Apply(ctx, m.rt.MetaGroup(), b); err != nil {
+	// 经 Replicator 提交（ApplyOrForward）：leader 路径落盘成功后更新内存
+	// 缓存即时可见；follower 的盲 apply 不碰缓存，靠 OnApplied→Reload
+	// （装配见 main）。集群档走转发：SDK 的 QueryRoute/建 topic 请求可能
+	// 落在任意节点（多组摊布下 topic 的队列可能全部哈希到非 meta leader
+	// 的组，消费者只连队列 leader 节点），批次是构造无关的绝对值 Set，
+	// 跨节点重放无副作用，经 ForwardApply 交给 meta leader 提案。
+	if err := replication.ApplyOrForward(ctx, m.rep, m.rt, m.fwd, m.rt.MetaGroup(), b, m.logger); err != nil {
 		return TopicConfig{}, fmt.Errorf("持久化 topic %s: %w", name, err)
 	}
 	m.topics[name] = tc
@@ -250,7 +259,11 @@ func (m *Meta) EnsureGroup(ctx context.Context, name string) (GroupConfig, error
 	raw, _ := json.Marshal(gc)
 	b := m.st.NewBatch()
 	b.Set(store.GroupMetaKey(name), raw)
-	if err := m.rep.Apply(ctx, m.rt.MetaGroup(), b); err != nil {
+	// ApplyOrForward（构造无关绝对值 Set，理由同 CreateTopic）：SDK 消费
+	// 者注册消费组的请求只发到队列 leader 节点，可能永远到不了 meta
+	// leader——纯 rep.Apply 会让该 topic 的新消费组在集群档永久失败
+	//（实测 (2/3)^6≈8.8% 的 topic 全部队列哈希到非 meta leader 的组）。
+	if err := replication.ApplyOrForward(ctx, m.rep, m.rt, m.fwd, m.rt.MetaGroup(), b, m.logger); err != nil {
 		return GroupConfig{}, fmt.Errorf("持久化 group %s: %w", name, err)
 	}
 	m.groups[name] = gc
@@ -304,7 +317,9 @@ func (m *Meta) UpdateTopicRetention(ctx context.Context, name string, retentionM
 	raw, _ := json.Marshal(tc)
 	b := m.st.NewBatch()
 	b.Set(store.TopicMetaKey(name), raw)
-	if err := m.rep.Apply(ctx, m.rt.MetaGroup(), b); err != nil {
+	// ApplyOrForward（构造无关绝对值 Set，理由同 CreateTopic）：retention
+	// 更新经 Admin API 到达，可能落在非 meta leader 节点
+	if err := replication.ApplyOrForward(ctx, m.rep, m.rt, m.fwd, m.rt.MetaGroup(), b, m.logger); err != nil {
 		return TopicConfig{}, fmt.Errorf("持久化 topic %s: %w", name, err)
 	}
 	m.topics[name] = tc
@@ -323,7 +338,8 @@ func (m *Meta) DeleteTopic(ctx context.Context, name string) error {
 	}
 	b := m.st.NewBatch()
 	b.Delete(store.TopicMetaKey(name))
-	if err := m.rep.Apply(ctx, m.rt.MetaGroup(), b); err != nil {
+	// ApplyOrForward（构造无关绝对键 Delete，理由同 CreateTopic）
+	if err := replication.ApplyOrForward(ctx, m.rep, m.rt, m.fwd, m.rt.MetaGroup(), b, m.logger); err != nil {
 		return fmt.Errorf("删除 topic %s: %w", name, err)
 	}
 	delete(m.topics, name)
@@ -340,7 +356,8 @@ func (m *Meta) DeleteGroup(ctx context.Context, name string) error {
 	}
 	b := m.st.NewBatch()
 	b.Delete(store.GroupMetaKey(name))
-	if err := m.rep.Apply(ctx, m.rt.MetaGroup(), b); err != nil {
+	// ApplyOrForward（构造无关绝对键 Delete，理由同 CreateTopic）
+	if err := replication.ApplyOrForward(ctx, m.rep, m.rt, m.fwd, m.rt.MetaGroup(), b, m.logger); err != nil {
 		return fmt.Errorf("删除 group %s: %w", name, err)
 	}
 	delete(m.groups, name)

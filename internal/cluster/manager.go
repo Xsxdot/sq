@@ -57,12 +57,18 @@ var ErrUncleanShutdown = errors.New("cluster: 上次为不干净关机，须以 
 
 // Options 是 NewManager 的装配参数。
 //
-// Peers 是全体节点 id → raft 监听地址（含本节点）；本节点地址仅在本
-// 节点自身未注入 Listener 时用于监听，不参与传输拨号（本节点消息短路）。
+// 监听地址双语义（I5 修复）：Peers 里的地址是**拨号通告**地址——NAT/容器
+// 场景下 raft_addr 是外网可达地址，本节点自己绑定它必然失败（外网地址
+// 不落在本机网卡上）。因此绑定与通告拆开：
+//   - ListenAddr：本节点**绑定**地址（可为本机网卡/0.0.0.0）；空时回退
+//     到 Peers[NodeID]（测试/单机形态，两者相同）
+//   - Peers[NodeID]：**拨号通告**地址，传输层永远用它拨对端、也把它
+//     写进 peer 表广播；本节点消息短路，不参与自身拨号
 type Options struct {
 	NodeID     uint64            // 本节点 id（1..3）
-	Peers      map[uint64]string // 全体节点 id → raft 监听地址（含本节点）
-	Listener   net.Listener      // 可选：测试注入已建监听（nil 则按 Peers[NodeID] 监听）
+	Peers      map[uint64]string // 全体节点 id → raft 监听地址（含本节点；语义=拨号通告地址）
+	Listener   net.Listener      // 可选：测试注入已建监听（nil 则按 ListenAddr/Peers[NodeID] 监听）
+	ListenAddr string            // 本节点绑定地址（空回退 Peers[NodeID]，见类型注释）
 	DataGroups uint32            // 数据组数，默认 3；首启持久化，此后不可变
 	Mode       AckMode
 	Store      *store.Store
@@ -249,14 +255,21 @@ func NewManager(o Options) (*Manager, error) {
 		m.groups[g] = gr
 	}
 
-	// 本节点监听：测试注入的 Listener 直接复用；否则按 Peers[NodeID]
-	// 监听。放在恢复判定之后——ErrUncleanShutdown 路径不得泄漏监听器。
+	// 本节点监听：测试注入的 Listener 直接复用；否则按 ListenAddr 绑定
+	//（空回退 Peers[NodeID]，单机/测试形态两者相同；NAT/容器场景
+	// ListenAddr 是本机绑定地址、Peers[NodeID] 是外网通告地址，见
+	// Options 类型注释）。放在恢复判定之后——ErrUncleanShutdown 路径
+	// 不得泄漏监听器。
 	if o.Listener != nil {
 		m.ln = o.Listener
 	} else {
-		ln, err := net.Listen("tcp", addr)
+		bind := o.ListenAddr
+		if bind == "" {
+			bind = addr
+		}
+		ln, err := net.Listen("tcp", bind)
 		if err != nil {
-			return nil, fmt.Errorf("cluster: 本节点 %d 监听 %s: %w", o.NodeID, addr, err)
+			return nil, fmt.Errorf("cluster: 本节点 %d 监听 %s: %w", o.NodeID, bind, err)
 		}
 		m.ln = ln
 	}
@@ -1065,12 +1078,17 @@ func Rejoin(ctx context.Context, o Options, dataDir string) (*Manager, error) {
 
 	// 第 4 步：重建本节点监听（EADDRINUSE 抢占，注释同 harness——
 	// kill 后旧传输层看门狗关监听器与 Done 不同步，直接重绑同地址
-	// 可能撞 EADDRINUSE；抢到端口=旧监听器已关的确定性证明）
-	addr := o.Peers[o.NodeID]
+	// 可能撞 EADDRINUSE；抢到端口=旧监听器已关的确定性证明）。
+	// 绑定地址语义同 NewManager：ListenAddr 优先（NAT/容器下与
+	// Peers[NodeID] 的通告地址分离），空回退 Peers[NodeID]。
+	bind := o.ListenAddr
+	if bind == "" {
+		bind = o.Peers[o.NodeID]
+	}
 	var ln net.Listener
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
-		l, err := net.Listen("tcp", addr)
+		l, err := net.Listen("tcp", bind)
 		if err == nil {
 			ln = l
 			break
@@ -1079,12 +1097,12 @@ func Rejoin(ctx context.Context, o Options, dataDir string) (*Manager, error) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		return nil, fmt.Errorf("cluster: 重入编排重建监听 %s: %w", addr, err)
+		return nil, fmt.Errorf("cluster: 重入编排重建监听 %s: %w", bind, err)
 	}
 	if ln == nil {
-		return nil, fmt.Errorf("cluster: 重入编排旧监听器未在 10s 内关闭，无法重绑 %s", addr)
+		return nil, fmt.Errorf("cluster: 重入编排旧监听器未在 10s 内关闭，无法重绑 %s", bind)
 	}
-	lg.Info("重入编排: 第 4 步 监听重建完成", "node", o.NodeID, "addr", addr, "duration", time.Since(start).Round(time.Millisecond))
+	lg.Info("重入编排: 第 4 步 监听重建完成", "node", o.NodeID, "addr", bind, "duration", time.Since(start).Round(time.Millisecond))
 
 	// 第 5 步：新 store + NewManager fresh 路径启动 + Start
 	st, err := store.Open(dataDir, false, lg)

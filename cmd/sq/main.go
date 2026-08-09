@@ -113,6 +113,11 @@ func run() error {
 	// 里以闭包形式注入，而这些闭包引用 mt/pr/rep——它们在 NewManager
 	// 之后才构造。闭包捕获变量而非值：声明在前、赋值在后，钩子触发
 	// 时（Start 之后）变量已就位。
+	//
+	// 钩子闭包读这些变量与主 goroutine 的赋值并发（装配窗口语义：
+	// 依赖未构造时跳过）——裸变量捕获是数据竞争（cmd 无 -race 覆盖），
+	// 统一改 atomic.Pointer 装载：闭包内 Load() 判 nil 跳过，主流程
+	// 赋值点 Store()。装配窗口语义不变，只是读是原子的。
 	var (
 		rep replication.Replicator
 		rt  replication.Router
@@ -122,6 +127,15 @@ func run() error {
 		pr  *produce.Producer
 		m   *cluster.Manager // 集群档非 nil；单机档保持 nil
 	)
+	// 钩子闭包的原子装载（见上方注释）：mt/pr 装配于 Start 之后、st 在
+	// Rejoin 后换新实例、rep 在 NewCluster 后才有——闭包内一律 Load()。
+	var (
+		mtPtr  atomic.Pointer[meta.Meta]
+		prPtr  atomic.Pointer[produce.Producer]
+		stPtr  atomic.Pointer[store.Store]
+		repPtr atomic.Pointer[replication.Cluster]
+	)
+	stPtr.Store(st)
 	if cfg.ClusterEnabled() {
 		cc := cfg.Cluster
 		// 确认档位映射：config 已校验合法值
@@ -137,18 +151,19 @@ func run() error {
 		// OnLeaderChange 触发 produce.InvalidateCounters：重新当选 leader
 		// 后 offset 缓存可能滞后多数派事实，必须失效。
 		//
-		// 闭包捕获 mt/pr 变量（声明在函数顶部、赋值为其后的 meta.New/
-		// produce.New）：装配序把 Start 放在 meta.New 之前，Start 后
-		// 立即触发的领导权事件（单节点即刻当选）可能先于变量赋值——
-		// 钩子触发时若依赖尚未构造，跳过该次（produce 未装配就没有
-		// 缓存可失效，语义等价）。两个闭包在 NewManager 与 Rejoin 间
-		// 复用：重入后的新 Manager 同样需要这两条装配线。
+		// 闭包经 atomic.Pointer（mtPtr/prPtr/stPtr/repPtr）读 mt/pr/st/rep：
+		// 装配序把 Start 放在 meta.New 之前，Start 后立即触发的领导权事件
+		//（单节点即刻当选）可能先于变量赋值——钩子触发时若依赖尚未构造，
+		// Load() 得 nil 跳过该次（produce 未装配就没有缓存可失效，语义
+		// 等价）。两个闭包在 NewManager 与 Rejoin 间复用：重入后的新
+		// Manager 同样需要这两条装配线。
 		onApplied := func(g uint32, repr []byte) {
 			// 空条目（选举/成员变更）repr 为 nil：无 FSM 数据，跳过
 			if len(repr) == 0 {
 				return
 			}
-			if mt == nil {
+			mtv := mtPtr.Load()
+			if mtv == nil {
 				return // 装配窗口（Start→meta.New）内无缓存可重载
 			}
 			touches, terr := store.BatchTouchesPrefix(repr, []byte("meta/"))
@@ -164,7 +179,7 @@ func run() error {
 			go func() {
 				// Reload 失败不致命（部分态）：下一条 applied 条目会
 				// 再次触发重载，最终收敛（Task 6 审查注记）
-				if rerr := mt.Reload(); rerr != nil {
+				if rerr := mtv.Reload(); rerr != nil {
 					logger.Error("meta 缓存重载失败（下一条 applied 条目会重试）", "g", g, "err", rerr)
 				}
 			}()
@@ -173,10 +188,15 @@ func run() error {
 			if !isSelf {
 				return
 			}
-			if pr == nil {
+			prv := prPtr.Load()
+			if prv == nil {
 				return // 装配窗口（Start→produce.New）内无缓存可失效
 			}
-			go pr.InvalidateCounters()
+			// 同步调用（评审 I4）：失而复得瞬间到 goroutine 执行之间，
+			// 并发 Append 会用陈旧 offset 覆写已 quorum 提交的消息——
+			// 失效必须在下一次 Append 前完成。只翻布尔锁内操作，不违反
+			// 钩子「不得阻塞」契约（重活才 dispatch）。
+			prv.InvalidateCounters()
 		}
 		// 控制处理器：本节点自己的 PrepareJoin（op=3）由 Manager 自装
 		// 处理，这里只注册转发两个 op——见 cluster.Options 注释。
@@ -187,9 +207,9 @@ func run() error {
 		controlHandler := func(op byte, payload []byte) ([]byte, error) {
 			switch op {
 			case cluster.OpForwardAppend:
-				return handleForwardAppend(payload, pr)
+				return handleForwardAppend(payload, prPtr.Load())
 			case cluster.OpForwardApply:
-				return handleForwardApply(payload, st, rep)
+				return handleForwardApply(payload, stPtr.Load(), repPtr.Load())
 			default:
 				return nil, fmt.Errorf("未知控制 op %d", op)
 			}
@@ -197,6 +217,7 @@ func run() error {
 		opts := cluster.Options{
 			NodeID:                 cc.NodeID,
 			Peers:                  cc.PeerRaftAddrs(),
+			ListenAddr:             cc.RaftListen, // 绑定地址（与 Peers[NodeID] 的通告地址分离，见 Options 注释）
 			DataGroups:             cc.DataGroups,
 			Mode:                   mode,
 			Store:                  st,
@@ -221,6 +242,7 @@ func run() error {
 				return fmt.Errorf("集群重入失败: %w", err)
 			}
 			st = m.Store() // Rejoin 内部重开了 store，后续装配用新实例
+			stPtr.Store(st)
 			// Rejoin 内部已 Start（第 5 步），不重复 Start
 		} else if err != nil {
 			return err
@@ -249,6 +271,7 @@ func run() error {
 		// Router 与 Forwarder（rt 断言取得 fwd，见 txn.New/delay.New）
 		cl := replication.NewCluster(m)
 		rep, rt, fwd = cl, cl, cl
+		repPtr.Store(cl) // 钩子闭包（ControlHandler 的 ForwardApply 分支）原子读
 		rv = clusterRouteView{m: m, cc: cc}
 		// 停机顺序：gRPC 排空（上面 select 分支）→ 定时器退出（各自 defer）
 		// → Manager.StopClean → st.Close。本 defer 注册在 st.Close 的 defer
@@ -271,7 +294,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	mtPtr.Store(mt) // OnApplied 钩子闭包原子读
 	pr = produce.New(rep, rt, st, mt, logger)
+	prPtr.Store(pr) // OnLeaderChange 钩子闭包原子读
 	dl := deliver.New(rep, rt, st, mt, pr, logger)
 
 	// 事务管理器。构造顺序有讲究：rpc.Server 要拿它处理 Send/EndTransaction，

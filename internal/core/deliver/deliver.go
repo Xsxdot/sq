@@ -89,6 +89,7 @@ func RetryBackoff(attempts int32) time.Duration {
 type Deliverer struct {
 	rep    replication.Replicator
 	rt     replication.Router
+	fwd    replication.Forwarder // 跨节点转发（集群档）；单机档 nil——IsLeader 恒真，转发分支不可达
 	st     *store.Store
 	mt     *meta.Meta
 	pr     *produce.Producer
@@ -105,9 +106,13 @@ type Deliverer struct {
 
 // New 构造 Deliverer。rep/rt 为复制抽象与组路由视图：单机档传
 // replication.NewStandalone(st) 与 StandaloneRouter{}，集群档由 main 装配。
+// fwd 从 rt 断言取得——集群档的 rt 即 *replication.Cluster（同时实现
+// Forwarder），单机档的 StandaloneRouter 不实现 Forwarder，断言得 nil；
+// 单机 IsLeader 恒真，转发分支不可达，nil 不会解引用（与 txn/delay 同款）。
 func New(rep replication.Replicator, rt replication.Router, st *store.Store,
 	mt *meta.Meta, pr *produce.Producer, logger *slog.Logger) *Deliverer {
-	return &Deliverer{rep: rep, rt: rt, st: st, mt: mt, pr: pr,
+	fwd, _ := rt.(replication.Forwarder)
+	return &Deliverer{rep: rep, rt: rt, fwd: fwd, st: st, mt: mt, pr: pr,
 		logger: logger.With("mod", "deliver"), qmu: map[string]*sync.Mutex{}}
 }
 
@@ -677,9 +682,40 @@ func (d *Deliverer) moveToDLQ(ctx context.Context, group, topic string, queueID 
 	// 先写后删；崩溃窗口（死信落盘后、inflight 删除前）重放 = 重复死信条目，
 	// at-least-once 语义内——重投扫描会再次把超限消息转入，死信区出现两条
 	// 同 ID 条目，死信消费端按消息 ID 幂等即可。次序不得反转（反转 = 丢失）。
-	if _, err := d.pr.Append(ctx, dlq); err != nil {
-		return fmt.Errorf("消息转入 DLQ (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+	//
+	// 集群档分派：死信 topic（%DLQ%{group}）是独立 topic，组号
+	// GroupForQueue(dlqTopic, ...) 与被消费队列无关——本节点是死信队列组
+	// leader 时本地 pr.Append（offset 分配在本节点）；否则经 fwd.ForwardAppend
+	// 把消息字节交给死信组 leader 追加（leader-only 构造的跨节点延伸，与
+	// txn.End 第一段同款；死信 topic 固定 1 队列，leader 侧 pr.Append 的
+	// 确定性选队结果恒为队列 0，转发寻址按 GroupForQueue(dlqTopic, 0) 即可）。
+	// 没有转发路径时（修复前），不 lead 死信组的节点每次 attempts 耗尽都撞
+	// ErrNotLeader，该队列消费永久停摆——attempts 耗尽恰是 DLQ 设计场景，
+	// 停摆即丢消息。
+	dlqG := d.rt.GroupForQueue(dlqTopic, 0)
+	var stored *core.Message
+	var aerr error
+	if d.rt.IsLeader(dlqG) {
+		stored, aerr = d.pr.Append(ctx, dlq)
+	} else {
+		raw, eerr := core.EncodeMessage(dlq)
+		if eerr != nil {
+			return fmt.Errorf("编码死信消息 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, eerr)
+		}
+		qid, off, ferr := d.fwd.ForwardAppend(ctx, dlqG, raw)
+		if ferr != nil {
+			return fmt.Errorf("转发转入死信 (group=%s topic=%s q=%d off=%d dlq=%s g=%d): %w",
+				group, topic, queueID, offset, dlqTopic, dlqG, ferr)
+		}
+		// 转发只回坐标：拼出日志所需的存储信息（ID/topic 本就来自死信本体）
+		stored = &core.Message{ID: dlq.ID, Topic: dlqTopic, QueueID: qid, Offset: off}
+		d.logger.Info("死信消息跨节点转发", "g", dlqG, "msg_id", dlq.ID, "dlq_topic", dlqTopic,
+			"origin_topic", topic, "origin_queue", queueID, "origin_offset", offset, "queue", qid, "offset", off)
 	}
+	if aerr != nil {
+		return fmt.Errorf("消息转入 DLQ (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, aerr)
+	}
+	_ = stored // 坐标已入日志（本地路径 pr.Append 的返回值供调用方核对，转发路径只用于日志）
 	if d.afterAppendHook != nil {
 		d.afterAppendHook()
 	}

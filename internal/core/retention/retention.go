@@ -255,21 +255,32 @@ func (m *Manager) purgeKeyIdx(ctx context.Context, topic string, cutoff int64) e
 	}
 	applied := 0
 	total := 0
+	// open 跟踪仍未 Close 的桶：已提交的桶被 rep.Apply 消费并 Close
+	//（Replicator 契约负责其生命周期）、非 leader 跳过的桶已自行 Close，
+	// 两者都从 open 摘除——错误路径只回收仍 open 的桶，避免对已消费
+	// 批次二次 Close（与 pebble 批次池别名同类的手续疏漏，I6）。
+	open := make(map[uint32]*store.Batch, len(buckets))
+	for qid, b := range buckets {
+		open[qid] = b
+	}
 	for qid, b := range buckets {
 		g := m.rt.GroupForQueue(topic, qid)
 		if !m.rt.IsLeader(g) {
 			b.Close() // 未提交而放弃的批次必须自行回收
+			delete(open, qid)
 			continue
 		}
 		if err := m.rep.Apply(ctx, g, b); err != nil {
-			// 已交给 Apply 的批次不再 Close；其余桶必须自行回收
-			for oq, ob := range buckets {
+			// 当前失败桶按 store 契约丢给 GC（Apply 失败不得 Close，见
+			// store.Apply 注释）；其余仍 open 的桶自行回收
+			for oq, ob := range open {
 				if oq != qid {
 					ob.Close()
 				}
 			}
 			return fmt.Errorf("索引删除提交: %w", err)
 		}
+		delete(open, qid) // 已提交：批次归 Apply 处置
 		applied++
 		total += counts[qid]
 	}

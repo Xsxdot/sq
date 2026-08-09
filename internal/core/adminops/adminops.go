@@ -71,16 +71,22 @@ func PurgeTopicData(ctx context.Context, rep replication.Replicator, rt replicat
 		}
 		return fmt.Errorf("扫描 keyidx %s: %w", tc.Name, err)
 	}
+	submitted := map[uint32]bool{}
 	for qid, b := range buckets {
 		if err := replication.ApplyOrForward(ctx, rep, rt, fwd, rt.GroupForQueue(tc.Name, qid), b, logger); err != nil {
-			// 已交给 ApplyOrForward 的批次不再 Close；其余桶必须自行回收
+			// 错误路径回收：只 Close 未提交的桶。已提交的桶被
+			// ApplyOrForward 消费并 Close（Replicator 契约负责其生命周期），
+			// 再 Close 一次是与 pebble 批次池别名同类的手续疏漏（今天
+			// ErrClosed 被忽略故无害，是隐患——I6）。当前失败桶按 store
+			// 契约丢给 GC（Apply 失败不得 Close，见 store.Apply 注释）。
 			for oq, ob := range buckets {
-				if oq != qid {
+				if oq != qid && !submitted[oq] {
 					ob.Close()
 				}
 			}
 			return fmt.Errorf("清理 keyidx %s q%d: %w", tc.Name, qid, err)
 		}
+		submitted[qid] = true
 	}
 	logger.Info("topic 数据已清理", "topic", tc.Name, "queues", tc.Queues, "idx_buckets", len(buckets))
 	return nil

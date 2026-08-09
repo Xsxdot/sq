@@ -164,6 +164,17 @@ func (t *Manager) End(ctx context.Context, txID string, commit bool) (bool, erro
 		return false, fmt.Errorf("读取 halfidx (tx=%s): %w", txID, err)
 	}
 	if !ok {
+		// 本地读不到 halfidx = 「已决断或从未 Stage」。meta leader 上读权威
+		// （Stage 返回前已 apply），可安全判幂等成功；非 meta leader 上
+		// 本地 FSM 可能滞后于多数派——已提交的 Stage 尚未 apply 到本节点
+		// 时同样读不到，若也判幂等成功，客户端收到 commit OK 但事务实际
+		// 未决断（producer 退出后回查无人应答、maxChecks 耗尽丢弃），是
+		// 假成功。必须报 ErrNotLeader 让 SDK 重试到 meta leader 决断。
+		// rpc EndTransaction handler 把该错误映射为 HA_NOT_AVAILABLE。
+		if !t.rt.IsLeader(t.rt.MetaGroup()) {
+			return false, fmt.Errorf("%w: 非 meta leader 本地读不可决断 (tx=%s)",
+				replication.ErrNotLeader, txID)
+		}
 		return false, nil
 	}
 	ref := &HalfRef{}

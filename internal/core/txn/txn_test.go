@@ -3,6 +3,7 @@ package txn
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"sync"
 	"testing"
@@ -22,6 +23,8 @@ type fixture struct {
 	dl  *deliver.Deliverer
 	mt  *meta.Meta
 	mgr *Manager
+	rep replication.Replicator
+	rt  replication.Router
 }
 
 func newFixture(t *testing.T, interval time.Duration, maxChecks int) *fixture {
@@ -39,7 +42,7 @@ func newFixture(t *testing.T, interval time.Duration, maxChecks int) *fixture {
 	rt := replication.StandaloneRouter{}
 	pr := produce.New(rep, rt, st, mt, slog.Default())
 	dl := deliver.New(rep, rt, st, mt, pr, slog.Default())
-	return &fixture{st: st, pr: pr, dl: dl, mt: mt, mgr: New(rep, rt, st, pr, mt, interval, maxChecks, slog.Default())}
+	return &fixture{st: st, pr: pr, dl: dl, mt: mt, mgr: New(rep, rt, st, pr, mt, interval, maxChecks, slog.Default()), rep: rep, rt: rt}
 }
 
 // msgCount 统计 msg/ 区消息条数（两段式重放用例断言目标队列条数用）。
@@ -138,6 +141,30 @@ func TestEndUnknownTxIDIsIdempotent(t *testing.T) {
 	}
 	if found {
 		t.Fatal("未知 txID 不该 found")
+	}
+}
+
+// nonLeaderRouter 假 Router：报告自己不是任何组 leader（模拟集群档里
+// 落在非 meta leader 节点的 EndTransaction）。GroupForQueue/MetaGroup
+// 沿用 StandaloneRouter 的恒 MetaGroup 语义——I1 判定只关心 IsLeader。
+type nonLeaderRouter struct{ replication.StandaloneRouter }
+
+func (nonLeaderRouter) IsLeader(uint32) bool { return false }
+
+// TestEndUnknownTxOnNonLeaderReturnsErrNotLeader 评审 I1 回归：非 meta
+// leader 节点上 End 本地读不到 halfidx 时，不能判幂等成功——本地 FSM
+// 可能滞后于多数派（Stage 已提交但未 apply 到本节点），判成功 = 客户端
+// 收到 commit OK 但事务实际未决断（假成功）。必须报 ErrNotLeader 让
+// rpc 层映射 HA_NOT_AVAILABLE、SDK 重试到 meta leader。
+func TestEndUnknownTxOnNonLeaderReturnsErrNotLeader(t *testing.T) {
+	f := newFixture(t, 30*time.Second, 15)
+	mgr := New(f.rep, nonLeaderRouter{}, f.st, f.pr, f.mt, 30*time.Second, 15, slog.Default())
+	_, err := mgr.End(context.Background(), "NO-SUCH-TX", true)
+	if err == nil {
+		t.Fatal("非 meta leader 上未知 txID 应报 ErrNotLeader（本地读不可决断），得到 nil")
+	}
+	if !errors.Is(err, replication.ErrNotLeader) {
+		t.Fatalf("应包装 replication.ErrNotLeader，得到 %v", err)
 	}
 }
 

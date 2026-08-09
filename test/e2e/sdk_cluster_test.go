@@ -500,6 +500,164 @@ func TestStandaloneToSingleNodeClusterUpgrade(t *testing.T) {
 	t.Logf("升级验证完成：raft/ 前缀 %d 个键，升级前 %d 条 + 升级后 %d 条消息全部收发", raftKeys, 5, 5)
 }
 
+// TestClusterDLQ 三节点下投递次数耗尽的毒消息跨组转入死信（评审 C1）：
+// 死信 topic（%DLQ%{group}）是独立 topic，组号 GroupForQueue 与被消费
+// 队列无关——本节点不 lead 死信组时，moveToDLQ 第一段必须经
+// ForwardAppend 转发给死信组 leader（修复前直接 pr.Append 报
+// ErrNotLeader，attempts 耗尽恰是 DLQ 设计场景，该队列每次 Receive 都
+// 撞死、消费永久停摆）。
+//
+// 用例：发毒消息 → 消费 2 次不 ack（maxAttempts=2）→ 断言死信 topic
+// 收到（新消费组拉取，含来源属性）→ 断言原队列仍可正常收发（不停摆）。
+// 修复前约 2/3 概率失败（毒消息队列组 leader 恰不 lead 死信组时）。
+func TestClusterDLQ(t *testing.T) {
+	grpcPorts := pickPorts(t, 3)
+	raftPorts := pickPorts(t, 3)
+	dirs := []string{t.TempDir(), t.TempDir(), t.TempDir()}
+	cfgs := make([]*config.Config, 3)
+	for i := 0; i < 3; i++ {
+		cfgs[i] = clusterNodeConfig(t, dirs[i], uint64(i+1), grpcPorts[i], raftPorts[i], 3)
+		cfgs[i].DefaultMaxAttempts = 2 // 2 次投递即超限，控制用例时长
+	}
+	writeClusterPeers(cfgs, grpcPorts, raftPorts)
+	endpoints := make([]string, 3)
+	cfgPaths := make([]string, 3)
+	logPaths := make([]string, 3)
+	for i := 0; i < 3; i++ {
+		cfgPaths[i] = writeNodeConfig(t, cfgs[i])
+		endpoints[i] = fmt.Sprintf("127.0.0.1:%d", grpcPorts[i])
+		logPaths[i] = filepath.Join(dirs[i], "broker.log")
+	}
+	started := make([]*brokerHandle, 3)
+	for i := 0; i < 3; i++ {
+		logFile, err := os.Create(logPaths[i])
+		if err != nil {
+			t.Fatalf("创建 broker 日志文件失败: %v", err)
+		}
+		cmd := exec.Command(brokerBinary, "-config", cfgPaths[i])
+		cmd.Stdout = logFile
+		cmd.Stderr = logFile
+		if err := cmd.Start(); err != nil {
+			logFile.Close()
+			t.Fatalf("启动 broker 进程失败: %v", err)
+		}
+		waitDone := make(chan error, 1)
+		go func() { waitDone <- cmd.Wait() }()
+		started[i] = &brokerHandle{
+			endpoint: endpoints[i], cfgPath: cfgPaths[i], logPath: logPaths[i],
+			logFile: logFile, cmd: cmd, waitDone: waitDone,
+		}
+	}
+	for i := 0; i < 3; i++ {
+		waitBrokerReady(t, started[i].endpoint, started[i].waitDone, started[i].logPath)
+	}
+	t.Cleanup(func() {
+		for i, h := range started {
+			if h.cmd.Process != nil {
+				h.stop(t)
+			}
+			if t.Failed() {
+				dumpBrokerLog(t, logPaths[i])
+			}
+		}
+	})
+	multi := strings.Join(endpoints, ";")
+	const topic, group = "e2e-dlq", "e2e-dlq-g"
+	ensureTopic(t, endpoints, topic)
+	waitRouteSpread(t, endpoints, topic, 60*time.Second)
+
+	// 发毒消息（不发消息则重投扫描无事可做，转入是惰性的）。连发 3 条：
+	// SDK 发布负载均衡按队列轮询（首 3 次落到 q2/q3/q4），DLQ topic
+	// 归组 g2——q3 的源队列组是 g3，与死信组必然不同节点（摊布后每节点
+	// 恰领一组），第 1 段跨组转发被确定性触发；其余走本地路径，两类都
+	// 覆盖到。
+	producer := newClusterProducer(t, multi, topic)
+	poisonBodies := []string{"dlq-poison-a", "dlq-poison-b", "dlq-poison-c"}
+	for i, body := range poisonBodies {
+		if _, err := producer.Send(context.Background(), &rmq.Message{Topic: topic, Body: []byte(body)}); err != nil {
+			t.Fatalf("Send #%d: %v", i, err)
+		}
+	}
+	producer.GracefulStop()
+
+	// 消费 2 次不 ack（invisible 短窗，任其过期重投）——第 2 次投递后
+	// attempts 达上限，下一次 Receive 触发转入死信。逐条计数，3 条都
+	// 要见过 2 次投递。
+	consumer := newClusterConsumer(t, multi, group, topic, clusterConsumerAwaitDefault)
+	seen := map[string]int{"dlq-poison-a": 0, "dlq-poison-b": 0, "dlq-poison-c": 0}
+	deadline := time.Now().Add(120 * time.Second)
+	for (seen["dlq-poison-a"] < 2 || seen["dlq-poison-b"] < 2 || seen["dlq-poison-c"] < 2) && time.Now().Before(deadline) {
+		mvs, err := consumer.Receive(context.Background(), 16, 3*time.Second)
+		if err != nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		for _, mv := range mvs {
+			if n, ok := seen[string(mv.GetBody())]; ok {
+				seen[string(mv.GetBody())] = n + 1
+				t.Logf("毒消息 %s 第 %d 次收到（不 ack）", mv.GetBody(), n+1)
+			}
+		}
+	}
+	for _, body := range poisonBodies {
+		if seen[body] < 2 {
+			t.Fatalf("毒消息 %s 未完成 2 次投递: %d", body, seen[body])
+		}
+	}
+
+	// 死信消费者：%DLQ%{group} 是普通 topic，SDK 直接订阅（新消费组）
+	dlqTopic := "%DLQ%" + group
+	dlqConsumer := newClusterConsumer(t, multi, group+"-reader", dlqTopic, clusterConsumerAwaitDefault)
+	gotDLQ := map[string]bool{}
+	deadline = time.Now().Add(120 * time.Second)
+	for len(gotDLQ) < len(poisonBodies) && time.Now().Before(deadline) {
+		_, _ = consumer.Receive(context.Background(), 16, 3*time.Second) // 戳原 topic：惰性转入 + 退避窗口过期
+		mvs, err := dlqConsumer.Receive(context.Background(), 16, 30*time.Second)
+		if err != nil {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		for _, mv := range mvs {
+			gotDLQ[string(mv.GetBody())] = true
+			props := mv.GetProperties()
+			if props["sq-origin-topic"] != topic {
+				t.Fatalf("死信缺少来源属性 sq-origin-topic: %v", props)
+			}
+			if err := dlqConsumer.Ack(context.Background(), mv); err != nil {
+				t.Fatalf("Ack 死信: %v", err)
+			}
+		}
+	}
+	for _, body := range poisonBodies {
+		if !gotDLQ[body] {
+			t.Fatalf("死信未收到 %s（修复前：不 lead 死信组的节点转入失败、队列停摆）", body)
+		}
+	}
+	// 转发证据：moveToDLQ 第一段在非死信组 leader 节点经 ForwardAppend
+	// 转发（日志「死信消息跨节点转发」）。q3 毒消息的源组与死信组必然
+	// 不同节点，断言 ≥1 次——跨组转发路径被确定性覆盖（评审 C1）。
+	fwdDLQ := countLogLines(t, logPaths, "死信消息跨节点转发")
+	if fwdDLQ == 0 {
+		t.Fatalf("死信跨组转发零次：q3 源组(g3)与死信组(g2)应不同节点，转发路径未触发")
+	}
+	t.Logf("毒消息已跨组转入死信：%s 收齐 %d 条，来源属性完整；死信转发计数=%d",
+		dlqTopic, len(gotDLQ), fwdDLQ)
+
+	// 原队列不停摆：继续发一条并收 ack（修复前该队列的 Receive 会因
+	// moveToDLQ 的 ErrNotLeader 持续失败）
+	producer2 := newClusterProducer(t, multi, topic)
+	if _, err := producer2.Send(context.Background(), &rmq.Message{Topic: topic, Body: []byte("after-dlq")}); err != nil {
+		t.Fatalf("Send after-dlq: %v", err)
+	}
+	producer2.GracefulStop()
+	gotAfter := recvAllAck(t, consumer, 1, 60*time.Second, "DLQ 后原队列消费")
+	for id := range gotAfter {
+		t.Logf("DLQ 后原队列正常消费 msgId=%s（不停摆）", id)
+	}
+	consumer.GracefulStop()
+	dlqConsumer.GracefulStop()
+}
+
 // TestThreeNodeClusterE2E 三节点全流程：全新起（三份配置、同一
 // credentials）→ SDK 三地址接入 → 发 200 → 全收全 ack（记粗略消费
 // 吞吐）→ kill 某数据组 leader → 继续发收（允许重复不允许丢）→ 重启
