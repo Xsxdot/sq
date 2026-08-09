@@ -25,7 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"math"
 	"net"
 	"sort"
 	"strings"
@@ -532,6 +531,9 @@ func TestControlOpRegistry(t *testing.T) {
 	}
 	if OpFetchSnapshot != 4 {
 		t.Fatalf("OpFetchSnapshot=%d; want 4（线协议黄金值）", OpFetchSnapshot)
+	}
+	if OpSeedState != 5 {
+		t.Fatalf("OpSeedState=%d; want 5（线协议黄金值）", OpSeedState)
 	}
 }
 
@@ -1931,11 +1933,23 @@ func TestInstallingMarkerRestartClearsRaftLog(t *testing.T) {
 	}, "X 未追平新 leader 的 R3 批")
 }
 
-// TestTruncateOnceRespectsLeaderMinMatch leader 截断的安全下界：
-// 不得截到最慢 follower 的 Match 之下——那会把一次心跳级追齐
-// 放大成整组状态传输。
+// TestTruncateOnceRespectsLeaderMinMatch（I2 修复后的语义）leader 截断
+// 下界的「逃生门」：最慢 follower 冻结在低位的 Match 不得再把整组日志
+// 钉死——隔断（死）节点的下界约束必须被打破，截断照常推进。
+//
+// 两条逃生机制的叠加：
+//   - 绝对上限 hardLagCap（10×retain=40）：applied≈102 时 applied-cap=
+//     62 > victimMatch，上限把 victim 的约束抬到 62，仅此已保证截断
+//     越过冻结 Match；
+//   - 存活探测（probePeerAlive）：隔断后探测必失败（控制帧被分区侧
+//     丢弃，拨号超时归 net.OpError），victim 被整体排除，upto 直取
+//     applied-retain=98。
+//
+// 修复前本测试断言「upto ≤ minMatch」——修复后那个断言对死节点不再
+// 成立（正是本批要解的问题）；活 follower 的性能纪律仍在（健康时
+// Match≈applied，不压低 upto、也不触发探测，见 truncateOnce 注释）。
 func TestTruncateOnceRespectsLeaderMinMatch(t *testing.T) {
-	h := startThreeNodeCluster(t, withRetainEntries(2))
+	h := startThreeNodeCluster(t, withRetainEntries(4)) // cap = 10×4 = 40
 	defer h.stopAll()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -1943,14 +1957,17 @@ func TestTruncateOnceRespectsLeaderMinMatch(t *testing.T) {
 	victim := h.nonLeaderOf(t, 0)
 
 	// 先等 victim 追平选举后的位点（bootstrap 成员变更 + 新 leader 的
-	// 空条目，Match=4）再隔断：minMatch 的下界由此确定——partition 瞬间
-	// 若 victim 的 ack 还在路上，leader 侧 Match 是未定值（0/4），测试
-	// 会在「截不截」的边界上抖动。
+	// 空条目，Match≥2）再隔断：partition 瞬间若 victim 的 ack 还在路上，
+	// leader 侧 Match 是未定值（0/2），测试会在冻结参照上抖动。
 	waitFor(t, 30*time.Second, func() bool {
 		st, _ := leader.Status(0)
 		return st.Progress[victim.nodeID].Match >= 2
 	}, "victim 未追平选举位点")
 	h.partitionOff(victim)
+	// 隔断后 leader 侧 Match 不再推进：冻结参照取分区后的首个观测值
+	st0, _ := leader.Status(0)
+	victimMatch := st0.Progress[victim.nodeID].Match
+
 	for i := 0; i < 100; i++ {
 		b := leader.Store().NewBatch()
 		if err := b.Set(store.TopicMetaKey(fmt.Sprintf("K%03d", i)), []byte("v")); err != nil {
@@ -1961,21 +1978,65 @@ func TestTruncateOnceRespectsLeaderMinMatch(t *testing.T) {
 		}
 		b.Close()
 	}
+	applied := leader.AppliedIndex(0)
 	upto, done := leader.truncateOnce(0)
 	if !done {
-		t.Fatal("应执行一次截断")
+		t.Fatal("应执行一次截断（死节点的冻结 Match 不得钉死截断）")
 	}
-	st, _ := leader.Status(0)
-	minMatch := uint64(math.MaxUint64)
-	for id, pr := range st.Progress {
-		if id != leader.nodeID && pr.Match < minMatch {
-			minMatch = pr.Match
-		}
+	// 逃生门判定：upto 越过冻结 Match。修复前 minMatch 会把截断钉在
+	// Match-retain ≤ 0，done 恒 false——`done` 本身即逃生门证据。
+	if upto <= victimMatch {
+		t.Fatalf("截断到 %d 未越过死节点冻结 Match %d——逃生门失效", upto, victimMatch)
 	}
-	if upto > minMatch {
-		t.Fatalf("截断到 %d 越过了最慢 follower 的 Match %d——安全下界失效", upto, minMatch)
+	// 不越界的纪律仍在：任何情况下不得截到 applied-retain 之下
+	if upto > applied-4 {
+		t.Fatalf("截断到 %d 越过 applied-retain %d——越界截断", upto, applied-4)
+	}
+	// 探测排除的证据：死节点被探测出不可达，Warn 留痕
+	if h.countLog(leader, "存活探测失败") < 1 {
+		t.Fatal("死节点未被探测排除（Warn 日志缺失）——探测路径未生效")
 	}
 	h.healPartition(victim)
+}
+
+// TestTruncateOnceExcludesLearnerFromMinMatch learner 不参与截断下界：
+// 永不联机的 learner（Match 恒 0）不得把整组截断钉死——learner 是
+// 非投票成员，快照追齐是设计内路径（见 truncateOnce 注释的排除规则）。
+// 修复前 minMatch 会把 learner 的 Match=0 计入，upto 恒 0、永不截断。
+func TestTruncateOnceExcludesLearnerFromMinMatch(t *testing.T) {
+	h := startThreeNodeCluster(t, withRetainEntries(2))
+	defer h.stopAll()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	leader := h.leaderOf(t, 0)
+
+	// 添加永不联机的 learner（id=99 不在成员表、传输层无其地址表项：
+	// 发给它的消息被静默丢弃，Match 恒 0）。
+	if err := leader.ProposeConfChange(ctx, 0, raftpb.ConfChangeAddLearnerNode, 99); err != nil {
+		t.Fatalf("提 AddLearner 99: %v", err)
+	}
+	waitFor(t, 30*time.Second, func() bool {
+		st, _ := leader.Status(0)
+		pr, ok := st.Progress[99]
+		return ok && pr.IsLearner
+	}, "learner 99 未进入成员表")
+	for i := 0; i < 10; i++ {
+		b := leader.Store().NewBatch()
+		if err := b.Set(store.TopicMetaKey(fmt.Sprintf("L%02d", i)), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		if err := leader.Propose(ctx, 0, b.Repr()); err != nil {
+			t.Fatal(err)
+		}
+		b.Close()
+	}
+	upto, done := leader.truncateOnce(0)
+	if !done {
+		t.Fatal("learner Match=0 不应钉死截断（learner 不参与下界）")
+	}
+	if upto == 0 {
+		t.Fatal("截断点被 learner 的 Match=0 压到 0——learner 未被排除")
+	}
 }
 
 // TestTruncateOnceNoopWhenNothingToDrop 保留量之内不该动手

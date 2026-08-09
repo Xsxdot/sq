@@ -10,6 +10,7 @@ package cluster
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -288,6 +289,113 @@ func TestJoinRejectsBadSeeds(t *testing.T) {
 	}
 	if _, err := Join(ctx, base(open()), map[uint64]string{2: "127.0.0.1:2"}); err == nil {
 		t.Fatal("seedPeers 只有本节点自己应报错，得到 nil")
+	}
+}
+
+// TestSeedStateProbe 锁 OpSeedState 的线协议形状（handler 侧，golden
+// 值在 TestControlOpRegistry）：请求 [4B BE 组]，响应 [1B FSM 非空]
+// [8B BE firstIndex]——Join 的种子日志档位探测（C2）的判定面。
+func TestSeedStateProbe(t *testing.T) {
+	h := startSingleNodeManager(t)
+	// 空 FSM 的组（数据组 1 无键）：nonEmpty=0；日志未压缩 firstIndex=1
+	resp, err := h.m.handleSeedState(encodeSeedStateReq(1))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(resp) != 9 {
+		t.Fatalf("响应 %d B; want 9（[1B 非空][8B firstIndex]）", len(resp))
+	}
+	if resp[0] != 0 {
+		t.Fatalf("空 FSM 的组 nonEmpty=%d; want 0", resp[0])
+	}
+	if first := binary.BigEndian.Uint64(resp[1:]); first != 1 {
+		t.Fatalf("未截断日志 firstIndex=%d; want 1", first)
+	}
+	// 直写一个组 0 键（单机档语义，不经 raft）：FSM 非空翻 1，日志仍
+	// 未压缩——这正是 Join 必须拒绝的档位（firstIndex=1 && FSM 非空）
+	b := h.m.Store().NewBatch()
+	if err := b.Set(store.TopicMetaKey("SEED"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := h.m.Store().Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	resp, err = h.m.handleSeedState(encodeSeedStateReq(0))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp[0] != 1 {
+		t.Fatalf("有键的组 nonEmpty=%d; want 1", resp[0])
+	}
+	if first := binary.BigEndian.Uint64(resp[1:]); first != 1 {
+		t.Fatalf("未截断日志 firstIndex=%d; want 1", first)
+	}
+	// 坏载荷与未知组必须显式报错（防坏对端，与 handlePrepareJoin 同纪律）
+	if _, err := h.m.handleSeedState([]byte{1, 2, 3}); err == nil {
+		t.Fatal("载荷不足 4B 应报错")
+	}
+	if _, err := h.m.handleSeedState(encodeSeedStateReq(99)); err == nil {
+		t.Fatal("未知组号应报错")
+	}
+}
+
+// TestJoinRejectsUncompressedSeed Join 的种子日志档位探测（第 2 步，
+// C2 修复）：种子「日志未压缩（firstIndex=1）且 FSM 非空」时 Join 必须
+// 显式拒绝——此时新节点追齐走日志重放（探测锚在假想条目 index-1），
+// 而单机档直写 FSM 的存量数据不在 raft 日志里，重放带不过去、快照也
+// 不触发，扩容会静默丢数据。修复前这是文档披露（不报错、数据缺失），
+// 现在由第 2 步探测执行（先于 PrepareJoin，拒绝不留 phantom learner）。
+func TestJoinRejectsUncompressedSeed(t *testing.T) {
+	// 种子：单节点集群 + 少量直写（远低于 2×RetainEntries，截断循环
+	// 永不触发，日志保持未压缩）——FSM 非空与 firstIndex=1 双条件齐备
+	seedStore, seed := startSoloManager(t, t.TempDir(), AckQuorumMem)
+	b := seedStore.NewBatch()
+	if err := b.Set(store.TopicMetaKey("SEED-ONLY"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedStore.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	// 测试前提自证：日志确实未压缩（firstIndex=1），FSM 确实非空
+	if f, err := seed.groups[0].stg.FirstIndex(); err != nil || f != 1 {
+		t.Fatalf("测试前提不成立：种子 firstIndex=%d err=%v（want 1）", f, err)
+	}
+	if nonEmpty, err := groupHasKeys(seedStore, 0, seed.dataGroups); err != nil || !nonEmpty {
+		t.Fatalf("测试前提不成立：组 0 FSM 应非空 nonEmpty=%v err=%v", nonEmpty, err)
+	}
+	seedAddr := seed.ln.Addr().String()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	joinStore := mustOpenStore(t, t.TempDir())
+	_, err := Join(ctx, Options{
+		NodeID:     2,
+		Peers:      map[uint64]string{1: seedAddr, 2: "127.0.0.1:0"},
+		DataGroups: 3,
+		Store:      joinStore,
+		Logger:     testSlog(t),
+	}, map[uint64]string{1: seedAddr})
+	if err == nil {
+		t.Fatal("未压缩种子（firstIndex=1 + FSM 非空）Join 应被拒绝，得到 nil")
+	}
+	if !strings.Contains(err.Error(), "日志未压缩") {
+		t.Fatalf("拒绝原因应指向日志未压缩，得到: %v", err)
+	}
+	// 无 phantom learner：拒绝发生在 PrepareJoin 之前，种子成员表里
+	// 不得出现节点 2（voter 或 learner 都不行）
+	cs, ok, err := seed.rs.LoadConfState(0)
+	if err != nil || !ok {
+		t.Fatalf("读种子成员表: ok=%v err=%v", ok, err)
+	}
+	for _, v := range cs.Voters {
+		if v == 2 {
+			t.Fatal("拒绝后种子成员表出现 voter 2——phantom learner")
+		}
+	}
+	for _, l := range cs.Learners {
+		if l == 2 {
+			t.Fatal("拒绝后种子成员表出现 learner 2——phantom learner")
+		}
 	}
 }
 

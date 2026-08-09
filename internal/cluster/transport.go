@@ -86,6 +86,11 @@ const ControlGroup uint32 = 0xFFFFFFFF
 //     键长][游标键]，响应=[1B 是否结束][4B BE 下一游标键长][下一游标
 //     键][块字节]——按 snapID 分块拉取钉住的快照视图（Manager 内部
 //     handler 消费，见 handleFetchSnapshot）
+//   - OpSeedState=5: payload=[4B BE 组]，响应=[1B 该组 FSM 是否非空]
+//     [8B BE firstIndex]——Join 前的种子日志档位探测（Manager 内部
+//     handler 消费，见 handleSeedState）：新节点以 learner 加入前先探
+//     种子「日志是否已压缩（firstIndex>1）」，未压缩且 FSM 非空时 Join
+//     走日志重放会静默丢失单机档直写数据，必须显式拒绝（C2 修复）
 //
 // 定义在本包而非 replication：Task 10 的 PrepareJoin handler 在 cluster
 // 侧装配，而依赖方向是 replication→cluster——常量放集群侧才能被双方
@@ -96,6 +101,7 @@ const (
 	OpForwardApply  byte = 2
 	OpPrepareJoin   byte = 3
 	OpFetchSnapshot byte = 4
+	OpSeedState     byte = 5
 )
 
 // envelope 发送队列中的一条待发消息：组号 + 消息指针。

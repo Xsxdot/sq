@@ -225,6 +225,15 @@ type Manager struct {
 // 截断循环保留的日志条目数。生产值由 Task 8 的配置面接管。
 const defaultRetainEntries uint64 = 10000
 
+// hardLagCapFactor 是截断下界「绝对上限」的系数（见 truncateOnce 注释）：
+// voter 落后超过 hardLagCapFactor × retainEntries 后不再约束截断，其
+// 条目被截掉、恢复后经 MsgSnap 快照追齐。10× 保留量是慷慨的心跳级
+// 追齐余量（正常跟随的 follower 落后量级是心跳往返的个位数条目，误伤
+// 不了活节点），并把最坏日志大小上界钉在 retainEntries + 10×retainEntries
+// （默认 10000 + 100000 = 11 万条）——磁盘占用有界，死节点不再能把
+// 整组日志钉死到爆盘。
+const hardLagCapFactor = 10
+
 // defaultTruncateInterval 是 Options.TruncateInterval 的默认值（0 即
 // 默认）：周期截断循环的执行间隔，30s 一轮 × 全组。
 const defaultTruncateInterval = 30 * time.Second
@@ -296,13 +305,14 @@ func NewManager(o Options) (*Manager, error) {
 	// 常量，生产可调值由 Task 8 的配置面接管。
 	m.snaps = newSnapRegistry(o.Store, snapRegistryDefaultTTL, lg)
 
-	// PrepareJoin/FetchSnapshot handler 自装（batch③/④）：在任何注入的
-	// ControlHandler 之前包一层——OpPrepareJoin（重入编排协议面）与
-	// OpFetchSnapshot（快照分块拉取）都由 Manager 内部处理，其余 op
-	// 转发给调用方注入的 handler；未注入时回「控制通道未装配」（保持
-	// nil handler 的对端语义，probePeerAlive 依赖该错误形状）。
+	// PrepareJoin/FetchSnapshot/SeedState handler 自装（batch③/④）：在
+	// 任何注入的 ControlHandler 之前包一层——OpPrepareJoin（重入编排
+	// 协议面）、OpFetchSnapshot（快照分块拉取）与 OpSeedState（Join 前
+	// 的种子日志档位探测）都由 Manager 内部处理，其余 op 转发给调用方
+	// 注入的 handler；未注入时回「控制通道未装配」（保持 nil handler 的
+	// 对端语义，probePeerAlive 依赖该错误形状）。
 	//
-	// 为什么这里只有 op 3/4 而没有 1/2：OpForwardAppend/OpForwardApply
+	// 为什么这里只有 op 3/4/5 而没有 1/2：OpForwardAppend/OpForwardApply
 	// 需要 core 组件（复制器、消息追加与批次重放），由 main 的
 	// ControlHandler 装配（见 cmd/sq/main.go 的 controlHandler）；Manager
 	// 自装层刻意只处理不依赖 core 的集群内协议——这不是漏接。
@@ -313,6 +323,8 @@ func NewManager(o Options) (*Manager, error) {
 			return m.handlePrepareJoin(payload)
 		case OpFetchSnapshot:
 			return m.handleFetchSnapshot(payload)
+		case OpSeedState:
+			return m.handleSeedState(payload)
 		}
 		if userHandler == nil {
 			return nil, errControlUnassembled
@@ -889,12 +901,25 @@ func (m *Manager) promoteLearners(g uint32) {
 
 // truncateOnce 对一组执行一次截断评估与执行。
 //
-// 截断点计算（三重下界取最小，再减保留量）：
+// 截断点计算（leader 侧四重下界取最小，再减保留量）：
 //   - 本节点 applied：不能截掉还没 apply 的条目；
-//   - leader 额外取 min(Progress.Match)：不能截掉最慢 follower 还要的条目。
-//     这不是正确性开关（有快照兜底），而是性能纪律——截过头会把一次
-//     心跳级追齐放大成整组状态传输（Global Constraints）；
+//   - leader 额外取 min(Progress.Match)：不能截掉最慢 follower 还要的
+//     条目。这不是正确性开关（有快照兜底），而是性能纪律——截过头会
+//     把一次心跳级追齐放大成整组状态传输（Global Constraints）；
+//   - 绝对上限 hardLagCap（10 × RetainEntries）：单个 voter 落后超过
+//     该量后不再约束截断——死节点/长期失联节点的 Match 冻结在低处，
+//     若无上限，一台死机（quorum 仍存）就把整组日志钉死、磁盘随写入
+//     无界膨胀。被超出的条目会被截掉，节点恢复后经 MsgSnap 快照追齐
+//     （batch④ 快照路径正是为此而建）；这是 I2 修复的逃生门；
 //   - 减 RetainEntries：留一段余量给刚落后一点点的 follower。
+//
+// 另有两条排除规则（同为性能纪律而非正确性开关）：
+//   - learner 不参与下界：非投票成员、快照追齐是设计内路径，不得钉死
+//     截断；
+//   - 真正会压低下界的 voter 先做存活探测（probePeerAlive）：死节点
+//     （控制通道拨号失败/超时）不以其冻结 Match 为下界，恢复后快照
+//     追齐。探测只在「该 peer 会压低当前 upto」时发起（上限已兜住的
+//     不探），健康集群零探测、每 tick 每组至多一次（500ms 上限）。
 //
 // 执行顺序固定为「先落锚点（Sync）→ 再删盘上条目 → 最后压内存视图」：
 // 任一步崩溃都停在「锚点已落、条目还在」的安全态（多留日志无害，重启
@@ -920,10 +945,32 @@ func (m *Manager) truncateOnce(g uint32) (uint64, bool) {
 	leader := false
 	if st, ok := m.Status(g); ok && st.RaftState == raft.StateLeader {
 		leader = true
+		// 逐 voter 收紧下界（见函数注释的四重下界与两条排除规则）：
+		// 自己与 learner 直接跳过；上限把 peer 抬到不再压低 upto 时
+		// 跳过（不探测）；余下真正构成下界的 peer 先探存活，死节点
+		// 排除（Warn 留痕——恢复后经快照追齐，见 batch④ 快照路径）。
+		hardCap := hardLagCapFactor * m.retainEntries
 		for id, pr := range st.Progress {
-			if id != m.nodeID && pr.Match < upto {
-				upto = pr.Match
+			if id == m.nodeID || pr.IsLearner {
+				continue
 			}
+			floor := pr.Match
+			if applied > hardCap && floor < applied-hardCap {
+				// 该 voter 落后已超绝对上限：其条目终将被截掉，只能靠
+				// 快照追齐——不再约束截断（I2 逃生门的主体）。
+				floor = applied - hardCap
+			}
+			if floor >= upto {
+				continue // 上限已把它抬到不构成下界，无需探测
+			}
+			if !m.probePeerAlive(id) {
+				// 死节点（控制通道拨号失败/超时）：不以其冻结 Match 为
+				// 下界。恢复后落后到截断点之外，raft 判定日志追齐不可能，
+				// 自动走 MsgSnap 快照追齐（与 learner 追齐同一路径）。
+				m.lg.Warn("截断：peer 存活探测失败，不以其 Match 为下界", "g", g, "node", id, "match", pr.Match)
+				continue
+			}
+			upto = floor
 		}
 	}
 	if upto <= m.retainEntries {
@@ -1329,6 +1376,77 @@ func (m *Manager) handlePrepareJoin(payload []byte) ([]byte, error) {
 	return resp, nil
 }
 
+// handleSeedState 处理 OpSeedState 控制请求（Manager 自装，见 NewManager）：
+// payload=[4B BE 组]，响应=[1B 该组 FSM 是否非空][8B BE firstIndex]。
+//
+// Join 前的种子日志档位探测（C2 修复，见 Join 注释的扩容前提）：新节点
+// 以 learner 加入前，先探种子「日志是否已压缩」——firstIndex>1 时新节点
+// 追齐走快照，单机档直写 FSM 的存量数据安全抵达；firstIndex==1 时追齐
+// 走日志重放，而存量数据根本不在日志里（当时直写 FSM），重放带不过去、
+// 快照也不触发，扩容即静默丢数据。探测读的是种子本地状态（本组日志
+// 起点 + 本组键族有无键），与请求方无关。
+//
+// firstIndex 的语义与 C1 修复同源：日志从未被截断时 raft 空存储的
+// FirstIndex 恒为 1（见 TestInstallingMarkerRestartClearsRaftLog 的
+// firstIndex=1 断言），截断一次后即 >1——「==1」即「未压缩」的判定面。
+func (m *Manager) handleSeedState(payload []byte) ([]byte, error) {
+	if len(payload) != 4 {
+		return nil, fmt.Errorf("cluster: SeedState 载荷须为 4B BE 组号，收到 %d B", len(payload))
+	}
+	g := binary.BigEndian.Uint32(payload)
+	gr, ok := m.groups[g]
+	if !ok {
+		return nil, fmt.Errorf("cluster: SeedState 组 %d 不存在（有效范围 [0, %d]）", g, m.Groups()-1)
+	}
+	first, err := gr.stg.FirstIndex()
+	if err != nil {
+		return nil, fmt.Errorf("cluster: SeedState 组 %d 读日志首索引: %w", g, err)
+	}
+	nonEmpty, err := groupHasKeys(m.st, g, m.dataGroups)
+	if err != nil {
+		return nil, fmt.Errorf("cluster: SeedState 组 %d 扫 FSM 键: %w", g, err)
+	}
+	resp := make([]byte, 9)
+	if nonEmpty {
+		resp[0] = 1
+	}
+	binary.BigEndian.PutUint64(resp[1:], first)
+	return resp, nil
+}
+
+// groupHasKeys 判定组 g 的 FSM 是否有任何键（存在性检查，不读内容）。
+// Join 的种子探测（handleSeedState）用它判定「FSM 非空」。
+//
+// 组 0 的键区间是连续全局键族（meta/ 等前缀），区间内第一键即命中；
+// 数据组逐键解析哈希归属（与快照枚举同一规则，见 keyGroupOf）——区间
+// 可能整段是别组键，命中本组键才停。扫描中的键解析失败即中止返回错误
+// （与快照枚举同一纪律：跳过 = 误判，保守拒绝 Join 而不是放行丢数据）。
+func groupHasKeys(st *store.Store, g, groups uint32) (bool, error) {
+	for _, r := range groupKeyRanges(g) {
+		found := false
+		err := st.Scan(r.lower, r.upper, 0, func(k, _ []byte) (bool, error) {
+			if g != MetaGroup {
+				kg, perr := keyGroupOf(k, groups)
+				if perr != nil {
+					return false, perr
+				}
+				if kg != g {
+					return true, nil // 归属别的组：继续扫本区间
+				}
+			}
+			found = true
+			return false, nil // 命中即停
+		})
+		if err != nil {
+			return false, fmt.Errorf("cluster: 组 %d 扫描 FSM 键: %w", g, err)
+		}
+		if found {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // rejoinGroupPrep 对单个组执行 learner 重入的 Remove→AddLearner 两步
 // 成员变更（每步 5s 时限），两步都 apply 才算完成。
 //
@@ -1721,6 +1839,61 @@ func storeHasKeys(st *store.Store) (bool, error) {
 	return nonEmpty, nil
 }
 
+// encodeSeedStateReq 编码 OpSeedState 请求：[4B BE 组号]。
+func encodeSeedStateReq(g uint32) []byte {
+	req := make([]byte, 4)
+	binary.BigEndian.PutUint32(req, g)
+	return req
+}
+
+// probeSeedState 向每个可达种子 × 每个组发 OpSeedState，探测种子日志
+// 档位（Join 第 2 步）。任一种子「日志未压缩（firstIndex=1）且 FSM
+// 非空」即返回显式错误——此时新节点追齐走日志重放（探测锚在假想条目
+// index-1，见 Join 注释的扩容前提），而单机档直写 FSM 的存量数据不在
+// 日志里，重放带不过去、快照也不触发，扩容即静默丢数据（C2 修复：
+// 由文档披露升级为显式失败）。
+//
+// 为什么只探 seedPeers（可达子集）：Join 本就要求种子覆盖全部组的
+// leader（见 Join 参数注释），探不可达节点只会白等超时；探测错误
+// （拨号失败/超时/响应布局非法）带上下文传播——无法确认档位就不能
+// 放行 Join。
+//
+// 注意：
+//   - 本探测是 Join 专有，Rejoin 不经过（Rejoin 不探种子档位——它的
+//     节点已在成员表里、目录被清空重来，走快照或重放都安全）
+//   - 判定用 firstIndex==1 而非常规阈值：日志从未被截断时 raft 空存储
+//     FirstIndex 恒为 1（截断一次即 >1），与 C1 修复的 firstIndex=1
+//     语义同源（见 handleSeedState 注释）
+func probeSeedState(ctx context.Context, lg *slog.Logger, o Options, seedPeers map[uint64]string) error {
+	// 确定性遍历：map 迭代无序，错误文本与测试断言需要稳定顺序
+	ids := make([]uint64, 0, len(seedPeers))
+	for id := range seedPeers {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	for _, peer := range ids {
+		for g := uint32(0); g <= o.DataGroups; g++ {
+			callCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			resp, err := controlCall(callCtx, lg, seedPeers, peer, OpSeedState, encodeSeedStateReq(g))
+			cancel()
+			if err != nil {
+				return fmt.Errorf("cluster: 加入编排第 2 步 种子 %d 组 %d 档位探测失败: %w", peer, g, err)
+			}
+			// 响应布局：[1B FSM 非空][8B BE firstIndex]（见 transport.go
+			// op 注册表注释），长度校验防坏对端
+			if len(resp) != 9 {
+				return fmt.Errorf("cluster: 加入编排第 2 步 种子 %d 组 %d 档位响应 %d B 非法（want 9B）", peer, g, len(resp))
+			}
+			nonEmpty := resp[0] == 1
+			first := binary.BigEndian.Uint64(resp[1:9])
+			if nonEmpty && first == 1 {
+				return fmt.Errorf("cluster: 加入编排第 2 步: 种子节点 %d 组 %d 日志未压缩（firstIndex=1）且 FSM 非空——Join 会走日志重放、静默丢失单机档存量数据。请先让种子写入越过约 2×RetainEntries（默认 10000）条并等待截断循环压缩（约 30s 一轮），再重试 Join", peer, g)
+			}
+		}
+	}
+	return nil
+}
+
 // Join 把全新节点（空数据目录）以 learner 身份加入既有集群——spec §7
 // 「单机 → 集群平滑升级」的入口：新节点靠存活 leader 的快照追平存量
 // 数据，追平后由 leader 侧 AutoPromoteLearners 循环自动升 voter。
@@ -1743,25 +1916,31 @@ func storeHasKeys(st *store.Store) (bool, error) {
 // follower 恰好匹配），新节点走**日志重放**——而单机档的 FSM 存量
 // 数据根本不在 raft 日志里（当时直写 FSM），重放带不过去、快照也不
 // 触发：种子写入量不足约 2×RetainEntries（默认 10000 → 约 2 万+ 条）
-// 就 Join 的扩容会**静默丢失**单机档存量数据（不是报错，是数据缺失）。
-// e2e 用 retain=1 + 多组 marker 把种子日志压过这一前提再 Join
-// （cluster_expand_test.go ②b 注释，逐条解释了判定路径）；生产扩容
-// 请先让种子写入越过该量、等截断循环把日志压住（约 30s 一轮）再 Join。
+// 就 Join 的扩容会**静默丢失**单机档存量数据。这条前提现已由第 2 步
+// 的种子日志档位探测**显式执行**（不满足直接拒绝，见 probeSeedState），
+// 不再只是文档披露；e2e 用 retain=1 + 多组 marker 把种子日志压过这一
+// 前提再 Join（cluster_expand_test.go ②b 注释，逐条解释了判定路径）；
+// 生产扩容请先让种子写入越过该量、等截断循环把日志压住（约 30s 一轮）
+// 再 Join。
 //
 // 编排（与 Rejoin 的后半程同构，差别只在前置条件）：
 //  1. 校验数据目录为空——经 Options.Store 内容判定（零键 = 空）。Join
 //     签名不带 dataDir，目录句柄由调用方先 store.Open 后经 Store 传入，
 //     与 Rejoin「调用方持句柄」的职责一致；失败时 store 仍归调用方
-//  2. 轮询 seedPeers 发 PrepareJoin，收齐 0..DataGroups 全组 AddLearner
+//  2. 种子日志档位探测（C2）——逐种子 × 逐组发 OpSeedState：任一种子
+//     「日志未压缩（firstIndex=1）且 FSM 非空」即拒绝 Join（此时走
+//     日志重放 = 静默丢单机档存量，见 probeSeedState）。探测在
+//     PrepareJoin **之前**：失败不留下任何 phantom learner
+//  3. 轮询 seedPeers 发 PrepareJoin，收齐 0..DataGroups 全组 AddLearner
 //     完成——seedPeers 是**可达种子**子集（不必全量成员表），但全部组
 //     的 leader 必须落在种子集合里，否则该组永远等不到完成、30s 超时
 //     （调用方职责：种子覆盖全部组的 leader）
-//  3. 空白启动（强制 Options.NoBootstrap=true）+ Start：不引导成员表
+//  4. 空白启动（强制 Options.NoBootstrap=true）+ Start：不引导成员表
 //     ——带引导的 StartNode 会与 leader 日志 (index, term) 撞车、快照
 //     永不触发，存量数据（单机档 FSM）永远追不上（根因与「重放 vs
 //     快照」的判定见 buildGroup fresh 分支注释）；空白启动消除撞车，
 //     追齐走 raft 标准判定（未压缩日志 = 重放，压缩日志 = MsgSnap）
-//  4. 返回；追平与升 voter 由 leader 侧 AutoPromoteLearners 自动完成
+//  5. 返回；追平与升 voter 由 leader 侧 AutoPromoteLearners 自动完成
 //     ——落后到日志之外时有 Task 7 的快照兜底（batch③ 时这条路走不通，
 //     正是本批解的问题）
 //
@@ -1800,38 +1979,54 @@ func Join(ctx context.Context, o Options, seedPeers map[uint64]string) (*Manager
 	}
 	lg.Info("加入编排: 第 1 步 数据目录为空校验通过", "node", o.NodeID, "duration", time.Since(start).Round(time.Millisecond))
 
-	// 第 2 步：PrepareJoin 全组编排——只轮询可达种子（o.Peers 是完整
-	// 成员表，NewManager 需要；轮询视图单独用 seedPeers 子集，见
-	// prepareJoinPoll 的对端枚举语义）。
+	// 第 2 步：种子日志档位探测（C2）——先校验 seedPeers 合法性，再逐
+	// 种子 × 逐组发 OpSeedState：任一种子「日志未压缩（firstIndex=1）
+	// 且 FSM 非空」即拒绝 Join——此时新节点追齐走日志重放，单机档直写
+	// FSM 的存量数据不在日志里，重放带不过去、快照也不触发，扩容静默
+	// 丢数据（判定与错误指引见 probeSeedState）。探测必须在 PrepareJoin
+	// 之前：失败不留下 phantom learner（半途失败会在成员表里留下孤儿
+	// learner，见第 3 步注释）。
 	if len(seedPeers) == 0 {
 		return nil, errors.New("cluster: 加入编排第 2 步: seedPeers 为空——至少需要一个存活成员作为种子")
 	}
 	if _, onlySelf := seedPeers[o.NodeID]; onlySelf && len(seedPeers) == 1 {
 		return nil, errors.New("cluster: 加入编排第 2 步: seedPeers 只有本节点自己——Join 需要至少一个**存活成员**作为种子（单节点自举请直接 NewManager）")
 	}
+	if err := probeSeedState(ctx, lg, o, seedPeers); err != nil {
+		return nil, err
+	}
+	lg.Info("加入编排: 第 2 步 种子日志档位探测通过",
+		"node", o.NodeID, "seeds", len(seedPeers), "duration", time.Since(start).Round(time.Millisecond))
+
+	// 第 3 步：PrepareJoin 全组编排——只轮询可达种子（o.Peers 是完整
+	// 成员表，NewManager 需要；轮询视图单独用 seedPeers 子集，见
+	// prepareJoinPoll 的对端枚举语义）。为什么探测失败不留半截状态：
+	// PrepareJoin 已把本节点 Remove→AddLearner 进成员表，半途失败会
+	// 留下「成员表里有、节点不在线」的孤儿 learner——所以前置的档位
+	// 探测必须放在本步之前。
 	pollOpts := o
 	pollOpts.Peers = seedPeers
 	if err := prepareJoinPoll(ctx, lg, pollOpts); err != nil {
-		return nil, fmt.Errorf("cluster: 加入编排第 2 步 PrepareJoin: %w", err)
+		return nil, fmt.Errorf("cluster: 加入编排第 3 步 PrepareJoin: %w", err)
 	}
-	lg.Info("加入编排: 第 2 步 PrepareJoin 完成",
+	lg.Info("加入编排: 第 3 步 PrepareJoin 完成",
 		"node", o.NodeID, "groups", o.DataGroups+1, "duration", time.Since(start).Round(time.Millisecond))
 
-	// 第 3 步：NewManager 空白启动（NoBootstrap 强制置位，理由见函数
+	// 第 4 步：NewManager 空白启动（NoBootstrap 强制置位，理由见函数
 	// 注释与 buildGroup fresh 分支——带成员表引导 = 快照永不触发）+ Start
 	o.NoBootstrap = true
 	m, err := NewManager(o)
 	if err != nil {
 		if errors.Is(err, ErrUncleanShutdown) {
-			return nil, fmt.Errorf("cluster: 加入编排第 3 步: 空目录仍报 ErrUncleanShutdown: %w", err)
+			return nil, fmt.Errorf("cluster: 加入编排第 4 步: 空目录仍报 ErrUncleanShutdown: %w", err)
 		}
-		return nil, fmt.Errorf("cluster: 加入编排第 3 步 NewManager: %w", err)
+		return nil, fmt.Errorf("cluster: 加入编排第 4 步 NewManager: %w", err)
 	}
 	m.Start(ctx)
 
-	// 第 4 步：追平与升 voter 交给 leader 侧 AutoPromoteLearners 循环
+	// 第 5 步：追平与升 voter 交给 leader 侧 AutoPromoteLearners 循环
 	// （落后到日志之外时由 Task 7 的快照兜底——正是本批要解的问题）
-	lg.Info("加入编排: 第 3/4 步 完成——fresh 启动，追平与升 voter 由 leader 侧自动循环接管",
+	lg.Info("加入编排: 第 4/5 步 完成——fresh 启动，追平与升 voter 由 leader 侧自动循环接管",
 		"node", o.NodeID, "autoPromote", o.AutoPromoteLearners, "duration", time.Since(start).Round(time.Millisecond))
 	return m, nil
 }
