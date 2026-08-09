@@ -1406,13 +1406,17 @@ var errChunkBudgetHit = errors.New("cluster: 快照块字节预算已满")
 // 单块预算的病理键值，本层也只多放进一块、不会突破帧上限；而超帧的
 // 响应会被传输层双端拒收（坏帧断连，见 readLoop），不会静默截断。
 //
-// 注册表 TTL 以创建时刻为基线（snapEntry.created），Get 不续期——拉取
-// 窗口超过 TTL 的慢视图会被 GCOnce 强制回收，对端拿到未知 snapID
-// 错误后以新描述符重试（快照整体拉取秒级完成，正常路径不触达）。
+// 注册表借用语义：Get 借出视图并续期（refs+1、刷新 TTL 基线 created），
+// 本方法用 defer Put 归还——视图归注册表所有，借出窗口内 GCOnce/Release
+// 不会 Close 它（refs>0 跳过），活跃拉取（每块一次 Get）不断续期，
+// 传输窗口超过固定 5min 不再中途回收。旧的「Get 不续期」语义在大库
+// 传输上活锁：视图被回收 → 对端拿到未知 snapID → 重试新快照 → 再
+// 回收。
 //
 // 注意：
 //   - 本 handler 在传输层读循环内同步执行，纯读视图枚举、不阻塞；
-//     视图归注册表所有，本方法不 Release
+//     借用只须覆盖 scanGroupKeys 的扫描窗口，defer Put 顺带覆盖到
+//     函数返回
 //   - 请求方身份由传输层 controlFrame 的「控制请求处理失败」Warn 补齐
 //     （带 remote）——handler 签名不带远端信息，两者在日志里按 snap_id
 //     配对
@@ -1444,6 +1448,7 @@ func (m *Manager) handleFetchSnapshot(payload []byte) ([]byte, error) {
 		}
 		return nil, fmt.Errorf("cluster: FetchSnapshot 未知 snapID %d（组 %d）", id, g)
 	}
+	defer m.snaps.Put(id) // 归还借用：视图归注册表所有，借出仅覆盖本次扫描窗口
 	// 首块（游标为空）打 Info：一次快照传输的起止是排查追齐耗时的基本单位
 	if len(cursor) == 0 {
 		m.lg.Info("快照拉取开始", "g", g, "snap_id", id)

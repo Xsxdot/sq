@@ -1662,7 +1662,7 @@ func TestFetchSnapshotStreamsGroupState(t *testing.T) {
 		b.Close()
 	}
 
-	id, _ := leader.snaps.Create(0, leader.AppliedIndex(0))
+	id := leader.snaps.Create(0, leader.AppliedIndex(0))
 	defer leader.snaps.Release(id)
 
 	got := map[string]string{}

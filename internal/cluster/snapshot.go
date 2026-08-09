@@ -6,6 +6,7 @@
 //     改为「现场生成」——取当前 applied 与同一时刻的 ReadView，
 //     元数据带真实 {Index, Term, ConfState}，Data 只放几十字节描述符
 //   - snapRegistry：按 snapID 持有 ReadView，供控制通道分块拉取；
+//     借用计数（Get 借出/Put 归还）+ 借出续期（每次借出刷新 TTL 基线）；
 //     TTL 到期强制回收（视图长期不关会阻止 Pebble 回收旧版本）
 //   - 描述符编解码：[8B snapID][8B leader nodeID][8B index]
 //
@@ -71,18 +72,32 @@ func decodeSnapDescriptor(b []byte) (snapDescriptor, error) {
 // snapEntry 是注册表里一条视图登记。
 type snapEntry struct {
 	view    *store.ReadView
-	created time.Time // 建立时刻：GCOnce 按 ttl 判活的基线
+	created time.Time // 建立时刻：GCOnce 按 ttl 判活的基线；Get 借出时刷新（续期）
 	g       uint32    // 所属组：日志上下文（排查视图泄漏定位用）
 	index   uint64    // 快照位点：日志上下文
+	refs    uint64    // 未归还的借用数：>0 时 GCOnce/Release 不得 Close 视图
 }
 
 // snapRegistry 按 snapID 持有 ReadView：raft 的 Snapshot() 现场生成
 // 描述符时把视图钉住登记，控制通道按 snapID 分块拉取（Task 6）；
 // TTL 到期由 GCOnce 强制回收——视图长期不关会阻止 Pebble 回收旧版本。
+//
+// 并发模型（为什么是引用计数而非 RWMutex）：视图的 Close 只允许在
+// refs==0 时发生，而 refs 的全部变更（Get 借出/Put 归还/GCOnce 判活/
+// Release 注销）都在 r.mu 内完成——「借出 → 扫描 → 归还」期间 refs>0，
+// Close 无从插入，扫描天然安全。RWMutex 的方案是「扫描持读锁、GC 持
+// 写锁 Close」，但扫描期间持读锁会把全部读与 GC 串行化（慢扫描阻塞
+// 整表），且 RUnlock 后视图仍可能被 Close 出竞态窗口；引用计数把正确
+// 性建立在不变式上而非锁的持有范围，扫描不需要持任何锁，GC 也不会被
+// 长扫描阻塞。ReadView.closed.Load() 检查保留为纵深防御。
 type snapRegistry struct {
 	st  *store.Store  // 建 ReadView 的源（与 FSM 同库）
 	ttl time.Duration // 视图存活时长，超时强制回收
 	lg  *slog.Logger
+
+	// now 是时间源：生产用 time.Now，测试注入假时钟使 TTL/续期断言
+	// 确定性。所有「当前时刻」判断（Create 建档、Get 续期）经它取。
+	now func() time.Time
 
 	mu     sync.Mutex           // 保护以下字段
 	nextID uint64               // 单调自增 snapID（从 1 起，永不复用）
@@ -92,7 +107,7 @@ type snapRegistry struct {
 // newSnapRegistry 构造快照注册表。st 是建 ReadView 的源，ttl 是视图
 // 存活时长，lg 为结构化日志。
 func newSnapRegistry(st *store.Store, ttl time.Duration, lg *slog.Logger) *snapRegistry {
-	return &snapRegistry{st: st, ttl: ttl, lg: lg, views: make(map[uint64]snapEntry)}
+	return &snapRegistry{st: st, ttl: ttl, lg: lg, now: time.Now, views: make(map[uint64]snapEntry)}
 }
 
 // Create 建立一份钉住当前时刻的 ReadView 并登记，返回自增 snapID。
@@ -101,21 +116,31 @@ func newSnapRegistry(st *store.Store, ttl time.Duration, lg *slog.Logger) *snapR
 // 对应关系由调用方（groupStorage.Snapshot）在 applyMu 临界区内保证，
 // 本方法自身不做位点判断。
 //
+// 注意：Create 不返回视图——原始指针直接外露会绕过借用计数，制造
+// 「无借用扫描」的竞态窗口。拉取方一律经 Get 借出视图。
+//
 // 返回：
-//   - id: 自增 snapID（>0），拉取方经 Get(id) 取视图
-//   - view: 一致性只读视图，拉取方用完须 Release（或等 GC）
-func (r *snapRegistry) Create(g uint32, index uint64) (id uint64, view *store.ReadView) {
+//   - id: 自增 snapID（>0），拉取方经 Get(id) 借出视图，用完 Put(id)
+func (r *snapRegistry) Create(g uint32, index uint64) (id uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.nextID++
 	id = r.nextID
-	view = r.st.NewReadView()
-	r.views[id] = snapEntry{view: view, created: time.Now(), g: g, index: index}
+	r.views[id] = snapEntry{view: r.st.NewReadView(), created: r.now(), g: g, index: index}
 	r.lg.Debug("快照视图已登记", "snap_id", id, "g", g, "index", index)
-	return id, view
+	return id
 }
 
-// Get 取回指定 snapID 的视图；已释放/已回收时 ok=false。
+// Get 借出指定 snapID 的视图并续期：refs+1、created 刷新为当前时刻。
+//
+// 借出语义：
+//   - 借出期间（直到 Put/Release 归还）GCOnce 与 Release 都不得 Close
+//     该视图——借出者扫描视图的安全性由 refs>0 保证
+//   - 续期让「活跃拉取中的视图」TTL 永不自然到期：每块拉取都刷新
+//     created，传输窗口超过固定 TTL 也不中断（旧的「Get 不续期」语义
+//     在大库传输上活锁：回收 → 对端重试 → 再回收）
+//
+// 调用方必须配对调用 Put(id) 归还；已释放/已回收时 ok=false（无借用）。
 func (r *snapRegistry) Get(id uint64) (*store.ReadView, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -123,20 +148,56 @@ func (r *snapRegistry) Get(id uint64) (*store.ReadView, bool) {
 	if !ok {
 		return nil, false
 	}
+	e.refs++
+	e.created = r.now()
+	r.views[id] = e // 写回：refs/created 的变更必须落回登记表
 	return e.view, true
 }
 
-// Release 释放并注销指定视图（幂等：重复释放/已回收时静默）。
+// Put 归还一次 Get 借出的视图：refs-1。条目保留在登记表里供后续分块
+// 续拉（多块传输之间 refs=0 的窗口内不注销），TTL 到期由 GCOnce 回收。
+//
+// 注意：
+//   - 必须在最后一次使用视图之后调用（调用方契约，与任何 use-after-
+//     close 约定相同）；对从未借出的 id 调用是编程错误，打 Warn 防御
+//   - refs 不为负数：重复归还只告警、不再扣减，避免回绕把条目变成
+//     「永不回收」的泄漏
+func (r *snapRegistry) Put(id uint64) {
+	r.mu.Lock()
+	e, ok := r.views[id]
+	if ok && e.refs == 0 {
+		r.lg.Warn("快照视图归还不匹配：无未归还借用（重复 Put 或未 Get 即 Put）",
+			"snap_id", id, "g", e.g, "index", e.index)
+	}
+	if ok && e.refs > 0 {
+		e.refs--
+		r.views[id] = e // 写回：refs 的变更必须落回登记表
+	}
+	r.mu.Unlock()
+}
+
+// Release 注销指定快照视图：从登记表移除并 Close，立即释放 Pebble
+// 旧版本。仅在无未归还借用（refs==0）时生效——还有借用者时跳过并告警，
+// 条目留待借用者归还后由 TTL GC 兜底回收。
+//
+// 适用场景：快照生成失败路径（Create 后未发出描述符，无人能借出）、
+// 测试收尾。持有借用的调用方应走 Put。
 func (r *snapRegistry) Release(id uint64) {
 	r.mu.Lock()
 	e, ok := r.views[id]
-	if ok {
+	if ok && e.refs == 0 {
 		delete(r.views, id)
 	}
 	r.mu.Unlock()
-	if ok {
+	if !ok {
+		return
+	}
+	if e.refs == 0 {
 		_ = e.view.Close()
-		r.lg.Debug("快照视图已释放", "snap_id", id, "g", e.g, "index", e.index)
+		r.lg.Debug("快照视图已注销", "snap_id", id, "g", e.g, "index", e.index)
+	} else {
+		r.lg.Warn("快照视图注销跳过：尚有未归还借用，待归还后由 GC 兜底",
+			"snap_id", id, "g", e.g, "index", e.index, "refs", e.refs)
 	}
 }
 
@@ -152,10 +213,14 @@ func (r *snapRegistry) WasCreated(id uint64) bool {
 	return id <= r.nextID
 }
 
-// GCOnce 回收全部已过期（created+ttl ≤ now）的视图，返回回收数量。
+// GCOnce 回收全部已过期（created+ttl ≤ now）且无借用（refs==0）的
+// 视图，返回回收数量。
 //
 // 视图泄漏是磁盘涨的元凶：持有视图期间 Pebble 不回收被覆盖的旧版本，
 // 超时未拉完的必须强制回收（拉取方对端拿到错误后重试新快照）。
+// 借出中的视图（refs>0）即使超 TTL 也跳过：Close 会炸正在扫描的借用
+// 者（pebble 对已关快照建迭代器直接 panic，无 recover 则进程死亡）——
+// 借出是一次分块扫描，短命，顺延到下一轮 GC 即可。
 // 回收打 Info 并带存活时长，保证泄漏可观测。
 func (r *snapRegistry) GCOnce(now time.Time) int {
 	// 先快照出过期集合再统一释放：Close 不持 r.mu（只注销时持），
@@ -164,7 +229,7 @@ func (r *snapRegistry) GCOnce(now time.Time) int {
 	stale := make([]snapEntry, 0)
 	r.mu.Lock()
 	for id, e := range r.views {
-		if now.Sub(e.created) >= r.ttl {
+		if now.Sub(e.created) >= r.ttl && e.refs == 0 {
 			ids = append(ids, id)
 			stale = append(stale, e)
 			delete(r.views, id)
@@ -240,7 +305,7 @@ func (s *groupStorage) Snapshot() (*raftpb.Snapshot, error) {
 	s.applyMu.Lock()
 	index := s.applied.Load()
 	cs := s.confState.Load()
-	id, _ := s.reg.Create(s.g, index)
+	id := s.reg.Create(s.g, index)
 	s.applyMu.Unlock()
 
 	term, err := s.mem.Term(index)
