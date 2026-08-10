@@ -24,7 +24,7 @@ sq 内嵌 Web 控制台（里程碑 M5b 起建，M6 事务消息同步进本基�
 | pages/transactions.html | 事务（待决半消息）视图 | `/transactions` | `GET /admin/transactions` | 已实现（M6） | `web/src/pages/Transactions.tsx` |
 | pages/send.html | 发送测试消息 | `/send` | `POST /admin/messages/send` | 已实现（M5b） | `web/src/pages/Send.tsx` |
 | pages/login.html | 登录 | `/login` | `POST /admin/login` | 已实现（M5b） | `web/src/pages/Login.tsx` |
-| `cluster.html` | 集群节点与 raft 组视图 | `/cluster` | `GET /admin/cluster` | 已确认 | `web/src/pages/Cluster.tsx` |
+| pages/cluster.html | 集群节点与 raft 组视图 | `/cluster` | `GET /admin/cluster` | 已实现（V2） | `web/src/pages/Cluster.tsx` |
 
 ## 共享约定
 
