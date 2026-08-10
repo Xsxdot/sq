@@ -22,6 +22,7 @@
 - **注释用中文**，解释「为什么」而非「做了什么」；新文件必须有文件头注释（职责 + 边界），导出函数必须有 doc 注释。
 - **提交信息结尾**：`Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>`
 - **不改 `/Users/xushixin/workspace/sq-m5` 与 `sq-m5b`**。
+- **一切临时文件、冒烟用的数据目录、编译产物，全部落在任务仓库内（用 `.smoke/`、`.tmp/` 之类跑完即删的目录），绝不写 `/tmp`、`/var` 或任何仓库外路径。** 这不是洁癖：本计划若在 handoff 之类的托管执行环境里跑，仓库外写入会触发 `external_directory` 审批；而当命令是由 subagent（子会话）发起时，审批请求归属的会话不是任务自身会话，托管方产不出工单，**没有人能批准它，任务就静默挂死**——2026-08-10 第一次派发即因此卡了 85 分钟。唯一的例外是本文件 Task 8 Step 3 的 Linux 交叉编译产物，那一步由本地操作者手工执行，不在托管任务范围内。
 - 每个 task 结束时跑 `go build ./... && go vet ./...`，全绿才提交。
 
 ## 文件结构
@@ -1452,11 +1453,7 @@ type RecoveryReport struct {
 // 恒等一致（见本文件头注释）。
 func InspectRecovery(st *store.Store, dataGroups uint32, mode AckMode, bootGen BootGenFunc, lg *slog.Logger) (RecoveryReport, error) {
 	rs := newRaftStore(st, lg)
-	clean, _, err := st.Get([]byte(cleanShutdownKey))
-	_ = clean
-	if err != nil {
-		return RecoveryReport{}, fmt.Errorf("cluster: 读干净关机标记: %w", err)
-	}
+	// 只探标记在不在，不消费它——消费是 NewManager 的副作用，命令不能替它做
 	_, hasClean, err := st.Get([]byte(cleanShutdownKey))
 	if err != nil {
 		return RecoveryReport{}, fmt.Errorf("cluster: 读干净关机标记: %w", err)
@@ -1535,7 +1532,7 @@ func GrantRecoverPermit(st *store.Store, now time.Time, bootGen BootGenFunc, lg 
 }
 ```
 
-`recovery.go` 的 import 补：`"errors"`、`"fmt"`、`"log/slog"`、`"time"`、`"go.etcd.io/raft/v3"`、`"github.com/xushixin/sq/internal/store"`。删掉上面示例里重复的第一次 `st.Get(cleanShutdownKey)` 调用（保留带 `hasClean` 的那次）。
+`recovery.go` 的 import 补：`"errors"`、`"fmt"`、`"log/slog"`、`"time"`、`"go.etcd.io/raft/v3"`、`"github.com/xushixin/sq/internal/store"`。
 
 新建 `cmd/sq/recover.go`：
 
@@ -1704,11 +1701,13 @@ Expected: PASS
 Run: `go build ./... && go vet ./...`
 Expected: 无输出
 
-手工验证报告渲染（用一个不存在集群状态的空目录，确认命令不 panic 且输出可读）：
+手工验证报告渲染（用一个不存在集群状态的空目录，确认命令不 panic 且输出可读）。
+**临时目录必须落在仓库内**（`.smoke/` 跑完即删，不提交），理由见全局约束：
 
 ```bash
-mkdir -p /tmp/sq-recover-smoke && printf 'data_dir: /tmp/sq-recover-smoke\ncluster:\n  enabled: true\n  node_id: 1\n  peers:\n    1: 127.0.0.1:9081\n' > /tmp/sq-recover-smoke.yaml
-go run ./cmd/sq recover -config /tmp/sq-recover-smoke.yaml
+mkdir -p .smoke/data && printf 'data_dir: .smoke/data\ncluster:\n  enabled: true\n  node_id: 1\n  peers:\n    1: 127.0.0.1:9081\n' > .smoke/sq.yaml
+go run ./cmd/sq recover -config .smoke/sq.yaml
+rm -rf .smoke
 ```
 Expected: 打印「恢复判定：fresh」与四行组现场，退出码 0
 
