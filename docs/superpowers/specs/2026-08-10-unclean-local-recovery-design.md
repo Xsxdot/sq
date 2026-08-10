@@ -40,13 +40,17 @@ backlog B11 原文说这件事「只在 fsync 档下成立」。这个判断不�
 - 所以 **kill -9 / OOM / panic / 快照 fail-stop 之后，本地日志是完整的**——进程没了，页缓存还在，重开 store 一条不少。真正会丢尾巴的只有机器掉电、内核崩溃、硬重启。
 - 而 e2e 里的「断电模拟」用的是 SIGKILL。也就是说：`TestScenarioFullPowerLossCannotRecover` 固化下来的那个「集群起不来」，实际发生在**三份日志毫发无伤**的前提下。
 
-### 2.3 顺带查出的两处口径不符
+### 2.3 mem 档的损失面：已经有界，本 spec 不动它
 
-**(a) mem 档承诺的后台批量 fsync 不存在。** spec §2.2、[group.go:341](../../internal/cluster/group.go) 的注释、`sq.example.yaml:61` 三处都写着「NoSync 落盘 + Manager 层后台周期批量 fsync 兜底」。全仓搜索确认：生产代码里没有任何 `SyncWAL`/`Flush()`/周期刷盘循环，`AckQuorumMem` 这个常量在非测试代码中零引用。mem 档从启动到关机一次主动 fsync 都不发，数据何时真落盘完全交给 Pebble 的 memtable flush 与内核脏页回写——**不可控、无上界**。
+**后台批量 fsync 已实现。** `Manager.flusher()`（[manager.go:1268](../../internal/cluster/manager.go)）每 200ms 提交一个空批次并带 `pebble.Sync`——空批次不携带数据，但触发一次 WAL fsync，借 WAL 顺序性把此前所有 NoSync 写一并刷盘；全组共享一条 WAL，一个 flusher 覆盖全部组。启动条件是 [manager.go:743](../../internal/cluster/manager.go) 的 `m.mode == AckQuorumMem`。
 
-后果：mem 档掉电丢的不是「最后几十毫秒」，而是「上一次 memtable flush 以来的全部」。给 mem 档设计的人工恢复出口，其可信度直接取决于这个数，所以本 spec 把补上这个兜底纳入范围（§3.4）。
+因此 **mem 档掉电的损失面是有界的：≤ 200ms 的写入**。这个数是签字出口（§3.5）报告里那句「最多可能丢多少」的事实来源，也是它能负责任地存在的前提。
 
-**(b) 好消息：mem 档的优雅停机本来就是安全的。** `MarkCleanShutdown` 用 `ApplyWith(b, true)` 写标记，且契约要求它是退出前最后一次同步写（[raftstore.go:511](../../internal/cluster/raftstore.go)）。Pebble 的 Sync 提交会把 WAL 中它之前的全部 NoSync 写一并 fsync。所以 mem 档的暴露面**只有**不干净关机，正常停机一条不丢。这把本 spec 的范围收窄了一圈。
+本 spec 因此**不新增任何刷盘机制**：不加 `store.SyncWAL()`、不加 `syncLoop`、不加 `cluster.sync_interval`。200ms 是 `flusher()` 里的硬编码常量，不做成配置项——没有需求驱动它可配，YAGNI。
+
+> 订正留痕：brainstorm 过程中一度判定「这个兜底不存在、损失无上界」，并据此把「补周期 fsync」纳入过范围。该判定源于一次被 `head -20` 截断的 grep（前 20 行恰好被测试文件占满，`manager.go:743` 被截掉），是错的。相关口径——V2 spec §2.2、`group.go` 的档位注释、`sq.example.yaml:61`——**全部与实现一致，无需修改**。
+
+**mem 档的优雅停机同样是安全的。** `MarkCleanShutdown` 用 `ApplyWith(b, true)` 写标记，且契约要求它是退出前最后一次同步写（[raftstore.go:511](../../internal/cluster/raftstore.go)）。Pebble 的 Sync 提交会把 WAL 中它之前的全部 NoSync 写一并 fsync。所以 mem 档的暴露面**只有**不干净关机，正常停机一条不丢。这把本 spec 的范围收窄了一圈。
 
 ---
 
@@ -103,15 +107,9 @@ mem 档掉电可能丢失投票记录：本节点在任期 T 投给 A，忘记�
 
 这一条消除了一个本来会致命的洞——不干净关机若恰好发生在快照安装中途，本地恢复会带着半截状态启动、向客户端返回缺失的消息。由于该标记是 `MarkInstalling` 用 Sync 写的，它在 mem 档掉电后同样存在，`local-forced` 也受此保护。**实现时不得为两条新路径另写一套回放逻辑**，否则这份保护会丢。
 
-### 3.4 补上 mem 档的周期 fsync
+### 3.4 刷盘机制不动（见 §2.3）
 
-新增 `store.SyncWAL()`：`db.LogData(nil, pebble.Sync)`——向 WAL 写一条空记录并 fsync，副作用是它之前所有 NoSync 写全部落盘。与 `ApplyWith(b, true)` 是同一机制，只是载荷为空；**不触发 memtable flush**（那是 `Flush()`，重得多），只付一次 fsync。放在 store 层是 B2 铁律的要求：集群层不得持有裸 `*pebble.DB`。
-
-`Manager` 起 `syncLoop`，**仅在 mem 档启动**（fsync 档每轮 Ready 已刷，重复无益），随 `doneCh` 收尾。节奏是「**上一轮完成后再等 interval**」而非固定 tick——慢盘上单次 fsync 可能超过整个 interval（实测存在 579 msg/s 的盘），固定 tick 会让请求堆积成雪崩。
-
-**不改动 ack 语义**：mem 档仍是「多数派内存确认即返回」，客户端不等 fsync。syncLoop 是独立 goroutine，写路径零阻塞。代价不是「每条消息一次 fsync」而是**恒定每秒 2 次**，与吞吐无关。
-
-新增配置 `cluster.sync_interval`，默认 `500ms`，`0` 表示禁用。保留 `0` 是给「只要吞吐、明确不要持久性」的部署一条逃生门——但它必须是显式写下的选择，而不是像今天这样是个没人知道的隐含默认。
+mem 档的 200ms 周期 fsync 已由 `Manager.flusher()` 提供，损失面已有界。本 spec 只**读取**这个事实用于签字报告，不新增、不改动、不做成配置项。
 
 ### 3.5 签字出口：一次性许可，绑定机器世代
 
@@ -122,9 +120,9 @@ sq recover -config /etc/sq/sq.yaml            # 只报告，不写任何东西
 sq recover -config /etc/sq/sq.yaml --grant    # 写入一次性许可
 ```
 
-**为什么用 `-config` 而非 `-data-dir`**：ack 档与 `sync_interval` 都在配置里、报告要用；且少一次手输错路径的机会——签错目录的代价是清掉一份好数据。
+**为什么用 `-config` 而非 `-data-dir`**：ack 档在配置里、报告要用；且少一次手输错路径的机会——签错目录的代价是清掉一份好数据。
 
-**报告内容**分两块。判定块：盘上世代 vs 当前世代、ack 档、`sync_interval`，归结为一句结论（例：「本次不干净关机发生在机器重启之后，mem 档下最多可能丢失最后 500ms 的写入」）。现场块：每组一行的 applied index、日志尾 index/term、快照锚点、成员表——这是运维判断「值不值得签」的原始素材。
+**报告内容**分两块。判定块：盘上世代 vs 当前世代、ack 档，归结为一句结论（例：「本次不干净关机发生在机器重启之后，mem 档的后台刷盘周期为 200ms，最多可能丢失最后 200ms 的写入」）。现场块：每组一行的 applied index、日志尾 index/term、快照锚点、成员表——这是运维判断「值不值得签」的原始素材。
 
 **许可的存储与作废**：键 `raft/local_recover_permit`，值是两行 UTF-8 文本——第一行授予时间（RFC3339），第二行授予时的机器世代。用纯文本而非 protobuf：这个值运维可能要用工具直接看，可读性比编码效率重要得多，而它一生只被写一次读一次。消费条件是**当前世代必须等于第二行的世代**，消费即删除（与抬 term 同批，Sync）。
 
@@ -149,10 +147,8 @@ sq recover -config /etc/sq/sq.yaml --grant    # 写入一次性许可
 | `internal/cluster/bootgen.go` | 新建 | 机器世代的读取（平台分派）与可注入的 provider；`SQ_BOOTGEN_OVERRIDE` 测试覆盖及其 Error 级告警 |
 | `internal/cluster/bootgen_linux.go` / `_darwin.go` / `_other.go` | 新建 | 按 build tag 分派的三份实现 |
 | `internal/cluster/recovery.go` | 新建 | 五分支恢复判定的决策函数（纯函数，输入：clean/hasRaft/mode/世代是否变/许可是否有效，输出：路径枚举 + 理由串），供 `NewManager` 与 `sq recover` 共用同一套判据 |
-| `internal/cluster/manager.go` | 修改 | `NewManager` 调用 `recovery.go` 的决策；新增 `syncLoop`；`local-forced` 的抬 term |
+| `internal/cluster/manager.go` | 修改 | `NewManager` 调用 `recovery.go` 的决策；`local-forced` 的抬 term |
 | `internal/cluster/raftstore.go` | 修改 | `raft/bootgen` 与 `raft/local_recover_permit` 的读写消费；`BumpTerm(g)` |
-| `internal/store/store.go` | 修改 | 新增 `SyncWAL()` |
-| `internal/config/config.go` | 修改 | 新增 `cluster.sync_interval`，校验与默认值 |
 | `cmd/sq/recover.go` | 新建 | `sq recover` 子命令：报告渲染与许可授予 |
 | `cmd/sq/main.go` | 修改 | 子命令分流；头注释更新（现有注释仍写着 B10 之前的哲学「拒启等人工介入违背高可用初衷」，已不成立） |
 
@@ -181,7 +177,6 @@ raft/local_recover_permit    → 一次性本地恢复许可（两行 UTF-8：�
 | `raft/bootgen` 写入失败 | 启动失败。判据不可靠时不得带着假的「世代未变」继续跑 |
 | 许可解析失败 / 世代不匹配 | 视为无许可，走 `ErrUncleanShutdown`。Error 级日志写明不匹配的两个世代值 |
 | 抬 term 写入失败 | 启动失败，许可**不消费**（消费与抬 term 同批，同生共死），运维重试即可 |
-| `SyncWAL` 单次失败 | Error 日志 + 连续失败计数；不中断进程（一次 fsync 失败不等于盘死了，但连续失败必须在日志里显眼） |
 | `sq recover` 时 broker 仍在运行 | Pebble 独占锁使 `Open` 失败，报错信息明写「请先停止本节点的 broker 进程」 |
 
 ---
@@ -193,7 +188,6 @@ raft/local_recover_permit    → 一次性本地恢复许可（两行 UTF-8：�
 - `NewManager` 恢复判定：Info 级单行输出全部判据（`recovery` 路径名、`bootgenStored`、`bootgenNow`、`mode`、`permit`），使得「为什么走了这条路」永远不需要猜。
 - `local-forced`：Error 级，含抬 term 前后的值与许可的授予时间戳。
 - `local-resume`：Info 级，含各组回放到的 applied 与日志尾。
-- syncLoop：每轮 Debug（含耗时），失败 Error 并带连续失败计数。
 - `SQ_BOOTGEN_OVERRIDE` 生效：Error 级，明写「机器世代被环境变量覆盖，仅供测试」。
 
 ---
@@ -206,25 +200,24 @@ raft/local_recover_permit    → 一次性本地恢复许可（两行 UTF-8：�
 
 **如何在测试中模拟机器重启**：世代读取做成可注入——Go 单测经 `Options` 上的 provider；进程级 e2e 只能经环境变量 `SQ_BOOTGEN_OVERRIDE`（真 broker 进程注不进 Go 函数）。该变量的误用风险由 §7 的 Error 级告警缓解，不能只靠文档。
 
-**单测**：五条恢复分支各一条；许可的世代绑定（世代 X 授予、世代 Y 消费必须被拒）；`local-forced` 后 HardState.Term 确实 +1 且 Vote 清空；`SyncWAL` 的落盘语义；syncLoop 在慢盘下不堆积。
+**单测**：五条恢复分支各一条；许可的世代绑定（世代 X 授予、世代 Y 消费必须被拒）；`local-forced` 后 HardState.Term 确实 +1 且 Vote 清空。
 
 另有一条**守安全门的用例**，单独点名因为它守的是 §3.1 那个会让整扇门失效的错误顺序：走完 `ErrUncleanShutdown` 分支之后，断言盘上 `raft/bootgen` **仍是旧值**。若哪天有人把写入挪到判定之前，本用例会红——否则这个缺陷在功能测试里完全看不出来，只会在某次真实事故中表现为「签字门自己开了」。
 
 **e2e**：①三节点全 SIGKILL → 自动本地恢复零丢失（替换旧用例）②mem + 世代变 + 无许可 → 拒启且数据保留 ③mem + 世代变 + 签字 → 起得来、term 抬了、数据还在 ④fsync 档 + 世代变 → 无需签字直接起来。
 
-**基准**：mem 档加周期 fsync 后的吞吐代价，用现成的 `BenchmarkProposeQuorumMem` 与跨机三档实测回填。预期基本无损（恒定 2 次/秒），**但预期不算数据**，验收必须带实测数字。
+**无新增基准**：本 spec 不改动写路径，写吞吐不受影响（§2.3）。
 
 ---
 
-## 9. 文档与口径同步
+## 9. 文档同步
 
-本 spec 落地时必须同步修正的三处不实描述（§2.3(a)）：
+本 spec 不改动刷盘机制，因此 V2 spec §2.2、[group.go:925](../../internal/cluster/group.go) 的档位注释、`sq.example.yaml:61` 的 ack 说明**全部保持原样**——它们本来就与实现一致（见 §2.3 的订正留痕）。
 
-- V2 spec §2.2 与 §5 中「后台周期批量 fsync 兜底」的措辞 → 改为描述真实的 `cluster.sync_interval` 机制
-- [group.go:341](../../internal/cluster/group.go) 的注释
-- `sq.example.yaml:61` 的 ack 档说明，并补 `cluster.sync_interval` 条目
+需要更新的只有两处，都因五分支恢复而起：
 
-外加 `cmd/sq/main.go` 头注释（§4 已列）与 `sq.example.yaml` 中自愈说明的更新——后者在 B10 时已改过一版，本次五分支落地后需再改一版。
+- `cmd/sq/main.go` 头注释：现仍写着 B10 之前的哲学「拒启等人工介入违背高可用初衷」，与今天的行为已不符；本批加入五分支后必须重写。
+- `sq.example.yaml` 的自愈说明：B10 时改过一版（先求接纳后清空），本次需补入五分支判定与 `sq recover` 签字流程。
 
 ---
 
@@ -232,7 +225,7 @@ raft/local_recover_permit    → 一次性本地恢复许可（两行 UTF-8：�
 
 - **网络卷**：机器世代判的是「内核没换过」。若数据目录挂在网络卷上、卷被 detach/attach 而机器未重启，页缓存假设不成立。本 spec 不覆盖此场景，文档明写。
 - **`SQ_BOOTGEN_OVERRIDE`**：测试设施。生产误用会把安全门焊开，缓解手段是 Error 级告警而非禁止（禁止会让进程级 e2e 无法覆盖这条路径）。
-- **mem 档掉电仍可能丢数据**：本 spec 把损失面从「无上界」压到「≤ `sync_interval`」，但不消除它。要零丢失请用 `quorum-fsync`。
+- **mem 档掉电仍可能丢数据**：损失面由既有的 `flusher()` 界定在 ≤200ms，本 spec 不改变它，也不消除它。要零丢失请用 `quorum-fsync`。
 - **`local-forced` 强制一次重新选举**：抬 term 的必然代价，全集群恢复时本来就要选举，实际影响为零。
 
 ---
@@ -244,6 +237,5 @@ raft/local_recover_permit    → 一次性本地恢复许可（两行 UTF-8：�
 3. B10 红线断言在新用例中通过：mem + 世代变 + 无许可 → 拒启且数据目录非空、两条日志串的出现/不出现均成立。
 4. 签字往返通过：`sq recover` 报告 → `--grant` → 启动成功 → term 已抬 → 数据完好；且同一许可在下一次世代变更后不再被消费。
 5. 安全门守卫用例通过：走完 `ErrUncleanShutdown` 分支后盘上 `raft/bootgen` 仍是旧值（§3.1 的错误顺序会被这条挡住）。
-6. mem 档周期 fsync 的吞吐代价有实测数字回填本 spec 与 backlog，不接受以预期代替。
-7. §9 列出的全部文档口径完成同步，`grep` 不再能找到「后台周期批量 fsync 兜底」这类与实现不符的描述。
-8. macOS 与 Linux 双平台：主套件 `-race` 全绿 + e2e 全量绿。
+6. §9 的两处文档完成更新（`main.go` 头注释、`sq.example.yaml` 自愈说明）。
+7. macOS 与 Linux 双平台：主套件 `-race` 全绿 + e2e 全量绿。
