@@ -116,6 +116,14 @@ type ClusterConfig struct {
 	// 回收，重来一遍），但请按「最慢一个 follower 拉完全量的时间」估，
 	// 不要无脑放大。0 = 未填，按默认。
 	SnapshotViewTTL time.Duration `yaml:"snapshot_view_ttl"`
+	// ReadBarrier 打开线性一致读屏障（read_barrier，默认 false）：打开后
+	// 消费读路径每次入口走一轮 raft read-index，用一次多数派心跳往返的
+	// 延迟换掉「旧 leader 尚未察觉失去领导权时投递过期数据」的窗口。
+	// 关闭时读己之写仍然成立（propose 等 apply），只是别人的写可能读不到。
+	ReadBarrier bool `yaml:"read_barrier"`
+	// ReadBarrierTimeout 单轮 read-index 的时间预算（read_barrier_timeout，
+	// 默认 3s，Go duration 格式）。0 = 未填，按默认。
+	ReadBarrierTimeout time.Duration `yaml:"read_barrier_timeout"`
 }
 
 // ClusterPeer 成员表里一个节点的描述。
@@ -275,6 +283,11 @@ func Load(path string) (*Config, error) {
 		// ——启动即挡，不留给运行时去「发现」。
 		if cc.SnapshotViewTTL < 0 {
 			return nil, fmt.Errorf("配置 cluster.snapshot_view_ttl 须为正 duration（如 5m），得到 %s", cc.SnapshotViewTTL)
+		}
+		// 非正 read_barrier_timeout 会让每轮 read-index 立即超时，屏障恒
+		// 失败、消费读路径被直接拒投——配置笔误启动即挡，不留到运行时。
+		if cc.ReadBarrierTimeout < 0 {
+			return nil, fmt.Errorf("配置 cluster.read_barrier_timeout 须为正 duration（如 3s），得到 %s", cc.ReadBarrierTimeout)
 		}
 		if cc.SnapshotChunkBytes == 0 {
 			cc.SnapshotChunkBytes = defaultClusterSnapshotChunkBytes

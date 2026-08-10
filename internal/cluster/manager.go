@@ -163,6 +163,13 @@ type Options struct {
 	// 发给新节点的消息会被传输层静默丢弃，快照永远到不了）。
 	// 校验：子集必须都在 Peers 表（无地址的引导成员无从拨号）。
 	BootstrapVoters []uint64
+
+	// ReadBarrier 打开线性一致读屏障（默认 false，零开销直读）。打开后
+	// 每次读路径入口走一轮 read-index：一次多数派心跳往返的延迟换掉
+	// 「旧 leader 尚未察觉失去领导权时返回过期数据」的窗口。
+	ReadBarrier bool
+	// ReadBarrierTimeout 单轮 read-index 的时间预算（0 = 默认 3s）。
+	ReadBarrierTimeout time.Duration
 }
 
 // Manager 是多组装配体：持有全部 raft 组、传输层与恢复判定。
@@ -231,6 +238,13 @@ type Manager struct {
 	// prepareJoinMu 串行化本节点的 PrepareJoin 处理（见
 	// handlePrepareJoin 注释：并发提成员变更会被 raft 静默替换）。
 	prepareJoinMu sync.Mutex
+
+	// readBarrier 来自 Options.ReadBarrier：读屏障开关（关闭时
+	// Manager.ReadBarrier 恒 nil，零开销直读）。
+	readBarrier bool
+	// readBarrierTimeout 来自 Options.ReadBarrierTimeout（0 = 保留组默认
+	// 3s）：buildGroup 造组时覆盖每组的单轮 read-index 预算。
+	readBarrierTimeout time.Duration
 }
 
 // defaultRetainEntries 是 Options.RetainEntries 的默认值（0 即默认）：
@@ -311,6 +325,8 @@ func NewManager(o Options) (*Manager, error) {
 		snapshotChunkBytes:     o.SnapshotChunkBytes,
 		noBootstrap:            o.NoBootstrap,
 		doneCh:                 make(chan struct{}),
+		readBarrier:            o.ReadBarrier,
+		readBarrierTimeout:     o.ReadBarrierTimeout,
 	}
 	m.rs = newRaftStore(o.Store, lg)
 	// 快照注册表：每个 Manager 一份，全组共享（Task 4）。TTL 由配置面
@@ -448,7 +464,7 @@ func NewManager(o Options) (*Manager, error) {
 		m.ln = ln
 	}
 
-	m.lg.Info("集群管理器初始化", "node", o.NodeID, "groups", m.Groups(), "dataGroups", o.DataGroups, "mode", o.Mode.String(), "recovery", recovery)
+	m.lg.Info("集群管理器初始化", "node", o.NodeID, "groups", m.Groups(), "dataGroups", o.DataGroups, "mode", o.Mode.String(), "recovery", recovery, "readBarrier", o.ReadBarrier)
 	return m, nil
 }
 
@@ -637,6 +653,10 @@ func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, e
 	// 从磁盘位点填充，否则已 apply 的条目会被重放（Task 4 约定）；
 	// fresh 路径 applied=0，Store 无副作用
 	gr.applied.Store(applied)
+	// 读屏障每轮的时间预算：装配方经 Options 覆盖（0 保留 newGroup 的默认）
+	if m.readBarrierTimeout > 0 {
+		gr.barrierTimeout = m.readBarrierTimeout
+	}
 	return gr, nil
 }
 
@@ -1349,6 +1369,33 @@ func (m *Manager) Propose(ctx context.Context, g uint32, batchRepr []byte) error
 func (m *Manager) IsLeader(g uint32) bool {
 	gr, ok := m.groups[g]
 	return ok && gr.isLeader()
+}
+
+// ReadBarrier 等 g 组的线性一致读屏障：返回 nil 后，本节点的本地读一定
+// 包含了本次调用发起之前已被确认的全部写。
+//
+// 参数：
+//   - ctx: 调用方的等待预算（并发调用合流，某个调用方放弃不影响其他人）
+//   - g: 数据组号
+//
+// 返回：
+//   - nil：可以安全读
+//   - ErrNotLeader：本节点不是该组 leader（读屏障只在 leader 成立）
+//   - ctx.Err() 或 raft 错误
+//
+// 注意：
+//   - 读屏障关闭（Options.ReadBarrier=false）时恒返回 nil，零开销
+//   - 组不存在按编程错误处理，返回 ErrNotLeader 让调用方换节点重试
+func (m *Manager) ReadBarrier(ctx context.Context, g uint32) error {
+	if !m.readBarrier {
+		return nil
+	}
+	gr, ok := m.groups[g]
+	if !ok {
+		m.lg.Warn("读屏障请求了不存在的组", "g", g)
+		return fmt.Errorf("%w: 组 %d 不存在于本节点", ErrNotLeader, g)
+	}
+	return gr.readBarrier(ctx)
 }
 
 // Leader 返回指定组当前 leader 的节点 ID；尚未选举完成时 ok=false。

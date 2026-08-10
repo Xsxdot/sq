@@ -243,6 +243,8 @@ func run() error {
 			TruncateInterval:       cc.TruncateInterval,
 			SnapshotChunkBytes:     cc.SnapshotChunkBytes,
 			SnapshotViewTTL:        cc.SnapshotViewTTL,
+			ReadBarrier:            cc.ReadBarrier,
+			ReadBarrierTimeout:     cc.ReadBarrierTimeout,
 			OnApplied:              onApplied,
 			OnLeaderChange:         onLeaderChange,
 			ControlHandler:         controlHandler,
