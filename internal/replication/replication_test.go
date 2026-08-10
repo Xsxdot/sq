@@ -239,6 +239,7 @@ type fakeLeaderRouter struct{ leader bool }
 func (r fakeLeaderRouter) GroupForQueue(string, uint32) uint32 { return 7 }
 func (r fakeLeaderRouter) MetaGroup() uint32                   { return 0 }
 func (r fakeLeaderRouter) IsLeader(uint32) bool                { return r.leader }
+func (r fakeLeaderRouter) ReadBarrier(context.Context, uint32) error { return nil }
 
 // fakeCaptureForwarder 捕获 ForwardApply 载荷的假转发器。
 type fakeCaptureForwarder struct {

@@ -63,6 +63,7 @@ type fixedLeaderRouter struct{ leader bool }
 func (r fixedLeaderRouter) GroupForQueue(string, uint32) uint32 { return 0 }
 func (r fixedLeaderRouter) MetaGroup() uint32                   { return 0 }
 func (r fixedLeaderRouter) IsLeader(uint32) bool                { return r.leader }
+func (r fixedLeaderRouter) ReadBarrier(context.Context, uint32) error { return nil }
 
 // TestPassPurgesExpired 过期消息与索引被清，未过期保留。
 func TestPassPurgesExpired(t *testing.T) {

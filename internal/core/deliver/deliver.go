@@ -143,6 +143,15 @@ func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID ui
 	if err != nil {
 		return nil, err
 	}
+	// 读屏障挂在 Receive 入口而不是每次 receiveOnce：一次 Receive 是一次
+	// 长轮询批次，屏障成本（一次多数派心跳往返）摊到整批上可以忽略；挂在
+	// 内层循环里会让每 100ms 的兜底轮询都付一次往返。
+	// 屏障关闭 / 单机档时这里恒 nil，零开销。
+	if err := d.rt.ReadBarrier(ctx, d.rt.GroupForQueue(topic, queueID)); err != nil {
+		d.logger.Warn("消费读屏障未通过，拒绝投递（避免投出过期数据）",
+			"group", group, "topic", topic, "queue", queueID, "err", err)
+		return nil, err
+	}
 	deadline := time.Now().Add(wait)
 	for {
 		// 先订阅再取件：若取件为空后才订阅，"取件为空 → 新消息写入 → 才订阅"

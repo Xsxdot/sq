@@ -73,6 +73,10 @@ type Router interface {
 	GroupForQueue(topic string, queueID uint32) uint32
 	MetaGroup() uint32
 	IsLeader(g uint32) bool
+	// ReadBarrier 等 g 组的线性一致读屏障：返回 nil 后本地读一定包含了
+	// 本次调用发起之前已被确认的全部写。单机后端恒 nil（无复制、无屏障
+	// 可言）；集群后端在读屏障关闭时同样恒 nil（零开销）。
+	ReadBarrier(ctx context.Context, g uint32) error
 }
 
 // Forwarder 跨节点转发原语（仅 Cluster 后端实现；Standalone 上调用属编程错误，panic）。
@@ -170,6 +174,9 @@ func (StandaloneRouter) MetaGroup() uint32 { return cluster.MetaGroup }
 // IsLeader 恒真：单机不存在非 leader 节点。
 func (StandaloneRouter) IsLeader(uint32) bool { return true }
 
+// ReadBarrier 单机档没有复制，本地读天然线性一致，恒放行。
+func (StandaloneRouter) ReadBarrier(context.Context, uint32) error { return nil }
+
 // Cluster 集群后端：Apply/ApplyAsync = m.Propose；兼作 Router（转
 // Manager）与 Forwarder（经控制通道跨节点转发）。
 type Cluster struct {
@@ -232,6 +239,11 @@ func (r *Cluster) MetaGroup() uint32 { return cluster.MetaGroup }
 
 // IsLeader 返回本节点是否为指定组的 leader（转 Manager）。
 func (r *Cluster) IsLeader(g uint32) bool { return r.m.IsLeader(g) }
+
+// ReadBarrier 转发 Manager.ReadBarrier；读屏障关闭时 Manager 内部即恒 nil。
+func (r *Cluster) ReadBarrier(ctx context.Context, g uint32) error {
+	return r.m.ReadBarrier(ctx, g)
+}
 
 // ForwardAppend 把一条已编码逻辑消息（core.EncodeMessage 字节）交给 g
 // 组 leader 的 produce 栈追加——offset 分配发生在 leader 侧，

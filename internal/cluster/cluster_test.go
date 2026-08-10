@@ -877,6 +877,8 @@ func newTestClusterN(t *testing.T, mode AckMode, hookOpts Options, n uint64) *te
 			ControlHandler:         hookOpts.ControlHandler,
 			LeaderBalancerInterval: hookOpts.LeaderBalancerInterval,
 			AutoPromoteLearners:    hookOpts.AutoPromoteLearners,
+			ReadBarrier:            hookOpts.ReadBarrier,
+			ReadBarrierTimeout:     hookOpts.ReadBarrierTimeout,
 		})
 		if err != nil {
 			t.Fatalf("节点 %d NewManager: %v", i, err)
@@ -2077,5 +2079,76 @@ func TestTruncateOnceNoopWhenNothingToDrop(t *testing.T) {
 	h := startSingleNodeManager(t, withRetainEntries(10000))
 	if _, done := h.m.truncateOnce(0); done {
 		t.Fatal("条目数远小于保留量时不应截断")
+	}
+}
+
+// TestReadBarrierOnLeaderPassesAndFailsOnFollower 三节点集成：leader 上的
+// 读屏障能走通（真的拿到 readIndex 并被 applied 追平），follower 上必须
+// 快速失败为 ErrNotLeader——读屏障只在 leader 成立，follower 直读没有
+// 线性一致保证，静默放行比报错危险得多。
+func TestReadBarrierOnLeaderPassesAndFailsOnFollower(t *testing.T) {
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{ReadBarrier: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const g = uint32(0)
+	// 先等 leader 摊布收敛：harness 注入了 200ms 摊布循环，收敛前组 0 的
+	// leader 可能在向 preferred 节点转移——此刻断言「谁是 follower」会被
+	// 转移窗口打脸（刚被转成 leader 的节点上的屏障当然放行）。收敛后组 0
+	// 稳在 preferred（节点 1），其余节点是稳定的 follower。
+	deadline := time.Now().Add(30 * time.Second)
+	for !tc.leadersMatchPreferred(t) && time.Now().Before(deadline) {
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !tc.leadersMatchPreferred(t) {
+		t.Fatal("leader 摊布未在 30s 内收敛，无法确定稳定的 follower")
+	}
+
+	leader := tc.leaderOf(t, g)
+	if err := tc.mgrs[leader].ReadBarrier(ctx, g); err != nil {
+		t.Fatalf("leader 上的读屏障应放行，得到 %v", err)
+	}
+
+	for id, m := range tc.mgrs {
+		if id == leader {
+			continue
+		}
+		err := m.ReadBarrier(ctx, g)
+		if !errors.Is(err, ErrNotLeader) {
+			t.Fatalf("follower 节点 %d 上的读屏障应报 ErrNotLeader，得到 %v", id, err)
+		}
+	}
+}
+
+// TestReadBarrierSeesRemoteWrite 读屏障的真正价值：别人写、我读。
+// 在 leader 上写一条 → 在 leader 上过屏障 → 本地必须读得到。
+// （单节点视角下这条恒成立；本用例的意义是把「屏障返回 nil 之后本地读
+// 必然可见」钉成回归断言，防止后人把屏障改成空实现。）
+func TestReadBarrierSeesRemoteWrite(t *testing.T) {
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{ReadBarrier: true})
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	const g = uint32(0)
+	leader := tc.leaderOf(t, g)
+	b := tc.stores[leader].NewBatch()
+	key := []byte("read-barrier-probe")
+	if err := b.Set(key, []byte("v1")); err != nil {
+		t.Fatalf("构造批次失败: %v", err)
+	}
+	repr := append([]byte(nil), b.Repr()...)
+	b.Close()
+	if err := tc.mgrs[leader].Propose(ctx, g, repr); err != nil {
+		t.Fatalf("提案失败: %v", err)
+	}
+	if err := tc.mgrs[leader].ReadBarrier(ctx, g); err != nil {
+		t.Fatalf("读屏障应放行，得到 %v", err)
+	}
+	v, ok, err := tc.stores[leader].Get(key)
+	if err != nil {
+		t.Fatalf("屏障放行后本地必须读到刚写入的键，得到 %v", err)
+	}
+	if !ok || string(v) != "v1" {
+		t.Fatalf("读到的值应为 v1（ok=%v），得到 %q", ok, v)
 	}
 }
