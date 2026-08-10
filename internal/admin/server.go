@@ -16,6 +16,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	nhpprof "net/http/pprof"
 	"sync"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -106,6 +107,17 @@ func (s *Server) routes(reg *prometheus.Registry) {
 	s.mux.HandleFunc("GET /admin/system", s.protected(s.handleSystem))
 	s.mux.HandleFunc("GET /admin/timeseries", s.protected(s.handleTimeseries))
 	s.mux.HandleFunc("GET /admin/ledger", s.protected(s.handleLedger))
+	// pprof 剖析端点：性能问题只能靠现场证据定位（吞吐差在哪层、CPU 烧在
+	// 哪个函数），没有这组端点就只能凭猜。挂在 admin 面（内部端口）并过
+	// protected——配置了 admin 凭据时 pprof 同样要凭据，heap/goroutine
+	// 剖面会泄漏内部结构，不能裸奔。Index 兜住 /debug/pprof/ 下的具名
+	// 剖面（heap/goroutine/block/mutex 等），profile/trace 是采样型端点
+	// 需单独注册。
+	s.mux.HandleFunc("GET /debug/pprof/", s.protected(nhpprof.Index))
+	s.mux.HandleFunc("GET /debug/pprof/cmdline", s.protected(nhpprof.Cmdline))
+	s.mux.HandleFunc("GET /debug/pprof/profile", s.protected(nhpprof.Profile))
+	s.mux.HandleFunc("GET /debug/pprof/symbol", s.protected(nhpprof.Symbol))
+	s.mux.HandleFunc("GET /debug/pprof/trace", s.protected(nhpprof.Trace))
 	// "/" 必须最后注册（可读性考虑，ServeMux 本身与注册顺序无关）：
 	// 它是兜底模式，上面每一条 /admin/... 都比它更具体，优先匹配
 	s.mux.HandleFunc("/", s.consoleHandler())

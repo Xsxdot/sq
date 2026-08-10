@@ -203,20 +203,17 @@ func run() error {
 		// ForwardAppend 分支：解码消息 → pr.Append（本节点必为目标组
 		// leader——发起方按 Leader(g) 寻址；错发时 Append 内的 propose
 		// 自然报 ErrNotLeader 随控制帧回传）。ForwardApply 分支：重建
-		// 批次 → rep.Apply 提案（构造无关批次，跨节点重放安全）。
+		// 批次 → cl.Apply 提案（构造无关批次，跨节点重放安全）。
 		//
-		// 注意：这里必须判**具体指针**（repPtr/stPtr 的 Load 结果）再传入
-		// 接口参数——atomic.Pointer 未 Store 时 Load 返回的是
-		// (*replication.Cluster)(nil)，带类型描述符的 nil 传入接口后
-		// rep == nil 判空失效（typed-nil 穿透接口判空），rep.Apply 会在
-		// transport readLoop goroutine 里 nil 解引用 panic、无 recover、
-		// 整进程崩。窗口真实：m.Start 之后、repPtr.Store(cl) 之前（等
-		// meta leader 期间）本节点可当选任意数据组 leader，I3 修复后
-		// meta 写全走 ForwardApply，滚动重启对端流量完全可能打进窗口。
-		// stPtr 一并挪进同一守卫：Rejoin 内部 Start 与 stPtr.Store 之间
-		// 旧 store 已关闭、新实例未就位，同样不能放行。装配窗口语义：
-		// 转发失败 → 调用方（对端 producer）重试或报错，与「装配中」
-		// 原有语义一致。
+		// 注意：装配窗口（m.Start 之后、repPtr/stPtr 未 Store）内必须
+		// 在此拦下——handleForwardApply 已改收具体指针（内部 cl == nil
+		// 判空真实生效，评审 m2），但 stPtr 的 typed-nil 若放行会在
+		// NewBatchFromRepr 处 nil 解引用 panic、无 recover、整进程崩。
+		// 窗口真实：m.Start 之后、repPtr.Store(cl) 之前（等 meta leader
+		// 期间）本节点可当选任意数据组 leader，I3 修复后 meta 写全走
+		// ForwardApply，滚动重启对端流量完全可能打进窗口。
+		// 装配窗口语义：转发失败 → 调用方（对端 producer）重试或报错，
+		// 与「装配中」原有语义一致。
 		controlHandler := func(op byte, payload []byte) ([]byte, error) {
 			switch op {
 			case cluster.OpForwardAppend:
@@ -242,22 +239,33 @@ func run() error {
 			Logger:                 logger,
 			LeaderBalancerInterval: leaderBalanceInterval,
 			AutoPromoteLearners:    true, // 重入自愈的最后一环：追平后自动升 voter
+			RetainEntries:          cc.LogRetainEntries,
+			TruncateInterval:       cc.TruncateInterval,
+			SnapshotChunkBytes:     cc.SnapshotChunkBytes,
+			SnapshotViewTTL:        cc.SnapshotViewTTL,
 			OnApplied:              onApplied,
 			OnLeaderChange:         onLeaderChange,
 			ControlHandler:         controlHandler,
 		}
 		m, err = cluster.NewManager(opts)
 		if errors.Is(err, cluster.ErrUncleanShutdown) {
-			// 无人值守自愈是集群模式默认行为：清空数据目录是破坏性动作，
-			// 日志留痕是补偿——拒启等人工介入违背高可用初衷。
-			logger.Error("检测到不干净关机，即将清空数据目录以 learner 重入", "dir", cfg.DataDir)
+			// 无人值守自愈是集群模式默认行为：本节点先向存活 leader 求得
+			// 接纳（PrepareJoin），拿到之后才清空数据目录以 learner 重入。
+			// 求不到接纳时 Rejoin 报错且**不清空**，本进程随即拒启——此时
+			// 本地那份数据是集群最后的兜底，宁可停机等人工恢复多数派，也
+			// 不能先毁了它（顺序红线见 cluster.Rejoin 文档注释）。
+			logger.Error("检测到不干净关机，开始重入编排（先求集群接纳，成功后才清空数据目录）", "dir", cfg.DataDir)
 			if cerr := st.Close(); cerr != nil {
 				return fmt.Errorf("关闭旧 store 后重入: %w", cerr)
 			}
 			opts.Store = nil // Rejoin 忽略 Store/Listener，内部按 dataDir 重开
 			m, err = cluster.Rejoin(runCtx, opts, cfg.DataDir)
 			if err != nil {
-				return fmt.Errorf("集群重入失败: %w", err)
+				// 拒启而非续跑：编排失败时数据目录未被清空，这份本地数据
+				// 是恢复的唯一依据。运维恢复多数派后重启本节点即可自愈。
+				logger.Error("集群重入编排失败，进程拒启；本地数据目录未被清空，恢复多数派后重启本节点即可重试",
+					"dir", cfg.DataDir, "err", err)
+				return fmt.Errorf("集群重入失败（本地数据未清空，可待多数派恢复后重启）: %w", err)
 			}
 			st = m.Store() // Rejoin 内部重开了 store，后续装配用新实例
 			stPtr.Store(st)
@@ -597,9 +605,11 @@ func handleForwardAppend(payload []byte, pr *produce.Producer) ([]byte, error) {
 //
 // 注意：批次重建失败（坏字节）即拒绝——apply 路径不允许任何静默降级，
 // 与 group.applyEntry 的失败哲学一致。提交失败（含 ErrNotLeader）随
-// 控制帧错误文本回传调用方。
-func handleForwardApply(payload []byte, st *store.Store, rep replication.Replicator) ([]byte, error) {
-	if rep == nil {
+// 控制帧错误文本回传调用方。形参收具体指针 *replication.Cluster（与
+// handleForwardAppend 的 *produce.Producer 同形）——cl == nil 判空
+// 真实生效（评审 m2：接口参数下 typed-nil 会穿透判空，判了等于没判）。
+func handleForwardApply(payload []byte, st *store.Store, cl *replication.Cluster) ([]byte, error) {
+	if cl == nil {
 		return nil, errors.New("转发处理器未就绪（装配中）")
 	}
 	if len(payload) < 4 {
@@ -612,7 +622,7 @@ func handleForwardApply(payload []byte, st *store.Store, rep replication.Replica
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), forwardOpTimeout)
 	defer cancel()
-	if err := rep.Apply(ctx, g, b); err != nil {
+	if err := cl.Apply(ctx, g, b); err != nil {
 		return nil, err
 	}
 	return nil, nil

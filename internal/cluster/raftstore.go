@@ -8,23 +8,40 @@
 //     要么新旧一致整体落盘，要么整体不落，不存在「新条目在、幽灵条目也在」
 //     的半截状态。批内次序本身无所谓（同批内无中间可见性），
 //     删尾必须与写条目同批才是语义关键。
-//   - 重启全量重读（Load）与按 commit 裁剪的成员表合成（confStateFromEntries）
+//   - 成员表的持久化（SaveConfState/LoadConfState）与重启恢复
+//     （Load + 干净关机判定）：成员表优先读持久化值，confStateFromEntries
+//     的日志重放合成仅作为旧数据目录的迁移路径
+//   - 快照锚点与日志截断（SaveSnapMeta/LoadSnapMeta/TruncateLog）：
+//     顺序契约恒为「先锚点后截断」——锚点 Sync 落盘是截断的前提，
+//     截断是范围删除；重启时锚点的 {Index, Term, ConfState} 就是
+//     MemoryStorage 快照的位点与成员表来源
 //   - 数据组数契约（EnsureGroups）与干净关机标记（Mark/ConsumeCleanShutdown）
 //
 // 边界：
-//   - 不做日志截断与快照（batch④）：日志无界增长，learner 追齐走全量重放
 //   - 不持有 pebble：一切写经 store 唯一写入口（NewBatch + ApplyWith），
 //     本层没有裸 db 句柄——B2 唯一写入口在集群层同样成立
-//   - applied 的写入由 FSM apply 路径并进批次（Task 4），本层只读
+//   - applied 的写入两处：普通条目经 FSM apply 批次并进，ConfChange
+//     条目经 SaveConfState 与成员表同批
 //
 // 键布局（共库下以 raft/ 前缀隔离日志区与 FSM 区；键内定长二进制大端，
 // 保证字节序=数值序，区间扫描天然升序）：
 //
 //	raft/groups                  → uint32 BE 数据组数（首启写入，此后校验）
 //	raft/clean_shutdown          → 干净关机标记（StopClean 写，启动读后删）
+//	raft/preraft                 → 前 raft 期存量数据标记（单机档直写 FSM
+//	                               的数据不在任何 raft 日志里，MarkPreRaft/
+//	                               HasPreRaft，Join 的种子档位判据）
 //	raft/<g>/hs                  → HardState protobuf
+//	raft/<g>/conf                → ConfState protobuf（成员表，ConfChange
+//	                               apply 时整表覆盖写，SaveConfState）
+//	raft/<g>/snap                → SnapshotMetadata protobuf（快照锚点，
+//	                               截断的前提，SaveSnapMeta Sync 落盘）
+//	raft/<g>/snapinstall         → SnapshotMetadata protobuf（快照安装中
+//	                               标记，先于任何数据写入落盘；存在即上次
+//	                               安装未收口，MarkInstalling/ResetGroupProgress）
 //	raft/<g>/ent/<index 8B BE>   → Entry protobuf
-//	raft/<g>/applied             → uint64 BE applied index（只读，写入在 Task 4）
+//	raft/<g>/applied             → uint64 BE applied index（普通条目经
+//	                               FSM 批次并进，ConfChange 与成员表同批）
 package cluster
 
 import (
@@ -43,11 +60,22 @@ import (
 // 后跟 '/' 定界——任意两位组号的键序严格分离（"1/" < "10/…"），
 // 前缀扫描不会跨组串扰。
 const (
-	groupsKey         = "raft/groups"
-	cleanShutdownKey  = "raft/clean_shutdown"
-	groupEntPrefixFmt = "raft/%d/ent/"
-	groupHsKeyFmt     = "raft/%d/hs"
-	groupAppliedFmt   = "raft/%d/applied"
+	// raftPrefix / raftPrefixEnd 圈出全部 raft 元数据键的半开区间
+	// ['raft/', 'raft0')——'/'=0x2f 的后继是 '0'=0x30，故 "raft0" 是
+	// "raft/" 前缀的右开边界。用于把 raft 元数据与 FSM 数据分开扫描
+	// （见 storeHasFSMKeys）。
+	raftPrefix    = "raft/"
+	raftPrefixEnd = "raft0"
+
+	groupsKey           = "raft/groups"
+	cleanShutdownKey    = "raft/clean_shutdown"
+	preRaftKey          = "raft/preraft"
+	groupEntPrefixFmt   = "raft/%d/ent/"
+	groupHsKeyFmt       = "raft/%d/hs"
+	groupConfFmt        = "raft/%d/conf"
+	groupSnapFmt        = "raft/%d/snap"
+	groupSnapInstallFmt = "raft/%d/snapinstall"
+	groupAppliedFmt     = "raft/%d/applied"
 )
 
 // raftStore 是 raft 日志的共库持久层。
@@ -116,26 +144,28 @@ func (r *raftStore) Persist(g uint32, hs *raftpb.HardState, ents []*raftpb.Entry
 	return nil
 }
 
-// Load 全量读回一组的 HardState 与全部日志条目（本批无截断，一条不落）。
+// Load 读回一组的 HardState、现存日志条目与快照元数据（截断锚点）。
 //
 // 返回：
 //   - hs: 从未持久化过时为空 HardState（raft.IsEmptyHardState 为真）
-//   - ents: 按 index 升序的全部条目，可能为空
+//   - ents: 按 index 升序的现存条目；截断过的组不含 ≤ 锚点 index 的
+//     条目（已被 TruncateLog 范围删除），可能为空（日志被全量截断）
+//   - snapMeta: 组的快照元数据（截断锚点）；从未截断过时为 nil
 //   - err: 读取或反序列化失败
 //
 // 注意：store.Scan 按 key 升序遍历，key 内 8B 大端 index 保证
 // 字节序=数值序，读回天然升序——spike 里兜底的显式 sort 在此可去。
 // 条目连续性由 raft 写入契约保证，本层不校验。
-func (r *raftStore) Load(g uint32) (*raftpb.HardState, []*raftpb.Entry, error) {
+func (r *raftStore) Load(g uint32) (*raftpb.HardState, []*raftpb.Entry, *raftpb.SnapshotMetadata, error) {
 	hs := &raftpb.HardState{}
 	hsData, ok, err := r.st.Get(hsKey(g))
 	if err != nil {
-		return nil, nil, fmt.Errorf("raftstore Load 组 %d 读 HardState: %w", g, err)
+		return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 读 HardState: %w", g, err)
 	}
 	if ok {
 		hs.Reset()
 		if err := proto.Unmarshal(hsData, hs); err != nil {
-			return nil, nil, fmt.Errorf("raftstore Load 组 %d 解码 HardState: %w", g, err)
+			return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 解码 HardState: %w", g, err)
 		}
 	}
 
@@ -153,11 +183,19 @@ func (r *raftStore) Load(g uint32) (*raftpb.HardState, []*raftpb.Entry, error) {
 			return true, nil
 		})
 	if err != nil {
-		return nil, nil, fmt.Errorf("raftstore Load 组 %d 扫描条目: %w", g, err)
+		return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 扫描条目: %w", g, err)
 	}
-	// 重启排障的第一行证据：组号、条目数、commit 位。
-	r.lg.Debug("raft 日志已读回", "g", g, "entries", len(ents), "commit", hs.GetCommit())
-	return hs, ents, nil
+
+	// 截断锚点与条目一并读回：buildGroup 用它在日志被全量截断时
+	// 恢复 MemoryStorage 的位点与成员表（见 buildGroup）。
+	snapMeta, _, err := r.LoadSnapMeta(g)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 读快照元数据: %w", g, err)
+	}
+	// 重启排障的第一行证据：组号、条目数、commit 位、锚点位。
+	r.lg.Debug("raft 日志已读回", "g", g, "entries", len(ents), "commit", hs.GetCommit(),
+		"snap", snapMeta.GetIndex())
+	return hs, ents, snapMeta, nil
 }
 
 // Applied 读取一组的已应用位点；从未写入过时返回 0。
@@ -170,6 +208,275 @@ func (r *raftStore) Applied(g uint32) (uint64, error) {
 		return 0, nil
 	}
 	return store.GetU64(data), nil
+}
+
+// SaveConfState 持久化一组的成员表，并与 applied 位点**同批**写入。
+//
+// 为什么同批：ConfChange 条目 apply 后若只更新内存 applied、不落盘，
+// 重启会从旧位点重放该条 ConfChange——raft 的 ApplyConfChange 本身幂等，
+// 但成员表来源一旦改成持久化值，重放就会用「旧成员表 + 重放变更」
+// 二次叠加，与 leader 的实际成员表分叉（batch③ 遗留缺口）。
+//
+// 参数：
+//   - g: 数据组号
+//   - cs: rn.ApplyConfChange 的返回值（raft 库算出的权威成员表）
+//   - applied: 本条 ConfChange 条目的 index
+func (r *raftStore) SaveConfState(g uint32, cs *raftpb.ConfState, applied uint64) error {
+	b := r.st.NewBatch()
+	if err := writeConfState(b, g, cs, applied); err != nil {
+		b.Close()
+		return err
+	}
+	// 成员表是选举安全的根：Sync 落盘，不进 quorum-mem 的异步刷盘队列
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore SaveConfState 组 %d: %w", g, err)
+	}
+	r.lg.Info("成员表已持久化", "g", g, "voters", cs.GetVoters(), "learners", cs.GetLearners(), "applied", applied)
+	return nil
+}
+
+// writeConfState 把成员表与 applied 位点写入调用方给定的批次。
+//
+// 两个调用方共用同一份核心：
+//   - SaveConfState：自建批次 + Sync 提交（成员变更 apply 路径）
+//   - installSnapshot 第 5 步收口批次：applied、成员表、锚点、删安装
+//     标记四者必须同批原子落盘——「安装完成」的定义就是这一批的原子
+//     性，拆开提交的崩溃窗口里会出现「数据已装完、标记残留」的重启
+//     重装（见 snapinstall 的收口注释）
+//
+// 批内写成员表与 applied 两个键，失败时批次由调用方处理（Close）。
+func writeConfState(b *store.Batch, g uint32, cs *raftpb.ConfState, applied uint64) error {
+	data, err := proto.Marshal(cs)
+	if err != nil {
+		return fmt.Errorf("raftstore 组 %d 编码成员表: %w", g, err)
+	}
+	if err := b.Set(confKey(g), data); err != nil {
+		return fmt.Errorf("raftstore 组 %d 写成员表: %w", g, err)
+	}
+	if err := b.Set(appliedKey(g), store.PutU64(applied)); err != nil {
+		return fmt.Errorf("raftstore 组 %d 写 applied: %w", g, err)
+	}
+	return nil
+}
+
+// LoadConfState 读回一组的成员表；从未写入过时 ok=false（调用方回退到
+// confStateFromEntries 的日志重放路径，见 buildGroup）。
+func (r *raftStore) LoadConfState(g uint32) (*raftpb.ConfState, bool, error) {
+	data, ok, err := r.st.Get(confKey(g))
+	if err != nil {
+		return nil, false, fmt.Errorf("raftstore LoadConfState 组 %d: %w", g, err)
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	cs := &raftpb.ConfState{}
+	if err := proto.Unmarshal(data, cs); err != nil {
+		return nil, false, fmt.Errorf("raftstore LoadConfState 组 %d 解码: %w", g, err)
+	}
+	return cs, true, nil
+}
+
+// SaveSnapMeta 持久化一组的快照元数据（截断锚点）。
+//
+// 元数据是截断的前提而非结果：raft 重启时用 FirstIndex-1 的 term 做
+// 任期比较，条目一旦删掉，那个 term 只能从这里查。因此顺序恒为
+// 「先 SaveSnapMeta（Sync）、后 TruncateLog」——反过来会在两次写之间
+// 留下「条目已删、锚点未落」的崩溃窗口，重启直接拒启。
+func (r *raftStore) SaveSnapMeta(g uint32, meta *raftpb.SnapshotMetadata) error {
+	b := r.st.NewBatch()
+	if err := writeSnapMeta(b, g, meta); err != nil {
+		b.Close()
+		return err
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore SaveSnapMeta 组 %d: %w", g, err)
+	}
+	r.lg.Info("快照锚点已落盘", "g", g, "index", meta.GetIndex(), "term", meta.GetTerm())
+	return nil
+}
+
+// writeSnapMeta 把快照锚点写入调用方给定的批次。
+//
+// 两个调用方共用同一份核心：
+//   - SaveSnapMeta：自建批次 + Sync 提交（截断前置，Task 3）
+//   - installSnapshot 第 5 步收口批次：接收方安装的快照锚点必须与
+//     applied、成员表、删安装标记同批原子落盘——锚点单独提交会让
+//     「已装完、标记残留」的崩溃窗口被重启误判为完整状态
+//
+// 失败时批次由调用方处理（Close）。
+func writeSnapMeta(b *store.Batch, g uint32, meta *raftpb.SnapshotMetadata) error {
+	data, err := proto.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("raftstore 组 %d 编码快照元数据: %w", g, err)
+	}
+	if err := b.Set(snapKey(g), data); err != nil {
+		return fmt.Errorf("raftstore 组 %d 写快照元数据: %w", g, err)
+	}
+	return nil
+}
+
+// LoadSnapMeta 读回快照元数据；从未截断过时 ok=false。
+func (r *raftStore) LoadSnapMeta(g uint32) (*raftpb.SnapshotMetadata, bool, error) {
+	data, ok, err := r.st.Get(snapKey(g))
+	if err != nil {
+		return nil, false, fmt.Errorf("raftstore LoadSnapMeta 组 %d: %w", g, err)
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	meta := &raftpb.SnapshotMetadata{}
+	if err := proto.Unmarshal(data, meta); err != nil {
+		return nil, false, fmt.Errorf("raftstore LoadSnapMeta 组 %d 解码: %w", g, err)
+	}
+	return meta, true, nil
+}
+
+// MarkInstalling 写入一组的快照安装中标记并 Sync 落盘。
+//
+// 顺序不变量：标记必须先于任何快照数据写入（installSnapshot 第 2 步
+// 早于第 3 步清空）——反过来（先清空后标记）的崩溃窗口里，磁盘上是
+// 「已清空、无标记」= 静默空状态，重启会把它当完整状态启动，客户端
+// 读到的消息永久缺失。先标记后清空则崩溃只留下「有标记」的半截状态，
+// 重启经 buildGroup 的标记检查清空重来。
+//
+// 标记值是本次要安装的快照元数据（{Index, Term, ConfState}）——
+// 重启的 Warn 日志用 Index 说明「装到一半的位点」。
+func (r *raftStore) MarkInstalling(g uint32, meta *raftpb.SnapshotMetadata) error {
+	data, err := proto.Marshal(meta)
+	if err != nil {
+		return fmt.Errorf("raftstore MarkInstalling 组 %d 编码: %w", g, err)
+	}
+	b := r.st.NewBatch()
+	if err := b.Set(snapInstallKey(g), data); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore MarkInstalling 组 %d 写标记: %w", g, err)
+	}
+	// 标记是崩溃判定的唯一依据：Sync 落盘，任何崩溃窗口都见得到它
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore MarkInstalling 组 %d: %w", g, err)
+	}
+	r.lg.Info("快照安装标记已落盘", "g", g, "index", meta.GetIndex(), "term", meta.GetTerm())
+	return nil
+}
+
+// LoadInstalling 读回一组的快照安装中标记；无标记时 ok=false。
+//
+// 标记损坏必须报错而不是返回「无标记」——静默当作未安装 = 把半截状态
+// 当完整状态启动（见 MarkInstalling 的顺序不变量）。
+func (r *raftStore) LoadInstalling(g uint32) (*raftpb.SnapshotMetadata, bool, error) {
+	data, ok, err := r.st.Get(snapInstallKey(g))
+	if err != nil {
+		return nil, false, fmt.Errorf("raftstore LoadInstalling 组 %d: %w", g, err)
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	meta := &raftpb.SnapshotMetadata{}
+	if err := proto.Unmarshal(data, meta); err != nil {
+		return nil, false, fmt.Errorf("raftstore LoadInstalling 组 %d 解码: %w", g, err)
+	}
+	return meta, true, nil
+}
+
+// ResetGroupProgress 把一组的进度整体重置：applied=0 + 删快照锚点 +
+// 删安装中标记 + 删全部日志条目 + 删 HardState，单批 Sync 落盘。
+//
+// 契约（C1 修复后）：本组状态半截，全部重来——日志与 HardState 清空后，
+// 重启的节点以空日志启动（firstIndex=1），leader 的探测只能全量重放
+// （完整）或发快照（完整），两条路径都完整。只清 applied 不动日志会把
+// 半截日志（锚点 A 之后的部分）当完整日志启动：raft 从 A+1 重放进被
+// 清空的 FSM，状态 1..A 永久丢失且 raft 不知情，leader 换人后探测锚
+// 在 A+1..P 上撞车、永不发快照——静默丢段。
+//
+// 何时用：buildGroup 启动时发现安装中标记 → wipeGroupKeys 清掉该组
+// FSM 键后调用——半截状态必须整体归零（applied=0 让 raft 从 1 重投递、
+// 锚点删除让 TruncateLog 的守卫重新放行、标记删除让「安装已完成」的
+// 判定不再成立、日志与 HardState 删除让日志起点回到 1），残留任何一个
+// 都会让重启路径把半截状态当完整状态。
+//
+// 同步性：整个批次 Sync 提交——「删标记」与「删日志」必须原子：若
+// 标记先落而日志未落，崩溃后重启见不到标记、却带着 applied=0 + 半截
+// 日志启动，恰是 C1 的静默丢段形态。单批 Sync 让两者同生共死。
+//
+// 注意：成员表键（raft/<g>/conf）刻意不删——重启后经全量重放或快照
+// 自然重建（ConfChange 条目 apply 时整表覆盖写），删除反而让重启节点
+// 在收到第一个条目前没有成员表可用。
+func (r *raftStore) ResetGroupProgress(g uint32) error {
+	b := r.st.NewBatch()
+	if err := b.Set(appliedKey(g), store.PutU64(0)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ResetGroupProgress 组 %d 写 applied=0: %w", g, err)
+	}
+	if err := b.Delete(snapKey(g)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ResetGroupProgress 组 %d 删快照锚点: %w", g, err)
+	}
+	if err := b.Delete(snapInstallKey(g)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ResetGroupProgress 组 %d 删安装标记: %w", g, err)
+	}
+	// 删全部日志条目：空日志启动 → firstIndex=1 → leader 只能全量重放
+	// 或发快照（见方法注释的契约）
+	if err := b.DeleteRange(entKey(g, 0), store.PrefixUpperBound(entPrefix(g))); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ResetGroupProgress 组 %d 删日志条目: %w", g, err)
+	}
+	// 删 HardState：term/vote/commit 一并归零，重启节点以空 HardState
+	// 启动（term=0 直接接受 leader 的任期），不残留半截提交位点
+	if err := b.Delete(hsKey(g)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ResetGroupProgress 组 %d 删 HardState: %w", g, err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore ResetGroupProgress 组 %d: %w", g, err)
+	}
+	r.lg.Warn("组进度已整体重置（applied=0、锚点/标记/日志/HardState 已删，重启后 firstIndex=1）", "g", g)
+	return nil
+}
+
+// deleteInstallingKey 在调用方给定的批次内删除一组的安装中标记。
+//
+// 为什么做成 batch 方法而不是导出裸键：安装完成的定义是「applied、
+// 成员表、锚点、删标记四者同批原子落盘」（installSnapshot 收口批次），
+// 标记删除必须与其它三项同一批次——收口批次一旦分开提交，崩溃窗口里
+// 就会出现「数据已装完、标记残留」的重启重装。方法签名收一个批次，
+// 调用方只能把删除并入某个批次，拆不出单独提交。
+func deleteInstallingKey(b *store.Batch, g uint32) error {
+	if err := b.Delete(snapInstallKey(g)); err != nil {
+		return fmt.Errorf("raftstore 删组 %d 安装标记: %w", g, err)
+	}
+	return nil
+}
+
+// TruncateLog 删除 index ≤ upto 的日志条目（Pebble range delete）。
+//
+// 前置：upto ≤ 已落盘 snap 元数据的 Index（锚点必须先落盘，见
+// SaveSnapMeta）。违反即报错拒绝执行——这是「先锚点后截断」顺序的
+// 编译期之外的运行期守卫。
+//
+// 幂等：重复截断到同一位点是 range delete 的无操作，周期截断会撞上。
+func (r *raftStore) TruncateLog(g uint32, upto uint64) error {
+	meta, ok, err := r.LoadSnapMeta(g)
+	if err != nil {
+		return err
+	}
+	if !ok || meta.GetIndex() < upto {
+		// 截断是「日志为什么变小了」的唯一解释，拒绝必须带锚点与请求位点
+		r.lg.Error("截断点越过快照锚点，拒绝执行", "g", g, "upto", upto,
+			"anchor_ok", ok, "anchor_index", meta.GetIndex())
+		return fmt.Errorf("raftstore TruncateLog 组 %d: 截断点 %d 越过快照锚点（锚点存在=%v, index=%d）——必须先 SaveSnapMeta",
+			g, upto, ok, meta.GetIndex())
+	}
+	b := r.st.NewBatch()
+	if err := b.DeleteRange(entKey(g, 0), entKey(g, upto+1)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore TruncateLog 组 %d 删条目(≤%d): %w", g, upto, err)
+	}
+	if err := r.st.ApplyWith(b, false); err != nil { // 截断丢了只是白留日志，无需 fsync
+		return fmt.Errorf("raftstore TruncateLog 组 %d: %w", g, err)
+	}
+	r.lg.Info("raft 日志已截断", "g", g, "upto", upto)
+	return nil
 }
 
 // EnsureGroups 校验数据组数与磁盘记录一致。
@@ -242,8 +549,49 @@ func (r *raftStore) ConsumeCleanShutdown() (bool, error) {
 	return true, nil
 }
 
+// MarkPreRaft 写入「前 raft 期存量数据」标记并 Sync 落盘。
+//
+// 语义：本节点在**首次以集群模式启动前**，数据目录里就已有 FSM 数据
+// （单机档直写 store 写进去的）。这批数据不在任何 raft 日志里——新节点
+// 靠日志重放追齐时带不过去，只有快照能带走。标记是 Join 判定「种子档位
+// 是否危险」的必要条件（见 probeSeedState）。
+//
+// 幂等：重复调用只是重写同一字节；调用点在 NewManager 的 fresh 路径，
+// 每个数据目录一生只经过一次。
+func (r *raftStore) MarkPreRaft() error {
+	b := r.st.NewBatch()
+	if err := b.Set([]byte(preRaftKey), []byte{1}); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore MarkPreRaft: %w", err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore MarkPreRaft: %w", err)
+	}
+	r.lg.Warn("检测到前 raft 期存量数据，已打标记——该批数据不在 raft 日志里，" +
+		"本节点作为 Join 种子时须先等日志压缩（否则新节点走重放会丢这批数据）")
+	return nil
+}
+
+// HasPreRaft 返回本节点是否带「前 raft 期存量数据」标记。
+//
+// 标记只增不删（存量数据永远不会回到日志里），因此它是**档位属性**而非
+// 瞬时状态：Join 探测把它与「日志未压缩」合取，才构成拒绝条件。
+func (r *raftStore) HasPreRaft() (bool, error) {
+	_, ok, err := r.st.Get([]byte(preRaftKey))
+	if err != nil {
+		return false, fmt.Errorf("raftstore HasPreRaft: %w", err)
+	}
+	return ok, nil
+}
+
 // confStateFromEntries 从日志条目重放成员变更，按 commit 裁剪后合成
 // 重启所需的 ConfState。
+//
+// **降级声明（batch④）**：本函数已从主路径降级为「旧数据目录一次性
+// 迁移路径」——新版本启动时成员表一律优先读持久化值（LoadConfState，
+// 见 buildGroup），只有 batch③ 及更早的数据目录从未写入过 raft/<g>/conf、
+// 首次升级到本版本时才走到这里。升级后的首次 ConfChange apply 会立即
+// 把成员表持久化，此路径此后不再被命中。
 //
 // raft 库 newRaft 只信任 Storage.InitialState() 返回的 ConfState，不会
 // 自己回放 ConfChange 条目重建成员表；而本批不做快照，因此必须由调用方
@@ -260,15 +608,16 @@ func (r *raftStore) ConsumeCleanShutdown() (bool, error) {
 // 比静默残留一个已移除的 voter 安全得多。
 //
 // 同时支持 V1 与 V2 两种 ConfChange 条目格式（V2 是 R4 起的提案格式，
-// 旧日志可能遗留 V1）；任一格式的解码失败都拒启。
+// 旧日志可能遗留 V1）；任一格式的解码失败都拒启。V2 条目可能携带多条
+// Changes（batch② 遗留的多变更守卫）：本进程从不产生联合共识条目，但
+// 旧日志与将来的 joint 提案都可能带多条——只取首条会漏掉后续变更，
+// 因此逐条遍历应用（applyOne）。
 func confStateFromEntries(ents []*raftpb.Entry, commit uint64) (*raftpb.ConfState, error) {
 	cs := &raftpb.ConfState{}
 	for _, ent := range ents {
 		if ent.GetIndex() > commit {
 			break // 条目升序，越过 commit 即全部未提交
 		}
-		var typ raftpb.ConfChangeType
-		var nodeID uint64
 		switch ent.GetType() {
 		case raftpb.EntryConfChange:
 			var cc raftpb.ConfChange
@@ -276,8 +625,7 @@ func confStateFromEntries(ents []*raftpb.Entry, commit uint64) (*raftpb.ConfStat
 			if err := proto.Unmarshal(ent.Data, &cc); err != nil {
 				return nil, fmt.Errorf("解码 ConfChange 条目 %d: %w", ent.GetIndex(), err)
 			}
-			typ = cc.GetType()
-			nodeID = cc.GetNodeId()
+			applyOne(cs, cc.GetType(), cc.GetNodeId())
 		case raftpb.EntryConfChangeV2:
 			var v2 raftpb.ConfChangeV2
 			v2.Reset()
@@ -286,30 +634,35 @@ func confStateFromEntries(ents []*raftpb.Entry, commit uint64) (*raftpb.ConfStat
 			}
 			ch := v2.GetChanges()
 			if len(ch) == 0 {
-				// 空 Changes（leave-joint 类条目）：不改变单代成员表，
-				// 跳过——本批从不产生联合共识条目，此分支仅防御
-				continue
+				continue // leave-joint 类空条目：不改变单代成员表
 			}
-			typ = ch[0].GetType()
-			nodeID = ch[0].GetNodeId()
+			for _, c := range ch {
+				applyOne(cs, c.GetType(), c.GetNodeId())
+			}
+			continue
 		default:
 			continue // 普通条目与选举空条目不参与成员表
 		}
-		switch typ {
-		case raftpb.ConfChangeAddNode:
-			removeUint64(&cs.Voters, nodeID)
-			removeUint64(&cs.Learners, nodeID)
-			cs.Voters = append(cs.Voters, nodeID)
-		case raftpb.ConfChangeAddLearnerNode:
-			removeUint64(&cs.Voters, nodeID)
-			removeUint64(&cs.Learners, nodeID)
-			cs.Learners = append(cs.Learners, nodeID)
-		case raftpb.ConfChangeRemoveNode:
-			removeUint64(&cs.Voters, nodeID)
-			removeUint64(&cs.Learners, nodeID)
-		}
 	}
 	return cs, nil
+}
+
+// applyOne 把单条成员变更应用到合成中的成员表（confStateFromEntries
+// 的公共应用步骤，V1 单条与 V2 多条 Changes 共用）。
+func applyOne(cs *raftpb.ConfState, typ raftpb.ConfChangeType, nodeID uint64) {
+	switch typ {
+	case raftpb.ConfChangeAddNode:
+		removeUint64(&cs.Voters, nodeID)
+		removeUint64(&cs.Learners, nodeID)
+		cs.Voters = append(cs.Voters, nodeID)
+	case raftpb.ConfChangeAddLearnerNode:
+		removeUint64(&cs.Voters, nodeID)
+		removeUint64(&cs.Learners, nodeID)
+		cs.Learners = append(cs.Learners, nodeID)
+	case raftpb.ConfChangeRemoveNode:
+		removeUint64(&cs.Voters, nodeID)
+		removeUint64(&cs.Learners, nodeID)
+	}
 }
 
 // removeUint64 从切片中移除第一个等于 v 的元素（不存在时静默）。
@@ -341,9 +694,30 @@ func hsKey(g uint32) []byte {
 	return []byte(fmt.Sprintf(groupHsKeyFmt, g))
 }
 
-// appliedKey 返回一组已应用位点键。写入由 FSM apply 路径并进批次（Task 4）。
+// appliedKey 返回一组已应用位点键。写入两处：普通条目经 applyEntry 的
+// FSM 批次并进（spec §5），ConfChange 条目经 SaveConfState 与成员表
+// 同批（见 SaveConfState 注释）。
 func appliedKey(g uint32) []byte {
 	return []byte(fmt.Sprintf(groupAppliedFmt, g))
+}
+
+// confKey 返回一组成员表的固定键。ConfChange apply 时整表覆盖写
+// （SaveConfState），单个固定键天然覆盖语义。
+func confKey(g uint32) []byte {
+	return []byte(fmt.Sprintf(groupConfFmt, g))
+}
+
+// snapKey 返回一组的快照锚点固定键。截断前整表覆盖写（SaveSnapMeta），
+// 单个固定键天然覆盖语义。
+func snapKey(g uint32) []byte {
+	return []byte(fmt.Sprintf(groupSnapFmt, g))
+}
+
+// snapInstallKey 返回一组的快照安装中标记固定键。存在即上次安装未
+// 收口（MarkInstalling 写、ResetGroupProgress/收口批次删），覆盖语义
+// 与 snapKey 相同——重装时直接覆盖旧标记。
+func snapInstallKey(g uint32) []byte {
+	return []byte(fmt.Sprintf(groupSnapInstallFmt, g))
 }
 
 // putU32BE 大端编码 4 字节（组数/节点 ID 等 uint32 字段用；8B 用 store.PutU64）。

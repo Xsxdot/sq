@@ -74,6 +74,11 @@ const ControlGroup uint32 = 0xFFFFFFFF
 // 与传输层 controlFrame 之间的协议面），取值即跨节点线协议——改动即
 // 不兼容（TestControlOpRegistry 锁死黄金值）。
 //
+//   - OpPing=0: payload 空，响应空——纯存活探测（probePeerAlive）。由
+//     Manager 自装层应答，**不下发给调用方注入的 ControlHandler**：探活
+//     是集群内协议，不该触发任何应用逻辑（旧实现让 op=0 穿透到 main 的
+//     handler，每个摊布周期回一次「未知控制 op 0」，并在测试里被 catch-all
+//     handler 当成业务事件收走）
 //   - OpForwardAppend=1: payload=[4B BE 目标组][core.EncodeMessage 字节]，
 //     响应 payload=[4B BE queueID][8B BE offset]——跨节点消息追加，
 //     offset 分配发生在 leader 侧（replication.ForwardAppend 消费）
@@ -82,15 +87,28 @@ const ControlGroup uint32 = 0xFFFFFFFF
 //   - OpPrepareJoin=3: payload=[8B BE nodeID]，响应=该节点完成
 //     Remove→AddLearner 的组号列表——learner 重入编排（Task 10
 //     PrepareJoin handler 消费）
+//   - OpFetchSnapshot=4: payload=[4B BE 组][8B BE snapID][4B BE 游标
+//     键长][游标键]，响应=[1B 是否结束][4B BE 下一游标键长][下一游标
+//     键][块字节]——按 snapID 分块拉取钉住的快照视图（Manager 内部
+//     handler 消费，见 handleFetchSnapshot）
+//   - OpSeedState=5: payload=[4B BE 组]，响应=[1B 该组 FSM 是否非空]
+//     [1B 前 raft 期存量标记][8B BE firstIndex]——Join 前的种子日志档位
+//     探测（Manager 内部 handler 消费，见 handleSeedState）：新节点以
+//     learner 加入前先探种子档位，「带前 raft 期存量数据」「该组 FSM 非空」
+//     「日志未压缩（firstIndex=1）」三者同时成立时 Join 走日志重放会静默
+//     丢失单机档直写数据，必须显式拒绝（C2 修复，N2 收窄判据）
 //
 // 定义在本包而非 replication：Task 10 的 PrepareJoin handler 在 cluster
 // 侧装配，而依赖方向是 replication→cluster——常量放集群侧才能被双方
 // 引用（plan 原稿放 replication 的决定经终审裁定迁移，见 progress 预检
 // 注记）。Task 11 的 ControlHandler 接线在 main 装配时引用本注册表。
 const (
+	OpPing          byte = 0
 	OpForwardAppend byte = 1
 	OpForwardApply  byte = 2
 	OpPrepareJoin   byte = 3
+	OpFetchSnapshot byte = 4
+	OpSeedState     byte = 5
 )
 
 // envelope 发送队列中的一条待发消息：组号 + 消息指针。
@@ -124,6 +142,11 @@ type transport struct {
 
 	connsMu sync.Mutex
 	conns   map[net.Conn]struct{} // 活动读连接，ctx 取消时统一关闭
+
+	// partitioned 是测试专用分区开关（setPartitioned，见其注释）：
+	// 置位期间本节点与集群双向不可达。生产路径恒为 false（atomic 读，
+	// 发送热路径零锁开销）。
+	partitioned atomic.Bool
 
 	wg sync.WaitGroup
 }
@@ -200,6 +223,9 @@ func (t *transport) Start(ctx context.Context) {
 //   - g: 数据组号，作为信封组号随帧传递，接收端原样交给 deliver
 //   - msgs: 待发送消息（指针切片，禁止值拷贝消息体）
 func (t *transport) Send(g uint32, msgs []*raftpb.Message) {
+	if t.partitioned.Load() {
+		return // 测试分区：整段丢弃出站消息（见 setPartitioned）
+	}
 	for _, m := range msgs {
 		to := m.GetTo()
 		q, ok := t.queues[to]
@@ -214,6 +240,18 @@ func (t *transport) Send(g uint32, msgs []*raftpb.Message) {
 			t.drops[to].Add(1) // 队列满：计数丢弃，等 raft 重试
 		}
 	}
+}
+
+// setPartitioned 测试专用：模拟本节点与集群整段网络分区——双向丢弃
+// （出站 Send 不入队、入站 readLoop 不 deliver），节点本身保持存活
+// （tick/选举照常）。恢复置 false 即立即恢复投递（连接从未断开）。
+//
+// 为什么双向：单向隔断时对端仍能收到本节点自增任期的竞选消息，每次
+// 竞选都把多数派 leader 打回 follower 一轮，分区期间多数派的写入会被
+// 反复打断；双向隔断让本节点在自己孤立的任期里空转，多数派不受干扰
+// （TestLaggingFollowerCatchesUpBySnapshot 的分区前提）。
+func (t *transport) setPartitioned(p bool) {
+	t.partitioned.Store(p)
 }
 
 // DropPeer 排空指定 peer 的发送队列并清零丢弃计数。
@@ -390,6 +428,12 @@ func (t *transport) readLoop(conn net.Conn) {
 			return
 		}
 		group := binary.BigEndian.Uint32(body[:4])
+		if t.partitioned.Load() {
+			// 测试分区：整段丢弃入站帧（raft 与控制帧一起丢，等价于
+			// 网络不可达；见 setPartitioned）。连接保持读消耗，对端
+			// 写不积压，恢复投递立即生效。
+			continue
+		}
 		if group == ControlGroup {
 			// 控制通道帧：不进 raft 消息流。请求/响应是短连接 RPC 的
 			// 一次往返——应答写回同一条连接后本循环退出（defer 关连接），
