@@ -9,8 +9,10 @@
 //   - 生命周期：Start 起全部组 + 传输层 + mem 档后台批量刷盘 + leader
 //     摊布循环（Options 注入周期，≤0 不启动）；StopClean 停全部机件后
 //     最后写干净关机标记；Done 等完全退出
-//   - 重启恢复判定：干净关机标记决定 fresh / 原身份回归 / 拒绝裸恢复
-//     （ErrUncleanShutdown，须清空状态以 learner 重入）
+//   - 重启恢复判定：五分支（干净关机 / 全新目录 / 本地日志可证完好 /
+//     签字放行 / 拒启重入），判定表见 recovery.go 与 spec §3.2——不干净
+//     关机但机器世代未变时本地日志完整，直接以原身份回放，不再无条件
+//     清空状态以 learner 重入
 //   - learner 重入编排（batch③）：Rejoin 六步入口（关店清目录→
 //     PrepareJoin 全组→重建监听→fresh 启动→追平升 voter 交给 leader
 //     侧循环）；Manager 自装 PrepareJoin 控制协议 handler；开启
@@ -170,6 +172,11 @@ type Options struct {
 	ReadBarrier bool
 	// ReadBarrierTimeout 单轮 read-index 的时间预算（0 = 默认 3s）。
 	ReadBarrierTimeout time.Duration
+
+	// BootGen 是机器世代的读取函数（测试注入点，nil 走平台实现）。
+	// 世代用于判断「本地日志在上次不干净关机后是否仍然完整」——见
+	// recovery.go 的判定表与 bootgen.go 的机制说明。
+	BootGen BootGenFunc
 }
 
 // Manager 是多组装配体：持有全部 raft 组、传输层与恢复判定。
@@ -273,11 +280,14 @@ const defaultSnapshotChunkBytes = 4 << 20
 // 装配序：
 //  1. EnsureGroups 校验/持久化数据组数（首启写入，此后不可变）
 //  2. ConsumeCleanShutdown 读取并删除干净关机标记
-//  3. 恢复路径三分：
-//     - 有标记：各组 Load 回放磁盘日志，RestartNode 原身份回归
-//     - 无标记且盘上有 raft 状态（任一组的 HardState 或 applied 非零）：
-//     返回 ErrUncleanShutdown——异步刷盘下不得裸恢复
-//     - 无标记且无 raft 状态（全新目录）：StartNode 按 Peers 引导
+//  3. 恢复路径五分支（判定表见 spec §3.2 与 recovery.go）：
+//     - 干净关机标记存在：各组 Load 回放磁盘日志，RestartNode 原身份回归
+//     - 无标记且盘上无 raft 状态（全新目录）：StartNode 按 Peers 引导
+//     - 无标记但有 raft 状态：机器世代未变（进程崩溃、机器没重启）或
+//     确认档为 quorum-fsync → 本地日志可证完好，等同干净回放；mem 档
+//     且机器重启过但有匹配的运维许可 → 消费许可 + 抬 term 后回放
+//     （pathLocalForced）；无许可 → 返回 ErrUncleanShutdown，交给重入
+//     编排（求不到接纳则拒启且数据完好）
 //  4. 装配本节点监听（注入或按 Peers[NodeID]）
 //
 // 返回的 Manager 未启动；调用方必须调用 Start 后使用。
@@ -384,14 +394,56 @@ func NewManager(o Options) (*Manager, error) {
 	if err != nil {
 		return nil, err
 	}
-	recovery := "fresh"
-	switch {
-	case clean:
-		recovery = "clean-resume"
-	case hasRaft:
-		m.lg.Error("检测到不干净关机，拒绝直接恢复——须清空状态以 learner 重入（先 Close store，再 WipeForRejoin，经存活 leader 的 ConfChange 重新加入）")
+	genNow, genNowOK := resolveBootGen(o.BootGen, m.lg)
+	genStored, genStoredOK, err := m.rs.LoadBootGen()
+	if err != nil {
+		return nil, err
+	}
+	permit, permitOK, err := m.rs.LoadRecoverPermit()
+	if err != nil {
+		return nil, err
+	}
+	path, reason := decideRecovery(recoveryInput{
+		Clean: clean, HasRaft: hasRaft, Mode: o.Mode,
+		GenNow: genNow, GenNowOK: genNowOK,
+		GenStored: genStored, GenStoredOK: genStoredOK,
+		PermitGen: permit.Gen, PermitOK: permitOK,
+	})
+	// 判定的全部输入与结论打成一行：重启排障时「为什么走了这条路」
+	// 永远不需要猜，也不需要去比对几处分散的日志
+	m.lg.Info("恢复路径判定", "recovery", path.String(), "reason", reason,
+		"clean", clean, "hasRaft", hasRaft, "mode", o.Mode.String(),
+		"bootgenNow", genNow, "bootgenNowOK", genNowOK,
+		"bootgenStored", genStored, "bootgenStoredOK", genStoredOK,
+		"permit", permitOK)
+
+	// replay 决定各组是否回放本地日志。三条本地恢复路径（干净关机、
+	// 世代未变、fsync 档/签字放行）共用同一套回放逻辑——必须复用
+	// buildGroup 的 clean 分支，不得另写：那条分支里已有「未完成快照
+	// 安装 → 清空该组重来」的处理（见 buildGroup 内 LoadInstalling 段），
+	// 另起炉灶会让不干净关机若恰好发生在快照安装中途时，节点带着半截
+	// 状态启动并向客户端返回缺失的消息。
+	replay := false
+	switch path {
+	case pathCleanResume, pathLocalResume:
+		replay = true
+	case pathLocalForced:
+		// 抬任期 + 清投票 + 消费许可（同批 Sync）：mem 档掉电可能丢掉
+		// 投票记录，不抬任期就可能在同一任期投第二次票、导致日志分叉
+		if err := m.rs.ForceLocalRecover(o.DataGroups); err != nil {
+			return nil, err
+		}
+		replay = true
+	case pathRejoin:
+		m.lg.Error("检测到不干净关机且无法证明本地日志可信，拒绝直接恢复——须清空状态以 learner 重入"+
+			"（先 Close store，再 WipeForRejoin，经存活 leader 的 ConfChange 重新加入）；"+
+			"若全集群均已硬宕、无人可接纳本节点，可用 `sq recover -config <配置> --grant` 签字放行本地恢复",
+			"reason", reason)
+		// 此处绝不写 bootgen：写了会让运维重启一次进程就自动放行，
+		// 安全门形同虚设（见 SaveBootGen 注释与守卫用例
+		// TestUncleanShutdownDoesNotWriteBootGen）
 		return nil, ErrUncleanShutdown
-	default:
+	case pathFresh:
 		// fresh：本目录一生只经过一次的「首次以集群模式启动」。此刻若
 		// store 里已有 FSM 数据，那就是单机档直写进去的存量——它不在
 		// 任何 raft 日志里，必须打标记（N2：Join 的拒绝条件要靠它把
@@ -407,6 +459,16 @@ func NewManager(o Options) (*Manager, error) {
 			}
 		}
 	}
+
+	// 世代只在能启动成功的路径上落盘（拒启分支已在上面 return）。
+	// 语义是「本数据目录最后一次被运行中的节点写入，发生在哪个世代」，
+	// 顺序写反即安全门失效——理由详见 SaveBootGen 的注释。
+	if genNowOK {
+		if err := m.rs.SaveBootGen(genNow); err != nil {
+			return nil, err
+		}
+	}
+	recovery := path.String()
 
 	// 引导成员表：全量 Peers（fresh 路径 StartNode 按此追加 ConfChange
 	// 条目）；Options.BootstrapVoters 非空时只引导给定子集（单机种子
@@ -438,7 +500,7 @@ func NewManager(o Options) (*Manager, error) {
 		peers = append(peers, raft.Peer{ID: id})
 	}
 	for g := uint32(0); g <= o.DataGroups; g++ {
-		gr, err := m.buildGroup(g, clean, peers)
+		gr, err := m.buildGroup(g, replay, peers)
 		if err != nil {
 			return nil, err
 		}

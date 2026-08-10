@@ -101,11 +101,17 @@ func TestManagerCleanRestartResumes(t *testing.T) {
 	_ = m2 // 起来即成功；NewManager 未返回 ErrUncleanShutdown 已在 helper 断言
 }
 
-// TestManagerUncleanRestartRefusesResume 不写标记直接停（模拟断电）后，
-// NewManager 必须返回 ErrUncleanShutdown——异步刷盘不可裸恢复（spec §2.2）。
+// TestManagerUncleanRestartRefusesResume mem 档 + 机器重启过（世代变了）
+// + 无许可：不干净重启必须仍返回 ErrUncleanShutdown——本地日志尾可能
+// 残缺，不得自作主张恢复（交给重入编排，求不到接纳则拒启且数据完好）。
+//
+// 首次启动注入 withBootGen("gen-a")，kill 后重启注入 withBootGen("gen-b")
+// 模拟「机器重启过」：世代变了，于是必须拒启。若两次注入同一世代，重启
+// 会走 local-resume 直接起来——那是 TestUncleanSameBootResumesLocally
+// 覆盖的另一侧。
 func TestManagerUncleanRestartRefusesResume(t *testing.T) {
 	dir := t.TempDir()
-	st1, m1 := startSoloManager(t, dir, AckQuorumMem)
+	st1, m1 := startSoloManager(t, dir, AckQuorumMem, withBootGen("gen-a"))
 	// kill 前先落地一条提案，保证至少一轮 Ready 被处理（HardState/
 	// 条目已持久化）：若 kill 抢在全部组第一个 Ready 之前，盘上不会
 	// 有任何 raft 状态，重启会走 fresh 路径——既往 ~1/16 抖动源。
@@ -124,7 +130,9 @@ func TestManagerUncleanRestartRefusesResume(t *testing.T) {
 		t.Fatal(err)
 	}
 	st2 := mustOpenStore(t, dir)
-	_, err := NewManager(soloOptions(t, st2, dir, AckQuorumMem))
+	o := soloOptions(t, st2, dir, AckQuorumMem)
+	withBootGen("gen-b")(&o) // 机器重启过（世代变了）
+	_, err := NewManager(o)
 	if !errors.Is(err, ErrUncleanShutdown) {
 		t.Fatalf("不干净重启 NewManager = %v; want ErrUncleanShutdown", err)
 	}
@@ -200,6 +208,28 @@ func startSoloManager(t *testing.T, dir string, mode AckMode, opts ...func(*Opti
 // 与 applied 的磁盘状态直读都经它（内测包内字段可直达，无需访问器）。
 type singleNodeManagerHarness struct {
 	m *Manager
+}
+
+// waitSoloLeader 轮询直到单节点 Manager 的 meta 组自选举出 leader。
+//
+// 为什么恢复分支用例必须先等 leader 再 kill：单节点自选举需要约 1s 的
+// 选举超时，若抢在第一个 Ready 处理完之前 kill，盘上还没有任何 raft
+// 状态，重启会被误判成 fresh 而不是走本地恢复分支——等待保证「不干净
+// 关机发生时本地日志真实存在」这个用例前提。
+func waitSoloLeader(t *testing.T, m *Manager) {
+	t.Helper()
+	deadline := time.Now().Add(30 * time.Second)
+	for time.Now().Before(deadline) {
+		st, ok := m.Status(MetaGroup)
+		if !ok {
+			t.Fatal("Status(MetaGroup) 应 ok=true")
+		}
+		if st.RaftState == raft.StateLeader {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	t.Fatal("单节点组未在 30s 内自选举为 leader")
 }
 
 // startSingleNodeManager 启动单节点 Manager 并返回测试句柄，供
@@ -575,4 +605,158 @@ func TestSnapStallStep(t *testing.T) {
 	if s.ticks != 0 {
 		t.Fatalf("在途借用应把计数归零，得到 %d", s.ticks)
 	}
+}
+
+// withBootGen 注入固定的机器世代，供恢复分支用例构造「重启过 / 没重启过」。
+func withBootGen(gen string) func(*Options) {
+	return func(o *Options) { o.BootGen = func() (string, error) { return gen, nil } }
+}
+
+// TestUncleanSameBootResumesLocally 世代未变（进程崩溃、机器没重启）时，
+// 不干净重启必须能直接以原身份起来——这正是三节点同时 kill -9 后集群
+// 能自愈的前提。
+func TestUncleanSameBootResumesLocally(t *testing.T) {
+	dir := t.TempDir()
+	st1, m1 := startSoloManager(t, dir, AckQuorumMem, withBootGen("gen-a"))
+	waitSoloLeader(t, m1)
+	m1.kill() // 不写干净关机标记 = 不干净关机
+	<-m1.Done()
+	if err := st1.Close(); err != nil {
+		t.Fatalf("关闭 store: %v", err)
+	}
+
+	st2 := mustOpenStore(t, dir)
+	o := soloOptions(t, st2, dir, AckQuorumMem)
+	withBootGen("gen-a")(&o) // 同一次开机
+	m2, err := NewManager(o)
+	if err != nil {
+		t.Fatalf("世代未变的不干净重启应本地恢复，却报错: %v", err)
+	}
+	m2.Start(context.Background()) // kill 依赖 Start 设置的 cancel 与 Done 观察者，未 Start 直接 kill 会 panic/挂死
+	m2.kill()
+	<-m2.Done()
+}
+
+// TestUncleanRebootedMemRequiresPermit mem 档 + 机器重启过 + 无许可：
+// 必须仍走 ErrUncleanShutdown（交给重入编排/拒启），不得自作主张恢复。
+func TestUncleanRebootedMemRequiresPermit(t *testing.T) {
+	dir := t.TempDir()
+	st1, m1 := startSoloManager(t, dir, AckQuorumMem, withBootGen("gen-a"))
+	waitSoloLeader(t, m1)
+	m1.kill()
+	<-m1.Done()
+	if err := st1.Close(); err != nil {
+		t.Fatalf("关闭 store: %v", err)
+	}
+
+	st2 := mustOpenStore(t, dir)
+	o := soloOptions(t, st2, dir, AckQuorumMem)
+	withBootGen("gen-b")(&o) // 机器重启过
+	if _, err := NewManager(o); !errors.Is(err, ErrUncleanShutdown) {
+		t.Fatalf("NewManager = %v; want ErrUncleanShutdown", err)
+	}
+}
+
+// TestUncleanRebootedFsyncResumesLocally fsync 档即使机器重启过也能直接
+// 本地恢复：条目与 term/vote 每次变更都已随 MustSync 落盘。
+func TestUncleanRebootedFsyncResumesLocally(t *testing.T) {
+	dir := t.TempDir()
+	st1, m1 := startSoloManager(t, dir, AckQuorumFsync, withBootGen("gen-a"))
+	waitSoloLeader(t, m1)
+	m1.kill()
+	<-m1.Done()
+	if err := st1.Close(); err != nil {
+		t.Fatalf("关闭 store: %v", err)
+	}
+
+	st2 := mustOpenStore(t, dir)
+	o := soloOptions(t, st2, dir, AckQuorumFsync)
+	withBootGen("gen-b")(&o)
+	m2, err := NewManager(o)
+	if err != nil {
+		t.Fatalf("fsync 档不干净重启应本地恢复，却报错: %v", err)
+	}
+	m2.Start(context.Background()) // kill 依赖 Start 设置的 cancel 与 Done 观察者，未 Start 直接 kill 会 panic/挂死
+	m2.kill()
+	<-m2.Done()
+}
+
+// TestUncleanShutdownDoesNotWriteBootGen 安全门守卫用例。
+//
+// 走完拒启分支之后，盘上的机器世代必须**仍是旧值**。若哪天有人把
+// SaveBootGen 挪到判定之前「统一处理」，序列就变成：机器重启 → 判定需要
+// 签字 → 顺手写了新世代 → 拒启 → 运维重启进程 → 世代已相等 → 自动本地
+// 恢复，签字门自己开了。这个缺陷在任何功能测试里都看不出来，只会在某次
+// 真实事故中表现为「安全门没起作用」，所以必须有一条用例专门盯着它。
+func TestUncleanShutdownDoesNotWriteBootGen(t *testing.T) {
+	dir := t.TempDir()
+	st1, m1 := startSoloManager(t, dir, AckQuorumMem, withBootGen("gen-a"))
+	waitSoloLeader(t, m1)
+	m1.kill()
+	<-m1.Done()
+	if err := st1.Close(); err != nil {
+		t.Fatalf("关闭 store: %v", err)
+	}
+
+	st2 := mustOpenStore(t, dir)
+	o := soloOptions(t, st2, dir, AckQuorumMem)
+	withBootGen("gen-b")(&o)
+	if _, err := NewManager(o); !errors.Is(err, ErrUncleanShutdown) {
+		t.Fatalf("前置不成立，NewManager = %v; want ErrUncleanShutdown", err)
+	}
+	gen, ok, err := newRaftStore(st2, testSlog(t)).LoadBootGen()
+	if err != nil {
+		t.Fatalf("LoadBootGen: %v", err)
+	}
+	if !ok || gen != "gen-a" {
+		t.Fatalf("拒启后盘上世代 = (%q, %v); want (\"gen-a\", true)——拒启分支绝不能写世代，"+
+			"否则运维一重启进程就会被自动放行，签字门形同虚设", gen, ok)
+	}
+}
+
+// TestForcedLocalRecoverWithPermit 签字往返：写许可 → 起得来 → term 抬了
+// → 许可已被消费（同一份许可不能再放行下一次）。
+func TestForcedLocalRecoverWithPermit(t *testing.T) {
+	dir := t.TempDir()
+	st1, m1 := startSoloManager(t, dir, AckQuorumMem, withBootGen("gen-a"))
+	waitSoloLeader(t, m1)
+	m1.kill()
+	<-m1.Done()
+	rs1 := newRaftStore(st1, testSlog(t))
+	beforeHS, _, _, err := rs1.Load(0)
+	if err != nil {
+		t.Fatalf("读抬 term 前的 HardState: %v", err)
+	}
+	beforeTerm := beforeHS.GetTerm()
+	if err := rs1.SaveRecoverPermit(recoverPermit{GrantedAt: "t", Gen: "gen-b"}); err != nil {
+		t.Fatalf("SaveRecoverPermit: %v", err)
+	}
+	if err := st1.Close(); err != nil {
+		t.Fatalf("关闭 store: %v", err)
+	}
+
+	st2 := mustOpenStore(t, dir)
+	o := soloOptions(t, st2, dir, AckQuorumMem)
+	withBootGen("gen-b")(&o)
+	m2, err := NewManager(o)
+	if err != nil {
+		t.Fatalf("有匹配许可时应放行本地恢复，却报错: %v", err)
+	}
+	// 对 rs2 的 term/许可断言必须在 m2.Start **之前**完成：Start 后组会
+	// 自行选举、term 可能再变，抬 term 的证明只能在启动前读。
+	rs2 := newRaftStore(st2, testSlog(t))
+	afterHS, _, _, err := rs2.Load(0)
+	if err != nil {
+		t.Fatalf("读抬 term 后的 HardState: %v", err)
+	}
+	if afterHS.GetTerm() <= beforeTerm {
+		t.Fatalf("term = %d，未高于恢复前的 %d——签字放行路径必须抬任期，否则可能在同一任期投第二次票",
+			afterHS.GetTerm(), beforeTerm)
+	}
+	if _, ok, _ := rs2.LoadRecoverPermit(); ok {
+		t.Fatal("许可仍在——一次性许可必须在放行时被消费")
+	}
+	m2.Start(context.Background()) // kill 依赖 Start 设置的 cancel 与 Done 观察者，未 Start 直接 kill 会 panic/挂死
+	m2.kill()
+	<-m2.Done()
 }
