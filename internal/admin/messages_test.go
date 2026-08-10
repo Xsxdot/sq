@@ -353,3 +353,56 @@ func TestSendDelayAndFIFO(t *testing.T) {
 		t.Fatalf("延时+顺序组合应 400，得到 %d", w.Code)
 	}
 }
+
+// followerRouter 恒非 leader 的路由替身：本节点不 lead 任何组。
+type followerRouter struct{}
+
+func (followerRouter) GroupForQueue(string, uint32) uint32       { return 0 }
+func (followerRouter) MetaGroup() uint32                         { return 0 }
+func (followerRouter) IsLeader(uint32) bool                      { return false }
+func (followerRouter) ReadBarrier(context.Context, uint32) error { return nil }
+
+// recordingForwarder 记录 ForwardAppend 被调用的假转发器。
+type recordingForwarder struct {
+	called  bool
+	queueID uint32
+	offset  uint64
+}
+
+func (f *recordingForwarder) ForwardAppend(ctx context.Context, g uint32, msgRaw []byte) (uint32, uint64, error) {
+	f.called = true
+	return f.queueID, f.offset, nil
+}
+
+func (f *recordingForwarder) ForwardApply(ctx context.Context, g uint32, repr []byte) error {
+	return nil
+}
+
+// TestMessageSendOnFollowerForwardsToLeader 控制台的发送测试消息在
+// follower 上必须经转发落到 leader，而不是把 ErrNotLeader 甩给用户。
+//
+// 为什么不是"提示用户换节点"：控制台的地址通常是运维随手挑的一个节点，
+// 要求用户自己找出 leader 再重开一个页面，是把系统内部状态外包给人。
+func TestMessageSendOnFollowerForwardsToLeader(t *testing.T) {
+	s, _, _, _, _, _ := newTestServer(t, "", "")
+	fwd := &recordingForwarder{queueID: 7, offset: 42}
+	s.rt = followerRouter{}
+	s.fwd = fwd
+	h := s.Handler()
+
+	w := doJSON(t, h, "POST", "/admin/messages/send", "",
+		map[string]any{"topic": "t", "body": "hello"})
+	if w.Code != http.StatusCreated {
+		t.Fatalf("follower 上的发送应经转发成功，得到 %d：%s", w.Code, w.Body)
+	}
+	if !fwd.called {
+		t.Fatal("未经 ForwardAppend 转发（把 ErrNotLeader 甩给用户是 UX 缺陷）")
+	}
+	var got struct {
+		Forwarded bool `json:"forwarded"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &got)
+	if !got.Forwarded {
+		t.Fatal("响应必须带 forwarded=true——用户有权知道这条走了转发")
+	}
+}

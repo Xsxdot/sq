@@ -15,7 +15,11 @@ package e2e
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"io"
+	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -525,5 +529,66 @@ func TestScenarioProducerExitsRightAfterCommit(t *testing.T) {
 
 	consumer := newClusterConsumer(t, pc.multi(), group, topic, clusterConsumerAwaitShort)
 	got := recvAllAck(t, consumer, cs.size(), 180*time.Second, "producer-exit 对账", false)
+	cs.assertAllConsumed(t, got)
+}
+
+// adminSend 走 admin HTTP 向指定节点发一条测试消息，返回 msg_id 与是否
+// 走了转发（响应 forwarded=true）。admin 端点免登录（节点配置未设
+// admin_username/admin_password）。
+func adminSend(t *testing.T, adminBase, topic, body string) (msgID string, forwarded bool) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{"topic": topic, "body": body})
+	if err != nil {
+		t.Fatalf("构造 admin 发送请求失败: %v", err)
+	}
+	resp, err := http.Post(adminBase+"/admin/messages/send", "application/json", strings.NewReader(string(payload)))
+	if err != nil {
+		t.Fatalf("admin 发送请求失败: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusCreated {
+		raw, _ := io.ReadAll(resp.Body)
+		t.Fatalf("admin 发送应 201，得到 %d：%s", resp.StatusCode, raw)
+	}
+	var got struct {
+		MsgID     string `json:"msg_id"`
+		Forwarded bool   `json:"forwarded"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&got); err != nil {
+		t.Fatalf("解析 admin 发送响应失败: %v", err)
+	}
+	return got.MsgID, got.Forwarded
+}
+
+// TestScenarioAdminSendOnFollowerForwards 控制台发送测试消息的转发链路
+// 端到端：对着**每一个**节点各发一条，全部必须成功且被消费到——总有
+// 节点不是目标组的 leader，那条正是走转发的。
+func TestScenarioAdminSendOnFollowerForwards(t *testing.T) {
+	if testing.Short() {
+		t.Skip("场景测试耗时，-short 跳过")
+	}
+	pc := startProcCluster(t, 3)
+	const topic, group = "scn-admin-forward", "scn-admin-forward-g"
+	ensureTopic(t, pc.endpoints(), topic)
+	waitRouteSpread(t, pc.endpoints(), topic, 60*time.Second)
+
+	cs := newConfirmedSet()
+	forwarded := 0
+	for i := range pc.handles {
+		// admin 监听地址是 "127.0.0.1:<port>"，直接拼成 HTTP 基址
+		adminBase := "http://" + pc.cfgs[i].AdminListen
+		id, fwd := adminSend(t, adminBase, topic, fmt.Sprintf("forward probe #%d", i))
+		cs.confirm(id)
+		if fwd {
+			forwarded++
+		}
+	}
+	t.Logf("三节点各发一条，其中 %d 条走了转发", forwarded)
+	if forwarded == 0 {
+		t.Fatal("三个节点都恰好是目标组 leader（不可能，除非转发标记没生效）")
+	}
+
+	consumer := newClusterConsumer(t, pc.multi(), group, topic, clusterConsumerAwaitShort)
+	got := recvAllAck(t, consumer, cs.size(), 120*time.Second, "admin-forward 对账", false)
 	cs.assertAllConsumed(t, got)
 }

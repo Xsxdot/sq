@@ -15,7 +15,7 @@
  *   - 延时/顺序的专属字段在提交前做前端必填校验：空值/0 会静默降级成普通消息
  *     立即投递，后端无法区分，必须在前端拦下；其余规则留给后端报错
  */
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useState, type FormEvent, type ReactNode } from 'react'
 import { Link } from 'react-router-dom'
 import { api } from '../api/client'
 import { usePoll } from '../hooks/usePoll'
@@ -46,8 +46,9 @@ export default function Send() {
   const [text, setText] = useState(DEFAULT_BODY)
 
   const [busy, setBusy] = useState(false)
-  const [err, setErr] = useState<string | null>(null)
+  const [err, setErr] = useState<ReactNode | null>(null)
   const [sent, setSent] = useState<{ msgId: string; topic: string } | null>(null)
+  const [forwarded, setForwarded] = useState(false)
 
   // topic 下拉只在数据首次到达时填一次初值，之后轮询刷新不覆盖用户正在选的
   useEffect(() => {
@@ -79,14 +80,29 @@ export default function Send() {
     setBusy(true)
     setErr(null)
     setSent(null)
+    setForwarded(false)
     try {
       const body: Record<string, unknown> = { topic: realTopic, body: text, tag, keys: keys ? [keys] : [] }
       if (type === 'DELAY') body.delay_ms = delayNum * UNIT_MS[delayUnit]
       if (type === 'FIFO') body.message_group = group
       const r = await api.send(body)
       setSent({ msgId: r.msg_id, topic: realTopic })
+      setForwarded(r.forwarded === true)
     } catch (e) {
-      setErr(e instanceof Error ? e.message : String(e))
+      const msg = e instanceof Error ? e.message : String(e)
+      // 集群档的 ErrNotLeader：给可操作指引而不是一句底层错误文本。
+      // 控制台的地址是运维随手挑的节点，本节点当前不是该组 leader 且
+      // 转发未成功（可能是 leader 悬空或转发链故障）——告知用户去哪看
+      if (msg.includes('不是该组 leader') || msg.includes('本节点不是该组 leader')) {
+        setErr(
+          <>
+            {msg}。本节点当前不是该组 leader 且转发未成功，
+            请到 <Link to="/cluster">集群页</Link> 查看当前 leader。
+          </>,
+        )
+      } else {
+        setErr(msg)
+      }
     } finally {
       setBusy(false)
     }
@@ -102,6 +118,7 @@ export default function Send() {
     setText(DEFAULT_BODY)
     setErr(null)
     setSent(null)
+    setForwarded(false)
   }
 
   return (
@@ -121,6 +138,11 @@ export default function Send() {
             <Notice kind="ok" onClose={() => setSent(null)}>
               已发送到 <b>{sent.topic}</b>。msgId <span className="mono">{sent.msgId}</span>
               {' '}· <Link to={`/messages?topic=${encodeURIComponent(sent.topic)}`}>到消息查询里看看 →</Link>
+            </Notice>
+          )}
+          {forwarded && sent && (
+            <Notice kind="ok" onClose={() => setForwarded(false)}>
+              本节点不是该 topic 所属组的 leader，消息已自动转发给 leader 节点写入。
             </Notice>
           )}
 

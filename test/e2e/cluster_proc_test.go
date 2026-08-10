@@ -55,6 +55,8 @@ func startProcCluster(t *testing.T, n int, mutate ...func(*config.Config)) *proc
 	t.Helper()
 	grpcPorts := pickPorts(t, n)
 	raftPorts := pickPorts(t, n)
+	// admin HTTP 端口逐节点错开：默认 :8082 在同机多进程下会互相抢占
+	adminPorts := pickPorts(t, n)
 
 	pc := &procCluster{
 		handles:  make([]*brokerHandle, n),
@@ -65,6 +67,7 @@ func startProcCluster(t *testing.T, n int, mutate ...func(*config.Config)) *proc
 	for i := 0; i < n; i++ {
 		pc.dirs[i] = t.TempDir()
 		pc.cfgs[i] = clusterNodeConfig(t, pc.dirs[i], uint64(i+1), grpcPorts[i], raftPorts[i], 3)
+		pc.cfgs[i].AdminListen = fmt.Sprintf("127.0.0.1:%d", adminPorts[i])
 		for _, fn := range mutate {
 			fn(pc.cfgs[i])
 		}

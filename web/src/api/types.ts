@@ -174,4 +174,11 @@ export interface SendResult {
   queue_id: number
   offset: number
   deliver_at_ms: number
+  /**
+   * true = 本条消息是经本节点转发给组 leader 写入的。
+   *
+   * 暴露给前端不是为了炫技：用户在 follower 上点发送、消息却写进了别的
+   * 节点，这个事实必须可见，否则排查"我发的消息去哪了"时会先怀疑丢消息
+   */
+  forwarded?: boolean
 }
