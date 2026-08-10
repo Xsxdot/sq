@@ -48,7 +48,7 @@ func newTestServerWithConns(t *testing.T, user, pass string, conns ConnCounter) 
 	// sys 与 /metrics 的系统 Collector、/admin/system 共用同一个
 	// sysinfo.Reporter（数据目录用独立临时目录，不影响 store 所在目录）
 	sys := sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default())
-	s := New(rep, rt, nil, st, mt, pr, dl, user, pass, sys, sp, metrics.NewRegistry(st, mt, sys, nil, nil, slog.Default()), conns, slog.Default())
+	s := New(rep, rt, nil, replication.StandaloneRouter{}, st, mt, pr, dl, user, pass, sys, sp, metrics.NewRegistry(st, mt, sys, nil, nil, slog.Default()), conns, slog.Default())
 	return s, st, mt, pr, dl, sp
 }
 
@@ -70,7 +70,7 @@ func newTestServerNoSampler(t *testing.T, user, pass string) (*Server, *store.St
 	pr := produce.New(rep, rt, st, mt, slog.Default())
 	dl := deliver.New(rep, rt, st, mt, pr, slog.Default())
 	sys := sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default())
-	s := New(rep, rt, nil, st, mt, pr, dl, user, pass, sys, nil, metrics.NewRegistry(st, mt, sys, nil, nil, slog.Default()), nil, slog.Default())
+	s := New(rep, rt, nil, replication.StandaloneRouter{}, st, mt, pr, dl, user, pass, sys, nil, metrics.NewRegistry(st, mt, sys, nil, nil, slog.Default()), nil, slog.Default())
 	return s, st, mt, pr, dl, nil
 }
 

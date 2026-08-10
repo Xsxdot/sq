@@ -1544,6 +1544,21 @@ func (m *Manager) Groups() uint32 {
 	return 1 + m.dataGroups
 }
 
+// SelfID 返回本节点在成员表中的 id。
+func (m *Manager) SelfID() uint64 { return m.nodeID }
+
+// PeerAddrs 返回完整成员表（**含本节点**）的 id → raft 地址副本。
+//
+// 与内部的 peerAddrs 的区别：那个刻意剔除本节点（传输层不给自己发消息），
+// 这个是给控制台看拓扑用的，缺了本节点就成了残缺的成员表。
+func (m *Manager) PeerAddrs() map[uint64]string {
+	out := make(map[uint64]string, len(m.peers))
+	for id, addr := range m.peers {
+		out[id] = addr
+	}
+	return out
+}
+
 // ProposeConfChange 向指定组提出一条成员变更并阻塞直到它被 apply。
 //
 // 重入编排原语：本批由测试 harness 驱动（Remove 旧 voter → AddLearner
