@@ -297,7 +297,10 @@ func TestLeaderVisibleOnlyAfterHookCompletes(t *testing.T) {
 //     应用，raft 不会重发 MsgSnap——静默续跑 = 内存（MemoryStorage 未
 //     更新）/磁盘（半截数据）/raft（自以为已到快照位点）三方分叉，
 //     永久卡死。panic 让进程死亡、由上层重启接管（与 Persist/applyEntry
-//     同策略）；重启时 buildGroup 的标记检查据此清空重来。
+//     同策略）；panic 不写干净关机标记，重启时 Start 判定不干净关机并返回
+//     ErrUncleanShutdown，恢复走整目录 WipeForRejoin + learner 重入
+//     （buildGroup 那条按组清空重来的分支属于「干净关机却留下标记」的
+//     停机中止情形，见 handleReady 的 ctx 分支）。
 //   - 为什么标记必然在盘上：installSnapshot 第 2 步 MarkInstalling
 //     （Sync）先于任何数据写入，本测试在拉块（第 4 步）注入必败回调，
 //     失败发生在删标记的收口批次（第 5 步）之前——标记必须仍在。
@@ -324,6 +327,11 @@ func TestInstallSnapshotFailurePanicsAndKeepsMarker(t *testing.T) {
 	gr.control = func(ctx context.Context, nodeID uint64, op byte, payload []byte) ([]byte, error) {
 		return nil, errors.New("注入的拉块失败（模拟对端不可达）")
 	}
+	// 注入的是永久失败：按生产的分钟级重试窗口跑，本用例要空转两分钟。
+	// 窗口缩到 0 = 尝试一次即耗尽预算，fail-stop 语义与窗口长短无关。
+	oldWindow := snapInstallRetryWindow
+	snapInstallRetryWindow = 0
+	defer func() { snapInstallRetryWindow = oldWindow }()
 
 	idx, tm := uint64(100), uint64(2)
 	snap := &raftpb.Snapshot{
@@ -624,6 +632,59 @@ func TestInstallSnapshotRetriesTransientFailure(t *testing.T) {
 	// installing 必然已清位、丢弃计数已归零（defer 保证）
 	if gr.installing.Load() {
 		t.Fatal("安装返回后 installing 必须清位")
+	}
+}
+
+// TestInstallSnapshotRetryBudgetIsTimeWindowed（终审 R3-2）重试预算按
+// 时间窗而不是按固定次数：旧实现「3 次，退避 1s+2s」总预算约 3 秒，而它
+// 自称要吸收的「对端重启」在真实部署里是 10~60 秒级——预算必然在对端
+// 回来之前耗尽并升级成 panic，而 panic 是不干净关机，恢复代价是整目录
+// WipeForRejoin + 全量重新同步。
+//
+// 断言两件事：窗口之内会反复重试（次数不再被 3 钉死），窗口耗尽后返回
+// 最后一次错误交由调用方 fail-stop（不无限重试）。窗口/退避在用例里缩到
+// 毫秒级——判据是「按窗口收敛」，与窗口的绝对长短无关。
+func TestInstallSnapshotRetryBudgetIsTimeWindowed(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	gr := newGroup(0, 1, raft.NewMemoryStorage(), nil, rs, st,
+		func(uint32, []*raftpb.Message) {}, AckQuorumMem, nil, nil, testSlog(t))
+	rn := raft.StartNode(raftConfig(1, gr.stg), []raft.Peer{{ID: 1}})
+	gr.rn = rn
+	defer rn.Stop()
+
+	oldWindow, oldBase, oldMax := snapInstallRetryWindow, snapInstallRetryBase, snapInstallRetryMax
+	snapInstallRetryWindow, snapInstallRetryBase, snapInstallRetryMax = 200*time.Millisecond, 5*time.Millisecond, 20*time.Millisecond
+	defer func() {
+		snapInstallRetryWindow, snapInstallRetryBase, snapInstallRetryMax = oldWindow, oldBase, oldMax
+	}()
+
+	attempts := 0
+	gr.control = func(ctx context.Context, nodeID uint64, op byte, payload []byte) ([]byte, error) {
+		attempts++
+		return nil, errors.New("注入的永久拉块失败")
+	}
+
+	idx, tm := uint64(100), uint64(2)
+	snap := &raftpb.Snapshot{
+		Data: encodeSnapDescriptor(snapDescriptor{ID: 7, Leader: 1, Index: idx}),
+		Metadata: &raftpb.SnapshotMetadata{
+			Index: &idx, Term: &tm, ConfState: &raftpb.ConfState{},
+		},
+	}
+	start := time.Now()
+	if err := gr.installSnapshotWithRetry(context.Background(), snap); err == nil {
+		t.Fatal("永久失败必须返回错误（交调用方 fail-stop），不得假成功")
+	}
+	elapsed := time.Since(start)
+	// 次数不再被 3 钉死：5ms 起、翻倍封顶 20ms 的退避，200ms 窗口内必然
+	// 远超 3 次。这正是旧实现修不掉的那个上界。
+	if attempts <= 3 {
+		t.Fatalf("窗口之内应持续重试（次数不再被固定预算钉死），实际只尝试 %d 次", attempts)
+	}
+	// 也不能无限重试：窗口耗尽即收工，别把 fail-stop 拖成永久停摆
+	if elapsed > 2*snapInstallRetryWindow {
+		t.Fatalf("窗口耗尽后必须停止重试，实际耗时 %v（窗口 %v）", elapsed, snapInstallRetryWindow)
 	}
 }
 

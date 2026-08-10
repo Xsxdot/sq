@@ -1772,6 +1772,15 @@ func TestLaggingFollowerCatchesUpBySnapshot(t *testing.T) {
 		_, ok, _ := victim.Store().Get(store.TopicMetaKey("S199"))
 		return ok && h.countLog(victim, "快照安装完成") >= 1
 	}, "落后节点未在 60s 内经快照追平（数据可见或「快照安装完成」日志缺失）")
+
+	// 定向台账必须被真实发送路径填上（终审 R3-1）：leader 侧的失败感知
+	// （reportStalledSnapshots）全靠它把「这份快照发给了谁」对上号。
+	// 台账只在 MsgSnap 经 rd.Messages 外发时登记（noteSnapSends），这条
+	// 断言是「raft 真的把 MsgSnap 交到了我们手上」的唯一整链路证据——
+	// 单测里手搓 Message 证明不了这一点。
+	if id, ok := leader.snaps.SentTo(0, victim.nodeID); !ok || id == 0 {
+		t.Fatalf("leader 未登记发给节点 %d 的快照定向台账（判活会退化为按位点聚合，一个 peer 的拉取会掩盖另一个的停摆）", victim.nodeID)
+	}
 }
 
 // TestInstallingMarkerRestartClearsRaftLog（C1 修复）安装中标记重启必须

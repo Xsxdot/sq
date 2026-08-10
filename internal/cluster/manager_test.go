@@ -528,7 +528,7 @@ func TestSnapStallStep(t *testing.T) {
 	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
 
 	// ① 对端正在拉块（视图在册 + idle 之内有借出）：计数归零，不上报
-	s, report := snapStallStep(snapStall{index: 100, ticks: 1}, true, 100, now.Add(-time.Second), true, now, idle)
+	s, report := snapStallStep(snapStall{index: 100, ticks: 1}, true, 100, now.Add(-time.Second), false, true, now, idle)
 	if report {
 		t.Fatal("对端正在拉块不得上报失败——会白白打断一次正常安装")
 	}
@@ -538,30 +538,41 @@ func TestSnapStallStep(t *testing.T) {
 
 	// ② 视图已不在册（被 TTL/硬上限回收）：那份快照对端已不可能拉完，
 	//    连续 snapStallTicks 轮后上报
-	s, report = snapStallStep(snapStall{}, false, 100, time.Time{}, false, now, idle)
+	s, report = snapStallStep(snapStall{}, false, 100, time.Time{}, false, false, now, idle)
 	if report {
 		t.Fatalf("第 1 轮不得上报（snapStallTicks=%d，误报代价是打断正常安装）", snapStallTicks)
 	}
 	if s.ticks != 1 || s.index != 100 {
 		t.Fatalf("首轮观察态应为 {index:100, ticks:1}，得到 %+v", s)
 	}
-	s, report = snapStallStep(s, true, 100, time.Time{}, false, now.Add(idle), idle)
+	s, report = snapStallStep(s, true, 100, time.Time{}, false, false, now.Add(idle), idle)
 	if !report {
 		t.Fatalf("连续 %d 轮无拉取活动必须上报失败，否则该 peer 永久掉组", snapStallTicks)
 	}
 
 	// ③ 视图在册但最近借出已超 idle：同样算停滞
-	s, report = snapStallStep(snapStall{index: 100, ticks: 1}, true, 100, now.Add(-2*idle), true, now, idle)
+	s, report = snapStallStep(snapStall{index: 100, ticks: 1}, true, 100, now.Add(-2*idle), false, true, now, idle)
 	if !report || s.ticks != snapStallTicks {
 		t.Fatalf("借出时刻超出 idle 应计一次停滞并上报，得到 report=%v %+v", report, s)
 	}
 
 	// ④ 位点变了（leader 换发了新快照）：旧位点的观察作废、重新计数
-	s, report = snapStallStep(snapStall{index: 100, ticks: snapStallTicks - 1}, true, 200, time.Time{}, false, now, idle)
+	s, report = snapStallStep(snapStall{index: 100, ticks: snapStallTicks - 1}, true, 200, time.Time{}, false, false, now, idle)
 	if report {
 		t.Fatal("换发新快照后必须重新计数，不能把旧位点的观察算在新快照头上")
 	}
 	if s.index != 200 || s.ticks != 1 {
 		t.Fatalf("新位点观察态应为 {index:200, ticks:1}，得到 %+v", s)
+	}
+
+	// ⑤ 借出时刻已超 idle，但此刻有在途借用（终审 R3-3）：对端正卡在
+	//    某一块特别大的传输上，借用本身就是活着的证据，不得上报
+	s, report = snapStallStep(snapStall{index: 100, ticks: snapStallTicks - 1}, true, 100,
+		now.Add(-2*idle), true, true, now, idle)
+	if report {
+		t.Fatal("在途借用（refs>0）不得判为停滞——单块大传输会让借出时刻显得陈旧")
+	}
+	if s.ticks != 0 {
+		t.Fatalf("在途借用应把计数归零，得到 %d", s.ticks)
 	}
 }

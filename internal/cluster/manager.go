@@ -1089,20 +1089,23 @@ type snapStall struct {
 // 参数：
 //   - prev/had: 上一轮观察态与它是否存在
 //   - pending: 本轮 Progress.PendingSnapshot（快照位点）
-//   - lastBorrow/live: 该位点视图的最近借出时刻与是否仍在册
-//     （snapRegistry.LastBorrow 的返回）
+//   - lastBorrow/borrowing/live: 发给该 peer 的那份视图的最近借出时刻、
+//     此刻是否有在途借用、台账与视图是否仍有效
+//     （snapRegistry.PeerBorrow 的返回）
 //   - now/idle: 当前时刻与「多久无拉取算一次停滞」
 //
 // 判据三条，按序：
 //  1. 位点变了（leader 换发了新快照）即重新计数——旧位点的观察无意义；
-//  2. 视图仍在册且 idle 之内有过借出 → 对端正在拉，计数归零；
+//  2. 视图仍有效，且 idle 之内有过借出**或**此刻正被借用 → 对端正在拉，
+//     计数归零。in-flight 借用必须单独算一条：一块特别大的传输会让
+//     lastBorrow 显得陈旧，而对端其实一直卡在这一块上（终审 R3-3）；
 //  3. 否则计数 +1，累计到 snapStallTicks 即 report=true。
-func snapStallStep(prev snapStall, had bool, pending uint64, lastBorrow time.Time, live bool, now time.Time, idle time.Duration) (next snapStall, report bool) {
+func snapStallStep(prev snapStall, had bool, pending uint64, lastBorrow time.Time, borrowing, live bool, now time.Time, idle time.Duration) (next snapStall, report bool) {
 	next = prev
 	if !had || prev.index != pending {
 		next = snapStall{index: pending} // 新快照：重新计数
 	}
-	if live && now.Sub(lastBorrow) < idle {
+	if live && (borrowing || now.Sub(lastBorrow) < idle) {
 		next.ticks = 0 // 对端正在拉块：不算停滞
 		return next, false
 	}
@@ -1123,9 +1126,13 @@ func snapStallStep(prev snapStall, had bool, pending uint64, lastBorrow time.Tim
 //
 // 判据（为什么不是超时计时器）：快照的真实状态字节由对端经控制通道
 // OpFetchSnapshot 分块拉取，每拉一块都会 Get 借出发送侧的 ReadView 并
-// 刷新其借出时刻——「视图最近借出时刻」就是对端是否活着的直接证据，
-// 比任何固定超时都准。视图已不在册（被 TTL/硬上限回收）同样是判据：
-// 那份快照对端已不可能拉完。
+// 刷新其借出时刻——「视图最近借出时刻 + 此刻是否有在途借用」就是对端
+// 是否活着的直接证据，比任何固定超时都准。视图已不在册（被 TTL/硬上限
+// 回收）同样是判据：那份快照对端已不可能拉完。
+//
+// 判活必须按 peer 定向（终审 R3-1）：查的是 snapRegistry 的发送台账
+// （MsgSnap 外发时登记的 (组, 目标) → snapID），而不是「该位点上有没有
+// 任一视图在被拉」。后者会让 peer A 的正常拉取掩盖 peer B 的彻底停摆。
 //
 // 参数：
 //   - g: 组号
@@ -1153,9 +1160,9 @@ func (m *Manager) reportStalledSnapshots(g uint32, idle time.Duration, now time.
 			continue
 		}
 		inSnapshot[id] = struct{}{}
-		last, live := m.snaps.LastBorrow(g, pr.PendingSnapshot)
+		last, borrowing, live := m.snaps.PeerBorrow(g, id, pr.PendingSnapshot)
 		s, had := seen[id]
-		next, report := snapStallStep(s, had, pr.PendingSnapshot, last, live, now, idle)
+		next, report := snapStallStep(s, had, pr.PendingSnapshot, last, borrowing, live, now, idle)
 		if !report {
 			seen[id] = next
 			continue

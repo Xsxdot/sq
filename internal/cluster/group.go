@@ -77,9 +77,12 @@ var ErrNotLeader = errors.New("cluster: 本节点不是该组 leader，提案被
 // 真按生产值跑一遍要拉 256 GiB——那条守卫就永远没有测试覆盖，写反了
 // 比较方向也无人知晓。测试把它们临时调小、defer 还原，是让守卫本身
 // 可验证的唯一低成本办法；生产路径不改这两个值。
+//
+// maxSnapshotBytes 必须是 int64 而不是 int：256<<30 超出 32 位 int 的
+// 表示范围，写成 int 时 GOARCH=386/arm 直接编译失败（终审 R3-4）。
 var (
-	maxSnapshotChunks = 1 << 16
-	maxSnapshotBytes  = 256 << 30
+	maxSnapshotChunks       = 1 << 16
+	maxSnapshotBytes  int64 = 256 << 30
 )
 
 // group 是一个 raft 组运行体：tick 驱动选举/心跳，Ready 循环执行
@@ -90,8 +93,12 @@ type group struct {
 	// 日志存储双记账（Task 4）：mem 是 raft 库读写日志的易失视图
 	// （Append/SetHardState/Compact），stg 是包在 mem 外的 raft.Storage
 	// 包装——raft 经它读日志，Snapshot() 由 groupStorage 现场生成
-	mem    *raft.MemoryStorage
-	stg    raft.Storage
+	mem *raft.MemoryStorage
+	stg raft.Storage
+	// snaps 是快照视图注册表（Manager 全组共享；单组单测路径由 newGroup
+	// 自建）。本组用它做两件事：stg 的现场快照生成建视图，以及 MsgSnap
+	// 外发时登记定向台账（noteSnapSends → leader 侧失败感知的判活依据）。
+	snaps  *snapRegistry
 	rs     *raftStore   // 日志的共库持久层
 	st     *store.Store // 共享 store：FSM apply 的唯一落点
 	send   func(g uint32, msgs []*raftpb.Message)
@@ -224,6 +231,7 @@ func newGroup(g uint32, selfID uint64, storage *raft.MemoryStorage, snaps *snapR
 		// 保证 Snapshot() 的 reg 永不为空
 		reg = newSnapRegistry(gr.st, snapRegistryDefaultTTL, gr.lg)
 	}
+	gr.snaps = reg
 	gr.stg = newGroupStorage(g, storage, reg, &gr.applied, &gr.confState, gr.selfID, &gr.applyMu, gr.lg)
 	return gr
 }
@@ -325,9 +333,18 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 			// stableSnapTo + appliedTo），raft 从此不再重发 MsgSnap；而
 			// 磁盘上仍是安装中标记 + 半截数据、内存侧 MemoryStorage 从未
 			// 更新——三方分叉、永不收敛。按 Persist/applyEntry 同策略
-			// fail-stop panic：进程死亡由上层重启接管，重启时 buildGroup
-			// 的安装中标记检查清空重来。标记第 2 步先于任何数据写入，
-			// 失败必在盘上；keepTicking 已由 installSnapshotWithRetry 收敛。
+			// fail-stop panic：进程死亡由上层重启接管。
+			//
+			// 重启后走的是哪条恢复路径（要看清代价）：panic 不会写干净
+			// 关机标记，因此重启时 Start 判定为不干净关机，直接返回
+			// ErrUncleanShutdown——恢复手段是整目录 WipeForRejoin +
+			// 以 learner 经存活 leader 重新加入，而**不是** buildGroup 里
+			// 那条按组清空重来的分支（那条只在干净关机却留下安装中标记
+			// 时才可能命中，即停机途中止的安装，见本函数上方的 ctx 分支）。
+			// 代价是整节点全量重新同步，所以 installSnapshotWithRetry 的
+			// 重试窗口必须真的够长（snapInstallRetryWindow），别让一次
+			// 网络抖动升级成一次全量重同步。keepTicking 已由
+			// installSnapshotWithRetry 收敛。
 			//
 			// 本地清空重来只是恢复的一半（N1）：本节点重启后是空日志，而
 			// leader 侧该 peer 的 Progress 仍停在 StateSnapshot——
@@ -362,7 +379,10 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	}
 	_ = gr.mem.Append(rd.Entries)
 	// 2. 发送 Messages：经注入的 send 回调外发（transport 发送永不
-	//    阻塞——满则丢，raft 心跳重试兜底，Task 3 契约）
+	//    阻塞——满则丢，raft 心跳重试兜底，Task 3 契约）。
+	//    外发前先登记本轮的 MsgSnap 定向台账——这是 leader 侧唯一能
+	//    知道「哪份快照发给了哪个 peer」的时刻（见 noteSnapSends）。
+	gr.noteSnapSends(rd.Messages)
 	gr.send(gr.g, rd.Messages)
 	// leader 变更观测：SoftState 变化是切换的第一信号（当选与失联都在此）
 	if rd.SoftState != nil {
@@ -553,24 +573,77 @@ func (gr *group) keepTicking() (stop func()) {
 // Advance 会把携带快照的 MsgStorageAppendResp 步进给 raft 内核，内核
 // 的 appliedSnap（stableSnapTo + appliedTo）把快照标记为已持久化已
 // 应用，raft 不会重发 MsgSnap——静默续跑是内存/磁盘/raft 三方分叉的
-// 永久卡死（vendored raft.go MsgStorageAppendResp 分支）。panic 后
-// 重启由 buildGroup 的安装中标记检查清空重来：标记（第 2 步，Sync）
-// 先于任何数据写入，失败必然发生在第 2 步之后、收口批次删标记之前，
-// 标记恒在盘上，清空重来永远成立。
-// snapInstallAttempts / snapInstallRetryBase 是安装的有限重试预算：
-// 尝试 3 次，退避 1s、2s。
+// 永久卡死（vendored raft.go MsgStorageAppendResp 分支）。
+//
+// panic 之后的恢复路径：panic 不写干净关机标记，重启时 Start 判定不干净
+// 关机并返回 ErrUncleanShutdown，恢复手段是整目录 WipeForRejoin + 以
+// learner 重新加入。buildGroup 里那条「见安装中标记即按组清空重来」的
+// 分支走的是另一种情形——干净关机却留下了标记（停机途中止的安装，见
+// handleReady 的 ctx 分支）；标记（第 2 步，Sync）先于任何数据写入，
+// 失败必然发生在第 2 步之后、收口批次删标记之前，标记恒在盘上，那条
+// 路径上的清空重来永远成立。
+
+// noteSnapSends 把本轮外发的 MsgSnap 登记进快照注册表的定向台账
+// （(组, 目标节点) → snapID）。
+//
+// 为什么放在这里：leader 侧唯一知道「这份快照发给了谁」的时刻就是
+// MsgSnap 外发的这一刻——raft 的 Progress 事后只保留 PendingSnapshot
+// 位点，不保留 snapID。没有这份台账，失败感知只能按位点聚合判活，
+// 一个 peer 的正常拉取会掩盖另一个 peer 的停摆（终审 R3-1）。
+//
+// 参数：msgs 为本轮 Ready 的待发消息（非 MsgSnap 一律跳过）。
+//
+// 注意：描述符不可解析时只记 Warn 不中断——那是发送侧自身的编码
+// 问题，接收方拉取时同样会报错并走既有的失败路径，这里没有更好的
+// 处置手段，绝不能因为台账登记失败而阻断消息外发。
+func (gr *group) noteSnapSends(msgs []*raftpb.Message) {
+	if gr.snaps == nil {
+		return
+	}
+	for _, m := range msgs {
+		if m == nil || m.GetType() != raftpb.MsgSnap {
+			continue
+		}
+		desc, err := decodeSnapDescriptor(m.GetSnapshot().GetData())
+		if err != nil {
+			gr.lg.Warn("MsgSnap 描述符不可解析，跳过定向台账登记（判活将退化为按停滞上报）",
+				"g", gr.g, "to", m.GetTo(), "err", err)
+			continue
+		}
+		gr.snaps.NoteSent(gr.g, m.GetTo(), desc.ID)
+		gr.lg.Info("向落后节点发出快照", "g", gr.g, "to", m.GetTo(),
+			"snap_id", desc.ID, "index", desc.Index)
+	}
+}
+
+// snapInstallRetryWindow / snapInstallRetryBase / snapInstallRetryMax 是
+// 安装的重试预算：在 snapInstallRetryWindow 之内按 1s 起、翻倍、封顶
+// snapInstallRetryMax 的退避反复重试。
 //
 // 为什么要重试：安装第 4 步是分钟级的网络操作（分块拉取），一次瞬时
 // 错误（对端重启、连接 reset、控制帧超时）就直接 fail-stop panic，等于
 // 把「网络抖了一下」升级成「进程自杀 + 该组重装一遍」。整个安装流程
 // 幂等——标记可重写、wipe 可重跑、块可重拉，重试的代价只是重来一遍。
 //
-// 为什么重试次数很小：真正不可恢复的错误（描述符不可解析、对端视图已
-// 回收、磁盘写失败）重试多少次都一样；重试只为吸收瞬时故障，超出预算
-// 就该交给 fail-stop + leader 侧重驱动这条更彻底的恢复路径。
-const (
-	snapInstallAttempts  = 3
-	snapInstallRetryBase = time.Second
+// 为什么预算按时间窗而不是按次数（终审 R3-2）：旧实现是「3 次，退避
+// 1s+2s」，总窗口约 3 秒——而它自称要吸收的「对端重启」在真实部署里
+// 是 10~60 秒级。3 秒的预算必然在对端重启完成之前耗尽，升级成 panic；
+// 而 panic 是不干净关机，重启后 Start 直接返回 ErrUncleanShutdown，
+// 恢复代价是整目录 WipeForRejoin + 全量重新同步。用「够长的时间窗 +
+// 有上限的退避」才真正覆盖它声称覆盖的故障，同时 ctx 取消随时可退。
+//
+// 为什么窗口不是无限：真正不可恢复的错误（描述符不可解析、对端视图已
+// 回收、磁盘写失败）重试多久都一样；超出窗口就该交给 fail-stop +
+// leader 侧重驱动这条更彻底的恢复路径。
+//
+// 为什么是 var 而不是 const（同 maxSnapshotChunks 的理由）：生产窗口是
+// 分钟级，而「注入永久失败 → 断言 fail-stop」的用例按生产窗口跑要空转
+// 两分钟。测试临时改小、defer 还原，是让 fail-stop 语义本身保持可验证
+// 的唯一低成本办法；生产路径不改这三个值。
+var (
+	snapInstallRetryWindow = 2 * time.Minute
+	snapInstallRetryBase   = time.Second
+	snapInstallRetryMax    = 15 * time.Second
 )
 
 // installSnapshotWithRetry 是 installSnapshot 的有限重试包装，并负责
@@ -599,26 +672,34 @@ func (gr *group) installSnapshotWithRetry(ctx context.Context, snap *raftpb.Snap
 		}
 	}()
 	var err error
-	for attempt := 1; attempt <= snapInstallAttempts; attempt++ {
+	deadline := time.Now().Add(snapInstallRetryWindow)
+	backoff := snapInstallRetryBase
+	for attempt := 1; ; attempt++ {
 		if err = gr.installSnapshot(ctx, snap); err == nil {
 			return nil
 		}
 		if ctx.Err() != nil {
 			return err // 停机中：不再重试，交调用方按停机路径处理
 		}
-		if attempt == snapInstallAttempts {
+		// 退避到期时间已越过窗口即收工——判据用「睡完之后」而不是
+		// 「此刻」，避免最后一次退避睡过头、把 2 分钟的窗口拖成 2 分 15 秒
+		if !time.Now().Add(backoff).Before(deadline) {
 			break
 		}
-		backoff := time.Duration(attempt) * snapInstallRetryBase
 		gr.lg.Warn("快照安装失败，退避重试（安装流程幂等，重来一遍）", "g", gr.g,
 			"index", snap.Metadata.GetIndex(), "attempt", attempt,
-			"max_attempts", snapInstallAttempts, "backoff", backoff.String(), "err", err)
+			"backoff", backoff.String(), "window", snapInstallRetryWindow.String(), "err", err)
 		select {
 		case <-time.After(backoff):
 		case <-ctx.Done():
 			return err
 		}
+		if backoff *= 2; backoff > snapInstallRetryMax {
+			backoff = snapInstallRetryMax
+		}
 	}
+	gr.lg.Error("快照安装重试预算耗尽（转入 fail-stop）", "g", gr.g,
+		"index", snap.Metadata.GetIndex(), "window", snapInstallRetryWindow.String(), "err", err)
 	return err
 }
 
@@ -717,7 +798,8 @@ func (gr *group) installSnapshot(ctx context.Context, snap *raftpb.Snapshot) err
 // 共同收敛，不会卡死。
 func (gr *group) pullSnapshotChunks(ctx context.Context, desc snapDescriptor) error {
 	var cursor []byte
-	keys, nbytes, chunks := 0, 0, 0
+	var nbytes int64 // 与 maxSnapshotBytes 同宽：32 位平台上 int 装不下上限
+	keys, chunks := 0, 0
 	for {
 		chunks++
 		if chunks > maxSnapshotChunks {
@@ -756,7 +838,7 @@ func (gr *group) pullSnapshotChunks(ctx context.Context, desc snapDescriptor) er
 			}
 			keys += len(pairs)
 			for _, p := range pairs {
-				nbytes += 8 + len(p.k) + len(p.v) // 8B = 块格式双长度头
+				nbytes += int64(8 + len(p.k) + len(p.v)) // 8B = 块格式双长度头
 			}
 			if nbytes > maxSnapshotBytes {
 				return fmt.Errorf("快照安装第 4 步 累计字节 %d 超上限 %d（第 %d 块，已拉 %d 键，对端状态异常）",

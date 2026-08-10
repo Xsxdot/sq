@@ -8,7 +8,8 @@
 //   - snapRegistry：按 snapID 持有 ReadView，供控制通道分块拉取；
 //     借用计数（Get 借出/Put 归还）+ 借出续期（每次借出刷新 TTL 基线）；
 //     TTL 到期强制回收，另有不可续期的硬上限兜底（视图长期不关会阻止
-//     Pebble 回收旧版本）；LastBorrow 供 leader 侧判定对端是否真在拉
+//     Pebble 回收旧版本）；NoteSent/PeerBorrow 供 leader 侧按「发给哪个
+//     peer 的哪份快照」精确判定对端是否真在拉
 //   - 描述符编解码：[8B snapID][8B leader nodeID][8B index]
 //
 // 边界：
@@ -118,12 +119,31 @@ type snapRegistry struct {
 	mu     sync.Mutex           // 保护以下字段
 	nextID uint64               // 单调自增 snapID（从 1 起，永不复用）
 	views  map[uint64]snapEntry // snapID → 视图登记
+
+	// sent 是「本节点作为 leader 发给哪个 peer 哪份快照」的定向台账
+	// （见 NoteSent/PeerBorrow）。规模上界是 组数 × 成员数，条目被同
+	// (g, to) 的后一次发送覆盖，不会无界增长。
+	sent map[snapSendKey]uint64 // (组, 目标节点) → snapID
+}
+
+// snapSendKey 是 sent 台账的键：一个 peer 在一个组里同时只可能处于
+// 一份快照的接收中（raft 的 Progress.PendingSnapshot 是单值）。
+type snapSendKey struct {
+	g  uint32
+	to uint64
 }
 
 // newSnapRegistry 构造快照注册表。st 是建 ReadView 的源，ttl 是视图
 // 存活时长，lg 为结构化日志。
 func newSnapRegistry(st *store.Store, ttl time.Duration, lg *slog.Logger) *snapRegistry {
-	return &snapRegistry{st: st, ttl: ttl, lg: lg, now: time.Now, views: make(map[uint64]snapEntry)}
+	return &snapRegistry{
+		st:    st,
+		ttl:   ttl,
+		lg:    lg,
+		now:   time.Now,
+		views: make(map[uint64]snapEntry),
+		sent:  make(map[snapSendKey]uint64),
+	}
 }
 
 // Create 建立一份钉住当前时刻的 ReadView 并登记，返回自增 snapID。
@@ -175,31 +195,62 @@ func (r *snapRegistry) Get(id uint64) (*store.ReadView, bool) {
 	return e.view, true
 }
 
-// LastBorrow 返回组 g 在 index 位点上仍在册的视图的最近借出时刻。
+// NoteSent 登记「本节点作为 leader 把 snapID 这份快照发给了 peer to」。
 //
-// 用途（N1 的 leader 侧失败感知）：leader 判定某 peer 是否真的在拉自己
-// 发出的那份快照。raft 的 Progress.PendingSnapshot 是快照位点（index），
-// 而注册表按 snapID 索引，故按 (g, index) 反查；同位点若有多份视图（同
-// 一 index 反复生成快照），取最近的一次借出——只要有任一份在被拉，就
-// 说明对端活着。
+// 为什么需要定向台账（终审 R3-1）：按 (g, index) 反查会把同一位点上的
+// 全部视图聚合成一个「有没有人在拉」的判断——peer A 正在正常拉块，就
+// 把 peer B 的彻底停摆一并掩盖掉，B 的失败上报要等到 A 传完 + 软 TTL
+// 自然到期才可能触发。快照是发给谁的只有发送侧知道（raft 的
+// Progress 只留 PendingSnapshot 位点，不留 snapID），因此在 MsgSnap
+// 外发时把 (组, 目标) → snapID 记下来，判活时按这份精确对应查。
 //
-// 返回：
-//   - last: 最近一次借出时刻（从未借出过的视图返回其建档时刻，等于给
-//     对端一个完整的启动宽限期）
-//   - ok: 该位点是否还有在册视图；false 表示视图已被回收/作废/从未生成
-//     ——对 leader 而言即「这份快照对端已不可能拉完」
-func (r *snapRegistry) LastBorrow(g uint32, index uint64) (last time.Time, ok bool) {
+// 幂等：同 (g, to) 重复登记直接覆盖——raft 给同一 peer 换发新快照时
+// 旧那份已无意义。
+func (r *snapRegistry) NoteSent(g uint32, to uint64, id uint64) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	for _, e := range r.views {
-		if e.g != g || e.index != index || e.revoked {
-			continue
-		}
-		if !ok || e.created.After(last) {
-			last, ok = e.created, true
-		}
+	r.sent[snapSendKey{g: g, to: to}] = id
+	r.lg.Debug("快照已发出，登记定向台账", "g", g, "to", to, "snap_id", id)
+}
+
+// SentTo 返回定向台账里登记的「最近发给 peer to 的快照 id」，不校验视图
+// 是否仍在册——判活请用 PeerBorrow。用于验证台账确实被真实发送路径填上
+// （视图在对端追平后就被回收了，那之后 PeerBorrow 只会返回 ok=false，
+// 无法回答「到底登记过没有」）。
+func (r *snapRegistry) SentTo(g uint32, to uint64) (id uint64, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id, ok = r.sent[snapSendKey{g: g, to: to}]
+	return id, ok
+}
+
+// PeerBorrow 返回「leader 最近发给 peer to 的那份快照视图」的借用实况，
+// 供 leader 侧失败感知（N1 / reportStalledSnapshots）判定对端是否真在拉。
+//
+// 参数 index 是调用方从 raft Progress.PendingSnapshot 读到的快照位点，
+// 用于校验台账没有过期：台账里的 snapID 必须仍在册且位点相符，否则
+// 视为「这份快照对端已不可能拉完」。
+//
+// 返回：
+//   - last: 该视图最近一次借出时刻（从未借出过的返回建档时刻，等于给
+//     对端一个完整的启动宽限期）
+//   - borrowing: 此刻是否有在途借用（refs>0）。单块传输耗时超过判定
+//     窗口时 last 会显得陈旧，但借用仍在——它同样是「对端活着」的证据
+//     （终审 R3-3）
+//   - ok: 台账与视图是否都还有效；false 表示视图已回收/作废/位点不符/
+//     从未给该 peer 发过快照
+func (r *snapRegistry) PeerBorrow(g uint32, to uint64, index uint64) (last time.Time, borrowing bool, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	id, ok := r.sent[snapSendKey{g: g, to: to}]
+	if !ok {
+		return time.Time{}, false, false
 	}
-	return last, ok
+	e, ok := r.views[id]
+	if !ok || e.revoked || e.g != g || e.index != index {
+		return time.Time{}, false, false
+	}
+	return e.created, e.refs > 0, true
 }
 
 // Put 归还一次 Get 借出的视图：refs-1。条目保留在登记表里供后续分块

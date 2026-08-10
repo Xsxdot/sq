@@ -301,60 +301,73 @@ func TestSnapRegistryHardTTLReclaimsIdleView(t *testing.T) {
 	}
 }
 
-// TestSnapRegistryLastBorrow LastBorrow 是 leader 侧失败感知（N1）的
-// 判据：按 (g, index) 反查最近借出时刻，leader 据此区分「对端在拉，
-// 别打断」与「没人拉，快照停滞了，报失败让它回 Probe」。
+// TestSnapRegistryPeerBorrow PeerBorrow 是 leader 侧失败感知（N1）的
+// 判据：按「发给谁的哪份快照」（NoteSent 登记的定向台账）反查该视图的
+// 借用实况，leader 据此区分「对端在拉，别打断」与「没人拉，快照停滞了，
+// 报失败让它回 Probe」。
 //
-// 同位点多份视图取最近一次：同一 index 可能反复生成快照（前一份被
-// 回收后重发），只要任一份在被拉就说明对端活着。
-func TestSnapRegistryLastBorrow(t *testing.T) {
+// 为什么必须定向（终审 R3-1）：旧实现按 (g, index) 聚合同位点的全部
+// 视图，peer A 的正常拉取会把 peer B 的彻底停摆一并掩盖——B 的失败要等
+// A 传完 + 软 TTL 自然到期才可能被发现。本用例的核心断言就是「A 在拉，
+// B 仍判为不活」。
+func TestSnapRegistryPeerBorrow(t *testing.T) {
 	st := openClusterTestStore(t)
 	reg := newSnapRegistry(st, time.Minute, testSlog(t))
 	clock := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
 	reg.now = func() time.Time { return clock }
 
-	// 无视图：ok=false，即「这份快照对端已不可能拉完」
-	if _, ok := reg.LastBorrow(1, 10); ok {
-		t.Fatal("无在册视图应返回 ok=false")
+	// 从未给该 peer 发过快照：ok=false
+	if _, _, ok := reg.PeerBorrow(1, 2, 10); ok {
+		t.Fatal("无发送台账应返回 ok=false")
 	}
-	id := reg.Create(1, 10)
+	idA := reg.Create(1, 10)
+	reg.NoteSent(1, 2, idA)
 	// 从未借出：返回建档时刻——给对端一个完整的启动宽限期
-	last, ok := reg.LastBorrow(1, 10)
-	if !ok || !last.Equal(clock) {
-		t.Fatalf("从未借出应返回建档时刻 %v，得到 %v ok=%v", clock, last, ok)
+	last, borrowing, ok := reg.PeerBorrow(1, 2, 10)
+	if !ok || borrowing || !last.Equal(clock) {
+		t.Fatalf("从未借出应返回建档时刻 %v/borrowing=false，得到 %v/%v ok=%v", clock, last, borrowing, ok)
 	}
-	// 别的 (g,index) 不串扰
-	if _, ok := reg.LastBorrow(2, 10); ok {
+	// 台账位点与 Progress 位点不符（陈旧台账）：不得命中
+	if _, _, ok := reg.PeerBorrow(1, 2, 11); ok {
+		t.Fatal("位点不符的陈旧台账不得命中")
+	}
+	// 别的组不串扰
+	if _, _, ok := reg.PeerBorrow(2, 2, 10); ok {
 		t.Fatal("别的组不得命中")
 	}
-	if _, ok := reg.LastBorrow(1, 11); ok {
-		t.Fatal("别的位点不得命中")
-	}
-	// 借出即刷新
+
+	// 定向隔离（R3-1 核心）：给 peer 3 单独发一份同位点快照，只有它在拉，
+	// peer 2 的判活不得被带活
+	idB := reg.Create(1, 10)
+	reg.NoteSent(1, 3, idB)
 	clock = clock.Add(30 * time.Second)
-	if _, ok := reg.Get(id); !ok {
-		t.Fatal("应能借出")
+	if _, ok := reg.Get(idB); !ok {
+		t.Fatal("应能借出 peer 3 的视图")
 	}
-	reg.Put(id)
-	last, ok = reg.LastBorrow(1, 10)
-	if !ok || !last.Equal(clock) {
-		t.Fatalf("借出后应返回借出时刻 %v，得到 %v ok=%v", clock, last, ok)
+	last2, borrowing2, ok2 := reg.PeerBorrow(1, 2, 10)
+	if !ok2 || borrowing2 || !last2.Equal(clock.Add(-30*time.Second)) {
+		t.Fatalf("peer 3 在拉不得把 peer 2 带活，得到 last=%v borrowing=%v ok=%v", last2, borrowing2, ok2)
 	}
-	// 同位点第二份视图：取两者中较近的一次
-	id2 := reg.Create(1, 10) // created = clock（当前）
-	clock = clock.Add(10 * time.Second)
-	if _, ok := reg.Get(id2); !ok {
-		t.Fatal("应能借出第二份")
+	// in-flight 借用本身即「活着」（R3-3）：即便 last 已陈旧
+	last3, borrowing3, ok3 := reg.PeerBorrow(1, 3, 10)
+	if !ok3 || !borrowing3 || !last3.Equal(clock) {
+		t.Fatalf("在途借用应报 borrowing=true 且 last=%v，得到 %v/%v ok=%v", clock, last3, borrowing3, ok3)
 	}
-	reg.Put(id2)
-	last, ok = reg.LastBorrow(1, 10)
-	if !ok || !last.Equal(clock) {
-		t.Fatalf("多份视图应取最近借出 %v，得到 %v ok=%v", clock, last, ok)
+	reg.Put(idB)
+	if _, borrowing, _ := reg.PeerBorrow(1, 3, 10); borrowing {
+		t.Fatal("归还后不应再报在途借用")
 	}
-	// 回收后 ok=false：leader 据此判定快照已不可能被拉完
-	reg.Release(id)
-	reg.Release(id2)
-	if _, ok := reg.LastBorrow(1, 10); ok {
-		t.Fatal("视图全部回收后应返回 ok=false")
+
+	// 重复发送覆盖台账：换发新快照后按新 snapID 判活
+	idC := reg.Create(1, 10)
+	reg.NoteSent(1, 2, idC)
+	reg.Release(idA) // 旧视图回收不影响新台账
+	if _, _, ok := reg.PeerBorrow(1, 2, 10); !ok {
+		t.Fatal("换发新快照后应按新 snapID 命中")
+	}
+	// 视图被回收：ok=false——leader 据此判定这份快照已不可能被拉完
+	reg.Release(idC)
+	if _, _, ok := reg.PeerBorrow(1, 2, 10); ok {
+		t.Fatal("视图回收后应返回 ok=false")
 	}
 }
