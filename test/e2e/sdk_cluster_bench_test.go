@@ -7,6 +7,8 @@
 //   - 三节点集群的并发写吞吐（quorum-mem / quorum-fsync 两档）
 //   - 同机单机档基线（同一台机器、同一份 broker 二进制），给出复制税
 //   - 内存峰值（复用 memPeakSampler，Linux VmHWM）
+//   - 对**外部已部署**集群跑同一套负载（TestExternalClusterWriteThroughput），
+//     用于每机一节点的跨机测量——与共置档同一个 runSendLoad，差值即共置税
 //
 // 边界：
 //   - 不测消费侧吞吐（投递路径另有长轮询节拍变量，见 newClusterConsumer）
@@ -290,6 +292,88 @@ func TestClusterWriteThroughput(t *testing.T) {
 				fmt.Sprintf("standalone/conc=%d", c)))
 		}
 	})
+
+	t.Log("=== 汇总（msg/s，端到端 SDK→gRPC→raft→quorum 确认）===")
+	for _, r := range results {
+		t.Logf("%-32s %8.0f msg/s  p50=%-12v p99=%v",
+			r.label, r.msgPerSec(), r.p50.Round(time.Microsecond), r.p99.Round(time.Microsecond))
+	}
+}
+
+// benchEndpoints 解析外部集群接入点列表（SQ_BENCH_ENDPOINTS，逗号分隔的
+// host:port）。未设或全为空返回 nil——调用方据此跳过跨机档。
+func benchEndpoints() []string {
+	var out []string
+	for _, f := range strings.Split(os.Getenv("SQ_BENCH_ENDPOINTS"), ",") {
+		if ep := strings.TrimSpace(f); ep != "" {
+			out = append(out, ep)
+		}
+	}
+	return out
+}
+
+// benchTopicTag 把标签压成可安全用作 topic 名的一段（只留字母数字，
+// 其余一律丢弃）。topic 名进路由键与 Pebble 键，不接受任意字符。
+func benchTopicTag(label string) string {
+	var b strings.Builder
+	for _, r := range label {
+		if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "ext"
+	}
+	return b.String()
+}
+
+// TestExternalClusterWriteThroughput 对**已在别处部署好**的集群跑同一套写
+// 负载，用于跨机（每机一节点）测量。
+//
+// 与 TestClusterWriteThroughput 的分工：那个用例自己拉起三个共置进程，测出
+// 的数字里含共置税——三份 CPU 抢同一台机器、三条 WAL 落同一块盘；本用例不
+// 管拓扑，只做客户端，集群按真实部署摆在别处。两者用的是同一个 runSendLoad，
+// 所以数字可以直接对比，差值就是共置税。
+//
+// 拓扑事实（几节点、什么确认档）本进程无从得知，由 SQ_BENCH_LABEL 显式带进
+// 标签；不给就记 external——跑完一批分不清档位的数字比没有数字更糟。
+//
+// topic 名带标签指纹（benchTopicTag）：同一个集群上换档重跑时，若沿用同名
+// topic，队列数与既有数据都会跟着上一档走，测的就不是本档了。
+//
+// 跑法（客户端所在机零 Go 工具链，交叉编译产物直接跑；SQ_E2E_BROKER 只为
+// 满足 TestMain 的二进制自检，本用例不拉起任何进程）：
+//
+//	SQ_BENCH=1 SQ_E2E_BROKER=/root/sqbench/sq \
+//	SQ_BENCH_ENDPOINTS=172.19.25.178:8081,172.19.25.179:8081,172.19.25.180:8081 \
+//	SQ_BENCH_LABEL=3host-quorum-fsync ./e2e.linux.test \
+//	  -test.run TestExternalClusterWriteThroughput -test.v -test.timeout=40m
+func TestExternalClusterWriteThroughput(t *testing.T) {
+	if os.Getenv("SQ_BENCH") == "" {
+		t.Skip("吞吐基准默认不随套件运行：设 SQ_BENCH=1 开启")
+	}
+	endpoints := benchEndpoints()
+	if len(endpoints) == 0 {
+		t.Skip("未设 SQ_BENCH_ENDPOINTS：跨机档需要外部已部署好的集群接入点")
+	}
+	label := os.Getenv("SQ_BENCH_LABEL")
+	if label == "" {
+		label = "external"
+	}
+	total := benchEnvInt("SQ_BENCH_MSGS", 20000)
+	bodyBytes := benchEnvInt("SQ_BENCH_BODY", 128)
+	concs := benchConcurrencies()
+	t.Logf("参数：接入点=%v 标签=%s 总条数=%d 体积=%dB 并发档=%v",
+		endpoints, label, total, bodyBytes, concs)
+
+	tag := benchTopicTag(label)
+	var results []benchResult
+	for _, c := range concs {
+		topic := fmt.Sprintf("bench-%s-%d", tag, c)
+		ensureTopic(t, endpoints, topic)
+		results = append(results, runSendLoad(t, endpoints[0], topic, c, total, bodyBytes,
+			fmt.Sprintf("%s/conc=%d", label, c)))
+	}
 
 	t.Log("=== 汇总（msg/s，端到端 SDK→gRPC→raft→quorum 确认）===")
 	for _, r := range results {
