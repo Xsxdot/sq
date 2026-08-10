@@ -162,6 +162,29 @@ type group struct {
 	propWaiters map[uint64]chan struct{}
 	ccWaiters   map[uint64]chan struct{}
 	nextID      atomic.Uint64
+
+	// readWaiters 读屏障等待者（第三个命名空间）：与 propWaiters/ccWaiters
+	// 共用 gr.mu 与 gr.nextID 计数器，但读状态经 Ready.ReadStates 回流、
+	// 不走日志条目，因此不会与前两者交叉误唤。
+	readWaiters map[uint64]*readWait
+
+	// 读屏障的「排队成批」合流状态（brMu 独立于 mu：合流只调度轮次，
+	// 不碰 waiter 表，两把锁不嵌套）。
+	// running=true 表示有一轮 read-index 在途；此时到达的等待者一律排进
+	// next 批，绝不搭当前这一轮的车——当前轮的 readIndex 取自它们发起
+	// 之前，中间被确认的写它们看不到，复用即破坏线性一致。
+	brMu      sync.Mutex
+	brNext    *barrierBatch
+	brRunning bool
+	// barrierTimeout 单轮 read-index 的时间预算（每轮独立计时，不随某个
+	// 等待者的 ctx 走——一个等待者放弃不该让整批失败）。
+	barrierTimeout time.Duration
+	// lifeCtx 是 run 循环的生命周期 ctx：合流的驱动 goroutine 用它做
+	// 父 ctx，组退出时在途轮次随之取消。
+	lifeCtx context.Context
+	// readIndexFn 单轮 read-index 的执行体，默认 readIndexOnce；测试注入
+	// 假实现以观察轮次调度（合流逻辑与 raft 交互解耦）。
+	readIndexFn func(ctx context.Context) error
 }
 
 // newGroup 构造单组运行体（不启动 run 循环）。
@@ -201,6 +224,7 @@ func newGroup(g uint32, selfID uint64, storage *raft.MemoryStorage, snaps *snapR
 		inbox:          make(chan *raftpb.Message, 1024),
 		propWaiters:    make(map[uint64]chan struct{}),
 		ccWaiters:      make(map[uint64]chan struct{}),
+		readWaiters:    make(map[uint64]*readWait),
 		doneCh:         make(chan struct{}),
 	}
 	// 提案 id 用时间戳做种子（终审 R4）：干净重启后计数器从远离旧值
@@ -208,6 +232,10 @@ func newGroup(g uint32, selfID uint64, storage *raft.MemoryStorage, snaps *snapR
 	// 进程消亡，新进程的 id 空间不得与旧进程重叠（否则重启回零是
 	// 跨节点 id 碰撞的第二条路径）。
 	gr.nextID.Store(uint64(time.Now().UnixNano()))
+	// 读屏障装配默认（Task 2 的 Manager 层可覆盖）：单轮 read-index 的
+	// 时间预算与执行体
+	gr.barrierTimeout = 3 * time.Second // 默认值；装配方经 Manager 覆盖
+	gr.readIndexFn = gr.readIndexOnce
 	// 成员表从持久化值初始化（Task 2）：重启后 Storage.Snapshot()
 	// 现场取用 gr.confState，无需再等第一条 ConfChange apply。
 	// rs 为 nil 的单元测试路径跳过；读回失败按不可恢复处理（与
@@ -284,6 +312,9 @@ func (gr *group) run(ctx context.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond) // ElectionTick=10 → 选举超时约 1s
 	defer ticker.Stop()
 	defer close(gr.doneCh)
+	// 存生命周期 ctx：读屏障的合流驱动 goroutine 以它为父 ctx，组退出时
+	// 在途的 read-index 轮次随之取消，不会挂着等到 barrierTimeout。
+	gr.lifeCtx = ctx
 	for {
 		select {
 		case <-ctx.Done():
@@ -384,6 +415,10 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	//    知道「哪份快照发给了哪个 peer」的时刻（见 noteSnapSends）。
 	gr.noteSnapSends(rd.Messages)
 	gr.send(gr.g, rd.Messages)
+	// 2.5 读状态回流：raft 已确认本节点在当前任期仍是 leader，给出的
+	//     readIndex 是本轮读屏障的下界。放在 apply 之前处理只是为了拿到
+	//     index；真正放行由 index<=applied 决定，apply 之后还会再扫一次。
+	gr.stepReadStates(rd.ReadStates)
 	// leader 变更观测：SoftState 变化是切换的第一信号（当选与失联都在此）
 	if rd.SoftState != nil {
 		// 顺序即屏障（batch③ 评审 m1）：先跑钩子（同步失效计数器缓存），
@@ -509,6 +544,9 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 			gr.notifyWaiter(gr.ccWaiters, cc.id)
 		}
 	}
+	// 读屏障放行必须晚于 apply：applied 是本轮 apply 推进的，早于它扫描
+	// 只会白扫一遍，屏障要多等一整轮 Ready 才放行。
+	gr.notifyReadWaiters(gr.applied.Load())
 }
 
 // keepTicking 在快照安装期间保持本组的选举计时器走动，返回停止函数。
