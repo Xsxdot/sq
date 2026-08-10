@@ -460,6 +460,14 @@ func NewManager(o Options) (*Manager, error) {
 		}
 	}
 
+	// local-resume 在 mem 档下同样要抬任期：投票记录走 NoSync 异步路径，
+	// 可能没落盘（见 needsTermBump）。local-forced 已在上面抬过，不重复。
+	if path == pathLocalResume && needsTermBump(path, o.Mode) {
+		if err := m.rs.BumpTermsForLocalResume(o.DataGroups); err != nil {
+			return nil, err
+		}
+	}
+
 	// 世代只在能启动成功的路径上落盘（拒启分支已在上面 return）。
 	// 语义是「本数据目录最后一次被运行中的节点写入，发生在哪个世代」，
 	// 顺序写反即安全门失效——理由详见 SaveBootGen 的注释。

@@ -253,3 +253,28 @@ func GrantRecoverPermit(st *store.Store, now time.Time, bootGen BootGenFunc, lg 
 	rs := newRaftStore(st, lg)
 	return rs.SaveRecoverPermit(recoverPermit{GrantedAt: now.Format(time.RFC3339), Gen: gen})
 }
+
+// needsTermBump 判定某条恢复路径是否必须在回放前抬任期、清投票。
+//
+// 判据是**投票记录是不是同步落盘的**，不是「机器有没有重启」：
+//   - fsync 档：syncPersist 跟随 raft.MustSync，term/vote 每次变更都已 fsync，
+//     投票不可能丢，抬了纯属白白多付一次选举
+//   - mem 档：HardState 走 Pebble 的 NoSync——commit 返回时数据可能还在
+//     进程内的 WAL 缓冲里（write(2) 由 flusher goroutine 异步执行），
+//     所以任何一次不干净关机后都可能少一张已投出的票
+//
+// 少一张票的后果是**损坏**而非丢数据：同一任期投第二次 → 两个 leader →
+// 日志分叉。抬任期在 raft 中永远安全，代价只是强制一次重新选举。
+//
+// clean-resume 不需要：MarkCleanShutdown 是 Sync 写，会把此前所有 NoSync
+// 写一并刷盘。fresh 无历史。rejoin 会清空状态重入，更无从谈起。
+func needsTermBump(p recoveryPath, mode AckMode) bool {
+	switch p {
+	case pathLocalForced:
+		return true
+	case pathLocalResume:
+		return mode == AckQuorumMem
+	default:
+		return false
+	}
+}

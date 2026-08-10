@@ -760,3 +760,80 @@ func TestForcedLocalRecoverWithPermit(t *testing.T) {
 	m2.kill()
 	<-m2.Done()
 }
+
+// TestUncleanSameBootMemBumpsTerm mem 档下世代未变的本地恢复也必须抬 term。
+//
+// 不抬的后果不是丢数据而是损坏：本节点可能在任期 T 投过票但没落盘，
+// 重启后又在 T 投第二次，同一任期两个 leader、日志分叉。
+func TestUncleanSameBootMemBumpsTerm(t *testing.T) {
+	dir := t.TempDir()
+	st1, m1 := startSoloManager(t, dir, AckQuorumMem, withBootGen("gen-a"))
+	waitSoloLeader(t, m1)
+	m1.kill()
+	<-m1.Done()
+	before, _, _, err := newRaftStore(st1, testSlog(t)).Load(0)
+	if err != nil {
+		t.Fatalf("读恢复前 HardState: %v", err)
+	}
+	beforeTerm := before.GetTerm()
+	if err := st1.Close(); err != nil {
+		t.Fatalf("关闭 store: %v", err)
+	}
+
+	st2 := mustOpenStore(t, dir)
+	o := soloOptions(t, st2, dir, AckQuorumMem)
+	withBootGen("gen-a")(&o)
+	m2, err := NewManager(o)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	after, _, _, err := newRaftStore(st2, testSlog(t)).Load(0)
+	if err != nil {
+		t.Fatalf("读恢复后 HardState: %v", err)
+	}
+	if after.GetTerm() <= beforeTerm {
+		t.Fatalf("term = %d，未高于恢复前的 %d——mem 档 local-resume 必须抬任期", after.GetTerm(), beforeTerm)
+	}
+	if after.GetVote() != 0 {
+		t.Fatalf("vote = %d; want 0——可能丢失的投票记录必须清空", after.GetVote())
+	}
+	m2.Start(context.Background()) // kill 依赖 Start 设置的 cancel 与 Done 观察者，未 Start 直接 kill 会 panic/挂死
+	m2.kill()
+	<-m2.Done()
+}
+
+// TestUncleanFsyncLocalResumeKeepsTerm fsync 档不抬 term：投票每次变更都已
+// fsync，抬了纯属白白多付一次选举，抬了也说明实现把判据搞错了。
+func TestUncleanFsyncLocalResumeKeepsTerm(t *testing.T) {
+	dir := t.TempDir()
+	st1, m1 := startSoloManager(t, dir, AckQuorumFsync, withBootGen("gen-a"))
+	waitSoloLeader(t, m1)
+	m1.kill()
+	<-m1.Done()
+	before, _, _, err := newRaftStore(st1, testSlog(t)).Load(0)
+	if err != nil {
+		t.Fatalf("读恢复前 HardState: %v", err)
+	}
+	beforeTerm := before.GetTerm()
+	if err := st1.Close(); err != nil {
+		t.Fatalf("关闭 store: %v", err)
+	}
+
+	st2 := mustOpenStore(t, dir)
+	o := soloOptions(t, st2, dir, AckQuorumFsync)
+	withBootGen("gen-b")(&o) // 机器重启过，走 fsync 档的 local-resume
+	m2, err := NewManager(o)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	after, _, _, err := newRaftStore(st2, testSlog(t)).Load(0)
+	if err != nil {
+		t.Fatalf("读恢复后 HardState: %v", err)
+	}
+	if after.GetTerm() != beforeTerm {
+		t.Fatalf("term 从 %d 变成了 %d——fsync 档不该抬任期", beforeTerm, after.GetTerm())
+	}
+	m2.Start(context.Background()) // kill 依赖 Start 设置的 cancel 与 Done 观察者，未 Start 直接 kill 会 panic/挂死
+	m2.kill()
+	<-m2.Done()
+}

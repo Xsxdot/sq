@@ -682,6 +682,40 @@ func (r *raftStore) LoadRecoverPermit() (recoverPermit, bool, error) {
 	return recoverPermit{GrantedAt: parts[0], Gen: parts[1]}, true, nil
 }
 
+// bumpTermsInto 把组 0..dataGroups 每组 HardState 的 Term 加 1、Vote 清空，
+// 写进给定批次（不提交——提交时机由调用方决定，这样抬 term 才能与消费许可
+// 同批原子落盘）。
+//
+// commit 位点刻意不动：它由日志重放与 leader 重新告知恢复，抬它没有意义
+// 且会与真实日志脱节。
+func (r *raftStore) bumpTermsInto(b *store.Batch, dataGroups uint32) error {
+	for g := uint32(0); g <= dataGroups; g++ {
+		hs := &raftpb.HardState{}
+		data, ok, err := r.st.Get(hsKey(g))
+		if err != nil {
+			return fmt.Errorf("组 %d 读 HardState: %w", g, err)
+		}
+		if ok {
+			if err := proto.Unmarshal(data, hs); err != nil {
+				return fmt.Errorf("组 %d 解码 HardState: %w", g, err)
+			}
+		}
+		newTerm := hs.GetTerm() + 1
+		var noVote uint64
+		hs.Term = &newTerm
+		hs.Vote = &noVote
+		enc, err := proto.Marshal(hs)
+		if err != nil {
+			return fmt.Errorf("组 %d 编码 HardState: %w", g, err)
+		}
+		if err := b.Set(hsKey(g), enc); err != nil {
+			return fmt.Errorf("组 %d 写 HardState: %w", g, err)
+		}
+		r.lg.Error("不干净关机后本地恢复：任期已抬、投票已清", "g", g, "term", newTerm)
+	}
+	return nil
+}
+
 // ForceLocalRecover 执行签字放行的本地恢复前置：抬全部组的任期、清空
 // 投票，并消费掉一次性许可。三件事在同一批次内 Sync 提交。
 //
@@ -693,44 +727,17 @@ func (r *raftStore) LoadRecoverPermit() (recoverPermit, bool, error) {
 // 日志分叉。这比丢数据严重，是损坏。抬任期在 raft 中永远安全（代价只是
 // 强制一次重新选举），抬完之后本节点不可能再在 T 投第二次。
 //
-// 为什么只有这条路径抬：另外三条恢复路径本来就没丢过投票，抬了纯属白白
-// 多付一次选举。
-//
 // 为什么与消费许可同批：两者必须同生共死。若先抬 term 后删许可而中间
 // 崩溃，许可会被重复消费；若先删许可后抬 term 而中间崩溃，运维签的字白费
 // 且节点仍带着旧任期启动。单批原子提交让这两种半截状态都不存在。
 //
 // 注意：commit 位点不动——它由日志重放与 leader 重新告知恢复，抬它没有
-// 意义且会与真实日志脱节。
+// 意义且会与真实日志脱节。抬 term 的适用范围见 needsTermBump。
 func (r *raftStore) ForceLocalRecover(dataGroups uint32) error {
 	b := r.st.NewBatch()
-	for g := uint32(0); g <= dataGroups; g++ {
-		hs := &raftpb.HardState{}
-		data, ok, err := r.st.Get(hsKey(g))
-		if err != nil {
-			b.Close()
-			return fmt.Errorf("raftstore ForceLocalRecover 组 %d 读 HardState: %w", g, err)
-		}
-		if ok {
-			if err := proto.Unmarshal(data, hs); err != nil {
-				b.Close()
-				return fmt.Errorf("raftstore ForceLocalRecover 组 %d 解码 HardState: %w", g, err)
-			}
-		}
-		newTerm := hs.GetTerm() + 1
-		var noVote uint64
-		hs.Term = &newTerm
-		hs.Vote = &noVote
-		enc, err := proto.Marshal(hs)
-		if err != nil {
-			b.Close()
-			return fmt.Errorf("raftstore ForceLocalRecover 组 %d 编码 HardState: %w", g, err)
-		}
-		if err := b.Set(hsKey(g), enc); err != nil {
-			b.Close()
-			return fmt.Errorf("raftstore ForceLocalRecover 组 %d 写 HardState: %w", g, err)
-		}
-		r.lg.Error("签字放行本地恢复：任期已抬、投票已清", "g", g, "term", newTerm)
+	if err := r.bumpTermsInto(b, dataGroups); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ForceLocalRecover: %w", err)
 	}
 	if err := b.Delete([]byte(recoverPermitKey)); err != nil {
 		b.Close()
@@ -740,6 +747,23 @@ func (r *raftStore) ForceLocalRecover(dataGroups uint32) error {
 		return fmt.Errorf("raftstore ForceLocalRecover: %w", err)
 	}
 	r.lg.Error("一次性本地恢复许可已消费（本次生效，不再对后续任何一次不干净关机放行）", "groups", dataGroups+1)
+	return nil
+}
+
+// BumpTermsForLocalResume 为 local-resume 抬任期、清投票并 Sync 落盘。
+//
+// 与 ForceLocalRecover 的区别只有一个：本方法**不碰许可键**。local-resume
+// 本来就不需要运维签字（它要么世代未变、要么是 fsync 档），只是 mem 档下
+// 投票记录可能没落盘，所以同样要抬任期。见 needsTermBump 的注释。
+func (r *raftStore) BumpTermsForLocalResume(dataGroups uint32) error {
+	b := r.st.NewBatch()
+	if err := r.bumpTermsInto(b, dataGroups); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore BumpTermsForLocalResume: %w", err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore BumpTermsForLocalResume: %w", err)
+	}
 	return nil
 }
 

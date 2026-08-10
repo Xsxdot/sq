@@ -126,3 +126,29 @@ func TestInspectRecoveryReportsPathAndPermitNeed(t *testing.T) {
 		t.Fatal("世代未变时 NeedsPermit 应为 false")
 	}
 }
+
+// TestNeedsTermBump 抬 term 的适用范围——按 spec §3.3 的表逐格覆盖。
+//
+// 判据是「投票记录是不是同步落盘的」，不是「机器有没有重启」：
+// fsync 档跟随 MustSync，term/vote 每次变更都已 fsync，投票不可能丢；
+// mem 档走 NoSync 异步路径，commit 返回时可能还在进程内缓冲。
+func TestNeedsTermBump(t *testing.T) {
+	cases := []struct {
+		path recoveryPath
+		mode AckMode
+		want bool
+	}{
+		{pathLocalResume, AckQuorumMem, true},
+		{pathLocalResume, AckQuorumFsync, false},
+		{pathLocalForced, AckQuorumMem, true},
+		{pathCleanResume, AckQuorumMem, false},
+		{pathCleanResume, AckQuorumFsync, false},
+		{pathFresh, AckQuorumMem, false},
+		{pathRejoin, AckQuorumMem, false},
+	}
+	for _, c := range cases {
+		if got := needsTermBump(c.path, c.mode); got != c.want {
+			t.Fatalf("needsTermBump(%v, %v) = %v; want %v", c.path, c.mode, got, c.want)
+		}
+	}
+}
