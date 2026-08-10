@@ -74,6 +74,10 @@ type NodeView struct {
 
 // GroupView 一个 raft 组在**本节点视角**下的状态。
 //
+// Commit 是 raft 提交位点（HardState.Commit，每个节点都有，follower 也有）；
+// Applied 是本节点已 apply 到位点。两者之差 commit−applied 即「待 apply」
+// ——applier 卡住会立刻显形，且每个节点自己就算得出（不依赖 leader 数据）。
+//
 // 注意：Peers 只有在本节点是该组 leader 时才有内容——raft 的
 // tracker.Progress 只在 leader 上维护，follower 上是空表。前端必须按
 // IsLeader 决定要不要渲染这一段，不能把空表当成"没有 peer"。
@@ -83,6 +87,7 @@ type GroupView struct {
 	IsLeader bool               `json:"is_leader"`
 	Role     string             `json:"role"`
 	Applied  uint64             `json:"applied"`
+	Commit   uint64             `json:"commit"`
 	Term     uint64             `json:"term"`
 	Peers    []PeerProgressView `json:"peers"`
 }
@@ -128,11 +133,15 @@ func (r *Cluster) Topology() ClusterView {
 			continue
 		}
 		leader, _ := r.m.Leader(g)
-		// Term 是 protobuf 指针：nil 时按 0 处理（组刚启动、尚未落过
+		// Term/Commit 是 protobuf 指针：nil 时按 0 处理（组刚启动、尚未落过
 		// HardState 的形态）
 		var term uint64
 		if st.HardState != nil && st.HardState.Term != nil {
 			term = *st.HardState.Term
+		}
+		var commit uint64
+		if st.HardState != nil && st.HardState.Commit != nil {
+			commit = *st.HardState.Commit
 		}
 		gv := GroupView{
 			ID:       g,
@@ -140,6 +149,7 @@ func (r *Cluster) Topology() ClusterView {
 			IsLeader: leader == self,
 			Role:     st.RaftState.String(),
 			Applied:  r.m.AppliedIndex(g),
+			Commit:   commit,
 			Term:     term,
 			Peers:    make([]PeerProgressView, 0, len(st.Progress)),
 		}
