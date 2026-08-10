@@ -60,9 +60,9 @@ func writeMsgAt(t *testing.T, st *store.Store, topic string, offset uint64, stor
 // fixedLeaderRouter 可编程 Router：IsLeader 按字段返回（leader-only 门控单测用）。
 type fixedLeaderRouter struct{ leader bool }
 
-func (r fixedLeaderRouter) GroupForQueue(string, uint32) uint32 { return 0 }
-func (r fixedLeaderRouter) MetaGroup() uint32                   { return 0 }
-func (r fixedLeaderRouter) IsLeader(uint32) bool                { return r.leader }
+func (r fixedLeaderRouter) GroupForQueue(string, uint32) uint32       { return 0 }
+func (r fixedLeaderRouter) MetaGroup() uint32                         { return 0 }
+func (r fixedLeaderRouter) IsLeader(uint32) bool                      { return r.leader }
 func (r fixedLeaderRouter) ReadBarrier(context.Context, uint32) error { return nil }
 
 // TestPassPurgesExpired 过期消息与索引被清，未过期保留。
