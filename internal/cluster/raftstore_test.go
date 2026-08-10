@@ -242,3 +242,28 @@ func TestTruncateLogIsIdempotent(t *testing.T) {
 		t.Fatalf("重复截断必须无害: %v", err)
 	}
 }
+
+// TestBootGenRoundTrip 机器世代的写入→读回→覆盖写。
+func TestBootGenRoundTrip(t *testing.T) {
+	st := mustOpenStore(t, t.TempDir())
+	rs := newRaftStore(st, testSlog(t))
+
+	if _, ok, err := rs.LoadBootGen(); err != nil || ok {
+		t.Fatalf("空库 LoadBootGen = (_, %v, %v); want (_, false, nil)", ok, err)
+	}
+	if err := rs.SaveBootGen("gen-1"); err != nil {
+		t.Fatalf("SaveBootGen: %v", err)
+	}
+	got, ok, err := rs.LoadBootGen()
+	if err != nil || !ok || got != "gen-1" {
+		t.Fatalf("LoadBootGen = (%q, %v, %v); want (\"gen-1\", true, nil)", got, ok, err)
+	}
+	// 覆盖写：每次启动都要写当次世代，旧值不得残留
+	if err := rs.SaveBootGen("gen-2"); err != nil {
+		t.Fatalf("SaveBootGen 覆盖: %v", err)
+	}
+	got, _, _ = rs.LoadBootGen()
+	if got != "gen-2" {
+		t.Fatalf("覆盖后 LoadBootGen = %q; want \"gen-2\"", got)
+	}
+}

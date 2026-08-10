@@ -31,6 +31,8 @@
 //	raft/preraft                 → 前 raft 期存量数据标记（单机档直写 FSM
 //	                               的数据不在任何 raft 日志里，MarkPreRaft/
 //	                               HasPreRaft，Join 的种子档位判据）
+//	raft/bootgen                 → 机器世代（写入时机见 SaveBootGen 注释：
+//	                               只在能启动成功的路径上写，拒启分支绝不写）
 //	raft/<g>/hs                  → HardState protobuf
 //	raft/<g>/conf                → ConfState protobuf（成员表，ConfChange
 //	                               apply 时整表覆盖写，SaveConfState）
@@ -70,6 +72,7 @@ const (
 	groupsKey           = "raft/groups"
 	cleanShutdownKey    = "raft/clean_shutdown"
 	preRaftKey          = "raft/preraft"
+	bootGenKey          = "raft/bootgen"
 	groupEntPrefixFmt   = "raft/%d/ent/"
 	groupHsKeyFmt       = "raft/%d/hs"
 	groupConfFmt        = "raft/%d/conf"
@@ -582,6 +585,47 @@ func (r *raftStore) HasPreRaft() (bool, error) {
 		return false, fmt.Errorf("raftstore HasPreRaft: %w", err)
 	}
 	return ok, nil
+}
+
+// LoadBootGen 读取盘上记录的机器世代。
+//
+// 返回：
+//   - 世代字符串、是否存在、错误
+//   - 从未写入过时返回 ("", false, nil)——首次以本版本启动的旧数据目录
+//     即此形态，恢复判定必须把它当作「世代不可比 = 保守处理」
+func (r *raftStore) LoadBootGen() (string, bool, error) {
+	data, ok, err := r.st.Get([]byte(bootGenKey))
+	if err != nil {
+		return "", false, fmt.Errorf("raftstore LoadBootGen: %w", err)
+	}
+	if !ok {
+		return "", false, nil
+	}
+	return string(data), true, nil
+}
+
+// SaveBootGen 写入本次启动的机器世代并 Sync 落盘。
+//
+// 写入时机是安全关键，调用方必须遵守：**只在决定走一条能启动成功的
+// 路径之后才调用**（clean-resume / fresh / local-resume / local-forced），
+// ErrUncleanShutdown 分支绝不调用。
+//
+// 理由：本键的语义是「本数据目录最后一次被运行中的节点写入，发生在哪个
+// 机器世代」。若拒启分支也写，序列就变成——机器重启 → 判定需要人工签字
+// → 顺手写了新世代 → 重入编排失败拒启 → 运维直接重启进程 → 此时盘上
+// 世代已等于当前世代 → 自动判定「机器没重启过、本地日志可信」→ 签字门
+// 被静默绕过。整扇安全门会因这一处顺序错误而形同虚设。
+func (r *raftStore) SaveBootGen(gen string) error {
+	b := r.st.NewBatch()
+	if err := b.Set([]byte(bootGenKey), []byte(gen)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore SaveBootGen: %w", err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore SaveBootGen: %w", err)
+	}
+	r.lg.Info("机器世代已记录", "gen", gen)
+	return nil
 }
 
 // confStateFromEntries 从日志条目重放成员变更，按 commit 裁剪后合成
