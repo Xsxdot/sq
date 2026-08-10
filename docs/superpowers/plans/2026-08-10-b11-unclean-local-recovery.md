@@ -2046,7 +2046,7 @@ EOF
 ### Task 7: e2e 场景用例
 
 **Files:**
-- Modify: `test/e2e/cluster_proc_test.go`（`spawn` 支持注入环境变量）
+- Modify: `test/e2e/cluster_proc_test.go`（`spawn` 支持注入环境变量；新增 `restartAll`）
 - Modify: `test/e2e/cluster_scenario_test.go`（改写 1 条、新增 3 条）
 
 **Interfaces:**
@@ -2079,6 +2079,44 @@ EOF
 func (pc *procCluster) setEnv(i int, kv ...string) {
 	pc.env[i] = append(pc.env[i], kv...)
 }
+```
+
+同一文件再加一个整批重启助手——**全集群停机后不能逐台 `restart`**：
+
+```go
+// restartAll 整批原地重启全部节点：先全部起进程、再逐个等就绪。
+//
+// 与 restart 的区别：全集群停机（进程全崩／真掉电后上电）后**必须先把进程
+// 全起来、再逐个等就绪**——ready 判定依赖 waitMetaLeader，而 raft 选举要
+// quorum；首个节点起来时是 1 of 3，选不出 leader，gRPC 监听不会出现。逐台
+// restart 会在第一个节点上等满 brokerStartTimeout 然后 Fatal（用例红在
+// harness 上，和被测行为无关）。restartAll 让三个进程几乎同时起，第二、三
+// 个节点一就绪多数派立刻成型、选举随即收敛。与 startProcCluster 的装配序
+// 是同一个道理（见该函数注释）。
+func (pc *procCluster) restartAll(t *testing.T) {
+	t.Helper()
+	for i := range pc.handles {
+		if pc.handles[i].cmd.Process != nil {
+			t.Fatalf("节点 %d 仍在运行，restartAll 前必须先 kill/stopGraceful", i+1)
+		}
+	}
+	for i := range pc.handles {
+		ep := pc.handles[i].endpoint
+		pc.handles[i] = pc.spawn(t, i, ep)
+	}
+	for i := range pc.handles {
+		waitBrokerReady(t, pc.handles[i].endpoint, pc.handles[i].waitDone, pc.handles[i].logPath)
+		t.Logf("节点 %d 已重启就绪 pid=%d", i+1, pc.handles[i].cmd.Process.Pid)
+	}
+}
+```
+
+顺带给既有的 `restart` doc 注释补一句适用范围，免得下一个人再踩：
+
+```go
+// 只适用于「多数派仍存活」的单点重启：ready 判定依赖 waitMetaLeader 先过，
+// 而选主要 quorum——全集群停机后的整批重启请用 restartAll，逐台 restart 会
+// 在第一个节点上死锁（详见 restartAll 注释）。
 ```
 
 - [ ] **Step 2: 改写 `TestScenarioFullPowerLossCannotRecover`**
@@ -2114,9 +2152,7 @@ func TestScenarioFullProcessCrashRecoversLocally(t *testing.T) {
 	for i := range pc.handles {
 		pc.kill(t, i)
 	}
-	for i := range pc.handles {
-		pc.restart(t, i)
-	}
+	pc.restartAll(t)
 
 	// 集群恢复可写 = 选主成功 = 三份本地日志都被接纳
 	ledger.append(t, sendAndTrack(t, pc.multi(), 60))
@@ -2211,9 +2247,7 @@ func TestScenarioRebootedMemRecoversAfterGrant(t *testing.T) {
 		}
 		t.Logf("节点 %d 签字输出：\n%s", i+1, out)
 	}
-	for i := range pc.handles {
-		pc.restart(t, i)
-	}
+	pc.restartAll(t)
 	ledger.append(t, sendAndTrack(t, pc.multi(), 40))
 	ledger.assertNoLoss(t, pc.multi())
 	for i := range pc.handles {
@@ -2235,6 +2269,7 @@ func TestScenarioRebootedFsyncResumesLocally(t *testing.T) {
 	ledger := sendAndTrack(t, pc.multi(), 60)
 	// fsync 档下条目每次 MustSync 都已落盘，理论上无需静置；仍留一小段，
 	// 让本用例与前两条保持同一形态，避免日后有人以为这里可以省
+	time.Sleep(500 * time.Millisecond)
 
 	for i := range pc.handles {
 		pc.kill(t, i)
@@ -2242,9 +2277,7 @@ func TestScenarioRebootedFsyncResumesLocally(t *testing.T) {
 	for i := range pc.handles {
 		pc.setEnv(i, "SQ_BOOTGEN_OVERRIDE=gen-after-reboot")
 	}
-	for i := range pc.handles {
-		pc.restart(t, i)
-	}
+	pc.restartAll(t)
 	ledger.append(t, sendAndTrack(t, pc.multi(), 30))
 	ledger.assertNoLoss(t, pc.multi())
 }
