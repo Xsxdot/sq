@@ -82,15 +82,6 @@ func (c *confirmedSet) assertAllConsumed(t *testing.T, got map[string]bool) {
 		len(c.ids), len(got))
 }
 
-// mergeInto 把本集合并入 dst（多个阶段的对账集合收拢时用）。
-func (c *confirmedSet) mergeInto(dst *confirmedSet) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	for id := range c.ids {
-		dst.confirm(id)
-	}
-}
-
 // produceThrottle 是场景用例的发送节流：每条 Send 之间等这么久。
 //
 // 为什么要节流：SDK 单消费者对积压的排水速率实测仅约 60 msg/s（一次
@@ -449,19 +440,31 @@ func (pc *procCluster) restartUnready(t *testing.T, i int) {
 	h.cmd.Process = nil
 }
 
-// TestScenarioPowerLossMajoritySurvives 多数派存活下的断电：kill 1 of 3，
-// 保留 2 个存活节点（quorum 仍在）——已确认消息由存活节点保留，掉队
-// 节点经 Rejoin 从 leader 追齐（幸存者能提交成员变更，有 quorum）。
+// TestScenarioPowerLossQuorumLostThenRestored 断电后 quorum 丢失再恢复：
+// 断电时一个节点优雅停（SIGTERM 写干净关机标记）、一个节点 kill -9（不
+// 干净）、一个节点保持存活——此刻 1 of 3 存活、无 quorum、写不进去
+// （「少数派不可写」红线已由场景二守着，不重复断言）。
 //
-// 与 TestScenarioFullPowerLossCannotRecover 互补：那是全集群断电的 P0 死
-// 路（无人能批准重入），这是「多数派在，断电可自愈」的绿路径——quorum
-// 保留数据这一半由它单独钉住。
-func TestScenarioPowerLossMajoritySurvives(t *testing.T) {
+// 断电前确认集里的消息，在两个掉队节点追齐之后必须全部可消费。
+//
+// 为什么是这两种停机方式而不是全杀：干净关机（优雅停）的节点重启时从
+// 本地日志**原身份回归**（RestartNode，不 wipe）——这是全套件里唯一单独
+// 覆盖「集群档下干净关机 → 本地日志原身份恢复」的用例；kill -9 的节点走
+// 的是不干净的 Rejoin 追齐。同一场景里干净与不干净两条恢复路混合出现，
+// 正是「断电」区别于「kill leader」的地方。
+//
+// **重启顺序是硬性的：必须先重启优雅停的节点，再重启被 kill 的节点。**
+// 这不是测试技巧，它就是这类故障的运维恢复步骤：先把能干净恢复的节点
+// 拉起来重建多数派，再让不干净的节点重入。顺序反过来的话——被 kill 的
+// 节点先起时集群还没有 leader（存活单节点给不出成员变更 quorum），重入
+// 编排拿不到接纳：在本分支的代码上它先清空数据目录再失败（数据没了），
+// wipe 顺序修复后会保留数据拒启——两种都让用例不成立。
+func TestScenarioPowerLossQuorumLostThenRestored(t *testing.T) {
 	if testing.Short() {
 		t.Skip("场景测试耗时，-short 跳过")
 	}
 	pc := startProcCluster(t, 3)
-	const topic, group = "scn-majority-loss", "scn-majority-loss-g"
+	const topic, group = "scn-quorum-lost", "scn-quorum-lost-g"
 	ensureTopic(t, pc.endpoints(), topic)
 	waitRouteSpread(t, pc.endpoints(), topic, 60*time.Second)
 
@@ -474,25 +477,49 @@ func TestScenarioPowerLossMajoritySurvives(t *testing.T) {
 	time.Sleep(8 * time.Second)
 	close(stop)
 	wg.Wait()
+	producer.GracefulStop()
 	confirmed := cs.size()
 	if confirmed == 0 {
 		t.Fatal("断电前一条都没确认，用例没测到东西")
 	}
-	t.Logf("断电时确认集 %d 条（多数派存活）", confirmed)
+	t.Logf("断电时确认集 %d 条", confirmed)
 
-	// 断电：同时 SIGKILL 掉 1 个节点（多数派=2 仍存活，quorum 不失）——
-	// 与场景一（杀数据组 leader）不同，这里不挑 leader，杀任意一个节点
-	victim := 1
-	t.Logf("断电 kill 节点 %d（多数派 2 个存活）", victim+1)
-	pc.kill(t, victim)
+	// 断电：X 优雅停（干净关机标记）、Y kill -9（不干净）、Z 保持存活。
+	// 此刻 1 of 3 存活、无 quorum（写不进去，红线由场景二守着）。
+	x, y, z := 0, 1, 2
+	t.Logf("断电：节点 %d 优雅停、节点 %d kill -9、节点 %d 存活", x+1, y+1, z+1)
+	pc.stopGraceful(t, x)
+	pc.kill(t, y)
+	if pc.aliveCount() != 1 {
+		t.Fatalf("断电后应只剩 1 个存活节点，实为 %d", pc.aliveCount())
+	}
 
-	// 上电：重启掉队节点（不干净关机 → ErrUncleanShutdown → Rejoin 自愈，
-	// 幸存者能批准成员变更），等路由恢复。
-	pc.restart(t, victim)
-	waitRouteSpread(t, pc.endpoints(), topic, 120*time.Second)
+	// 上电①：先重启 X（优雅停 → 干净恢复，从本地日志原身份回归）。
+	pc.restart(t, x)
+	// 等 quorum 恢复：X + Z = 2 of 3，全部组选出 leader、路由可答。用
+	// QueryRoute（无副作用，不污染 topic 影响对账）轮询等就绪。
+	readyDeadline := time.Now().Add(60 * time.Second)
+	ready := false
+	for !ready && time.Now().Before(readyDeadline) {
+		if qs, err := tryQueryRoute(pc.endpointOf(z), topic); err == nil && len(qs) > 0 {
+			ready = true
+		} else {
+			time.Sleep(2 * time.Second)
+		}
+	}
+	if !ready {
+		t.Fatal("X 干净恢复后 60s 内 quorum 未恢复（2 of 3 无法选主）")
+	}
+	t.Logf("X 干净恢复后 quorum 已恢复（2 of 3 选出 leader）")
 
+	// 上电②：再重启 Y（不干净 → Rejoin；此刻有 leader 可批准成员变更）。
+	pc.restart(t, y)
+	waitRouteSpread(t, pc.endpoints(), topic, 180*time.Second)
+
+	// 对账：断电前确认集必须全部可消费（X 干净回归 + Z 未离场保留数据，
+	// Y 追齐后三节点一致）
 	consumer := newClusterConsumer(t, pc.multi(), group, topic, clusterConsumerAwaitShort)
-	got := recvAllAck(t, consumer, confirmed, 240*time.Second, "majority-loss 对账", false)
+	got := recvAllAck(t, consumer, confirmed, 240*time.Second, "quorum-lost-restore 对账", false)
 	cs.assertAllConsumed(t, got)
 }
 
