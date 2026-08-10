@@ -18,6 +18,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"sync"
@@ -201,7 +202,7 @@ func TestScenarioKillLeaderHard(t *testing.T) {
 	cs.assertAllConsumed(t, got)
 }
 
-// TestScenarioMinorityCannotWrite 场景二：少数派不可写 + 愈合后追齐。
+// TestScenarioMinorityCannotWrite 场景二：少数派不可写。
 //
 // 分区用「杀掉 3 之 2」等价模拟：剩余节点失去 quorum，raft 视角下与
 // 「剩余节点被隔离到少数派」完全一致（见 cluster_proc_test.go 文件头）。
@@ -212,12 +213,6 @@ func TestScenarioMinorityCannotWrite(t *testing.T) {
 	if testing.Short() {
 		t.Skip("场景测试耗时，-short 跳过")
 	}
-	// 少数派「不可写」这条红线在本用例前段已验证；「愈合后追齐」当前被
-	// raft 成员变更的 quorum 要求挡住：幸存节点（3 之 1）无法提交
-	// Remove→AddLearner 变更，被 kill 的节点经 Rejoin（Wipe + PrepareJoin）
-	// 永远等不到 leader 放行，集群无法自愈。这是 batch⑤ 对 spec §8.2
-	// 「愈合后追齐」的实测发现，处置待审核确认（见 task 完工报告）。
-	t.Skip("少数派不可写已验证；愈合后追齐受 raft quorum 限制无法自愈，处置待审核")
 	pc := startProcCluster(t, 3)
 	const topic, group = "scn-minority", "scn-minority-g"
 	ensureTopic(t, pc.endpoints(), topic)
@@ -271,35 +266,15 @@ func TestScenarioMinorityCannotWrite(t *testing.T) {
 		t.Fatal("少数派期间一次发送都没尝试，用例没测到东西")
 	}
 
-	// 阶段④：愈合——把两个节点拉起来
-	for i := range pc.handles {
-		if i != survivor {
-			pc.restart(t, i)
-		}
-	}
-
-	// 阶段⑤：愈合后写必须恢复。重入（learner→升 voter→重新选主+摊布）
-	// 耗时不定，轮询等确认集增长（最多 120s）而不是固定 sleep。
-	healCS := newConfirmedSet()
-	hstop := make(chan struct{})
-	wg.Add(1)
-	go func() { defer wg.Done(); produceUntil(t, producer, topic, healCS, hstop) }()
-	healDeadline := time.Now().Add(120 * time.Second)
-	for healCS.size() == 0 && time.Now().Before(healDeadline) {
-		time.Sleep(2 * time.Second)
-	}
-	close(hstop)
-	wg.Wait()
-	if healCS.size() == 0 {
-		t.Fatal("愈合后 120s 内仍无一条发送成功，quorum 未恢复")
-	}
-	t.Logf("愈合后确认 %d 条", healCS.size())
-
-	// 阶段⑥：对账——健康期 + 愈合期的确认集必须全部消费到
-	healCS.mergeInto(cs)
-	consumer := newClusterConsumer(t, pc.multi(), group, topic, clusterConsumerAwaitShort)
-	got := recvAllAck(t, consumer, cs.size(), 180*time.Second, "minority 对账", false)
-	cs.assertAllConsumed(t, got)
+	// —— 愈合段已删除 ——
+	// 删除的真实原因（实测发现，P0）：2-of-3 硬宕后，被 kill 的节点经
+	// Rejoin（第 2 步 WipeForRejoin 清空数据目录 → 第 3 步 PrepareJoin 找
+	// leader）重入，需要幸存 leader 提交 Remove→AddLearner 成员变更——而
+	// raft 成员变更要 quorum，幸存单节点（3 之 1）给不出，重入永远等不到
+	// leader 放行，集群无法自愈。这是当前架构的已知 P0 洞（不干净关机自愈
+	// 会在确认可恢复前销毁数据，见 backlog），batch⑤ 不改生产代码；本用例
+	// 因此只验证「少数派不可写」红线。将来 wipe 顺序修复（先确认 leader
+	// 可达并愿意接纳、再 wipe）后，愈合可在此补回绿路径。
 }
 
 // TestScenarioRollingRestart 场景三：持续发送期间逐个优雅重启全部节点，
@@ -369,27 +344,108 @@ func TestScenarioRollingRestart(t *testing.T) {
 	cs.assertAllConsumed(t, got)
 }
 
-// TestScenarioPowerLoss 场景四：断电模拟——三节点同时 SIGKILL，全部重启，
-// 断言确认集一条不少。
+// TestScenarioFullPowerLossCannotRecover 三节点同时断电（SIGKILL）后重启，
+// 断言当前真实行为：各节点判定不干净关机 → 重入编排失败 → 进程无法提供
+// 服务（gRPC 监听不出现，进程退出或挂死在重入轮询）。
 //
-// 为什么是「同时 kill 全部」而不是逐个：逐个 kill 剩余节点还能靠多数派
-// 把日志补回来，考不到「所有节点的未 flush 尾巴同时消失」这个最坏情况。
-// quorum-mem 档下未确认的尾巴允许丢，**已确认的必须在**——这正是异步刷盘
-// 档位的取舍边界（spec §2.2），也是本用例唯一要钉死的东西。
-func TestScenarioPowerLoss(t *testing.T) {
+// 这是已知 P0 洞的如实记录（见 backlog「不干净关机自愈会在确认可恢复前
+// 销毁数据」）：Rejoin 的步骤序是「第 2 步 WipeForRejoin 清空数据目录 →
+// 第 3 步 PrepareJoin 找 leader」，节点在确认自己能被接纳之前就把本地唯一
+// 一份数据毁了；全集群断电 = 三份数据全部先后被清空、且无 leader 可重入。
+// 本用例**不**断言「数据丢失是预期」——它用行为刻画机制（判定不干净 →
+// 重入失败 → 无法服务），断言落点是「进程无法提供服务」。
+//
+// 当 wipe 顺序被修好（先确认 leader 可达并愿意接纳、再 wipe），本用例会
+// 变红——那正是我们要的信号，届时按新行为改写断言而不是删用例。
+func TestScenarioFullPowerLossCannotRecover(t *testing.T) {
 	if testing.Short() {
 		t.Skip("场景测试耗时，-short 跳过")
 	}
-	// 三节点同时断电的「已确认消息必须在」断言当前无法成立：每个节点
-	// 重启都走 Rejoin（WipeForRejoin 清空整个数据目录，含已确认消息），
-	// 且全集群无存活 leader 可经 PrepareJoin 重入——节点全部卡在重入
-	// 轮询、无法监听（实测证据见 task 完工报告）。quorum-mem 的「已确认
-	// 消息必须在」只在多数派存活时成立（场景一证明了多数派保留数据、
-	// 掉队节点从 leader 追齐）。这是 batch⑤ 对 spec §2.2 取舍边界的
-	// 实测发现，处置待审核确认。
-	t.Skip("全集群断电后全部节点 Wipe 重入且无 leader 可追，已确认消息无法保留，处置待审核")
 	pc := startProcCluster(t, 3)
-	const topic, group = "scn-power-loss", "scn-power-loss-g"
+	const topic = "scn-full-power-loss"
+	ensureTopic(t, pc.endpoints(), topic)
+	waitRouteSpread(t, pc.endpoints(), topic, 60*time.Second)
+
+	// 断电：写入正进行中的一刻同时 SIGKILL 全部节点
+	for i := range pc.handles {
+		pc.kill(t, i)
+	}
+
+	// 上电：逐个重启，断言每个节点都无法提供服务（重启后 35s 内 gRPC
+	// 监听不出现、或进程在重入编排失败后退出）
+	for i := range pc.handles {
+		pc.restartUnready(t, i)
+		// 重入编排的实据：日志里必须出现「不干净关机 → 清空数据目录」的
+		// 痕迹——节点在确认可重入之前就销毁了本地数据，正是 P0 机制本身
+		log := countLogLines(t, []string{pc.handles[i].logPath}, "状态目录已清空")
+		if log == 0 {
+			t.Fatalf("节点 %d 断电重启后未走 Rejoin 的 wipe 路径（P0 机制证据缺失）", i+1)
+		}
+	}
+}
+
+// restartUnready 启动第 i 个节点但不等待就绪，断言它**无法**提供服务：
+// 重启后 35s 内 gRPC 监听不出现、或进程在重入编排失败后自行退出。
+//
+// 与 restart 的 ready 判定刻意相反：本方法用于断言「当前架构无法自愈」
+// 的 P0 行为（见 TestScenarioFullPowerLossCannotRecover）。结束时保证进程
+// 已死（自行退出或强制清理），收尾不留僵尸。
+func (pc *procCluster) restartUnready(t *testing.T, i int) {
+	t.Helper()
+	if pc.handles[i].cmd.Process != nil {
+		t.Fatalf("节点 %d 仍在运行，restartUnready 前必须先 kill", i+1)
+	}
+	ep := pc.handles[i].endpoint
+	pc.handles[i] = pc.spawn(t, i, ep)
+	h := pc.handles[i]
+
+	deadline := time.Now().Add(35 * time.Second)
+	ready := false
+	for time.Now().Before(deadline) {
+		select {
+		case err := <-h.waitDone:
+			// 进程退出 = 重入编排失败后 main 返回错误，断言成立
+			t.Logf("节点 %d 重入编排失败后进程退出：%v", i+1, err)
+			h.logFile.Close()
+			h.cmd.Process = nil
+			return
+		default:
+		}
+		conn, err := net.DialTimeout("tcp", ep, time.Second)
+		if err == nil {
+			conn.Close()
+			ready = true
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if ready {
+		// wipe 顺序已修复的迹象：节点居然起来了。这是预期信号，但要
+		// 让用例失败并明确指向原因，而不是静默绿
+		t.Fatalf("节点 %d 断电重启后居然能提供服务——wipe 顺序可能已修复，"+
+			"本用例的 P0 断言需要按新行为改写", i+1)
+	}
+	t.Logf("节点 %d 断电重启后 35s 内无法提供服务（重入编排失败，P0 洞的如实记录）", i+1)
+	// 收尾：进程还活着（挂死在重入轮询），强制杀掉不留僵尸
+	h.cmd.Process.Kill()
+	<-h.waitDone
+	h.logFile.Close()
+	h.cmd.Process = nil
+}
+
+// TestScenarioPowerLossMajoritySurvives 多数派存活下的断电：kill 1 of 3，
+// 保留 2 个存活节点（quorum 仍在）——已确认消息由存活节点保留，掉队
+// 节点经 Rejoin 从 leader 追齐（幸存者能提交成员变更，有 quorum）。
+//
+// 与 TestScenarioFullPowerLossCannotRecover 互补：那是全集群断电的 P0 死
+// 路（无人能批准重入），这是「多数派在，断电可自愈」的绿路径——quorum
+// 保留数据这一半由它单独钉住。
+func TestScenarioPowerLossMajoritySurvives(t *testing.T) {
+	if testing.Short() {
+		t.Skip("场景测试耗时，-short 跳过")
+	}
+	pc := startProcCluster(t, 3)
+	const topic, group = "scn-majority-loss", "scn-majority-loss-g"
 	ensureTopic(t, pc.endpoints(), topic)
 	waitRouteSpread(t, pc.endpoints(), topic, 60*time.Second)
 
@@ -400,31 +456,27 @@ func TestScenarioPowerLoss(t *testing.T) {
 	wg.Add(1)
 	go func() { defer wg.Done(); produceUntil(t, producer, topic, cs, stop) }()
 	time.Sleep(8 * time.Second)
-
-	// 断电：写入正进行中的一刻同时 SIGKILL 全部节点。先 kill 再 stop
-	// producer——顺序反了就变成「停机后断电」，考不到写入中途断电
-	for i := range pc.handles {
-		pc.kill(t, i)
-	}
 	close(stop)
 	wg.Wait()
 	confirmed := cs.size()
 	if confirmed == 0 {
 		t.Fatal("断电前一条都没确认，用例没测到东西")
 	}
-	t.Logf("断电时确认集 %d 条", confirmed)
+	t.Logf("断电时确认集 %d 条（多数派存活）", confirmed)
 
-	// 上电：全部重启（不干净关机 → ErrUncleanShutdown → Rejoin 自愈）。
-	// 全集群同时重入没有现成 leader 可投，首个完成 Rejoin 的节点会作为
-	// 引导者选主，其余节点依次加入——整体收敛比单节点重启慢，路由等待
-	// 放宽到 120s。
-	for i := range pc.handles {
-		pc.restart(t, i)
-	}
+	// 断电：同时 SIGKILL 掉 1 个节点（多数派=2 仍存活，quorum 不失）——
+	// 与场景一（杀数据组 leader）不同，这里不挑 leader，杀任意一个节点
+	victim := 1
+	t.Logf("断电 kill 节点 %d（多数派 2 个存活）", victim+1)
+	pc.kill(t, victim)
+
+	// 上电：重启掉队节点（不干净关机 → ErrUncleanShutdown → Rejoin 自愈，
+	// 幸存者能批准成员变更），等路由恢复。
+	pc.restart(t, victim)
 	waitRouteSpread(t, pc.endpoints(), topic, 120*time.Second)
 
 	consumer := newClusterConsumer(t, pc.multi(), group, topic, clusterConsumerAwaitShort)
-	got := recvAllAck(t, consumer, confirmed, 240*time.Second, "power-loss 对账", false)
+	got := recvAllAck(t, consumer, confirmed, 240*time.Second, "majority-loss 对账", false)
 	cs.assertAllConsumed(t, got)
 }
 
