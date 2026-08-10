@@ -140,11 +140,39 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 		Body:         []byte(req.Body), BornAtMs: now, BornHost: "admin",
 	}
 	var err error
+	forwarded := false
 	if req.DelayMs > 0 {
 		m.DeliverAtMs = now + req.DelayMs
 		m, err = s.pr.AppendDelay(r.Context(), m)
 	} else {
-		m, err = s.pr.Append(r.Context(), m)
+		// 集群档写转发（batch⑤）：本节点不是目标组 leader 时经
+		// fwd.ForwardAppend 交给组 leader 的 produce 栈追加——控制台的地址
+		// 通常是运维随手挑的一个节点，要求用户自己找出 leader 再重开页面，
+		// 是把系统内部状态外包给人。转发组号按 QueueID=0 计算（与事务
+		// 提交段同款约定：选队由 leader 侧 produce 栈完成，发起方按该组
+		// 寻址）。fwd 为 nil（单机档，IsLeader 恒真）时转发分支不可达。
+		g := s.rt.GroupForQueue(req.Topic, 0)
+		if s.rt.IsLeader(g) {
+			m, err = s.pr.Append(r.Context(), m)
+		} else {
+			raw, eerr := core.EncodeMessage(m)
+			if eerr != nil {
+				s.httpError(w, http.StatusInternalServerError, "编码转发消息: %v", eerr)
+				return
+			}
+			qid, off, ferr := s.fwd.ForwardAppend(r.Context(), g, raw)
+			if ferr != nil {
+				// 转发是跨节点动作，失败必须留痕（带 g 与 leader 定位）
+				s.logger.Error("admin 测试消息转发失败", "topic", req.Topic, "g", g, "err", ferr)
+				s.httpError(w, http.StatusInternalServerError, "本节点不是该组 leader 且转发未成功: %v", ferr)
+				return
+			}
+			forwarded = true
+			s.logger.Info("admin 测试消息已转发到组 leader", "topic", req.Topic, "g", g,
+				"queue", qid, "offset", off)
+			m = &core.Message{ID: m.ID, Topic: req.Topic, QueueID: qid, Offset: off,
+				DeliverAtMs: m.DeliverAtMs, BornAtMs: m.BornAtMs}
+		}
 	}
 	if err != nil {
 		s.logger.Error("admin 测试消息发送失败", "topic", req.Topic,
@@ -153,11 +181,18 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.logger.Info("admin 测试消息已发送", "topic", req.Topic, "msg_id", m.ID,
-		"queue", m.QueueID, "offset", m.Offset, "deliver_at_ms", m.DeliverAtMs)
-	s.writeJSON(w, http.StatusCreated, map[string]any{
+		"queue", m.QueueID, "offset", m.Offset, "deliver_at_ms", m.DeliverAtMs, "forwarded", forwarded)
+	// forwarded 只在该条真走了转发时出现（omitempty 语义）：前端据此渲染
+	// 一条中性说明，用户在 follower 上点发送、消息却写进了别的节点，这个
+	// 事实必须可见，否则排查"我发的消息去哪了"时会先怀疑丢消息
+	resp := map[string]any{
 		"msg_id": m.ID, "queue_id": m.QueueID, "offset": m.Offset,
 		"deliver_at_ms": m.DeliverAtMs,
-	})
+	}
+	if forwarded {
+		resp["forwarded"] = true
+	}
+	s.writeJSON(w, http.StatusCreated, resp)
 }
 
 // handleDLQResend POST /admin/dlq/{group}/resend：把死信按 sq-origin-topic

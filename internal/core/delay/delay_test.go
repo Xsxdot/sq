@@ -22,16 +22,18 @@ import (
 // 不实现 Forwarder——门控拦截后转发分支不可达，nil fwd 不会解引用。
 type fixedLeaderRouter struct{ leader bool }
 
-func (r fixedLeaderRouter) GroupForQueue(string, uint32) uint32 { return 0 }
-func (r fixedLeaderRouter) MetaGroup() uint32                   { return 0 }
-func (r fixedLeaderRouter) IsLeader(uint32) bool                { return r.leader }
+func (r fixedLeaderRouter) GroupForQueue(string, uint32) uint32       { return 0 }
+func (r fixedLeaderRouter) MetaGroup() uint32                         { return 0 }
+func (r fixedLeaderRouter) IsLeader(uint32) bool                      { return r.leader }
+func (r fixedLeaderRouter) ReadBarrier(context.Context, uint32) error { return nil }
 
 // flipRouter 可在测试中翻转 IsLeader 的 Router（Run 门控测试用）。
 type flipRouter struct{ leader atomic.Bool }
 
-func (r *flipRouter) GroupForQueue(string, uint32) uint32 { return 0 }
-func (r *flipRouter) MetaGroup() uint32                   { return 0 }
-func (r *flipRouter) IsLeader(uint32) bool                { return r.leader.Load() }
+func (r *flipRouter) GroupForQueue(string, uint32) uint32       { return 0 }
+func (r *flipRouter) MetaGroup() uint32                         { return 0 }
+func (r *flipRouter) IsLeader(uint32) bool                      { return r.leader.Load() }
+func (r *flipRouter) ReadBarrier(context.Context, uint32) error { return nil }
 
 type fixture struct {
 	st *store.Store

@@ -14,7 +14,7 @@
  */
 import type {
   Overview, TimeSeries, LedgerRow, Topic, TopicDetail,
-  Group, GroupDetail, Message, DelayEntry, TxnEntry, SendResult, SystemInfo,
+  Group, GroupDetail, Message, DelayEntry, TxnEntry, SendResult, SystemInfo, ClusterView,
 } from './types'
 
 /** 本地 token 的存储键。与 index.html 里的主题键同一命名风格。 */
@@ -156,4 +156,6 @@ export const api = {
   /** 按队列位点范围查消息。 */
   messagesByQueue: (topic: string, queueId: number, fromOffset: number, limit: number) =>
     request<Message[]>(`/admin/messages?topic=${encodeURIComponent(topic)}&queue_id=${queueId}&from_offset=${fromOffset}&limit=${limit}`),
+  /** 集群拓扑与复制进度（单机档回 enabled=false）。 */
+  cluster: () => request<ClusterView>('/admin/cluster'),
 }

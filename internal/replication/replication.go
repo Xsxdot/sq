@@ -40,6 +40,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"sort"
 
 	"github.com/xushixin/sq/internal/cluster"
 	"github.com/xushixin/sq/internal/store"
@@ -50,6 +51,120 @@ import (
 // 依赖方向 cluster → replication → rpc，协议层不耦合 raft 细节。
 // 错误本身由 cluster 定义与包装，本转发保证 errors.Is 穿透（值相等）。
 var ErrNotLeader = cluster.ErrNotLeader
+
+// ClusterView 控制台用的集群拓扑只读快照。
+//
+// 为什么 DTO 定在 replication 而不是 cluster：依赖方向是
+// cluster → replication → 上层，admin 只依赖 replication；把 raft 的
+// tracker.Progress 直接漏给 admin 会让协议面耦合 raft 细节。
+type ClusterView struct {
+	// Enabled=false 表示单机档：前端据此渲染「当前为单机模式」，而不是报错
+	Enabled bool        `json:"enabled"`
+	SelfID  uint64      `json:"self_id"`
+	Nodes   []NodeView  `json:"nodes"`
+	Groups  []GroupView `json:"groups"`
+}
+
+// NodeView 成员表里的一个节点。
+type NodeView struct {
+	ID       uint64 `json:"id"`
+	RaftAddr string `json:"raft_addr"`
+	Self     bool   `json:"self"`
+}
+
+// GroupView 一个 raft 组在**本节点视角**下的状态。
+//
+// Commit 是 raft 提交位点（HardState.Commit，每个节点都有，follower 也有）；
+// Applied 是本节点已 apply 到位点。两者之差 commit−applied 即「待 apply」
+// ——applier 卡住会立刻显形，且每个节点自己就算得出（不依赖 leader 数据）。
+//
+// 注意：Peers 只有在本节点是该组 leader 时才有内容——raft 的
+// tracker.Progress 只在 leader 上维护，follower 上是空表。前端必须按
+// IsLeader 决定要不要渲染这一段，不能把空表当成"没有 peer"。
+type GroupView struct {
+	ID       uint32             `json:"id"`
+	Leader   uint64             `json:"leader"`
+	IsLeader bool               `json:"is_leader"`
+	Role     string             `json:"role"`
+	Applied  uint64             `json:"applied"`
+	Commit   uint64             `json:"commit"`
+	Term     uint64             `json:"term"`
+	Peers    []PeerProgressView `json:"peers"`
+}
+
+// PeerProgressView leader 视角下某个 peer 的复制进度。
+//
+// PendingSnapshot 非零 = 该 peer 正在被发快照。长期非零就是 batch④ 定向
+// 台账要解决的「快照卡住」现场，前端应当醒目标记。
+type PeerProgressView struct {
+	ID              uint64 `json:"id"`
+	Match           uint64 `json:"match"`
+	Next            uint64 `json:"next"`
+	State           string `json:"state"`
+	RecentActive    bool   `json:"recent_active"`
+	IsLearner       bool   `json:"is_learner"`
+	PendingSnapshot uint64 `json:"pending_snapshot"`
+}
+
+// Topologer 集群拓扑只读视图来源。单机后端回 Enabled=false 的空视图。
+type Topologer interface {
+	Topology() ClusterView
+}
+
+// Topology 单机档没有集群拓扑：回 Enabled=false，让前端渲染「单机模式」
+// 而不是把空数组当成"集群里没有节点"。
+func (StandaloneRouter) Topology() ClusterView { return ClusterView{Enabled: false} }
+
+// Topology 汇总本节点视角下的全部组状态。
+//
+// 注意：Status(g) 的 Progress 只在本节点是该组 leader 时非空（raft 的
+// tracker 只在 leader 上维护），follower 上 Peers 恒为空切片。
+func (r *Cluster) Topology() ClusterView {
+	self := r.m.SelfID()
+	v := ClusterView{Enabled: true, SelfID: self}
+	for id, addr := range r.m.PeerAddrs() {
+		v.Nodes = append(v.Nodes, NodeView{ID: id, RaftAddr: addr, Self: id == self})
+	}
+	sort.Slice(v.Nodes, func(i, j int) bool { return v.Nodes[i].ID < v.Nodes[j].ID })
+
+	for g := uint32(0); g < r.m.Groups(); g++ {
+		st, ok := r.m.Status(g)
+		if !ok {
+			continue
+		}
+		leader, _ := r.m.Leader(g)
+		// Term/Commit 是 protobuf 指针：nil 时按 0 处理（组刚启动、尚未落过
+		// HardState 的形态）
+		var term uint64
+		if st.HardState != nil && st.HardState.Term != nil {
+			term = *st.HardState.Term
+		}
+		var commit uint64
+		if st.HardState != nil && st.HardState.Commit != nil {
+			commit = *st.HardState.Commit
+		}
+		gv := GroupView{
+			ID:       g,
+			Leader:   leader,
+			IsLeader: leader == self,
+			Role:     st.RaftState.String(),
+			Applied:  r.m.AppliedIndex(g),
+			Commit:   commit,
+			Term:     term,
+			Peers:    make([]PeerProgressView, 0, len(st.Progress)),
+		}
+		for id, pr := range st.Progress {
+			gv.Peers = append(gv.Peers, PeerProgressView{
+				ID: id, Match: pr.Match, Next: pr.Next,
+				State: pr.State.String(), RecentActive: pr.RecentActive,
+				IsLearner: pr.IsLearner, PendingSnapshot: pr.PendingSnapshot,
+			})
+		}
+		sort.Slice(gv.Peers, func(i, j int) bool { return gv.Peers[i].ID < gv.Peers[j].ID })
+		v.Groups = append(v.Groups, gv)
+	}
+	return v
+}
 
 // Pending 一次已定序、待确认的复制提交；Wait 语义与 store.Pending 一致。
 type Pending interface{ Wait() error }
@@ -73,6 +188,10 @@ type Router interface {
 	GroupForQueue(topic string, queueID uint32) uint32
 	MetaGroup() uint32
 	IsLeader(g uint32) bool
+	// ReadBarrier 等 g 组的线性一致读屏障：返回 nil 后本地读一定包含了
+	// 本次调用发起之前已被确认的全部写。单机后端恒 nil（无复制、无屏障
+	// 可言）；集群后端在读屏障关闭时同样恒 nil（零开销）。
+	ReadBarrier(ctx context.Context, g uint32) error
 }
 
 // Forwarder 跨节点转发原语（仅 Cluster 后端实现；Standalone 上调用属编程错误，panic）。
@@ -170,6 +289,9 @@ func (StandaloneRouter) MetaGroup() uint32 { return cluster.MetaGroup }
 // IsLeader 恒真：单机不存在非 leader 节点。
 func (StandaloneRouter) IsLeader(uint32) bool { return true }
 
+// ReadBarrier 单机档没有复制，本地读天然线性一致，恒放行。
+func (StandaloneRouter) ReadBarrier(context.Context, uint32) error { return nil }
+
 // Cluster 集群后端：Apply/ApplyAsync = m.Propose；兼作 Router（转
 // Manager）与 Forwarder（经控制通道跨节点转发）。
 type Cluster struct {
@@ -232,6 +354,11 @@ func (r *Cluster) MetaGroup() uint32 { return cluster.MetaGroup }
 
 // IsLeader 返回本节点是否为指定组的 leader（转 Manager）。
 func (r *Cluster) IsLeader(g uint32) bool { return r.m.IsLeader(g) }
+
+// ReadBarrier 转发 Manager.ReadBarrier；读屏障关闭时 Manager 内部即恒 nil。
+func (r *Cluster) ReadBarrier(ctx context.Context, g uint32) error {
+	return r.m.ReadBarrier(ctx, g)
+}
 
 // ForwardAppend 把一条已编码逻辑消息（core.EncodeMessage 字节）交给 g
 // 组 leader 的 produce 栈追加——offset 分配发生在 leader 侧，

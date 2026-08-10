@@ -30,6 +30,8 @@ const NAV = [
   { to: '/messages', label: '消息查询' },
   { to: '/dlq', label: '死信队列' },
   { to: '/send', label: '发送测试消息' },
+  { group: '运维' },
+  { to: '/cluster', label: '集群' },
 ] as const
 
 function readTheme(): 'light' | 'dark' {

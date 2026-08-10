@@ -50,9 +50,11 @@ type Server struct {
 	password string
 	// sys 运行态读数来源，同时是拒写开关的唯一读取入口。为 nil 时
 	// /admin/system 返回 503，拒写判定一律视为未拒写（测试构造用）
-	sys    *sysinfo.Reporter
-	sp     *metrics.Sampler // 时序采样器；admin_listen 关闭时 main 不装配，为 nil
-	conns  ConnCounter      // 在线连接数来源；为 nil 时总览 connections 回 0
+	sys   *sysinfo.Reporter
+	sp    *metrics.Sampler // 时序采样器；admin_listen 关闭时 main 不装配，为 nil
+	conns ConnCounter      // 在线连接数来源；为 nil 时总览 connections 回 0
+	// topo 集群拓扑来源；单机档传 StandaloneRouter{}，nil 时按单机档处理
+	topo   replication.Topologer
 	logger *slog.Logger
 
 	tokens sync.Map // token(string) → 过期时间(time.Time)
@@ -69,11 +71,11 @@ type Server struct {
 // replication.NewStandalone(st)、StandaloneRouter{} 与 nil fwd（IsLeader
 // 恒真，转发分支不可达）；集群档由 main 装配。
 func New(rep replication.Replicator, rt replication.Router, fwd replication.Forwarder,
-	st *store.Store, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer,
+	topo replication.Topologer, st *store.Store, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer,
 	username, password string, sys *sysinfo.Reporter, sp *metrics.Sampler,
 	reg *prometheus.Registry, conns ConnCounter, logger *slog.Logger) *Server {
 	s := &Server{
-		rep: rep, rt: rt, fwd: fwd,
+		rep: rep, rt: rt, fwd: fwd, topo: topo,
 		st: st, mt: mt, pr: pr, dl: dl,
 		username: username, password: password, sys: sys, sp: sp,
 		conns:  conns,
@@ -118,6 +120,7 @@ func (s *Server) routes(reg *prometheus.Registry) {
 	s.mux.HandleFunc("GET /debug/pprof/profile", s.protected(nhpprof.Profile))
 	s.mux.HandleFunc("GET /debug/pprof/symbol", s.protected(nhpprof.Symbol))
 	s.mux.HandleFunc("GET /debug/pprof/trace", s.protected(nhpprof.Trace))
+	s.mux.HandleFunc("GET /admin/cluster", s.protected(s.handleCluster))
 	// "/" 必须最后注册（可读性考虑，ServeMux 本身与注册顺序无关）：
 	// 它是兜底模式，上面每一条 /admin/... 都比它更具体，优先匹配
 	s.mux.HandleFunc("/", s.consoleHandler())

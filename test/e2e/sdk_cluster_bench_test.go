@@ -37,8 +37,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
-	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -184,7 +182,25 @@ func runSendLoad(t *testing.T, endpoint, topic string, conc, total, bodyBytes in
 		perG = 1
 	}
 	var sent, failed atomic.Int64
-	var firstErr atomic.Value // 首个发送错误，失败时打进日志
+	// 首个发送错误，失败时打进日志。用 sync.Once 而非 atomic.Value：
+	// atomic.Value 要求历次写入的**具体类型**一致，而这里存的是 SDK 返回的
+	// error——重压下同一轮里会同时冒出 *status.Error、超时的 wrapError 等
+	// 不同具体类型，第二个类型撞上第一个就 panic「compare and swap of
+	// inconsistently typed value into Value」，基准进程当场死掉、连已经跑完
+	// 的档位结果都一起丢掉（实测：2 核机 quorum-fsync/conc=16 必现）。
+	// Once 只保证「第一个到达者写入」，与存什么类型无关。
+	var (
+		firstErrOnce sync.Once
+		firstErrMu   sync.Mutex
+		firstErr     error
+	)
+	// 读侧也要加锁：t.Fatalf/t.Logf 在 wg.Wait() 之后读，但 -race 只认锁不认
+	// 「时序上应该安全」，加锁才能让整套基准在 -race 下也能跑
+	loadFirstErr := func() error {
+		firstErrMu.Lock()
+		defer firstErrMu.Unlock()
+		return firstErr
+	}
 	lat := make([][]time.Duration, conc)
 	var wg sync.WaitGroup
 	// 起跑线对齐：全部协程就位后同时开闸，避免先到的协程在别人还在建连接
@@ -204,7 +220,11 @@ func runSendLoad(t *testing.T, endpoint, topic string, conc, total, bodyBytes in
 				d := time.Since(t0)
 				if err != nil {
 					failed.Add(1)
-					firstErr.CompareAndSwap(nil, err)
+					firstErrOnce.Do(func() {
+						firstErrMu.Lock()
+						firstErr = err
+						firstErrMu.Unlock()
+					})
 					continue
 				}
 				sent.Add(1)
@@ -235,11 +255,11 @@ func runSendLoad(t *testing.T, endpoint, topic string, conc, total, bodyBytes in
 		elapsed: elapsed, p50: pick(0.5), p99: pick(0.99),
 	}
 	if r.sent == 0 {
-		t.Fatalf("%s: 一条都没发成功（失败 %d 条，首个错误: %v）", label, r.failed, firstErr.Load())
+		t.Fatalf("%s: 一条都没发成功（失败 %d 条，首个错误: %v）", label, r.failed, loadFirstErr())
 	}
 	if rate := float64(r.failed) / float64(r.sent+r.failed); rate > 0.01 {
 		t.Fatalf("%s: 失败率 %.2f%%（成功 %d / 失败 %d，首个错误: %v）超 1%%，吞吐数字不可信",
-			label, 100*rate, r.sent, r.failed, firstErr.Load())
+			label, 100*rate, r.sent, r.failed, loadFirstErr())
 	}
 	t.Logf("%s: %.0f msg/s（成功 %d 条 / %v，失败 %d，p50=%v p99=%v）",
 		label, r.msgPerSec(), r.sent, elapsed.Round(time.Millisecond), r.failed,
@@ -385,60 +405,17 @@ func TestExternalClusterWriteThroughput(t *testing.T) {
 // startBenchCluster 起一个三节点集群并等全部就绪，返回首节点 endpoint
 // 与收尾函数。ack 为确认档（quorum-mem|quorum-fsync），queues 为队列数。
 //
-// 为什么不用 launchBroker：它内部就等就绪，而三节点必须**全部先起进程、
-// 再逐个等就绪**——raft 选举要 quorum，等第一个节点就绪会永远卡在「等
-// meta 组出 leader」（同 TestThreeNodeClusterE2E 的启动序注释）。
+// 启动逻辑已委托给 procCluster（见 cluster_proc_test.go）：三节点必须
+// **全部先起进程、再逐个等就绪**——raft 选举要 quorum，等第一个节点
+// 就绪会永远卡在「等 meta 组出 leader」。
 //
 // 日志档压到 info：debug 下三个节点写日志本身就是可观开销，会污染吞吐。
 func startBenchCluster(t *testing.T, ack string, queues int) (string, func()) {
 	t.Helper()
-	grpcPorts := pickPorts(t, 3)
-	raftPorts := pickPorts(t, 3)
-	dirs := []string{t.TempDir(), t.TempDir(), t.TempDir()}
-	cfgs := make([]*config.Config, 3)
-	for i := 0; i < 3; i++ {
-		cfgs[i] = clusterNodeConfig(t, dirs[i], uint64(i+1), grpcPorts[i], raftPorts[i], 3)
-		cfgs[i].Cluster.Ack = ack
-		cfgs[i].DefaultQueueNums = uint32(queues)
-		cfgs[i].LogLevel = "info"
-	}
-	writeClusterPeers(cfgs, grpcPorts, raftPorts)
-
-	handles := make([]*brokerHandle, 3)
-	for i := 0; i < 3; i++ {
-		cfgPath := writeNodeConfig(t, cfgs[i])
-		endpoint := fmt.Sprintf("127.0.0.1:%d", grpcPorts[i])
-		logPath := filepath.Join(dirs[i], "broker.log")
-		logFile, err := os.Create(logPath)
-		if err != nil {
-			t.Fatalf("创建 broker 日志文件失败: %v", err)
-		}
-		cmd := exec.Command(brokerBinary, "-config", cfgPath)
-		cmd.Stdout = logFile
-		cmd.Stderr = logFile
-		if err := cmd.Start(); err != nil {
-			logFile.Close()
-			t.Fatalf("启动 broker 进程失败: %v", err)
-		}
-		waitDone := make(chan error, 1)
-		go func() { waitDone <- cmd.Wait() }()
-		handles[i] = &brokerHandle{
-			endpoint: endpoint, cfgPath: cfgPath, logPath: logPath,
-			logFile: logFile, cmd: cmd, waitDone: waitDone,
-		}
-	}
-	for i := 0; i < 3; i++ {
-		waitBrokerReady(t, handles[i].endpoint, handles[i].waitDone, handles[i].logPath)
-		t.Logf("bench broker %d 就绪 endpoint=%s pid=%d", i+1, handles[i].endpoint, handles[i].cmd.Process.Pid)
-	}
-	peaks := newMemPeakSampler(handles)
-	stop := func() {
-		peaks.stopAndReport(t)
-		for _, h := range handles {
-			if h.cmd.Process != nil {
-				h.stop(t)
-			}
-		}
-	}
-	return handles[0].endpoint, stop
+	pc := startProcCluster(t, 3, func(c *config.Config) {
+		c.Cluster.Ack = ack
+		c.DefaultQueueNums = uint32(queues)
+		c.LogLevel = "info"
+	})
+	return pc.endpointOf(0), func() { pc.stopAll(t) }
 }

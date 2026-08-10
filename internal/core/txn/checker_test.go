@@ -17,9 +17,10 @@ import (
 // 不实现 Forwarder——门控拦截后转发分支不可达，nil fwd 不会解引用。
 type fixedLeaderRouter struct{ leader bool }
 
-func (r fixedLeaderRouter) GroupForQueue(string, uint32) uint32 { return 0 }
-func (r fixedLeaderRouter) MetaGroup() uint32                   { return 0 }
-func (r fixedLeaderRouter) IsLeader(uint32) bool                { return r.leader }
+func (r fixedLeaderRouter) GroupForQueue(string, uint32) uint32       { return 0 }
+func (r fixedLeaderRouter) MetaGroup() uint32                         { return 0 }
+func (r fixedLeaderRouter) IsLeader(uint32) bool                      { return r.leader }
+func (r fixedLeaderRouter) ReadBarrier(context.Context, uint32) error { return nil }
 
 // fakeNotifier 记录收到的回查请求，可编程返回值。
 type fakeNotifier struct {

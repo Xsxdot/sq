@@ -243,6 +243,8 @@ func run() error {
 			TruncateInterval:       cc.TruncateInterval,
 			SnapshotChunkBytes:     cc.SnapshotChunkBytes,
 			SnapshotViewTTL:        cc.SnapshotViewTTL,
+			ReadBarrier:            cc.ReadBarrier,
+			ReadBarrierTimeout:     cc.ReadBarrierTimeout,
 			OnApplied:              onApplied,
 			OnLeaderChange:         onLeaderChange,
 			ControlHandler:         controlHandler,
@@ -417,7 +419,10 @@ func run() error {
 		// fwd 单机档为 nil：StandaloneRouter 的 IsLeader 恒真，adminops 的
 		// 转发分支不可达（nil 不会被解引用）；集群档即 *replication.Cluster，
 		// adminops 成片清理跨组时经它转发给目标组 leader。
-		adm := admin.New(rep, rt, fwd, st, mt, pr, dl, cfg.AdminUsername, cfg.AdminPassword, sys, sp, reg, srv, logger)
+		// 集群拓扑来源：集群档的 rt（*replication.Cluster）同时实现
+		// Topologer；单机档的 StandaloneRouter 也实现（回 enabled=false）。
+		topo, _ := rt.(replication.Topologer)
+		adm := admin.New(rep, rt, fwd, topo, st, mt, pr, dl, cfg.AdminUsername, cfg.AdminPassword, sys, sp, reg, srv, logger)
 		aln, err := net.Listen("tcp", cfg.AdminListen)
 		if err != nil {
 			return fmt.Errorf("admin HTTP 监听 %s: %w", cfg.AdminListen, err)
