@@ -1,6 +1,10 @@
 package cluster
 
-import "testing"
+import (
+	"testing"
+
+	"go.etcd.io/raft/v3/raftpb"
+)
 
 // TestDecideRecovery 覆盖五条恢复分支的全部判据组合。
 //
@@ -78,5 +82,47 @@ func TestDecideRecovery(t *testing.T) {
 				t.Fatal("decideRecovery 的理由串为空——它要进日志和 sq recover 的报告，不能没有")
 			}
 		})
+	}
+}
+
+// TestInspectRecoveryReportsPathAndPermitNeed CLI 用的只读入口必须与
+// NewManager 得出同一条路径——两处各判一次迟早会出现「命令说你不用签字、
+// 进程说你要签字」，那是最伤运维信任的一类分歧。
+func TestInspectRecoveryReportsPathAndPermitNeed(t *testing.T) {
+	dir := t.TempDir()
+	st := mustOpenStore(t, dir)
+	rs := newRaftStore(st, testSlog(t))
+	if err := rs.EnsureGroups(3); err != nil {
+		t.Fatalf("EnsureGroups: %v", err)
+	}
+	term, vote, commit := uint64(3), uint64(1), uint64(5)
+	if err := rs.Persist(0, &raftpb.HardState{Term: &term, Vote: &vote, Commit: &commit}, nil, true); err != nil {
+		t.Fatalf("造 HardState: %v", err)
+	}
+	if err := rs.SaveBootGen("gen-a"); err != nil {
+		t.Fatalf("SaveBootGen: %v", err)
+	}
+
+	rep, err := InspectRecovery(st, 3, AckQuorumMem, func() (string, error) { return "gen-b", nil }, testSlog(t))
+	if err != nil {
+		t.Fatalf("InspectRecovery: %v", err)
+	}
+	if !rep.NeedsPermit {
+		t.Fatal("mem 档 + 世代变了 + 无许可，NeedsPermit 应为 true")
+	}
+	if rep.Reason == "" {
+		t.Fatal("Reason 为空——它是报告要打给运维看的主体")
+	}
+	if len(rep.Groups) != 4 {
+		t.Fatalf("Groups 长度 = %d; want 4（组 0..3）", len(rep.Groups))
+	}
+
+	// 世代未变时不需要签字，命令必须明说，而不是闷头写一个永不被消费的许可
+	rep2, err := InspectRecovery(st, 3, AckQuorumMem, func() (string, error) { return "gen-a", nil }, testSlog(t))
+	if err != nil {
+		t.Fatalf("InspectRecovery: %v", err)
+	}
+	if rep2.NeedsPermit {
+		t.Fatal("世代未变时 NeedsPermit 应为 false")
 	}
 }

@@ -1,19 +1,35 @@
-// recovery.go 提供不干净关机后的恢复路径判定。
+// recovery.go 提供不干净关机后的恢复路径判定，以及给 sq recover 命令用
+// 的只读现场采集与许可授予入口。
 //
 // 职责：
 //   - 把「盘上状态 + 确认档位 + 机器世代 + 运维许可」四组判据映射到
 //     唯一一条恢复路径，并给出可直接进日志/进报告的中文理由
+//   - InspectRecovery / GrantRecoverPermit：CLI 侧的只读现场与签字入口，
+//     与 NewManager 共用同一套判据（见文件头注释）
 //
 // 边界：
-//   - 纯函数：不碰 raft、不碰磁盘、不打日志、不读环境变量。四组判据由
-//     调用方采集后传入
+//   - decideRecovery 是纯函数：不碰 raft、不碰磁盘、不打日志、不读环境
+//     变量。四组判据由调用方采集后传入
 //   - 不执行恢复：本文件只回答「走哪条路」，怎么走在 manager.go
+//   - InspectRecovery 只读（连干净关机标记都不消费）；GrantRecoverPermit
+//     是唯一的写入口，且只写许可键
 //
 // 为什么要抽成纯函数：NewManager 与 sq recover 必须给出**完全一致**的
 // 判断。一旦两处各写一套，迟早出现「命令说你不用签字、进程说你要签字」，
 // 那是最伤运维信任的一类分歧。共用一个函数是唯一可靠的保证方式；顺带
 // 让五条分支能脱离 raft 与磁盘直接单测（recovery_test.go 的判定表）。
 package cluster
+
+import (
+	"errors"
+	"fmt"
+	"log/slog"
+	"time"
+
+	"go.etcd.io/raft/v3"
+
+	"github.com/xushixin/sq/internal/store"
+)
 
 // recoveryPath 是不干净关机后的恢复路径。
 type recoveryPath int
@@ -116,4 +132,124 @@ func decideRecovery(in recoveryInput) (recoveryPath, string) {
 	default:
 		return pathRejoin, "不干净关机且无法证明本地日志可信（机器世代不可比或已变、确认档为 quorum-mem、无运维许可），走重入编排"
 	}
+}
+
+// GroupReport 是单个 raft 组在恢复报告中的现场数据。
+type GroupReport struct {
+	Group     uint32 // 组号（0 为 meta 组）
+	Applied   uint64 // 已应用位点
+	LastIndex uint64 // 日志尾 index（无条目时为 0）
+	LastTerm  uint64 // 日志尾 term（无条目时为 0）
+	SnapIndex uint64 // 快照锚点 index（从未截断时为 0）
+	Term      uint64 // 当前任期
+	Commit    uint64 // 提交位点
+}
+
+// RecoveryReport 是 sq recover 打给运维看的完整报告。
+type RecoveryReport struct {
+	Path        string        // 恢复路径短名
+	Reason      string        // 中文理由
+	NeedsPermit bool          // 是否需要运维签字才能本地恢复
+	GenNow      string        // 当前机器世代（读不到时为空）
+	GenNowOK    bool          // 当前世代是否可用
+	GenStored   string        // 盘上记录的机器世代
+	GenStoredOK bool          // 盘上是否记录过
+	Mode        AckMode       // 确认档位
+	HasPermit   bool          // 是否已存在许可
+	PermitGen   string        // 已存在许可绑定的世代
+	Groups      []GroupReport // 各组现场
+}
+
+// InspectRecovery 只读地采集恢复判据与各组现场，供 sq recover 渲染报告。
+//
+// 参数：
+//   - st: 已打开的 store（调用方负责开关）
+//   - dataGroups: 数据组数（组 0..dataGroups 全部纳入报告）
+//   - mode: 确认档位（来自配置）
+//   - bootGen: 机器世代读取函数（nil 走平台实现）
+//   - lg: 日志器
+//
+// 返回：报告与错误。
+//
+// 注意：本函数**只读**——不消费干净关机标记、不写机器世代、不动任何键。
+// 判定复用 decideRecovery，与 NewManager 同源，因此命令与进程给出的结论
+// 恒等一致（见本文件头注释）。
+func InspectRecovery(st *store.Store, dataGroups uint32, mode AckMode, bootGen BootGenFunc, lg *slog.Logger) (RecoveryReport, error) {
+	rs := newRaftStore(st, lg)
+	// 只探标记在不在，不消费它——消费是 NewManager 的副作用，命令不能替它做
+	_, hasClean, err := st.Get([]byte(cleanShutdownKey))
+	if err != nil {
+		return RecoveryReport{}, fmt.Errorf("cluster: 读干净关机标记: %w", err)
+	}
+	genNow, genNowOK := resolveBootGen(bootGen, lg)
+	genStored, genStoredOK, err := rs.LoadBootGen()
+	if err != nil {
+		return RecoveryReport{}, err
+	}
+	permit, permitOK, err := rs.LoadRecoverPermit()
+	if err != nil {
+		return RecoveryReport{}, err
+	}
+
+	hasRaft := false
+	groups := make([]GroupReport, 0, dataGroups+1)
+	for g := uint32(0); g <= dataGroups; g++ {
+		hs, ents, snapMeta, err := rs.Load(g)
+		if err != nil {
+			return RecoveryReport{}, err
+		}
+		applied, err := rs.Applied(g)
+		if err != nil {
+			return RecoveryReport{}, err
+		}
+		gr := GroupReport{
+			Group: g, Applied: applied,
+			SnapIndex: snapMeta.GetIndex(),
+			Term:      hs.GetTerm(), Commit: hs.GetCommit(),
+		}
+		if n := len(ents); n > 0 {
+			gr.LastIndex = ents[n-1].GetIndex()
+			gr.LastTerm = ents[n-1].GetTerm()
+		}
+		if applied != 0 || !raft.IsEmptyHardState(hs) {
+			hasRaft = true
+		}
+		groups = append(groups, gr)
+	}
+
+	path, reason := decideRecovery(recoveryInput{
+		Clean: hasClean, HasRaft: hasRaft, Mode: mode,
+		GenNow: genNow, GenNowOK: genNowOK,
+		GenStored: genStored, GenStoredOK: genStoredOK,
+		PermitGen: permit.Gen, PermitOK: permitOK,
+	})
+	return RecoveryReport{
+		Path: path.String(), Reason: reason,
+		NeedsPermit: path == pathRejoin,
+		GenNow:      genNow, GenNowOK: genNowOK,
+		GenStored: genStored, GenStoredOK: genStoredOK,
+		Mode:      mode,
+		HasPermit: permitOK, PermitGen: permit.Gen,
+		Groups: groups,
+	}, nil
+}
+
+// GrantRecoverPermit 写入一次性本地恢复许可，绑定当前机器世代。
+//
+// 参数：
+//   - st: 已打开的 store
+//   - now: 授予时间（调用方传入，便于测试固定时钟）
+//   - bootGen: 机器世代读取函数（nil 走平台实现）
+//   - lg: 日志器
+//
+// 世代读不到时拒绝授予：许可靠世代作废，没有世代的许可等于一张永不过期
+// 的通行证，比不给还危险。
+func GrantRecoverPermit(st *store.Store, now time.Time, bootGen BootGenFunc, lg *slog.Logger) error {
+	gen, ok := resolveBootGen(bootGen, lg)
+	if !ok {
+		return errors.New("cluster: 读不到本机机器世代，拒绝授予本地恢复许可——" +
+			"许可靠世代作废，没有世代的许可是一张永不过期的通行证")
+	}
+	rs := newRaftStore(st, lg)
+	return rs.SaveRecoverPermit(recoverPermit{GrantedAt: now.Format(time.RFC3339), Gen: gen})
 }
