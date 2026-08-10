@@ -182,3 +182,50 @@ export interface SendResult {
    */
   forwarded?: boolean
 }
+
+/** 成员表里的一个节点 */
+export interface ClusterNode {
+  id: number
+  raft_addr: string
+  self: boolean
+}
+
+/** leader 视角下某个 peer 的复制进度。pending_snapshot 非零 = 正在被发快照 */
+export interface PeerProgress {
+  id: number
+  match: number
+  next: number
+  state: string
+  recent_active: boolean
+  is_learner: boolean
+  pending_snapshot: number
+}
+
+/**
+ * 一个 raft 组在本节点视角下的状态。
+ *
+ * commit 是 raft 提交位点（每节点都有，follower 也有）；applied 是本节点
+ * 已 apply 到位点。「待 apply = commit − applied」是每节点自己就算得出的
+ * 落后量，不需要跨节点减法。
+ *
+ * peers 只在 is_leader 为 true 时有内容——raft 的复制进度只在 leader 上
+ * 维护。渲染时必须按 is_leader 判断，空数组不等于"没有 peer"。
+ */
+export interface ClusterGroup {
+  id: number
+  leader: number
+  is_leader: boolean
+  role: string
+  applied: number
+  commit: number
+  term: number
+  peers: PeerProgress[]
+}
+
+/** 集群拓扑。enabled=false 表示当前是单机模式，不是故障 */
+export interface ClusterView {
+  enabled: boolean
+  self_id: number
+  nodes: ClusterNode[]
+  groups: ClusterGroup[]
+}

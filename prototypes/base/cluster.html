@@ -1,0 +1,175 @@
+<!--
+  sq 控制台原型 · 集群
+
+  职责：
+    - 成员表 + 每个 raft 组的 leader/角色/applied + 落后量，供排查
+      「leader 在哪、谁在掉队、快照为什么卡住」时定位
+    - 本节点是某组 leader 时，该组展示各 peer 的复制进度
+      （Match / Next / RecentActive / PendingSnapshot）
+
+  对应 batch⑤ Admin API：GET /admin/cluster
+
+  边界：
+    - 零依赖、纯 mock、file:// 直开；数据只取自 shared/mock.js（SQ.cluster）
+    - 落后量沿用全站的 offset 带语汇（同一视图内共用一把刻度），不新造图形
+    - peers 只在本节点是该组 leader 时有内容（raft 复制进度只在 leader 上
+      维护），follower 视角的组展示「复制进度仅在本节点为该组 leader 时可见」
+    - 只读：领导权转移、成员变更等管理动作不挂在本页（要独立确认流程）
+-->
+<meta charset="utf-8">
+<title>sq 控制台 · 集群</title>
+<link rel="stylesheet" href="shared/app.css">
+<script src="shared/mock.js"></script>
+
+<div class="app-shell">
+  <aside class="sidebar">
+    <div class="brand"><b>sq</b><span>SIMPLE QUEUE</span></div>
+    <nav>
+      <a href="index.html" class="nav-item">总览</a>
+      <div class="nav-group">资源</div>
+      <a href="pages/topics.html" class="nav-item">Topic</a>
+      <a href="pages/groups.html" class="nav-item">消费组</a>
+      <a href="pages/delay.html" class="nav-item">延时队列</a>
+      <a href="pages/transactions.html" class="nav-item">事务</a>
+      <div class="nav-group">排查</div>
+      <a href="pages/messages.html" class="nav-item">消息查询</a>
+      <a href="pages/dlq.html" class="nav-item">死信队列</a>
+      <a href="pages/send.html" class="nav-item">发送测试消息</a>
+      <div class="nav-group">运维</div>
+      <a href="cluster.html" class="nav-item active" aria-current="page">集群</a>
+    </nav>
+  </aside>
+
+  <div class="main">
+    <header class="topbar">
+      <span class="page-title">集群</span>
+      <span class="spacer"></span>
+      <span class="endpoint">127.0.0.1:8081</span>
+      <span class="live"><i class="dot"></i>5s 后刷新</span>
+      <button class="btn">立即刷新</button>
+      <a class="btn" href="pages/login.html">退出登录</a>
+    </header>
+
+    <main class="content">
+      <!-- 本节点不是任何组 leader 时的全站提示：承接写转发 UX（batch⑤）——
+           中性陈述不是警告，这是集群正常形态 -->
+      <div class="notice" id="hint-follower" hidden>
+        <span>本节点当前<b>不是任何 raft 组的 leader</b>，写请求会被自动转发到对应组的 leader 节点。</span>
+      </div>
+
+      <!-- 节点卡 -->
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-title">节点</span>
+          <span class="panel-note">本页面视角所在节点高亮</span>
+        </div>
+        <div class="strip" id="nodes"></div>
+      </section>
+
+      <!-- 组表 -->
+      <section class="panel">
+        <div class="panel-head">
+          <span class="panel-title">Raft 组</span>
+          <span class="panel-note">「待 apply」= commit − applied，每节点自己算得出——applier 卡住立刻显形；offset 带同视图共用一把刻度</span>
+        </div>
+        <table>
+          <thead>
+            <tr>
+              <th style="width:70px">组号</th>
+              <th style="width:110px">LEADER</th>
+              <th style="width:110px">本节点角色</th>
+              <th class="r" style="width:100px">APPLIED</th>
+              <th class="r" style="width:100px">COMMIT</th>
+              <th class="r" style="width:96px">任期</th>
+              <th>待 apply（commit−applied）</th>
+              <th style="width:210px">复制进度</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+        <div class="panel-body">
+          <div class="panel-note">
+            复制进度只在本节点是该组 leader 时可见——raft 的 tracker 只在 leader
+            上维护复制位点，follower 视角拿不到 peer 数据，不是「集群里只有我一个」。
+            <b>PendingSnapshot 非零</b>表示该 peer 正在被发快照，长期非零即「快照卡住」现场，
+            应当排查该 peer 的拉取是否在前进。
+          </div>
+        </div>
+      </section>
+    </main>
+  </div>
+</div>
+
+<script>
+  const c = SQ.cluster;
+  const tbody = document.getElementById('tbody');
+
+  // 本节点不是任何组 leader：挂全站提示（承接写转发 UX）
+  if (!c.groups.some(g => g.isLeader)) {
+    document.getElementById('hint-follower').hidden = false;
+  }
+
+  /* ---------- 节点卡 ---------- */
+  const nodesBox = document.getElementById('nodes');
+  c.nodes.forEach(n => {
+    const div = document.createElement('div');
+    div.className = 'stat';
+    div.innerHTML = `
+      <div>
+        <div class="stat-label">${n.self ? '本节点 · ' : ''}节点 ${n.id}</div>
+        <div class="stat-val" style="font-size:17px">${n.self ? '本节点' : 'peer'}</div>
+        <small class="muted" style="font-family:var(--mono)">${n.raftAddr}</small>
+      </div>`;
+    nodesBox.appendChild(div);
+  });
+
+  /* ---------- 组表 ---------- */
+  // 「待 apply = commit − applied」每节点自己算得出；offset 带同视图共用
+  // 一把刻度（commit−applied 的最大值）归一，可直接横向比较
+  const lagOf = g => Math.max(0, g.commit - g.applied);
+  const maxLag = Math.max(...c.groups.map(lagOf), 1);
+
+  c.groups.forEach(g => {
+    const isSelfLeader = g.isLeader;
+    const lag = lagOf(g);
+    const lagPct = Math.min(100, lag / maxLag * 100);
+    const sev = lag > 500 ? 'rib-warn' : 'rib-ok';
+
+    const tr = document.createElement('tr');
+    const roleBadge = g.isLeader
+      ? '<span class="badge type">leader</span>'
+      : g.role === 'StateFollower'
+        ? '<span class="badge">follower</span>'
+        : `<span class="badge warn">${g.role.replace('State', '')}</span>`;
+    const leaderName = g.leader ? `节点 ${g.leader}` : '—';
+    // 复制进度：leader 视角显示各 peer 的 Match/Next + 复制落后
+    // （leaderApplied − p.Match）——只有 leader 行有数据（tracker 只在
+    // leader 上维护），follower 视角明示不可见
+    const peerCell = isSelfLeader
+      ? g.peers.map(p => {
+          const snap = p.pendingSnapshot ? ` <span class="badge warn" title="该 peer 正在被发快照，长期非零即卡住">快照挂起</span>` : '';
+          const act = p.recentActive ? '' : ' <span class="badge warn">不活跃</span>';
+          const peerLag = Math.max(0, g.commit - p.match);
+          return `<div class="prog" style="margin:2px 0">peer ${p.id}：Match ${SQ.fmt(p.match)} · 落后 ${SQ.fmt(peerLag)}${snap}${act}</div>`;
+        }).join('')
+      : '<span class="panel-note">复制进度仅在本节点为该组 leader 时可见</span>';
+
+    tr.innerHTML = `
+      <td class="num">${g.id}${g.id === 0 ? ' <small class="muted">meta</small>' : ''}</td>
+      <td class="name">${leaderName}</td>
+      <td>${roleBadge}</td>
+      <td class="num">${SQ.fmt(g.applied)}</td>
+      <td class="num">${SQ.fmt(g.commit)}</td>
+      <td class="num">${g.term}</td>
+      <td>
+        <div class="ribbon">
+          <span class="${sev}" style="width:${lagPct.toFixed(1)}%"></span>
+          <span class="cursor"></span>
+          ${lag === 0 ? '<span class="caught">已追平</span>' : ''}
+        </div>
+        <div class="prog"><span>待 apply ${SQ.fmt(lag)}</span></div>
+      </td>
+      <td>${peerCell}</td>`;
+    tbody.appendChild(tr);
+  });
+</script>
