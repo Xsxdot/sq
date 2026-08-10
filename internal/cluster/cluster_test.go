@@ -439,6 +439,86 @@ func TestSingleNodeUncleanRestartRejoins(t *testing.T) {
 	t.Logf("单节点断电恢复完成：全组 leader 复归节点 1")
 }
 
+// TestRejoinKeepsDataWhenClusterUnreachable 断言重入编排在**取得集群接纳
+// 之前不得销毁本地数据**。
+//
+// 为什么这条是红线：不干净关机（kill -9 / OOM / 断电 / fail-stop panic）
+// 后 main 会无人值守自动走 Rejoin。若清空数据目录发生在确认能重同步之前，
+// 则「全集群同时断电」= 三份副本各自 wipe 后都找不到 leader，数据永久全损；
+// 「2-of-3 硬宕」= 两个节点 wipe 后无法凑够 quorum 批准自己的 ConfChange，
+// 集群从一次可恢复事件变成永久死亡。接受「不干净的节点必须从 leader 重
+// 同步」是合理的，在能重同步之前先毁数据不是。
+//
+// 断言：对端全不可达时 Rejoin 报错，且数据目录原样保留（可重新打开、
+// 旧键仍在）——留给运维恢复多数派后重启即可自愈。
+func TestRejoinKeepsDataWhenClusterUnreachable(t *testing.T) {
+	dir := t.TempDir()
+	lg := testSlog(t)
+
+	// 先造一份「断电前的真实数据」：开 store 写一键再关，模拟 main 在
+	// 检测到 ErrUncleanShutdown 后关旧 store 的前置状态（六步之 1）
+	st, err := store.Open(dir, false, lg)
+	if err != nil {
+		t.Fatalf("预置 store: %v", err)
+	}
+	b := st.NewBatch()
+	if err := b.Set([]byte("meta/topic/survivor"), []byte("v")); err != nil {
+		t.Fatalf("预置写入: %v", err)
+	}
+	if err := st.Apply(b); err != nil {
+		t.Fatalf("预置提交: %v", err)
+	}
+	if err := st.Close(); err != nil {
+		t.Fatalf("预置关闭 store: %v", err)
+	}
+
+	// 三个对端地址都是「listen 后立刻关掉」拿到的死端口：controlCall 必然
+	// 连不上，等价于「多数派全灭，没有任何 leader 能批准我重入」
+	peers := map[uint64]string{}
+	for id := uint64(1); id <= 3; id++ {
+		l, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("取死端口: %v", err)
+		}
+		peers[id] = l.Addr().String()
+		l.Close()
+	}
+
+	// 短 ctx：prepareJoinPoll 的 30s 是 WithTimeout(ctx, 30s)，父 ctx 更短
+	// 时以父为准——用例不必真等满 30s
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	m, err := Rejoin(ctx, Options{
+		NodeID:     2,
+		Peers:      peers,
+		DataGroups: 3,
+		Logger:     lg,
+	}, dir)
+	if err == nil {
+		m.StopClean(context.Background())
+		t.Fatal("对端全不可达时 Rejoin 竟然成功——重入编排必须在拿不到接纳时失败")
+	}
+	t.Logf("Rejoin 如期失败: %v", err)
+
+	// 红线断言：数据目录没被清空，旧键还在
+	st2, err := store.Open(dir, false, lg)
+	if err != nil {
+		t.Fatalf("重入失败后数据目录已不可打开（疑似已被 wipe）: %v", err)
+	}
+	defer st2.Close()
+	v, ok, err := st2.Get([]byte("meta/topic/survivor"))
+	if err != nil {
+		t.Fatalf("重入失败后读旧键: %v", err)
+	}
+	if !ok {
+		t.Fatal("重入失败后旧键已消失——数据目录在取得集群接纳之前就被清空了")
+	}
+	if string(v) != "v" {
+		t.Fatalf("旧键值被改写: %q", v)
+	}
+	t.Log("重入编排失败但本地数据完好——可待多数派恢复后重启自愈")
+}
+
 // waitLeader 轮询节点 id 的 Leader(g) 直到报告 lead==nodeID（或超时
 // Fatal）。单节点恢复场景用：节点必须重新成为各组 leader 才算恢复。
 func (tc *testCluster) waitLeader(t *testing.T, g uint32, nodeID uint64, timeout time.Duration) {
@@ -1181,14 +1261,11 @@ func (tc *testCluster) rejoinAsLearner(t *testing.T, ctx context.Context, victim
 	}
 	t.Logf("节点 %d 旧 store 已关闭", victim)
 
-	// 2. 清空状态目录（含旧 raft 日志——身份由 leader ConfChange 重赋）
-	if err := WipeForRejoin(dir); err != nil {
-		t.Fatalf("WipeForRejoin(%s): %v", dir, err)
-	}
-	t.Logf("节点 %d 状态目录已清空", victim)
-
-	// 3. 各存活 leader 先 Remove 旧 voter 再 AddLearner（meta + 全数据组）。
+	// 2. 各存活 leader 先 Remove 旧 voter 再 AddLearner（meta + 全数据组）。
 	//    先 Remove 是 raft 前置：同 id 已在成员表（voter）时再 Add 会报错。
+	//
+	//    编排先于清空（与生产 Rejoin 同序，见其文档注释的安全红线）：
+	//    取得集群接纳之前不得销毁本地仅有的一份副本。
 	for g := uint32(0); g <= tc.dataGroups; g++ {
 		lead := tc.leaderOf(t, g) // 内部跳过已 kill 节点（含 victim）
 		ccCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
@@ -1203,6 +1280,13 @@ func (tc *testCluster) rejoinAsLearner(t *testing.T, ctx context.Context, victim
 		cancel()
 		t.Logf("组 %d（leader %d）: 已 Remove→AddLearner 节点 %d", g, lead, victim)
 	}
+
+	// 3. 清空状态目录（含旧 raft 日志——身份由 leader ConfChange 重赋）。
+	//    执行到这里集群已接纳重入，销毁旧状态是既定步骤而非赌注。
+	if err := WipeForRejoin(dir); err != nil {
+		t.Fatalf("WipeForRejoin(%s): %v", dir, err)
+	}
+	t.Logf("节点 %d 状态目录已清空", victim)
 
 	// 4. 抢占 victim 的监听地址作为新 Manager 的监听器：kill 后 Done
 	//    不保证旧传输层看门狗已关监听器（它不在传输层 wg 内），直接重绑

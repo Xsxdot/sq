@@ -1841,12 +1841,12 @@ func WipeForRejoin(dataDir string) error {
 // 六步：
 //  1. 旧 store 已关闭——调用方职责（pebble 持有目录句柄，不关闭
 //     WipeForRejoin 清不掉；本函数不代关，签名约定即此）
-//  2. WipeForRejoin 清空数据目录（含旧 raft 日志——身份由存活
-//     leader 的 ConfChange 日志重赋）
-//  3. 轮询全部对端发 PrepareJoin：每端对**自己当前 lead** 的组做
+//  2. 轮询全部对端发 PrepareJoin：每端对**自己当前 lead** 的组做
 //     Remove→AddLearner 并返回完成组号，收齐 0..DataGroups 全组完成
 //     （30s 总时限；期间 leader 可能换手——重发即可，Remove/AddLearner
 //     幂等，见 handlePrepareJoin/rejoinGroupPrep）
+//  3. WipeForRejoin 清空数据目录（含旧 raft 日志——身份由存活
+//     leader 的 ConfChange 日志重赋）
 //  4. 重建本节点监听（EADDRINUSE 抢占，逻辑与注释同 harness）：kill
 //     后 Done 不保证旧传输层看门狗已关监听器，直接重绑同一地址可能
 //     撞 EADDRINUSE；先 net.Listen 抢到端口（拿到即旧监听器已关的
@@ -1867,6 +1867,11 @@ func WipeForRejoin(dataDir string) error {
 //     （leader 侧注入，见 Options 字段注释）
 //   - 本节点自身不自动清目录——Wipe 是破坏性动作，main（Task 11）在
 //     检测到 ErrUncleanShutdown 后应先打日志留痕再调用本函数
+//   - **第 2 步与第 3 步的先后是安全红线，不得调换**：清空必须发生在
+//     集群正式接纳（PrepareJoin 全组完成）之后。理由与后果见函数体内
+//     第 2 步的注释；守护用例为 TestRejoinKeepsDataWhenClusterUnreachable
+//   - 编排失败（第 2 步）时数据目录原样保留，进程应拒启告警而不是续跑：
+//     恢复多数派后重启即可重试自愈，本地那份数据是最后的兜底
 func Rejoin(ctx context.Context, o Options, dataDir string) (*Manager, error) {
 	if o.DataGroups == 0 {
 		o.DataGroups = 3 // 与 NewManager 同一默认
@@ -1879,16 +1884,35 @@ func Rejoin(ctx context.Context, o Options, dataDir string) (*Manager, error) {
 	// 第 1 步：旧 store 已关闭（调用方职责，见函数注释）
 	lg.Info("重入编排: 第 1 步 旧 store 已关闭", "node", o.NodeID, "dir", dataDir)
 
-	// 第 2 步：清空状态目录（幂等：整体重跑安全）
+	// 第 2 步：PrepareJoin 全组编排（30s 总时限，leader 换手重发幂等）
+	//
+	// 为什么编排必须排在清空之前（这个顺序是安全红线，不得为"少一次
+	// 网络往返"之类的理由调换）：本地数据是这个节点仅有的一份副本，
+	// 清空之后唯一的恢复途径就是从存活 leader 全量重同步。若先清空再
+	// 去问能不能重入，问不到时数据已经没了——「全集群同时断电」会让
+	// 三份副本各自清空后都找不到 leader（永久全损），「2-of-3 硬宕」
+	// 会让两个节点清空后再也凑不齐批准自己 ConfChange 的 quorum（一次
+	// 可恢复事件变成集群永久死亡）。
+	//
+	// 反过来，PrepareJoin 成功即「集群已提交 Remove→AddLearner，正式
+	// 接纳本节点以空日志重入」——此时清空不但安全而且必须：leader 侧
+	// 已把本节点当成全新 learner，本地旧日志留着反而是分叉源。
+	//
+	// prepareJoinPoll 只做对外控制调用，不碰 dataDir，因此失败返回时
+	// 本地数据分毫未动（TestRejoinKeepsDataWhenClusterUnreachable 守这条）。
+	if err := prepareJoinPoll(ctx, lg, o); err != nil {
+		lg.Error("重入编排: 第 2 步 PrepareJoin 失败，数据目录保持原样未清空——"+
+			"恢复多数派后重启本节点即可重试自愈",
+			"node", o.NodeID, "dir", dataDir, "err", err)
+		return nil, fmt.Errorf("cluster: 重入编排第 2 步 PrepareJoin（本地数据未清空，可待多数派恢复后重启）: %w", err)
+	}
+
+	// 第 3 步：清空状态目录（幂等：整体重跑安全）。执行到这里说明集群
+	// 已正式接纳本节点重入，销毁本地旧状态是编排的既定步骤而非赌注。
 	if err := WipeForRejoin(dataDir); err != nil {
 		return nil, err
 	}
-	lg.Info("重入编排: 第 2 步 状态目录已清空", "dir", dataDir, "duration", time.Since(start).Round(time.Millisecond))
-
-	// 第 3 步：PrepareJoin 全组编排（30s 总时限，leader 换手重发幂等）
-	if err := prepareJoinPoll(ctx, lg, o); err != nil {
-		return nil, fmt.Errorf("cluster: 重入编排第 3 步 PrepareJoin: %w", err)
-	}
+	lg.Info("重入编排: 第 3 步 状态目录已清空（集群已接纳在先）", "dir", dataDir, "duration", time.Since(start).Round(time.Millisecond))
 
 	// 第 4 步：重建本节点监听（EADDRINUSE 抢占，注释同 harness——
 	// kill 后旧传输层看门狗关监听器与 Done 不同步，直接重绑同地址

@@ -249,16 +249,23 @@ func run() error {
 		}
 		m, err = cluster.NewManager(opts)
 		if errors.Is(err, cluster.ErrUncleanShutdown) {
-			// 无人值守自愈是集群模式默认行为：清空数据目录是破坏性动作，
-			// 日志留痕是补偿——拒启等人工介入违背高可用初衷。
-			logger.Error("检测到不干净关机，即将清空数据目录以 learner 重入", "dir", cfg.DataDir)
+			// 无人值守自愈是集群模式默认行为：本节点先向存活 leader 求得
+			// 接纳（PrepareJoin），拿到之后才清空数据目录以 learner 重入。
+			// 求不到接纳时 Rejoin 报错且**不清空**，本进程随即拒启——此时
+			// 本地那份数据是集群最后的兜底，宁可停机等人工恢复多数派，也
+			// 不能先毁了它（顺序红线见 cluster.Rejoin 文档注释）。
+			logger.Error("检测到不干净关机，开始重入编排（先求集群接纳，成功后才清空数据目录）", "dir", cfg.DataDir)
 			if cerr := st.Close(); cerr != nil {
 				return fmt.Errorf("关闭旧 store 后重入: %w", cerr)
 			}
 			opts.Store = nil // Rejoin 忽略 Store/Listener，内部按 dataDir 重开
 			m, err = cluster.Rejoin(runCtx, opts, cfg.DataDir)
 			if err != nil {
-				return fmt.Errorf("集群重入失败: %w", err)
+				// 拒启而非续跑：编排失败时数据目录未被清空，这份本地数据
+				// 是恢复的唯一依据。运维恢复多数派后重启本节点即可自愈。
+				logger.Error("集群重入编排失败，进程拒启；本地数据目录未被清空，恢复多数派后重启本节点即可重试",
+					"dir", cfg.DataDir, "err", err)
+				return fmt.Errorf("集群重入失败（本地数据未清空，可待多数派恢复后重启）: %w", err)
 			}
 			st = m.Store() // Rejoin 内部重开了 store，后续装配用新实例
 			stPtr.Store(st)
