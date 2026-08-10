@@ -267,3 +267,68 @@ func TestBootGenRoundTrip(t *testing.T) {
 		t.Fatalf("覆盖后 LoadBootGen = %q; want \"gen-2\"", got)
 	}
 }
+
+// TestRecoverPermitRoundTrip 许可的写入→读回→被 ForceLocalRecover 消费。
+func TestRecoverPermitRoundTrip(t *testing.T) {
+	st := mustOpenStore(t, t.TempDir())
+	rs := newRaftStore(st, testSlog(t))
+
+	if _, ok, err := rs.LoadRecoverPermit(); err != nil || ok {
+		t.Fatalf("空库 LoadRecoverPermit = (_, %v, %v); want (_, false, nil)", ok, err)
+	}
+	want := recoverPermit{GrantedAt: "2026-08-10T20:00:00+08:00", Gen: "gen-b"}
+	if err := rs.SaveRecoverPermit(want); err != nil {
+		t.Fatalf("SaveRecoverPermit: %v", err)
+	}
+	got, ok, err := rs.LoadRecoverPermit()
+	if err != nil || !ok || got != want {
+		t.Fatalf("LoadRecoverPermit = (%+v, %v, %v); want (%+v, true, nil)", got, ok, err, want)
+	}
+}
+
+// TestForceLocalRecoverBumpsTermAndConsumesPermit 抬 term + 清 vote + 消费许可，
+// 三件事必须一起发生。
+//
+// 抬 term 是防日志分叉的关键：mem 档掉电可能丢掉投票记录，本节点在任期 T
+// 投过 A 却忘了，重启后又在 T 投给 B → 同一任期两个 leader → 日志分叉。
+// 抬任期在 raft 里永远安全，抬完就不可能在 T 投第二次。
+func TestForceLocalRecoverBumpsTermAndConsumesPermit(t *testing.T) {
+	st := mustOpenStore(t, t.TempDir())
+	rs := newRaftStore(st, testSlog(t))
+	const groups = uint32(3)
+
+	// 造出「组 0..3 各有一个带 term/vote 的 HardState」的现场
+	for g := uint32(0); g <= groups; g++ {
+		term, vote, commit := uint64(7), uint64(2), uint64(11)
+		hs := &raftpb.HardState{Term: &term, Vote: &vote, Commit: &commit}
+		if err := rs.Persist(g, hs, nil, true); err != nil {
+			t.Fatalf("组 %d 造 HardState: %v", g, err)
+		}
+	}
+	if err := rs.SaveRecoverPermit(recoverPermit{GrantedAt: "t", Gen: "gen-b"}); err != nil {
+		t.Fatalf("SaveRecoverPermit: %v", err)
+	}
+
+	if err := rs.ForceLocalRecover(groups); err != nil {
+		t.Fatalf("ForceLocalRecover: %v", err)
+	}
+
+	for g := uint32(0); g <= groups; g++ {
+		hs, _, _, err := rs.Load(g)
+		if err != nil {
+			t.Fatalf("组 %d Load: %v", g, err)
+		}
+		if hs.GetTerm() != 8 {
+			t.Fatalf("组 %d term = %d; want 8（抬一位）", g, hs.GetTerm())
+		}
+		if hs.GetVote() != 0 {
+			t.Fatalf("组 %d vote = %d; want 0——投票记录可能已丢，必须清空才不会在同一任期投第二次", g, hs.GetVote())
+		}
+		if hs.GetCommit() != 11 {
+			t.Fatalf("组 %d commit = %d; want 11（commit 位点不该被动）", g, hs.GetCommit())
+		}
+	}
+	if _, ok, _ := rs.LoadRecoverPermit(); ok {
+		t.Fatal("许可在 ForceLocalRecover 之后仍然存在——一次性许可必须被消费掉，否则下次不干净关机会被静默复用")
+	}
+}

@@ -33,6 +33,8 @@
 //	                               HasPreRaft，Join 的种子档位判据）
 //	raft/bootgen                 → 机器世代（写入时机见 SaveBootGen 注释：
 //	                               只在能启动成功的路径上写，拒启分支绝不写）
+//	raft/local_recover_permit    → 一次性本地恢复许可（两行文本：授予时间 /
+//	                               授予时机器世代；由 ForceLocalRecover 消费）
 //	raft/<g>/hs                  → HardState protobuf
 //	raft/<g>/conf                → ConfState protobuf（成员表，ConfChange
 //	                               apply 时整表覆盖写，SaveConfState）
@@ -50,6 +52,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -73,6 +76,7 @@ const (
 	cleanShutdownKey    = "raft/clean_shutdown"
 	preRaftKey          = "raft/preraft"
 	bootGenKey          = "raft/bootgen"
+	recoverPermitKey    = "raft/local_recover_permit"
 	groupEntPrefixFmt   = "raft/%d/ent/"
 	groupHsKeyFmt       = "raft/%d/hs"
 	groupConfFmt        = "raft/%d/conf"
@@ -625,6 +629,117 @@ func (r *raftStore) SaveBootGen(gen string) error {
 		return fmt.Errorf("raftstore SaveBootGen: %w", err)
 	}
 	r.lg.Info("机器世代已记录", "gen", gen)
+	return nil
+}
+
+// recoverPermit 是一次性本地恢复许可的内容。
+//
+// Gen 绑定授予时的机器世代，这是许可的作废机制：机器每重启一次世代就变，
+// 旧许可自动失效。用世代而非 TTL，是为了不依赖时钟——签字只对运维当时
+// 看到的那一次事故有效。
+type recoverPermit struct {
+	GrantedAt string // 授予时间（RFC3339，只给人看）
+	Gen       string // 授予时的机器世代（作废判据）
+}
+
+// SaveRecoverPermit 写入一次性本地恢复许可并 Sync 落盘。
+//
+// 值编码为两行 UTF-8 文本（第一行授予时间、第二行授予时世代）而非
+// protobuf：运维可能要用普通工具直接查看它，可读性远比编码效率重要，
+// 而这个值一生只被写一次、读一次。
+func (r *raftStore) SaveRecoverPermit(p recoverPermit) error {
+	b := r.st.NewBatch()
+	val := p.GrantedAt + "\n" + p.Gen
+	if err := b.Set([]byte(recoverPermitKey), []byte(val)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore SaveRecoverPermit: %w", err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore SaveRecoverPermit: %w", err)
+	}
+	r.lg.Error("已写入一次性本地恢复许可——下次启动将允许带着可能残缺的本地日志恢复，可能丢失已确认的消息",
+		"grantedAt", p.GrantedAt, "gen", p.Gen)
+	return nil
+}
+
+// LoadRecoverPermit 读取一次性本地恢复许可。
+//
+// 返回：许可内容、是否存在、错误。格式不合法时按「不存在」处理并记
+// Error——一个读不懂的许可绝不能被当成有效签字。
+func (r *raftStore) LoadRecoverPermit() (recoverPermit, bool, error) {
+	data, ok, err := r.st.Get([]byte(recoverPermitKey))
+	if err != nil {
+		return recoverPermit{}, false, fmt.Errorf("raftstore LoadRecoverPermit: %w", err)
+	}
+	if !ok {
+		return recoverPermit{}, false, nil
+	}
+	parts := strings.SplitN(string(data), "\n", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		r.lg.Error("本地恢复许可格式不合法，按无许可处理", "raw", string(data))
+		return recoverPermit{}, false, nil
+	}
+	return recoverPermit{GrantedAt: parts[0], Gen: parts[1]}, true, nil
+}
+
+// ForceLocalRecover 执行签字放行的本地恢复前置：抬全部组的任期、清空
+// 投票，并消费掉一次性许可。三件事在同一批次内 Sync 提交。
+//
+// 参数：
+//   - dataGroups: 数据组数；本方法处理组 0（meta 组）到 dataGroups
+//
+// 为什么必须抬 term：quorum-mem 档掉电可能丢掉投票记录——本节点在任期 T
+// 投给过 A，重启后忘了，又在 T 投给 B，于是同一任期出现两个 leader、
+// 日志分叉。这比丢数据严重，是损坏。抬任期在 raft 中永远安全（代价只是
+// 强制一次重新选举），抬完之后本节点不可能再在 T 投第二次。
+//
+// 为什么只有这条路径抬：另外三条恢复路径本来就没丢过投票，抬了纯属白白
+// 多付一次选举。
+//
+// 为什么与消费许可同批：两者必须同生共死。若先抬 term 后删许可而中间
+// 崩溃，许可会被重复消费；若先删许可后抬 term 而中间崩溃，运维签的字白费
+// 且节点仍带着旧任期启动。单批原子提交让这两种半截状态都不存在。
+//
+// 注意：commit 位点不动——它由日志重放与 leader 重新告知恢复，抬它没有
+// 意义且会与真实日志脱节。
+func (r *raftStore) ForceLocalRecover(dataGroups uint32) error {
+	b := r.st.NewBatch()
+	for g := uint32(0); g <= dataGroups; g++ {
+		hs := &raftpb.HardState{}
+		data, ok, err := r.st.Get(hsKey(g))
+		if err != nil {
+			b.Close()
+			return fmt.Errorf("raftstore ForceLocalRecover 组 %d 读 HardState: %w", g, err)
+		}
+		if ok {
+			if err := proto.Unmarshal(data, hs); err != nil {
+				b.Close()
+				return fmt.Errorf("raftstore ForceLocalRecover 组 %d 解码 HardState: %w", g, err)
+			}
+		}
+		newTerm := hs.GetTerm() + 1
+		var noVote uint64
+		hs.Term = &newTerm
+		hs.Vote = &noVote
+		enc, err := proto.Marshal(hs)
+		if err != nil {
+			b.Close()
+			return fmt.Errorf("raftstore ForceLocalRecover 组 %d 编码 HardState: %w", g, err)
+		}
+		if err := b.Set(hsKey(g), enc); err != nil {
+			b.Close()
+			return fmt.Errorf("raftstore ForceLocalRecover 组 %d 写 HardState: %w", g, err)
+		}
+		r.lg.Error("签字放行本地恢复：任期已抬、投票已清", "g", g, "term", newTerm)
+	}
+	if err := b.Delete([]byte(recoverPermitKey)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ForceLocalRecover 删许可: %w", err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore ForceLocalRecover: %w", err)
+	}
+	r.lg.Error("一次性本地恢复许可已消费（本次生效，不再对后续任何一次不干净关机放行）", "groups", dataGroups+1)
 	return nil
 }
 
