@@ -6,7 +6,7 @@
 
 **Goal:** 让不干净关机的节点在能证明本地日志完好时直接以原身份从本地日志恢复，消除「全集群同时硬宕后三节点互相等待、谁都起不来」这一 B10 遗留缺口。
 
-**Architecture:** 在现有 `NewManager` 的三分支恢复判定上引入第四个判据——**机器世代**（Linux `boot_id` / darwin `kern.boottime`），把判定扩为五分支。世代未变即证明页缓存从未丢失、本地日志完整，直接走既有的干净回放路径；`quorum-fsync` 档因每轮 `MustSync` 已落盘，即使机器重启也可直接本地恢复；只有「`quorum-mem` + 机器真重启过」这一格保留拒启，并由新增的 `sq recover` 命令提供一次性、绑定机器世代的运维签字出口。判定逻辑抽成纯函数供 `NewManager` 与 `sq recover` 共用。
+**Architecture:** 在现有 `NewManager` 的三分支恢复判定上引入第四个判据——**机器世代**（Linux `boot_id` / darwin `kern.boottime`），把判定扩为五分支。世代未变即证明页缓存从未丢失，本地日志可信，直接走既有的干净回放路径（mem 档另需抬 term——见 Task 6b，投票记录走的是 NoSync 异步路径，可能没落盘）；`quorum-fsync` 档因每轮 `MustSync` 已落盘，即使机器重启也可直接本地恢复；只有「`quorum-mem` + 机器真重启过」这一格保留拒启，并由新增的 `sq recover` 命令提供一次性、绑定机器世代的运维签字出口。判定逻辑抽成纯函数供 `NewManager` 与 `sq recover` 共用。
 
 **Tech Stack:** Go；`go.etcd.io/raft/v3`；`github.com/cockroachdb/pebble/v2`（经 `internal/store` 唯一写入口）；`golang.org/x/sys/unix`（darwin 世代读取，已是间接依赖）；`google.golang.org/protobuf`。
 
@@ -1750,6 +1750,299 @@ EOF
 
 ---
 
+### Task 6b: mem 档 `local-resume` 也抬 term（实现期订正）
+
+> **这个 task 是 Task 1–6 完成后新增的**，起因是 Task 7 的 e2e 用例实测推翻了原设计的一条前提。改动的是 Task 4 与 Task 5 已提交的代码，不是重做它们。背景见 spec §2.2 与 §3.3 的两段「订正留痕」。
+
+**为什么**：原设计只让 `local-forced` 抬 term，理由是「世代未变 ⇒ 页缓存完好 ⇒ 什么都没丢」。这个理由是错的——Pebble 的 `NoSync` 提交返回时，数据可能还在进程内的 WAL 缓冲里（`WriteRecord` 只 `f.ready.Signal()` 就返回，真正的 `write(2)` 由 flusher goroutine 异步做）。而 mem 档下 HardState（含 Vote）走的正是这条路径。于是 `local-resume` 可能带着一张「投过但没落盘」的选票以原身份复活 → 同一任期投第二次 → 两个 leader → 日志分叉。
+
+**这个洞是 B11 新开的**，不是既有缺陷：B11 之前不干净的节点一律清空重入，带的是全新状态，无从双投票。所以抬 term 是新路径必须自带的安全前置，不是「顺手补个老问题」。
+
+**Files:**
+- Modify: `internal/cluster/recovery.go`（新增 `needsTermBump`）
+- Modify: `internal/cluster/raftstore.go`（抽出共用的抬 term 批次逻辑，新增 `BumpTermsForLocalResume`）
+- Modify: `internal/cluster/manager.go`（`pathLocalResume` 分支按档位决定是否抬）
+- Test: `internal/cluster/recovery_test.go`、`internal/cluster/raftstore_test.go`、`internal/cluster/manager_test.go`
+
+**Interfaces:**
+- Produces:
+  - `func needsTermBump(p recoveryPath, mode AckMode) bool`
+  - `func (r *raftStore) BumpTermsForLocalResume(dataGroups uint32) error`（抬 term + 清 vote，**不**碰许可键）
+- Changes: `ForceLocalRecover` 内部改为复用同一段抬 term 逻辑，对外签名与语义不变（抬 term + 消费许可，同批 Sync）
+
+- [ ] **Step 1: 写失败的测试**
+
+追加到 `internal/cluster/recovery_test.go`：
+
+```go
+// TestNeedsTermBump 抬 term 的适用范围——按 spec §3.3 的表逐格覆盖。
+//
+// 判据是「投票记录是不是同步落盘的」，不是「机器有没有重启」：
+// fsync 档跟随 MustSync，term/vote 每次变更都已 fsync，投票不可能丢；
+// mem 档走 NoSync 异步路径，commit 返回时可能还在进程内缓冲。
+func TestNeedsTermBump(t *testing.T) {
+	cases := []struct {
+		path recoveryPath
+		mode AckMode
+		want bool
+	}{
+		{pathLocalResume, AckQuorumMem, true},
+		{pathLocalResume, AckQuorumFsync, false},
+		{pathLocalForced, AckQuorumMem, true},
+		{pathCleanResume, AckQuorumMem, false},
+		{pathCleanResume, AckQuorumFsync, false},
+		{pathFresh, AckQuorumMem, false},
+		{pathRejoin, AckQuorumMem, false},
+	}
+	for _, c := range cases {
+		if got := needsTermBump(c.path, c.mode); got != c.want {
+			t.Fatalf("needsTermBump(%v, %v) = %v; want %v", c.path, c.mode, got, c.want)
+		}
+	}
+}
+```
+
+追加到 `internal/cluster/manager_test.go`：
+
+```go
+// TestUncleanSameBootMemBumpsTerm mem 档下世代未变的本地恢复也必须抬 term。
+//
+// 不抬的后果不是丢数据而是损坏：本节点可能在任期 T 投过票但没落盘，
+// 重启后又在 T 投第二次，同一任期两个 leader、日志分叉。
+func TestUncleanSameBootMemBumpsTerm(t *testing.T) {
+	dir := t.TempDir()
+	st1, m1 := startSoloManager(t, dir, AckQuorumMem, withBootGen("gen-a"))
+	waitSoloLeader(t, m1)
+	m1.kill()
+	<-m1.Done()
+	before, _, _, err := newRaftStore(st1, testSlog(t)).Load(0)
+	if err != nil {
+		t.Fatalf("读恢复前 HardState: %v", err)
+	}
+	beforeTerm := before.GetTerm()
+	if err := st1.Close(); err != nil {
+		t.Fatalf("关闭 store: %v", err)
+	}
+
+	st2 := mustOpenStore(t, dir)
+	o := soloOptions(t, st2, dir, AckQuorumMem)
+	withBootGen("gen-a")(&o)
+	m2, err := NewManager(o)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	after, _, _, err := newRaftStore(st2, testSlog(t)).Load(0)
+	if err != nil {
+		t.Fatalf("读恢复后 HardState: %v", err)
+	}
+	if after.GetTerm() <= beforeTerm {
+		t.Fatalf("term = %d，未高于恢复前的 %d——mem 档 local-resume 必须抬任期", after.GetTerm(), beforeTerm)
+	}
+	if after.GetVote() != 0 {
+		t.Fatalf("vote = %d; want 0——可能丢失的投票记录必须清空", after.GetVote())
+	}
+	m2.kill()
+	<-m2.Done()
+}
+
+// TestUncleanFsyncLocalResumeKeepsTerm fsync 档不抬 term：投票每次变更都已
+// fsync，抬了纯属白白多付一次选举，抬了也说明实现把判据搞错了。
+func TestUncleanFsyncLocalResumeKeepsTerm(t *testing.T) {
+	dir := t.TempDir()
+	st1, m1 := startSoloManager(t, dir, AckQuorumFsync, withBootGen("gen-a"))
+	waitSoloLeader(t, m1)
+	m1.kill()
+	<-m1.Done()
+	before, _, _, err := newRaftStore(st1, testSlog(t)).Load(0)
+	if err != nil {
+		t.Fatalf("读恢复前 HardState: %v", err)
+	}
+	beforeTerm := before.GetTerm()
+	if err := st1.Close(); err != nil {
+		t.Fatalf("关闭 store: %v", err)
+	}
+
+	st2 := mustOpenStore(t, dir)
+	o := soloOptions(t, st2, dir, AckQuorumFsync)
+	withBootGen("gen-b")(&o) // 机器重启过，走 fsync 档的 local-resume
+	m2, err := NewManager(o)
+	if err != nil {
+		t.Fatalf("NewManager: %v", err)
+	}
+	after, _, _, err := newRaftStore(st2, testSlog(t)).Load(0)
+	if err != nil {
+		t.Fatalf("读恢复后 HardState: %v", err)
+	}
+	if after.GetTerm() != beforeTerm {
+		t.Fatalf("term 从 %d 变成了 %d——fsync 档不该抬任期", beforeTerm, after.GetTerm())
+	}
+	m2.kill()
+	<-m2.Done()
+}
+```
+
+- [ ] **Step 2: 跑测试确认失败**
+
+Run: `go test ./internal/cluster/ -run 'TestNeedsTermBump|TestUncleanSameBootMemBumpsTerm|TestUncleanFsyncLocalResumeKeepsTerm' -v`
+Expected: FAIL——`undefined: needsTermBump`；`TestUncleanSameBootMemBumpsTerm` 报 term 未变（旧行为）
+
+- [ ] **Step 3: 写实现**
+
+`internal/cluster/recovery.go` 追加：
+
+```go
+// needsTermBump 判定某条恢复路径是否必须在回放前抬任期、清投票。
+//
+// 判据是**投票记录是不是同步落盘的**，不是「机器有没有重启」：
+//   - fsync 档：syncPersist 跟随 raft.MustSync，term/vote 每次变更都已 fsync，
+//     投票不可能丢，抬了纯属白白多付一次选举
+//   - mem 档：HardState 走 Pebble 的 NoSync——commit 返回时数据可能还在
+//     进程内的 WAL 缓冲里（write(2) 由 flusher goroutine 异步执行），
+//     所以任何一次不干净关机后都可能少一张已投出的票
+//
+// 少一张票的后果是**损坏**而非丢数据：同一任期投第二次 → 两个 leader →
+// 日志分叉。抬任期在 raft 中永远安全，代价只是强制一次重新选举。
+//
+// clean-resume 不需要：MarkCleanShutdown 是 Sync 写，会把此前所有 NoSync
+// 写一并刷盘。fresh 无历史。rejoin 会清空状态重入，更无从谈起。
+func needsTermBump(p recoveryPath, mode AckMode) bool {
+	switch p {
+	case pathLocalForced:
+		return true
+	case pathLocalResume:
+		return mode == AckQuorumMem
+	default:
+		return false
+	}
+}
+```
+
+`internal/cluster/raftstore.go`：把 `ForceLocalRecover` 里逐组抬 term 的循环抽成共用函数，并新增只抬不消费许可的入口：
+
+```go
+// bumpTermsInto 把组 0..dataGroups 每组 HardState 的 Term 加 1、Vote 清空，
+// 写进给定批次（不提交——提交时机由调用方决定，这样抬 term 才能与消费许可
+// 同批原子落盘）。
+//
+// commit 位点刻意不动：它由日志重放与 leader 重新告知恢复，抬它没有意义
+// 且会与真实日志脱节。
+func (r *raftStore) bumpTermsInto(b *store.Batch, dataGroups uint32) error {
+	for g := uint32(0); g <= dataGroups; g++ {
+		hs := &raftpb.HardState{}
+		data, ok, err := r.st.Get(hsKey(g))
+		if err != nil {
+			return fmt.Errorf("组 %d 读 HardState: %w", g, err)
+		}
+		if ok {
+			if err := proto.Unmarshal(data, hs); err != nil {
+				return fmt.Errorf("组 %d 解码 HardState: %w", g, err)
+			}
+		}
+		newTerm := hs.GetTerm() + 1
+		var noVote uint64
+		hs.Term = &newTerm
+		hs.Vote = &noVote
+		enc, err := proto.Marshal(hs)
+		if err != nil {
+			return fmt.Errorf("组 %d 编码 HardState: %w", g, err)
+		}
+		if err := b.Set(hsKey(g), enc); err != nil {
+			return fmt.Errorf("组 %d 写 HardState: %w", g, err)
+		}
+		r.lg.Error("不干净关机后本地恢复：任期已抬、投票已清", "g", g, "term", newTerm)
+	}
+	return nil
+}
+
+// BumpTermsForLocalResume 为 local-resume 抬任期、清投票并 Sync 落盘。
+//
+// 与 ForceLocalRecover 的区别只有一个：本方法**不碰许可键**。local-resume
+// 本来就不需要运维签字（它要么世代未变、要么是 fsync 档），只是 mem 档下
+// 投票记录可能没落盘，所以同样要抬任期。见 needsTermBump 的注释。
+func (r *raftStore) BumpTermsForLocalResume(dataGroups uint32) error {
+	b := r.st.NewBatch()
+	if err := r.bumpTermsInto(b, dataGroups); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore BumpTermsForLocalResume: %w", err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore BumpTermsForLocalResume: %w", err)
+	}
+	return nil
+}
+```
+
+`ForceLocalRecover` 改为复用 `bumpTermsInto`，其余不变（仍在同一批次里 `b.Delete(recoverPermitKey)` 后 Sync 提交）。**同时修掉它 doc 注释里那句「为什么只有这条路径抬」**——那个说法已经不成立了，改为指向 `needsTermBump`。
+
+`internal/cluster/manager.go` 的恢复分支改为：
+
+```go
+	replay := false
+	switch path {
+	case pathCleanResume, pathLocalResume:
+		replay = true
+	case pathLocalForced:
+		// 抬任期 + 清投票 + 消费许可，同批 Sync
+		if err := m.rs.ForceLocalRecover(o.DataGroups); err != nil {
+			return nil, err
+		}
+		replay = true
+	...
+	}
+	// local-resume 在 mem 档下同样要抬任期：投票记录走 NoSync 异步路径，
+	// 可能没落盘（见 needsTermBump）。local-forced 已在上面抬过，不重复。
+	if path == pathLocalResume && needsTermBump(path, o.Mode) {
+		if err := m.rs.BumpTermsForLocalResume(o.DataGroups); err != nil {
+			return nil, err
+		}
+	}
+```
+
+- [ ] **Step 4: 跑测试确认通过**
+
+Run: `go test ./internal/cluster/ -run 'TestNeedsTermBump|TestUnclean|TestForcedLocalRecover' -v`
+Expected: 全 PASS
+
+Run: `go test ./internal/cluster/`
+Expected: ok（既有用例不得回归）
+
+- [ ] **Step 5: 加关键节点日志**
+
+- 逐组抬 term 的 Error 日志已在 `bumpTermsInto` 内（沿用 Task 4 的规格，文案改为对两条路径都成立的「不干净关机后本地恢复」）
+- 恢复路径判定的那行 Info 日志已包含 `mode`，与本 task 的分支判据一致，无需新增
+- 不为 `needsTermBump` 打日志：它是纯函数，且结论已随抬 term 的 Error 日志体现
+
+- [ ] **Step 6: 加注释**
+
+核对 Step 3 已包含：`needsTermBump` 用一整段写清「判据是投票是否同步落盘，不是机器有没有重启」以及 Pebble NoSync 的异步性；`bumpTermsInto` 说明为何不提交、commit 位点为何不动；`BumpTermsForLocalResume` 说明它与 `ForceLocalRecover` 的唯一区别；`ForceLocalRecover` 里那句过时的「只有这条路径抬」必须改掉；`manager.go` 调用点说明为何 `local-forced` 不重复抬。
+
+- [ ] **Step 7: 提交**
+
+```bash
+go build ./... && go vet ./...
+git add internal/cluster/recovery.go internal/cluster/raftstore.go internal/cluster/manager.go internal/cluster/recovery_test.go internal/cluster/raftstore_test.go internal/cluster/manager_test.go
+git commit -m "$(cat <<'EOF'
+fix(cluster): mem 档 local-resume 也抬 term——NoSync 是异步的，投票可能没落盘
+
+原设计只让 local-forced 抬 term，理由是「世代未变 ⇒ 页缓存完好 ⇒ 什么都
+没丢」。这个理由是错的：Pebble 的 NoSync 提交返回时数据可能还在进程内的
+WAL 缓冲里（WriteRecord 只 Signal 一下就返回，write(2) 由 flusher goroutine
+异步做），而 mem 档下 HardState 含 Vote 走的正是这条路径。
+
+于是 local-resume 可能带着一张「投过但没落盘」的选票以原身份复活，在同一
+任期投第二次 → 两个 leader → 日志分叉。这个洞是 B11 新开的：此前不干净的
+节点一律清空重入，带的是全新状态，无从双投票。
+
+判据因此不是「机器有没有重启」而是「投票记录是不是同步落盘的」——fsync 档
+跟随 MustSync，投票不可能丢，抬了白付一次选举；mem 档一律要抬。
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
 ### Task 7: e2e 场景用例
 
 **Files:**
@@ -1799,15 +2092,24 @@ func (pc *procCluster) setEnv(i int, kv ...string) {
 //
 // 这条用例取代了旧的 TestScenarioFullPowerLossCannotRecover。旧用例把
 // 「三节点全崩 = 集群永久需要人工介入」固化成了期望行为，而那个行为的
-// 前提是错的：SIGKILL 杀的是进程，机器没重启，页缓存完好，三份日志毫发
-// 无伤——它们只是被一条过度保守的规则拦在门外（B11）。
+// 前提是错的：SIGKILL 杀的是进程，机器没重启，页缓存还在，三份日志基本
+// 完好——它们只是被一条过度保守的规则拦在门外（B11）。
 //
 // 真掉电（页缓存丢失）的形态由 TestScenarioRebootedMemNeedsPermit 与
 // TestScenarioRebootedMemRecoversAfterGrant 覆盖，B10 的顺序红线断言在
 // 前者中继续生效。
+//
+// **kill 前必须静置**：Pebble 的 NoSync 提交返回时，数据可能还在进程内的
+// WAL 缓冲里（flusher goroutine 异步写出），所以紧贴 SIGKILL 发出的那一批
+// 已确认消息本来就会丢——断言它们不丢等于断言系统从来不具备的性质，用例
+// 会真红且红得没有意义。静置 500ms（> flusher() 的 200ms 周期 + 余量）之后
+// 全部已确认写入都已随周期 fsync 落盘，零丢失才是可断言的。
 func TestScenarioFullProcessCrashRecoversLocally(t *testing.T) {
 	pc := startProcCluster(t, 3)
 	ledger := sendAndTrack(t, pc.multi(), 120)
+
+	// 让 200ms 周期 fsync 至少跑满一轮，把上面这批确认集变成可断言的
+	time.Sleep(500 * time.Millisecond)
 
 	for i := range pc.handles {
 		pc.kill(t, i)
@@ -1890,6 +2192,7 @@ func TestScenarioRebootedMemNeedsPermit(t *testing.T) {
 func TestScenarioRebootedMemRecoversAfterGrant(t *testing.T) {
 	pc := startProcCluster(t, 3)
 	ledger := sendAndTrack(t, pc.multi(), 90)
+	time.Sleep(500 * time.Millisecond) // 理由同上一条用例：等周期 fsync 跑满一轮
 
 	for i := range pc.handles {
 		pc.kill(t, i)
@@ -1930,6 +2233,8 @@ func TestScenarioRebootedMemRecoversAfterGrant(t *testing.T) {
 func TestScenarioRebootedFsyncResumesLocally(t *testing.T) {
 	pc := startProcCluster(t, 3, func(c *config.Config) { c.Cluster.Ack = "quorum-fsync" })
 	ledger := sendAndTrack(t, pc.multi(), 60)
+	// fsync 档下条目每次 MustSync 都已落盘，理论上无需静置；仍留一小段，
+	// 让本用例与前两条保持同一形态，避免日后有人以为这里可以省
 
 	for i := range pc.handles {
 		pc.kill(t, i)
@@ -2081,7 +2386,7 @@ EOF
 |---|---|
 | §3.1 机器世代（含平台分派、容器语义、写入时机陷阱） | Task 1（读取）+ Task 2（落盘与注释）+ Task 5（写入时机与守卫用例） |
 | §3.2 五分支判定表 | Task 3（纯函数 + 11 组表驱动）+ Task 5（接线） |
-| §3.3 `local-forced` 抬 term | Task 4 |
+| §3.3 抬 term 的适用范围（四格表） | Task 4（`local-forced`）+ **Task 6b**（mem 档 `local-resume` 也抬、fsync 档不抬） |
 | §3.3b 复用 `buildGroup(clean=true)` | Task 5 的 `replay` 变量与其注释 |
 | §3.4 不动刷盘机制 | 全局约束第 2 条，无 task（刻意） |
 | §3.5 签字出口（报告、许可作废、互斥、逐台、留痕、不破坏部署） | Task 4（许可键）+ Task 6（命令） |
@@ -2089,14 +2394,16 @@ EOF
 | §5 键布局 | Task 2（`raft/bootgen`）+ Task 4（`raft/local_recover_permit`） |
 | §6 错误处理 | Task 1（读不到）、Task 2（写失败即启动失败）、Task 4（许可格式非法、同批提交）、Task 6（Pebble 独占锁） |
 | §7 可观测性 | 各 task 的「加关键节点日志」step |
-| §8 测试策略 | Task 3、5（单测）+ Task 7（e2e 四条） |
+| §8 测试策略 | Task 3、5（单测）+ **Task 6b**（抬 term 四格逐格单测）+ Task 7（e2e 四条，含「静置 ≥500ms 再 kill」的断言时机纪律） |
 | §9 文档同步 | Task 6（`main.go` 头注释）+ Task 8（`sq.example.yaml`） |
-| §11 验收标准 7 条 | Task 3/5/7（1–5）、Task 8（6–7） |
+| §11 验收标准 7 条 + 4b | Task 3/5/7（1–5）、Task 8（6–7）、**Task 6b**（4b 抬 term 适用范围） |
 
 无遗漏。
 
+> **Task 6b 是 Task 1–6 完成后补的订正 task**：Task 7 的 e2e 实测推翻了 spec 原先「NoSync 提交返回即进页缓存」的前提（Pebble 的 `WriteRecord` 只 `Signal` 一下就返回，`write(2)` 由 flusher goroutine 异步做）。spec §2.2/§3.3/§8/§11 已同步订正并留痕，本表按订正后的 spec 重新核对过。执行顺序上 **Task 6b 必须排在 Task 7 之前**——Task 7 的 mem 档场景断言依赖抬 term 后的行为。
+
 **2. 占位符扫描**：无 TBD/TODO；每个代码 step 都给出了可直接落地的完整代码；测试 step 给出了完整测试函数体而非描述。
 
-**3. 类型一致性**：`BootGenFunc` 在 Task 1 定义，Task 5（`Options.BootGen`）、Task 6（`InspectRecovery`/`GrantRecoverPermit` 参数）使用，签名一致；`recoverPermit{GrantedAt, Gen}` 在 Task 4 定义，Task 5、6 使用一致；`recoveryInput` 字段名在 Task 3 定义，Task 5、6 构造时逐字对应；`recoveryPath` 常量名在 Task 3 定义，Task 5 的 switch 与 Task 6 的 `NeedsPermit` 判定使用一致。
+**3. 类型一致性**：`BootGenFunc` 在 Task 1 定义，Task 5（`Options.BootGen`）、Task 6（`InspectRecovery`/`GrantRecoverPermit` 参数）使用，签名一致；`recoverPermit{GrantedAt, Gen}` 在 Task 4 定义，Task 5、6 使用一致；`recoveryInput` 字段名在 Task 3 定义，Task 5、6 构造时逐字对应；`recoveryPath` 常量名在 Task 3 定义，Task 5 的 switch、Task 6 的 `NeedsPermit` 判定、Task 6b 的 `needsTermBump` 使用一致；Task 6b 新增的 `bumpTermsInto` 由 `ForceLocalRecover`（Task 4）与 `BumpTermsForLocalResume` 共用，抽取时 `ForceLocalRecover` 的对外签名不变。
 
 **4. 一处需要执行者注意的既有代码依赖**：Task 5 替换的是 `manager.go` 现有的 `switch { case clean: ... case hasRaft: ... default: ... }` 段落（约 379–409 行），其中 `default` 分支的 preRaft 标记逻辑必须原样保留到新的 `case pathFresh` 里——那是 Join 拒绝判据的依据（batch④ N2），丢了会让单机升级档与全新集群无法区分。

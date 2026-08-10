@@ -36,9 +36,18 @@
 backlog B11 原文说这件事「只在 fsync 档下成立」。这个判断不准确。真正决定本地日志是否可信的，是**页缓存有没有丢**：
 
 - `syncPersist()` 只在 `mode == AckQuorumFsync && rd.MustSync` 时刷盘（[group.go:926](../../internal/cluster/group.go)）。mem 档从不 fsync。
-- 但 Pebble 的 `NoSync` 并不是「没写」，它走 `write(2)` 进 OS 页缓存，只是不 fsync。
-- 所以 **kill -9 / OOM / panic / 快照 fail-stop 之后，本地日志是完整的**——进程没了，页缓存还在，重开 store 一条不少。真正会丢尾巴的只有机器掉电、内核崩溃、硬重启。
-- 而 e2e 里的「断电模拟」用的是 SIGKILL。也就是说：`TestScenarioFullPowerLossCannotRecover` 固化下来的那个「集群起不来」，实际发生在**三份日志毫发无伤**的前提下。
+- 但 Pebble 的 `NoSync` 并不是「没写」：数据进了 WAL 的 `LogWriter`，由后台 flusher goroutine 写进 OS 页缓存，只是不 fsync。
+- 所以 **kill -9 / OOM / panic / 快照 fail-stop 之后，本地日志基本上是完整的**——进程没了，页缓存还在，重开 store 几乎一条不少。真正会成片丢尾巴的是机器掉电、内核崩溃、硬重启。
+- 而 e2e 里的「断电模拟」用的是 SIGKILL。也就是说：`TestScenarioFullPowerLossCannotRecover` 固化下来的那个「集群起不来」，实际发生在**三份日志几乎毫发无伤**的前提下。
+
+> **订正留痕（2026-08-10，实现期实测推翻）**：上面四条原本写的是绝对形态——「`NoSync` 走 `write(2)` 进页缓存」「kill -9 之后本地日志是**完整的**，一条不少」。这是错的，实现期的 e2e 用例把它打穿了：三节点同时 SIGKILL 后，有 10 条**已确认**的消息丢失。
+>
+> 查 Pebble v2.1.6 的 `record/log_writer.go`：`WriteRecord` 把数据拷进当前块后只做 `f.ready.Signal()` 就返回，真正的 `write(2)` 由 flusher goroutine 异步执行（flush loop 会取**部分块** `w.block.buf[w.block.flushed:written]` 立刻写出，所以通常是微秒级，但它终究在 commit 返回**之后**）。**commit 返回的那一刻，数据可能还在进程内缓冲区里。**
+>
+> 修正后的口径，本 spec 全文以此为准：
+> - **机器世代未变，消除的是「页缓存丢失」，消除不了「进程内缓冲丢失」。** 前者是成片的（≤200ms，见 §2.3），后者是微秒到毫秒级的尾巴——机器负载高时可以到十几毫秒。
+> - 这个丢失面是 quorum-mem 档**固有**的，B11 不碰写路径，既不加剧也不消除它。
+> - 但它有一个 B11 **新引入**的后果，见 §3.3：mem 档下 HardState（含 Vote）走的也是这条异步路径，于是 `local-resume` 可能带着一张「投过但没落盘」的选票复活。这个洞在 B11 之前不存在——那时不干净的节点一律清空重入，带的是全新状态。
 
 ### 2.3 mem 档的损失面：已经有界，本 spec 不动它
 
@@ -84,8 +93,8 @@ backlog B11 原文说这件事「只在 fsync 档下成立」。这个判断不�
 |---|---|---|---|---|---|
 | 有干净关机标记 | 任意 | 任意 | — | `clean-resume` | 现状不变：回放本地日志，`RestartNode` 原身份回归 |
 | 无标记、无 raft 状态 | 任意 | 任意 | — | `fresh` | 现状不变：按 `Peers`/`BootstrapVoters` 引导 |
-| 无标记、有 raft 状态 | 任意 | **未变** | — | **`local-resume`** | 新增。等同 `clean-resume`：回放本地日志，原身份 `RestartNode` |
-| 无标记、有 raft 状态 | **fsync** | 变了 | — | **`local-resume`** | 新增。同上 |
+| 无标记、有 raft 状态 | 任意 | **未变** | — | **`local-resume`** | 新增。回放本地日志，原身份 `RestartNode`；mem 档另需抬 term（§3.3） |
+| 无标记、有 raft 状态 | **fsync** | 变了 | — | **`local-resume`** | 新增。同上；fsync 档不抬 term |
 | 无标记、有 raft 状态 | mem | 变了 | **有** | **`local-forced`** | 新增。消费许可 + 抬 term（§3.3）后回放本地日志 |
 | 无标记、有 raft 状态 | mem | 变了 | 无 | `ErrUncleanShutdown` | 现状不变：`main` 走 `Rejoin` 重入编排；编排失败则拒启且数据完好（B10） |
 
@@ -93,13 +102,26 @@ backlog B11 原文说这件事「只在 fsync 档下成立」。这个判断不�
 
 **为什么最后一行保留自动 Rejoin 而不是直接拒启。** mem 档掉电但多数派仍存活时，「清空 + 以 learner 从 leader 拉一份干净副本」本来就是最优解——强于带着残缺日志硬起来。只有当它**也失败**（没有任何节点能接纳我 = 全集群都倒了），才落到 B10 的「拒启且数据完好」。**签字出口因此定位极清晰：它只服务于「没有任何人能帮我」这一种局面。**
 
-### 3.3 `local-forced` 必须抬 term
+### 3.3 mem 档的每一条本地恢复路径都必须抬 term
 
-mem 档掉电可能丢失投票记录：本节点在任期 T 投给 A，忘记，重启后又在 T 投给 B → 同一任期两个 leader → 日志分叉。这比丢数据严重，是**损坏**。
+投票记录丢失是**损坏**级别的故障，不是丢数据：本节点在任期 T 投给 A，忘了，重启后又在 T 投给 B → 同一任期两个 leader → 日志分叉。
 
-解法：`local-forced` 路径在回放之前，把每个组持久化 HardState 的 `Term` 加 1、`Vote` 清空，Sync 落盘。抬任期在 raft 中永远安全（只是强制一次重新选举），抬完之后本节点不可能再在 T 投第二次。
+解法：在回放之前，把每个组持久化 HardState 的 `Term` 加 1、`Vote` 清空，Sync 落盘。抬任期在 raft 中永远安全（只是强制一次重新选举），抬完之后本节点不可能再在 T 投第二次。
 
-**另外三条恢复路径都不抬**：它们本来就没丢过投票，抬了纯属白白多付一次选举。
+**谁要抬，取决于投票记录是不是同步落盘的**：
+
+| ack 档 | 路径 | 抬 term？ | 理由 |
+|---|---|---|---|
+| fsync | `local-resume` | **否** | `syncPersist` 跟随 `MustSync`，term/vote 每次变更都已 fsync，投票不可能丢 |
+| mem | `local-resume` | **是** | HardState 走 NoSync 异步路径，commit 返回时可能还在进程内缓冲（§2.2 订正留痕） |
+| mem | `local-forced` | **是** | 同上，且还叠加了页缓存丢失 |
+| 任意 | `clean-resume` / `fresh` | 否 | 优雅停机的 `MarkCleanShutdown` 是 Sync 写，会把此前 NoSync 写一并刷盘；`fresh` 无历史 |
+
+> **订正留痕（2026-08-10，实现期）**：本节原本只要求 `local-forced` 抬 term，理由是「世代未变 ⇒ 页缓存完好 ⇒ 什么都没丢」。这个理由被 §2.2 的订正证伪了——世代未变消除不了进程内缓冲的丢失，而 mem 档的 HardState 恰好走这条路。
+>
+> 这个洞是 **B11 新开的**，不是既有缺陷：B11 之前，不干净的节点一律清空后以 learner 重入，带的是全新状态，无从双投票。是 `local-resume` 让它带着可能残缺的投票记录以原身份复活。所以这不是「顺手补个既有问题」，而是新路径必须自带的安全前置。
+>
+> 代价是每次 mem 档不干净重启多一次选举（几百毫秒）。相对于「同一任期两个 leader」，这个价格不值一提。
 
 ### 3.3b 两条新路径复用 `buildGroup(clean=true)`，半截快照安装的处理白送
 
@@ -194,17 +216,19 @@ raft/local_recover_permit    → 一次性本地恢复许可（两行 UTF-8：�
 
 ## 8. 测试策略
 
-**会被推翻的既有用例**：`TestScenarioFullPowerLossCannotRecover` 断言「三节点同时 SIGKILL 后全部拒启」。SIGKILL 不重启机器、世代不变，改动后三节点会各自本地恢复并重新选主。该用例改名为 `TestScenarioFullProcessCrashRecoversLocally`，断言三节点自动起来、集群恢复可写、确认集零丢失。
+**会被推翻的既有用例**：`TestScenarioFullPowerLossCannotRecover` 断言「三节点同时 SIGKILL 后全部拒启」。SIGKILL 不重启机器、世代不变，改动后三节点会各自本地恢复并重新选主。该用例改名为 `TestScenarioFullProcessCrashRecoversLocally`，断言三节点自动起来、集群恢复可写、数据目录未被清空。
+
+**零丢失断言必须挑对时机。** 按 §2.2 的订正，mem 档下 commit 返回时数据可能还在进程内缓冲，紧贴 SIGKILL 发出的那一批已确认消息**本来就会丢**——断言它们不丢等于断言一个系统从来不具备的性质，用例会真红，而且红得没有意义。正确的断言形态是：发送完成后**显式静置 ≥500ms**（大于 `flusher()` 的 200ms 周期 + 余量）再 kill，此时全部已确认写入都已随周期 fsync 落盘，零丢失成立且稳定。紧贴 kill 的那一批不做任何断言。这条纪律对每一个「杀进程后对账」的用例都适用。
 
 **B10 的红线断言一条不丢**，搬到新用例：注入「世代变了」+ mem 档 + 无许可 → 断言拒启、数据目录非空、日志中出现「数据目录保持原样未清空」且**不**出现「状态目录已清空」。顺序倒置的口子照样会在这里红，只是搬到了它现在真正对应的分支上。
 
 **如何在测试中模拟机器重启**：世代读取做成可注入——Go 单测经 `Options` 上的 provider；进程级 e2e 只能经环境变量 `SQ_BOOTGEN_OVERRIDE`（真 broker 进程注不进 Go 函数）。该变量的误用风险由 §7 的 Error 级告警缓解，不能只靠文档。
 
-**单测**：五条恢复分支各一条；许可的世代绑定（世代 X 授予、世代 Y 消费必须被拒）；`local-forced` 后 HardState.Term 确实 +1 且 Vote 清空。
+**单测**：五条恢复分支各一条；许可的世代绑定（世代 X 授予、世代 Y 消费必须被拒）；抬 term 的适用范围按 §3.3 的表逐格覆盖——`local-forced` 与 **mem 档的 `local-resume`** 后 HardState.Term 确实 +1 且 Vote 清空，而 **fsync 档的 `local-resume`** 后 Term 必须**保持不变**（抬了就是白付一次选举，也说明实现把判据搞错了）。
 
 另有一条**守安全门的用例**，单独点名因为它守的是 §3.1 那个会让整扇门失效的错误顺序：走完 `ErrUncleanShutdown` 分支之后，断言盘上 `raft/bootgen` **仍是旧值**。若哪天有人把写入挪到判定之前，本用例会红——否则这个缺陷在功能测试里完全看不出来，只会在某次真实事故中表现为「签字门自己开了」。
 
-**e2e**：①三节点全 SIGKILL → 自动本地恢复零丢失（替换旧用例）②mem + 世代变 + 无许可 → 拒启且数据保留 ③mem + 世代变 + 签字 → 起得来、term 抬了、数据还在 ④fsync 档 + 世代变 → 无需签字直接起来。
+**e2e**：①三节点全 SIGKILL → 自动本地恢复、数据目录未清空、静置后发送的消息零丢失（替换旧用例）②mem + 世代变 + 无许可 → 拒启且数据保留 ③mem + 世代变 + 签字 → 起得来、term 抬了、数据还在 ④fsync 档 + 世代变 → 无需签字直接起来。
 
 **无新增基准**：本 spec 不改动写路径，写吞吐不受影响（§2.3）。
 
@@ -233,9 +257,10 @@ raft/local_recover_permit    → 一次性本地恢复许可（两行 UTF-8：�
 ## 11. 验收标准
 
 1. 五条恢复分支各有单测覆盖，且 `NewManager` 与 `sq recover` 走同一个决策函数（结构上保证判断一致）。
-2. `TestScenarioFullProcessCrashRecoversLocally` 通过：三节点全 SIGKILL 后无人值守恢复、确认集零丢失。
+2. `TestScenarioFullProcessCrashRecoversLocally` 通过：三节点全 SIGKILL 后无人值守恢复、数据目录未被清空、静置 ≥500ms 后确认的消息零丢失（紧贴 kill 的那一批不断言，理由见 §8）。
 3. B10 红线断言在新用例中通过：mem + 世代变 + 无许可 → 拒启且数据目录非空、两条日志串的出现/不出现均成立。
 4. 签字往返通过：`sq recover` 报告 → `--grant` → 启动成功 → term 已抬 → 数据完好；且同一许可在下一次世代变更后不再被消费。
+4b. 抬 term 的适用范围与 §3.3 的表逐格一致，特别是 fsync 档 `local-resume` 后 Term 保持不变。
 5. 安全门守卫用例通过：走完 `ErrUncleanShutdown` 分支后盘上 `raft/bootgen` 仍是旧值（§3.1 的错误顺序会被这条挡住）。
 6. §9 的两处文档完成更新（`main.go` 头注释、`sq.example.yaml` 自愈说明）。
 7. macOS 与 Linux 双平台：主套件 `-race` 全绿 + e2e 全量绿。
