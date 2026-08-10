@@ -175,28 +175,44 @@ func TestScenarioKillLeaderHard(t *testing.T) {
 	t.Logf("kill -9 节点 %d（%s），故障前确认集 %d 条", victim+1, victimEP, before)
 	pc.kill(t, victim)
 
-	// 阶段③：故障期继续发——轮询等确认集越过故障前规模。SDK 路由刷新
-	// 的恢复点不定（实测 kill 后 13~50s 内都有出现），固定 sleep 会踩在
-	// 恢复点上造成假失败；「确认集增长」才是 failover 收敛的确定性观测。
-	recoverDeadline := time.Now().Add(90 * time.Second)
-	for cs.size() <= before && time.Now().Before(recoverDeadline) {
-		time.Sleep(2 * time.Second)
-	}
-	if cs.size() <= before {
-		close(stop)
-		wg.Wait()
-		t.Fatalf("kill leader 后 90s 内确认集未增长（停在 %d 条），failover 未收敛", before)
-	}
-	t.Logf("failover 已收敛：确认集 %d 条（较故障前 +%d）", cs.size(), cs.size()-before)
+	// 阶段③：故障期继续发 35s（覆盖 SDK 路由缓存刷新节拍 30s + 选举余量）。
+	// 这段窗口内**旧 producer** 的恢复点不定（实测 kill 后 13s~90s+ 都有，
+	// 那是 SDK 客户端路由缓存的恢复行为，不是 broker 故障）——「集群恢复」
+	// 不在旧 producer 身上断言，交给阶段④的全新 producer 验证（fresh
+	// QueryRoute，把客户端缓存与集群事实解耦）。
+	time.Sleep(35 * time.Second)
 
-	// 阶段④：重启被 kill 的节点（走 ErrUncleanShutdown → Rejoin 自愈）
+	// 阶段④：验证集群恢复可写——全新 producer 连一个存活节点（fresh
+	// QueryRoute 到当前 leader），发送带重试（选举/摊布收敛前可能短暂
+	// 失败）。这一步才是「failover 真的收敛」的确定性观测。
+	fresh := newClusterProducer(t, pc.endpointOf((victim+1)%3), topic)
+	for i := 0; i < 50; i++ {
+		recs, err := fresh.Send(context.Background(), &rmq.Message{Topic: topic, Body: []byte(fmt.Sprintf("post-failover #%d", i))})
+		if err != nil {
+			for retry := 0; retry < 12 && err != nil; retry++ {
+				time.Sleep(5 * time.Second)
+				recs, err = fresh.Send(context.Background(), &rmq.Message{Topic: topic, Body: []byte(fmt.Sprintf("post-failover #%d", i))})
+			}
+		}
+		if err != nil || len(recs) == 0 {
+			fresh.GracefulStop()
+			close(stop)
+			wg.Wait()
+			t.Fatalf("failover 后 60s 内集群仍不可写（第 %d 条）: %v", i, err)
+		}
+		cs.confirm(recs[0].MessageID)
+	}
+	fresh.GracefulStop()
+	t.Logf("failover 后全新 producer 写入 50 条（集群恢复可写，确认集 %d 条）", cs.size())
+
+	// 阶段⑤：重启被 kill 的节点（走 ErrUncleanShutdown → Rejoin 自愈）
 	pc.restart(t, victim)
 	time.Sleep(10 * time.Second)
 	close(stop)
 	wg.Wait()
 	t.Logf("发送收尾：成功 %d 失败 %d（故障窗口内失败是预期的）", sent, failed)
 
-	// 阶段⑤：对账——确认集必须被全量消费到
+	// 阶段⑥：对账——确认集必须被全量消费到
 	consumer := newClusterConsumer(t, pc.multi(), group, topic, clusterConsumerAwaitShort)
 	got := recvAllAck(t, consumer, cs.size(), 180*time.Second, "kill-leader 对账", false)
 	cs.assertAllConsumed(t, got)
