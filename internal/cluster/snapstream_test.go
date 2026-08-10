@@ -11,6 +11,7 @@ package cluster
 
 import (
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/xushixin/sq/internal/store"
@@ -232,5 +233,44 @@ func TestScanGroupKeysMultiFamilyMultiBlockConverges(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestAssertRangesDisjointCatchesOverlap 键区间守卫（m3）：断言的是
+// 「两两不相交」而非「已升序」——升序由紧邻上游的 sort.Sort 无条件
+// 保证，断言 IsSorted 恒真是死代码。真正会被未来的键族前缀改动破坏的
+// 是不相交：加进一个与既有键族互为前缀的名字（"msg" vs "msg/"），
+// 两段区间重叠，同一个键会被发进两个块，块间互斥崩塌、游标语义失效。
+func TestAssertRangesDisjointCatchesOverlap(t *testing.T) {
+	mustPanic := func(name string, ranges []keyRange) {
+		t.Helper()
+		defer func() {
+			r := recover()
+			if r == nil {
+				t.Fatalf("%s: 应 panic，实际正常返回", name)
+			}
+			if msg, _ := r.(string); !strings.Contains(msg, "两两不相交") {
+				t.Fatalf("%s: panic 文本应指向不相交守卫，得到: %v", name, r)
+			}
+		}()
+		assertRangesDisjoint(7, ranges)
+	}
+	// 互为前缀的键族："msg" 的上界 "msh" 越过了 "msg/" 的下界
+	mustPanic("互为前缀的键族", []keyRange{
+		{lower: []byte("msg"), upper: store.PrefixUpperBound([]byte("msg"))},
+		{lower: []byte("msg/"), upper: store.PrefixUpperBound([]byte("msg/"))},
+	})
+	// 空区间（lower ≥ upper）：整段永远扫不出键，对应键族静默丢失
+	mustPanic("空区间", []keyRange{
+		{lower: []byte("msg/"), upper: []byte("msg/")},
+	})
+
+	// 反向自证：真实的两个组都必须通过守卫（守卫不是恒 panic）
+	for _, g := range []uint32{MetaGroup, 1} {
+		ranges := groupKeyRanges(g)
+		if len(ranges) == 0 {
+			t.Fatalf("组 %d 区间集不得为空", g)
+		}
+		assertRangesDisjoint(g, ranges)
 	}
 }

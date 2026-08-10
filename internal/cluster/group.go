@@ -16,6 +16,7 @@
 package cluster
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"errors"
@@ -60,6 +61,26 @@ func (m AckMode) String() string {
 // 收到本错误后应先经 Manager.Leader(g) 找到当前 leader 再重试，而不是
 // 原地死等。可被 errors.Is 识别。
 var ErrNotLeader = errors.New("cluster: 本节点不是该组 leader，提案被拒绝")
+
+// 快照拉取的两条绝对上限（I4）：正常安装远达不到，命中即说明发送侧
+// 枚举异常或对端不可信。取值理由——
+//   - maxSnapshotChunks=65536：按默认 4 MiB 分块预算，相当于 256 GiB
+//     单组状态；单组真到这个量级，快照追齐本身已不是可行方案；
+//   - maxSnapshotBytes=256 GiB：与上一条同量级，兜住「块数不多但每块
+//     巨大」的另一半（块大小由发送侧决定，接收侧不能假设它守规矩）。
+//
+// 为什么必须有：没有上限时，拉块循环的唯一退出条件是对端说 done——
+// 把「对端诚实」当成了本节点不崩的前提。坏对端（或发送侧枚举 bug）
+// 可以无界地往本节点磁盘写。
+//
+// 为什么是 var 而不是 const：两条上限都取在「正常永不触及」的量级上，
+// 真按生产值跑一遍要拉 256 GiB——那条守卫就永远没有测试覆盖，写反了
+// 比较方向也无人知晓。测试把它们临时调小、defer 还原，是让守卫本身
+// 可验证的唯一低成本办法；生产路径不改这两个值。
+var (
+	maxSnapshotChunks = 1 << 16
+	maxSnapshotBytes  = 256 << 30
+)
 
 // group 是一个 raft 组运行体：tick 驱动选举/心跳，Ready 循环执行
 // 「持久化 → 发送 → apply → Advance」契约，FSM 为共享 store。
@@ -116,6 +137,14 @@ type group struct {
 	applyMu sync.Mutex
 
 	doneCh chan struct{} // run 循环完全退出后关闭，测试/调用方同步用
+
+	// installing 标记本组正在安装快照（handleReady 的快照分支进出时
+	// 置位/清位）。安装期 Ready 循环不消费 inbox，step 必须改为「满则
+	// 丢弃」——见 step 注释的 I5 说明。
+	installing atomic.Bool
+	// installDrops 累计安装期因 inbox 满而丢弃的消息数（可观测性：
+	// 安装结束时打点，长期非零说明安装耗时已长到影响心跳投递）。
+	installDrops atomic.Uint64
 
 	// waiter 双命名空间（终审观察项①）：普通提案与成员变更的 id 共用
 	// 同一个 nextID 计数器，但 apply 时 EntryNormal 只通知 propWaiters、
@@ -278,9 +307,16 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	//    否则选举计时器停摆，安装完成后本节点会被判定失联。
 	//    rn.Tick() 可跨 goroutine 调用（内部走 channel，满则丢）。
 	if !raft.IsEmptySnap(rd.Snapshot) {
-		stop := gr.keepTicking()
-		err := gr.installSnapshot(ctx, rd.Snapshot)
-		stop()
+		err := gr.installSnapshotWithRetry(ctx, rd.Snapshot)
+		if err != nil && ctx.Err() != nil {
+			// 停机途中的安装失败不是故障：安装中标记（第 2 步）已在盘上，
+			// 重启时 buildGroup 清空重来。此处 panic 只会把一次正常停机
+			// 变成一次崩溃退出。直接返回本轮——run 循环下一次 select 即
+			// 走 ctx.Done() 分支退出。
+			gr.lg.Warn("快照安装随停机中止（安装中标记已在盘上，重启清空重来）",
+				"g", gr.g, "index", rd.Snapshot.Metadata.GetIndex(), "err", err)
+			return
+		}
 		if err != nil {
 			// 安装失败是不可恢复状态：绝不能 Advance 后静默续跑——
 			// Advance 把 MsgStorageAppendResp（携带快照）步进给 raft
@@ -291,8 +327,17 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 			// 更新——三方分叉、永不收敛。按 Persist/applyEntry 同策略
 			// fail-stop panic：进程死亡由上层重启接管，重启时 buildGroup
 			// 的安装中标记检查清空重来。标记第 2 步先于任何数据写入，
-			// 失败必在盘上；keepTicking 已由上方 stop() 收敛。
-			gr.lg.Error("快照安装失败，组停摆", "g", gr.g,
+			// 失败必在盘上；keepTicking 已由 installSnapshotWithRetry 收敛。
+			//
+			// 本地清空重来只是恢复的一半（N1）：本节点重启后是空日志，而
+			// leader 侧该 peer 的 Progress 仍停在 StateSnapshot——
+			// tracker.IsPaused() 对该状态无条件返回 true，leader 既不发
+			// 日志也不重发快照，节点会永久静默掉组。另一半由 leader 侧的
+			// reportStalledSnapshots（Manager 截断循环）补齐：观察到对端
+			// 长期不来拉视图即 ReportSnapshot(SnapshotFailure)，raft 收到
+			// MsgSnapStatus 后 BecomeProbe，重新探测并按需重发快照。
+			// 两侧缺一，这条 panic 就是"周期性自杀 + 永久掉组"。
+			gr.lg.Error("快照安装失败，组停摆（等待重启；leader 侧由失败感知重驱动）", "g", gr.g,
 				"index", rd.Snapshot.Metadata.GetIndex(), "err", err)
 			panic(err)
 		}
@@ -512,6 +557,71 @@ func (gr *group) keepTicking() (stop func()) {
 // 重启由 buildGroup 的安装中标记检查清空重来：标记（第 2 步，Sync）
 // 先于任何数据写入，失败必然发生在第 2 步之后、收口批次删标记之前，
 // 标记恒在盘上，清空重来永远成立。
+// snapInstallAttempts / snapInstallRetryBase 是安装的有限重试预算：
+// 尝试 3 次，退避 1s、2s。
+//
+// 为什么要重试：安装第 4 步是分钟级的网络操作（分块拉取），一次瞬时
+// 错误（对端重启、连接 reset、控制帧超时）就直接 fail-stop panic，等于
+// 把「网络抖了一下」升级成「进程自杀 + 该组重装一遍」。整个安装流程
+// 幂等——标记可重写、wipe 可重跑、块可重拉，重试的代价只是重来一遍。
+//
+// 为什么重试次数很小：真正不可恢复的错误（描述符不可解析、对端视图已
+// 回收、磁盘写失败）重试多少次都一样；重试只为吸收瞬时故障，超出预算
+// 就该交给 fail-stop + leader 侧重驱动这条更彻底的恢复路径。
+const (
+	snapInstallAttempts  = 3
+	snapInstallRetryBase = time.Second
+)
+
+// installSnapshotWithRetry 是 installSnapshot 的有限重试包装，并负责
+// 安装期的两项全局状态：keepTicking（选举计时器不停摆）与 installing
+// 标记（step 改为满则丢，见 step 注释的 I5 说明）。
+//
+// 参数：
+//   - ctx: 组运行上下文；取消即立即放弃重试并返回最后一次错误
+//   - snap: raft 交下来的快照（元数据 + 描述符 Data）
+//
+// 返回：全部尝试都失败时返回最后一次错误；调用方（handleReady）据
+// ctx 是否已取消区分「停机中止」与「真故障 fail-stop」。
+//
+// 注意：本方法返回后 installing 必然已清位、keepTicking 必然已收敛
+// （defer 保证，含 panic 路径）。
+func (gr *group) installSnapshotWithRetry(ctx context.Context, snap *raftpb.Snapshot) error {
+	gr.installing.Store(true)
+	stop := gr.keepTicking()
+	defer func() {
+		stop()
+		gr.installing.Store(false)
+		// 安装期丢弃计数打点：长期非零说明安装耗时已长到影响心跳投递，
+		// 是「该把安装挪出 Ready 循环」的量化信号
+		if n := gr.installDrops.Swap(0); n > 0 {
+			gr.lg.Warn("安装期入站消息丢弃（inbox 满，raft 重发兜底）", "g", gr.g, "dropped", n)
+		}
+	}()
+	var err error
+	for attempt := 1; attempt <= snapInstallAttempts; attempt++ {
+		if err = gr.installSnapshot(ctx, snap); err == nil {
+			return nil
+		}
+		if ctx.Err() != nil {
+			return err // 停机中：不再重试，交调用方按停机路径处理
+		}
+		if attempt == snapInstallAttempts {
+			break
+		}
+		backoff := time.Duration(attempt) * snapInstallRetryBase
+		gr.lg.Warn("快照安装失败，退避重试（安装流程幂等，重来一遍）", "g", gr.g,
+			"index", snap.Metadata.GetIndex(), "attempt", attempt,
+			"max_attempts", snapInstallAttempts, "backoff", backoff.String(), "err", err)
+		select {
+		case <-time.After(backoff):
+		case <-ctx.Done():
+			return err
+		}
+	}
+	return err
+}
+
 func (gr *group) installSnapshot(ctx context.Context, snap *raftpb.Snapshot) error {
 	// 第 1 步：解析描述符 → (snapID, leader, index)
 	meta := snap.GetMetadata()
@@ -591,11 +701,29 @@ func (gr *group) installSnapshot(ctx context.Context, snap *raftpb.Snapshot) err
 // snapstream 的 decodeChunk 还原（与发送侧 encodeChunk 唯一配对）。
 // 每块一个 NoSync 批次——持久性由收口批次（第 5 步）一次性承担，
 // 中途崩溃由安装标记的「清空重来」兜底。
+//
+// 三条硬护栏（I4）——本循环的退出条件不能只靠对端诚实：
+//   - 游标必须严格前进：next ≤ 上一游标即报错中止。发送侧的枚举单调性
+//     一旦被破坏（键族表写错、对端版本不一致、恶意对端），症状是同一批
+//     键反复重发、循环永不 done；校验游标把「静默死循环」变成一条明确的
+//     协议错误。这也是 batch④ 首轮评审 C1 之所以表现为死循环而非报错的
+//     直接原因；
+//   - 块数上限 maxSnapshotChunks：兜住「每块都推进一点点但永远拉不完」；
+//   - 累计字节上限 maxSnapshotBytes：兜住「块数不多但每块巨大」，也挡住
+//     坏对端把本节点磁盘写爆。
+//
+// 两条上限都取得极宽（正常快照远达不到），命中即说明对端行为异常——
+// 报错中止后由 fail-stop 与 leader 侧的失败感知（reportStalledSnapshots）
+// 共同收敛，不会卡死。
 func (gr *group) pullSnapshotChunks(ctx context.Context, desc snapDescriptor) error {
 	var cursor []byte
-	keys, bytes, chunks := 0, 0, 0
+	keys, nbytes, chunks := 0, 0, 0
 	for {
 		chunks++
+		if chunks > maxSnapshotChunks {
+			return fmt.Errorf("快照安装第 4 步 块数超上限 %d（已拉 %d 键 %d B，对端枚举异常）",
+				maxSnapshotChunks, keys, nbytes)
+		}
 		req := encodeSnapFetchReq(gr.g, desc.ID, cursor)
 		resp, err := gr.control(ctx, desc.Leader, OpFetchSnapshot, req)
 		if err != nil {
@@ -604,6 +732,11 @@ func (gr *group) pullSnapshotChunks(ctx context.Context, desc snapDescriptor) er
 		done, next, chunk, err := decodeSnapFetchResp(resp)
 		if err != nil {
 			return fmt.Errorf("快照安装第 4 步 响应解码失败（第 %d 块）: %w", chunks, err)
+		}
+		// 游标单调性校验：done=true 的最后一块不再续扫，next 无意义，跳过
+		if !done && cursor != nil && bytes.Compare(next, cursor) <= 0 {
+			return fmt.Errorf("快照安装第 4 步 游标未前进（第 %d 块）：next=0x%s ≤ 上一游标 0x%s，对端枚举不单调",
+				chunks, keyHexPrefix(next), keyHexPrefix(cursor))
 		}
 		pairs, err := decodeChunk(chunk)
 		if err != nil {
@@ -623,19 +756,23 @@ func (gr *group) pullSnapshotChunks(ctx context.Context, desc snapDescriptor) er
 			}
 			keys += len(pairs)
 			for _, p := range pairs {
-				bytes += 8 + len(p.k) + len(p.v) // 8B = 块格式双长度头
+				nbytes += 8 + len(p.k) + len(p.v) // 8B = 块格式双长度头
+			}
+			if nbytes > maxSnapshotBytes {
+				return fmt.Errorf("快照安装第 4 步 累计字节 %d 超上限 %d（第 %d 块，已拉 %d 键，对端状态异常）",
+					nbytes, maxSnapshotBytes, chunks, keys)
 			}
 		}
 		if chunks%16 == 0 {
 			gr.lg.Debug("快照拉取进度", "g", gr.g, "snap_id", desc.ID,
-				"chunk", chunks, "keys", keys, "bytes", bytes)
+				"chunk", chunks, "keys", keys, "bytes", nbytes)
 		}
 		if done {
 			break
 		}
 		cursor = next
 	}
-	gr.lg.Debug("快照拉取结束", "g", gr.g, "snap_id", desc.ID, "chunks", chunks, "keys", keys, "bytes", bytes)
+	gr.lg.Debug("快照拉取结束", "g", gr.g, "snap_id", desc.ID, "chunks", chunks, "keys", keys, "bytes", nbytes)
 	return nil
 }
 
@@ -913,7 +1050,7 @@ func (gr *group) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTyp
 // 交给本组处理。异步入队由 run 循环单 goroutine 消费，tick 与 Step
 // 因此不会竞争。
 //
-// 全量入队不会撑爆 inbox 的不变量：单组在途消息 ≤ 2×MaxInflightMsgs
+// 稳态下全量入队不会撑爆 inbox：单组在途消息 ≤ 2×MaxInflightMsgs
 // （256）=512，小于 inbox 容量 1024——三节点拓扑下每条消息至多往返
 // 一次（出站 + 对端回包），raft 的 inflight 上限即入队总量上界；
 // 单节点组稳态不产自消息（自我投递仅出现在选举期）。
@@ -922,10 +1059,27 @@ func (gr *group) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTyp
 // goroutine 由整条连接共享，阻塞在某一组的 step 会拖死同连接上其余
 // 所有组的消息投递——raft 重试与上层编排是丢弃的兜底。
 //
+// 安装期改为「满则丢弃」（I5）：上面那条 inflight 不变量只覆盖稳态——
+// Ready 循环在快照安装期间整段不消费 inbox，而 leader 的心跳按
+// HeartbeatTick 持续到达（100ms tick ≈ 10 条/秒），与 inflight 无关地
+// 单向累积；生产级快照是分钟级操作，约 100 秒即填满 1024 的队列，此后
+// step 阻塞的是**整条连接**的读循环，同连接上其余所有组的消息投递一起
+// 停摆。丢心跳无害（raft 按 tick 重发，选举计时由 keepTicking 维持），
+// 拖死其它组则是真故障，故安装期宁可丢。丢弃计数在安装结束时打点。
+//
 // 注意：m 必须为指针——v3 的 raftpb.Message 内嵌互斥锁
 // （protoimpl.MessageState），按值传递会触发 vet copylocks，
 // 且与 rn.Step 的指针签名天然一致。
 func (gr *group) step(m *raftpb.Message) {
+	if gr.installing.Load() {
+		select {
+		case gr.inbox <- m:
+		case <-gr.doneCh:
+		default:
+			gr.installDrops.Add(1) // 安装期队列满：丢弃，raft 重发兜底
+		}
+		return
+	}
 	select {
 	case gr.inbox <- m:
 	case <-gr.doneCh:

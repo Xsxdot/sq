@@ -53,7 +53,7 @@ type keyRange struct {
 }
 
 // keyRanges 实现 sort.Interface：按 lower 字节序升序，供 groupKeyRanges
-// 排序与 IsSorted 断言复用（续扫单调性的强制不变量，见 groupKeyRanges）。
+// 排序用（续扫单调性的前提之一，见 groupKeyRanges）。
 type keyRanges []keyRange
 
 func (r keyRanges) Len() int           { return len(r) }
@@ -74,9 +74,11 @@ func (r keyRanges) Swap(i, j int)      { r[i], r[j] = r[j], r[i] }
 // 在首，若按字面序扫描，from 游标跨段后跳回字节序更小的键族，续扫
 // 推进不单调：要么整族静默漏掉，要么整族反复重扫、永无 done。
 //
-// 排序完成后立即断言 enforce：这是 scanGroupKeys 游标推进规则的前提，
-// 不能只靠注释承诺——未来键族前缀改名（如 msg/ → message/）破坏字节序
-// 时，在快照路径上以最小代价 panic，而不是静默重发/丢键。
+// 升序由这里的 sort.Sort 无条件保证（键族表怎么写都不影响结果），
+// 因此紧随其后的断言校验的是排序无法自动满足的那一半——两两不相交，
+// 见 assertRangesDisjoint。两条合起来才是 scanGroupKeys 游标推进规则的
+// 完整前提：升序保证「本段扫完才进下一段」，不相交保证「一个键只属于
+// 一段」。
 func groupKeyRanges(g uint32) []keyRange {
 	meta := [][]byte{[]byte("delay/"), []byte("delayalloc"), []byte("half/"), []byte("halfidx/"), []byte("meta/")}
 	if g == MetaGroup {
@@ -85,7 +87,7 @@ func groupKeyRanges(g uint32) []keyRange {
 			ranges = append(ranges, keyRange{lower: lower, upper: store.PrefixUpperBound(lower)})
 		}
 		sort.Sort(keyRanges(ranges))
-		assertRangesSorted(g, ranges)
+		assertRangesDisjoint(g, ranges)
 		return ranges
 	}
 	data := [][]byte{[]byte(msgPrefix), []byte(allocPrefix), []byte(keyIdxPrefix), []byte(cursorPrefix), []byte(inflightPrefix)}
@@ -94,22 +96,45 @@ func groupKeyRanges(g uint32) []keyRange {
 		ranges = append(ranges, keyRange{lower: lower, upper: store.PrefixUpperBound(lower)})
 	}
 	sort.Sort(keyRanges(ranges))
-	assertRangesSorted(g, ranges)
+	assertRangesDisjoint(g, ranges)
 	return ranges
 }
 
-// assertRangesSorted 断言区间集已按 lower 字节序升序，乱序即 panic。
-// 续扫单调性是 scanGroupKeys 全部游标推进规则的前提，破坏它 = 静默
-// 漏发/死循环，比快照生成失败严重得多，因此用 panic 而不是 error。
-func assertRangesSorted(g uint32, ranges []keyRange) {
-	if sort.IsSorted(keyRanges(ranges)) {
+// assertRangesDisjoint 断言排序后的区间集两两不相交且各自非空
+// （lower < upper、前一段 upper ≤ 后一段 lower），违反即 panic。
+//
+// 为什么断言的是「不相交」而不是「已升序」：升序由紧邻上游的 sort.Sort
+// 保证，排序之后再断言 IsSorted 恒真——那是一条永不触发的死代码，读起来
+// 像不变量守卫，实际什么都没守。不相交才是排序无法自动满足、且真会被
+// 未来的键族前缀改动破坏的性质：一旦有人加了 "msg" 与 "msg/" 这类互为
+// 前缀的键族，两段区间重叠，scanGroupKeys 会把重叠部分发两遍（同一键
+// 出现在两个块里），接收方按最后一次写入落盘——看似"能跑"，实则块与块
+// 之间不再互斥，游标语义崩塌。
+//
+// 用 panic 而不是 error：这是装配期的代码错误（键族表写错），不是运行期
+// 的对端/磁盘故障；静默漏发或重发比拒绝生成快照严重得多。
+func assertRangesDisjoint(g uint32, ranges []keyRange) {
+	bad := ""
+	for i, r := range ranges {
+		if bytes.Compare(r.lower, r.upper) >= 0 {
+			bad = fmt.Sprintf("第 %d 段区间为空（lower %q ≥ upper %q）", i, r.lower, r.upper)
+			break
+		}
+		if i > 0 && bytes.Compare(ranges[i-1].upper, r.lower) > 0 {
+			bad = fmt.Sprintf("第 %d 段与第 %d 段重叠（前段 upper %q > 本段 lower %q）",
+				i-1, i, ranges[i-1].upper, r.lower)
+			break
+		}
+	}
+	if bad == "" {
 		return
 	}
 	lowers := make([]string, 0, len(ranges))
 	for _, r := range ranges {
 		lowers = append(lowers, fmt.Sprintf("%q", r.lower))
 	}
-	panic(fmt.Sprintf("cluster: 组 %d 键区间未按字节序升序排列: [%s]", g, strings.Join(lowers, " ")))
+	panic(fmt.Sprintf("cluster: 组 %d 键区间不满足两两不相交: %s；全部下界 [%s]",
+		g, bad, strings.Join(lowers, " ")))
 }
 
 // groupForQueue 计算 topic+queueID 归属的数据组号（1..groups）。
