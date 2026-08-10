@@ -7,7 +7,8 @@
 //     元数据带真实 {Index, Term, ConfState}，Data 只放几十字节描述符
 //   - snapRegistry：按 snapID 持有 ReadView，供控制通道分块拉取；
 //     借用计数（Get 借出/Put 归还）+ 借出续期（每次借出刷新 TTL 基线）；
-//     TTL 到期强制回收（视图长期不关会阻止 Pebble 回收旧版本）
+//     TTL 到期强制回收，另有不可续期的硬上限兜底（视图长期不关会阻止
+//     Pebble 回收旧版本）；LastBorrow 供 leader 侧判定对端是否真在拉
 //   - 描述符编解码：[8B snapID][8B leader nodeID][8B index]
 //
 // 边界：
@@ -32,9 +33,22 @@ import (
 
 // snapRegistryDefaultTTL 是快照视图的默认存活时长：超时未被拉完的
 // 视图会被 GC 强制回收。持有视图会阻止 Pebble 回收被覆盖的旧版本，
-// 泄漏即磁盘涨——TTL 是视图生命周期的兜底下限。生产值由 Task 8 的
-// 配置面接管，本常量只做装配默认。
+// 泄漏即磁盘涨——TTL 是视图生命周期的兜底下限。生产值由配置面注入
+// （cluster.snapshot_view_ttl → Options.SnapshotViewTTL），本常量只在
+// 未填时兜底。
 const snapRegistryDefaultTTL = 5 * time.Minute
+
+// snapViewHardTTLFactor 是视图硬上限相对 TTL 的倍数：视图从建档起活过
+// ttl×该倍数即被强制作废，**不受借出续期影响**。
+//
+// 为什么续期之外还要硬上限：Get 每次借出都把 created 推到当下，只要对端
+// 持续发 OpFetchSnapshot（哪怕游标原地不动、哪怕是有 bug 或恶意的对端），
+// 软 TTL 就永不到期——续期把「大库传输被误杀」的活锁修好的同时，也把
+// TTL 这道「视图必然被回收」的闸整个让掉了，退化成无限期钉住 Pebble 旧
+// 版本的磁盘泄漏。硬上限是不可续期的兜底：命中即作废（拒绝新借出），
+// 待在途借用归还后立即 Close。10 倍留给正常大库传输足够余量（默认
+// 5min×10=50min），又保证泄漏有确定上界。
+const snapViewHardTTLFactor = 10
 
 // snapDescriptor 是快照 Data 载荷的编码内容：用几十字节代替真实状态
 // 字节，接收方据此从源节点分块拉取（Task 6 的 OpFetchSnapshot）。
@@ -73,6 +87,8 @@ func decodeSnapDescriptor(b []byte) (snapDescriptor, error) {
 type snapEntry struct {
 	view    *store.ReadView
 	created time.Time // 建立时刻：GCOnce 按 ttl 判活的基线；Get 借出时刷新（续期）
+	bornAt  time.Time // 建档时刻：**永不刷新**，硬上限（ttl×hardTTLFactor）的基线
+	revoked bool      // 已作废：拒绝新借出，refs 归零即 Close（硬上限命中时置位）
 	g       uint32    // 所属组：日志上下文（排查视图泄漏定位用）
 	index   uint64    // 快照位点：日志上下文
 	refs    uint64    // 未归还的借用数：>0 时 GCOnce/Release 不得 Close 视图
@@ -126,7 +142,8 @@ func (r *snapRegistry) Create(g uint32, index uint64) (id uint64) {
 	defer r.mu.Unlock()
 	r.nextID++
 	id = r.nextID
-	r.views[id] = snapEntry{view: r.st.NewReadView(), created: r.now(), g: g, index: index}
+	now := r.now()
+	r.views[id] = snapEntry{view: r.st.NewReadView(), created: now, bornAt: now, g: g, index: index}
 	r.lg.Debug("快照视图已登记", "snap_id", id, "g", g, "index", index)
 	return id
 }
@@ -139,19 +156,50 @@ func (r *snapRegistry) Create(g uint32, index uint64) (id uint64) {
 //   - 续期让「活跃拉取中的视图」TTL 永不自然到期：每块拉取都刷新
 //     created，传输窗口超过固定 TTL 也不中断（旧的「Get 不续期」语义
 //     在大库传输上活锁：回收 → 对端重试 → 再回收）
+//   - 续期不能无限：已被硬上限作废（revoked）的视图拒绝借出，见
+//     snapViewHardTTLFactor——否则「一直请求但游标不推进」的对端可以
+//     把视图永久钉住
 //
-// 调用方必须配对调用 Put(id) 归还；已释放/已回收时 ok=false（无借用）。
+// 调用方必须配对调用 Put(id) 归还；已释放/已回收/已作废时 ok=false
+// （无借用，调用方不得再 Put）。
 func (r *snapRegistry) Get(id uint64) (*store.ReadView, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.views[id]
-	if !ok {
+	if !ok || e.revoked {
 		return nil, false
 	}
 	e.refs++
 	e.created = r.now()
 	r.views[id] = e // 写回：refs/created 的变更必须落回登记表
 	return e.view, true
+}
+
+// LastBorrow 返回组 g 在 index 位点上仍在册的视图的最近借出时刻。
+//
+// 用途（N1 的 leader 侧失败感知）：leader 判定某 peer 是否真的在拉自己
+// 发出的那份快照。raft 的 Progress.PendingSnapshot 是快照位点（index），
+// 而注册表按 snapID 索引，故按 (g, index) 反查；同位点若有多份视图（同
+// 一 index 反复生成快照），取最近的一次借出——只要有任一份在被拉，就
+// 说明对端活着。
+//
+// 返回：
+//   - last: 最近一次借出时刻（从未借出过的视图返回其建档时刻，等于给
+//     对端一个完整的启动宽限期）
+//   - ok: 该位点是否还有在册视图；false 表示视图已被回收/作废/从未生成
+//     ——对 leader 而言即「这份快照对端已不可能拉完」
+func (r *snapRegistry) LastBorrow(g uint32, index uint64) (last time.Time, ok bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, e := range r.views {
+		if e.g != g || e.index != index || e.revoked {
+			continue
+		}
+		if !ok || e.created.After(last) {
+			last, ok = e.created, true
+		}
+	}
+	return last, ok
 }
 
 // Put 归还一次 Get 借出的视图：refs-1。条目保留在登记表里供后续分块
@@ -162,6 +210,9 @@ func (r *snapRegistry) Get(id uint64) (*store.ReadView, bool) {
 //     close 约定相同）；对从未借出的 id 调用是编程错误，打 Warn 防御
 //   - refs 不为负数：重复归还只告警、不再扣减，避免回绕把条目变成
 //     「永不回收」的泄漏
+//   - 已被硬上限作废（revoked）的条目在 refs 归零的这一刻立即注销并
+//     Close——作废的语义是「等在途借用还完就走」，等下一轮 GC 只会白白
+//     多钉住一个 GC 周期的 Pebble 旧版本
 func (r *snapRegistry) Put(id uint64) {
 	r.mu.Lock()
 	e, ok := r.views[id]
@@ -169,11 +220,22 @@ func (r *snapRegistry) Put(id uint64) {
 		r.lg.Warn("快照视图归还不匹配：无未归还借用（重复 Put 或未 Get 即 Put）",
 			"snap_id", id, "g", e.g, "index", e.index)
 	}
+	closeNow := false
 	if ok && e.refs > 0 {
 		e.refs--
-		r.views[id] = e // 写回：refs 的变更必须落回登记表
+		if e.refs == 0 && e.revoked {
+			delete(r.views, id) // 作废条目还清借用：就地注销
+			closeNow = true
+		} else {
+			r.views[id] = e // 写回：refs 的变更必须落回登记表
+		}
 	}
 	r.mu.Unlock()
+	// Close 放在锁外：与 GCOnce 同一纪律，不让 Close 阻塞其它 Get/Create
+	if closeNow {
+		_ = e.view.Close()
+		r.lg.Info("快照视图作废后归还即回收", "snap_id", id, "g", e.g, "index", e.index)
+	}
 }
 
 // Release 注销指定快照视图：从登记表移除并 Close，立即释放 Pebble
@@ -221,25 +283,59 @@ func (r *snapRegistry) WasCreated(id uint64) bool {
 // 借出中的视图（refs>0）即使超 TTL 也跳过：Close 会炸正在扫描的借用
 // 者（pebble 对已关快照建迭代器直接 panic，无 recover 则进程死亡）——
 // 借出是一次分块扫描，短命，顺延到下一轮 GC 即可。
+//
+// 硬上限（bornAt + ttl×snapViewHardTTLFactor，不受借出续期影响）：
+//   - refs==0：与软 TTL 同路径，直接回收；
+//   - refs>0：置 revoked（拒绝新借出），待在途借用经 Put 归还时立即
+//     Close。作废不 Close 是同一条不变式——refs>0 时 Close 必炸借用者。
+//
 // 回收打 Info 并带存活时长，保证泄漏可观测。
 func (r *snapRegistry) GCOnce(now time.Time) int {
 	// 先快照出过期集合再统一释放：Close 不持 r.mu（只注销时持），
 	// 避免长时间持有视图的 Close 阻塞其它 Get/Create
+	hard := r.ttl * snapViewHardTTLFactor
 	ids := make([]uint64, 0)
 	stale := make([]snapEntry, 0)
+	reasons := make([]string, 0)
+	revoked := make([]snapEntry, 0)
+	revokedIDs := make([]uint64, 0)
 	r.mu.Lock()
 	for id, e := range r.views {
-		if now.Sub(e.created) >= r.ttl && e.refs == 0 {
+		expired := now.Sub(e.created) >= r.ttl
+		overHard := now.Sub(e.bornAt) >= hard
+		if e.refs == 0 && (expired || overHard || e.revoked) {
 			ids = append(ids, id)
 			stale = append(stale, e)
+			reason := "ttl"
+			if overHard {
+				reason = "hard-ttl"
+			} else if e.revoked {
+				reason = "revoked"
+			}
+			reasons = append(reasons, reason)
 			delete(r.views, id)
+			continue
+		}
+		// refs>0 且撞硬上限：作废而非 Close——Close 会炸在途借用者
+		if overHard && !e.revoked {
+			e.revoked = true
+			r.views[id] = e
+			revokedIDs = append(revokedIDs, id)
+			revoked = append(revoked, e)
 		}
 	}
 	r.mu.Unlock()
+	for i, id := range revokedIDs {
+		e := revoked[i]
+		r.lg.Warn("快照视图撞硬上限，已作废（拒绝新借出，待在途借用归还即回收）",
+			"snap_id", id, "g", e.g, "index", e.index, "refs", e.refs,
+			"age", now.Sub(e.bornAt).Round(time.Second).String(), "hard_ttl", hard.String())
+	}
 	for i, id := range ids {
 		e := stale[i]
 		_ = e.view.Close()
-		r.lg.Info("快照视图超时回收", "snap_id", id, "g", e.g, "index", e.index, "lifetime", r.ttl.String())
+		r.lg.Info("快照视图回收", "snap_id", id, "g", e.g, "index", e.index,
+			"reason", reasons[i], "age", now.Sub(e.bornAt).Round(time.Second).String())
 	}
 	return len(ids)
 }

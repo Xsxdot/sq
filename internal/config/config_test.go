@@ -513,8 +513,27 @@ cluster:
 	if cfg.Cluster.SnapshotChunkBytes != 4<<20 {
 		t.Fatalf("snapshot_chunk_bytes 默认 = %d; want 4MiB", cfg.Cluster.SnapshotChunkBytes)
 	}
+	if cfg.Cluster.SnapshotViewTTL != 5*time.Minute {
+		t.Fatalf("snapshot_view_ttl 默认 = %v; want 5m", cfg.Cluster.SnapshotViewTTL)
+	}
 	// 上界守卫：分块必须小于传输层帧上限，否则整份快照永远发不出去
 	if _, err := loadClusterConfigErr(t, "  snapshot_chunk_bytes: 33554432\n"); err == nil {
 		t.Fatal("分块大小超过 16MiB 帧上限必须被拒绝")
+	}
+	// 非正 TTL：视图刚建完就过期，快照传输永远拉不完——启动即挡
+	if _, err := loadClusterConfigErr(t, "  snapshot_view_ttl: -1s\n"); err == nil {
+		t.Fatal("负 snapshot_view_ttl 必须被拒绝")
+	}
+	// 显式填值透传（不被默认值盖掉）
+	cfg2 := loadClusterConfig(t, `
+cluster:
+  node_id: 1
+  raft_listen: ":9081"
+  snapshot_view_ttl: 20m
+  peers:
+    - {id: 1, raft_addr: "127.0.0.1:9081", advertise_host: "127.0.0.1", advertise_port: 8081}
+`)
+	if cfg2.Cluster.SnapshotViewTTL != 20*time.Minute {
+		t.Fatalf("snapshot_view_ttl 显式值 = %v; want 20m", cfg2.Cluster.SnapshotViewTTL)
 	}
 }

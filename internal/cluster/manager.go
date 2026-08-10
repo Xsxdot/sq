@@ -41,6 +41,7 @@ import (
 
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/tracker"
 
 	"github.com/xushixin/sq/internal/store"
 )
@@ -130,6 +131,17 @@ type Options struct {
 	// maxFrameLen（16MiB）——上界由配置面校验保证（见 config.go 的
 	// snapshot_chunk_bytes 校验）。
 	SnapshotChunkBytes int
+
+	// SnapshotViewTTL 是快照视图的存活时长（batch④，默认 5min；0 按
+	// snapRegistryDefaultTTL）：视图每被借出一次（对端拉一块）即续期，
+	// 超过该时长无人问津即由 GC 回收；从建档起活过 TTL×
+	// snapViewHardTTLFactor 命中不可续期的硬上限被强制作废。
+	//
+	// 为什么要可配：持有视图会阻止 Pebble 回收旧版本，TTL 直接决定
+	// 「慢 follower 拉快照」与「磁盘被旧版本压住」之间的取舍——大库 +
+	// 慢网必须调大，否则传输没完视图先被回收、来回重来。生产由 main
+	// 注入（config cluster.snapshot_view_ttl）。
+	SnapshotViewTTL time.Duration
 
 	// NoBootstrap 控制 fresh 路径的引导方式（batch④ Task 10，默认
 	// false）：false 时以 StartNode(peers) 引导完整成员表（新集群开机、
@@ -301,24 +313,36 @@ func NewManager(o Options) (*Manager, error) {
 		doneCh:                 make(chan struct{}),
 	}
 	m.rs = newRaftStore(o.Store, lg)
-	// 快照注册表：每个 Manager 一份，全组共享（Task 4）。TTL 用默认
-	// 常量，生产可调值由 Task 8 的配置面接管。
-	m.snaps = newSnapRegistry(o.Store, snapRegistryDefaultTTL, lg)
+	// 快照注册表：每个 Manager 一份，全组共享（Task 4）。TTL 由配置面
+	// 注入（cluster.snapshot_view_ttl），未填时落回装配默认常量。
+	viewTTL := o.SnapshotViewTTL
+	if viewTTL <= 0 {
+		viewTTL = snapRegistryDefaultTTL
+	}
+	m.snaps = newSnapRegistry(o.Store, viewTTL, lg)
 
-	// PrepareJoin/FetchSnapshot/SeedState handler 自装（batch③/④）：在
-	// 任何注入的 ControlHandler 之前包一层——OpPrepareJoin（重入编排
-	// 协议面）、OpFetchSnapshot（快照分块拉取）与 OpSeedState（Join 前
-	// 的种子日志档位探测）都由 Manager 内部处理，其余 op 转发给调用方
-	// 注入的 handler；未注入时回「控制通道未装配」（保持 nil handler 的
-	// 对端语义，probePeerAlive 依赖该错误形状）。
+	// Ping/PrepareJoin/FetchSnapshot/SeedState handler 自装（batch③/④）：在
+	// 任何注入的 ControlHandler 之前包一层——OpPing（存活探测）、
+	// OpPrepareJoin（重入编排协议面）、OpFetchSnapshot（快照分块拉取）与
+	// OpSeedState（Join 前的种子日志档位探测）都由 Manager 内部处理，其余
+	// op 转发给调用方注入的 handler；未注入时回「控制通道未装配」（保持
+	// nil handler 的对端语义，probePeerAlive 的兜底分类依赖该错误形状）。
 	//
-	// 为什么这里只有 op 3/4/5 而没有 1/2：OpForwardAppend/OpForwardApply
+	// OpPing 必须在这一层截住、绝不下发给用户 handler：探活是集群内协议，
+	// 让它触发应用逻辑既无意义又有害——旧实现下 main 的 handler 每个摊布
+	// 周期回一次「未知控制 op 0」，而 catch-all 型的测试 handler 会把探活
+	// 当成业务事件收走（TestClusterForwardAppendWire 的间歇失败源头）。
+	//
+	// 为什么这里只有 op 0/3/4/5 而没有 1/2：OpForwardAppend/OpForwardApply
 	// 需要 core 组件（复制器、消息追加与批次重放），由 main 的
 	// ControlHandler 装配（见 cmd/sq/main.go 的 controlHandler）；Manager
 	// 自装层刻意只处理不依赖 core 的集群内协议——这不是漏接。
 	userHandler := o.ControlHandler
 	m.controlHandler = func(op byte, payload []byte) ([]byte, error) {
 		switch op {
+		case OpPing:
+			// 存活探测：能应答即证明进程活着，无载荷、无副作用
+			return nil, nil
 		case OpPrepareJoin:
 			return m.handlePrepareJoin(payload)
 		case OpFetchSnapshot:
@@ -351,6 +375,21 @@ func NewManager(o Options) (*Manager, error) {
 	case hasRaft:
 		m.lg.Error("检测到不干净关机，拒绝直接恢复——须清空状态以 learner 重入（先 Close store，再 WipeForRejoin，经存活 leader 的 ConfChange 重新加入）")
 		return nil, ErrUncleanShutdown
+	default:
+		// fresh：本目录一生只经过一次的「首次以集群模式启动」。此刻若
+		// store 里已有 FSM 数据，那就是单机档直写进去的存量——它不在
+		// 任何 raft 日志里，必须打标记（N2：Join 的拒绝条件要靠它把
+		// 「单机升级档」与「全新集群刚写了些数据」区分开，否则后者也被
+		// 一刀切拒绝，而它的数据本来就能靠日志重放完整带过去）。
+		preRaft, err := storeHasFSMKeys(o.Store)
+		if err != nil {
+			return nil, fmt.Errorf("cluster: 探测前 raft 期存量数据: %w", err)
+		}
+		if preRaft {
+			if err := m.rs.MarkPreRaft(); err != nil {
+				return nil, err
+			}
+		}
 	}
 
 	// 引导成员表：全量 Peers（fresh 路径 StartNode 按此追加 ConfChange
@@ -827,9 +866,10 @@ func (m *Manager) balanceOnce(g uint32, preferred uint64, stableTicks map[uint32
 	stableTicks[g] = -leaderStableTicks
 }
 
-// probePeerAlive 探测节点是否存活：控制通道短连接 RPC——拨号成功即
-// 视为存活（对端应答什么无关紧要：即使报「控制通道未装配」也证明它
-// 活着）；拨号失败（连接拒绝/超时）视为死亡。
+// probePeerAlive 探测节点是否存活：控制通道短连接 RPC 发 OpPing——
+// 对端 Manager 自装层直接空应答即视为存活；拨号失败（连接拒绝/超时）
+// 视为死亡。对端若是不认识 OpPing 的旧版本，会回一个协议错误，那同样
+// 证明它活着（见下方 net.OpError 分类兜底）。
 //
 // 为什么需要它：RecentActive 在本集群配置下不会衰减（raft 只在
 // CheckQuorum 消息里重置它，而 CheckQuorum 未开启），死节点的
@@ -840,7 +880,7 @@ func (m *Manager) balanceOnce(g uint32, preferred uint64, stableTicks map[uint32
 func (m *Manager) probePeerAlive(nodeID uint64) bool {
 	ctx, cancel := context.WithTimeout(context.Background(), 500*time.Millisecond)
 	defer cancel()
-	_, err := m.Control(ctx, nodeID, 0, nil)
+	_, err := m.Control(ctx, nodeID, OpPing, nil)
 	if err == nil {
 		return true
 	}
@@ -928,9 +968,31 @@ func (m *Manager) promoteLearners(g uint32) {
 //
 // 返回：实际截断到的位点与是否真的执行了截断（无事可做时 done=false）。
 func (m *Manager) truncateOnce(g uint32) (uint64, bool) {
+	return m.truncateOnceWith(g, make(map[uint64]bool))
+}
+
+// truncateOnceWith 是 truncateOnce 的实现体，多收一个本轮存活探测缓存。
+//
+// probed 由调用方持有：截断循环每轮建一个、跨全部组复用，同一 peer 一轮
+// 只探一次（见 truncateLoop 注释的耗时账）。缓存的生命周期必须是「一轮」
+// ——跨轮复用会让死节点复活后仍被当作死的，多截一段日志。
+// 传 nil 等价于不缓存（每次现探）。
+func (m *Manager) truncateOnceWith(g uint32, probed map[uint64]bool) (uint64, bool) {
 	gr, ok := m.groups[g]
 	if !ok {
 		return 0, false
+	}
+	// alive 是带本轮缓存的存活探测：命中缓存直接复用，未命中现探并记账
+	alive := func(id uint64) bool {
+		if probed == nil {
+			return m.probePeerAlive(id)
+		}
+		if v, ok := probed[id]; ok {
+			return v
+		}
+		v := m.probePeerAlive(id)
+		probed[id] = v
+		return v
 	}
 	// 成员表与位点同临界区配对——与 Task 4 applyEntry/Snapshot 同一纪律：
 	// 锚点 index（源自 applied）与 confState 必须取同一 apply 时刻，否则
@@ -963,7 +1025,7 @@ func (m *Manager) truncateOnce(g uint32) (uint64, bool) {
 			if floor >= upto {
 				continue // 上限已把它抬到不构成下界，无需探测
 			}
-			if !m.probePeerAlive(id) {
+			if !alive(id) {
 				// 死节点（控制通道拨号失败/超时）：不以其冻结 Match 为
 				// 下界。恢复后落后到截断点之外，raft 判定日志追齐不可能，
 				// 自动走 MsgSnap 快照追齐（与 learner 追齐同一路径）。
@@ -1003,6 +1065,117 @@ func (m *Manager) truncateOnce(g uint32) (uint64, bool) {
 	return upto, true
 }
 
+// snapStallTicks 是 leader 判定「对端没在拉这份快照」所需的连续观察
+// 轮数：连续 2 轮（默认 30s 间隔 ⇒ ≥60s）都没有任何拉取活动才上报失败。
+//
+// 为什么要 ≥2 轮而不是一撞见就报：误报的代价是打断一次正在进行的正常
+// 安装（对端被打回 Probe，白白重来一遍分钟级传输）。而漏报只是多等一
+// 轮。两轮 + 「视图最近借出时刻」的活跃度证据，足以把「安装中」与
+// 「对端已经死了/根本没收到 MsgSnap」分开。
+const snapStallTicks = 2
+
+// snapStall 是 leader 对单个 peer 的快照停滞观察态（只存在于截断循环
+// 的 goroutine 局部，不共享、无需加锁）。
+type snapStall struct {
+	index uint64 // 观察时的 PendingSnapshot 位点；leader 换发新快照即重新计数
+	ticks int    // 连续观察到「无拉取活动」的轮数
+}
+
+// snapStallStep 演进单个 peer 的快照停滞观察态，返回新观察态与「是否
+// 该上报失败」。抽成纯函数是为了让判据本身可被单测覆盖——外层
+// reportStalledSnapshots 需要一个真的处在 StateSnapshot 的 raft
+// Progress，那是集成级前提，不该成为验证这段判据的门槛。
+//
+// 参数：
+//   - prev/had: 上一轮观察态与它是否存在
+//   - pending: 本轮 Progress.PendingSnapshot（快照位点）
+//   - lastBorrow/live: 该位点视图的最近借出时刻与是否仍在册
+//     （snapRegistry.LastBorrow 的返回）
+//   - now/idle: 当前时刻与「多久无拉取算一次停滞」
+//
+// 判据三条，按序：
+//  1. 位点变了（leader 换发了新快照）即重新计数——旧位点的观察无意义；
+//  2. 视图仍在册且 idle 之内有过借出 → 对端正在拉，计数归零；
+//  3. 否则计数 +1，累计到 snapStallTicks 即 report=true。
+func snapStallStep(prev snapStall, had bool, pending uint64, lastBorrow time.Time, live bool, now time.Time, idle time.Duration) (next snapStall, report bool) {
+	next = prev
+	if !had || prev.index != pending {
+		next = snapStall{index: pending} // 新快照：重新计数
+	}
+	if live && now.Sub(lastBorrow) < idle {
+		next.ticks = 0 // 对端正在拉块：不算停滞
+		return next, false
+	}
+	next.ticks++
+	return next, next.ticks >= snapStallTicks
+}
+
+// reportStalledSnapshots 是快照失败的 leader 侧感知（N1 的另一半）。
+//
+// 为什么必须有：本节点作为 leader 给落后 peer 发出 MsgSnap 后，raft 把
+// 该 peer 的 Progress 置为 StateSnapshot，而 tracker.IsPaused() 对该状态
+// **无条件返回 true**——leader 从此既不发日志也不重发快照。退出该状态只
+// 有两条路：收到 MsgSnapStatus（即本方法调用的 ReportSnapshot），或 peer
+// 的 MsgAppResp 推进了 Match（而 leader 压根不发 MsgApp，所以不会发生）。
+// 接收侧安装失败是 fail-stop panic + 重启清空重来，重启后它是空日志、
+// Match=0，自己无法脱困。两侧缺一，一次瞬时安装失败就让该 peer 对这个组
+// 永久静默，直到 leader 换届或 leader 自己重启。
+//
+// 判据（为什么不是超时计时器）：快照的真实状态字节由对端经控制通道
+// OpFetchSnapshot 分块拉取，每拉一块都会 Get 借出发送侧的 ReadView 并
+// 刷新其借出时刻——「视图最近借出时刻」就是对端是否活着的直接证据，
+// 比任何固定超时都准。视图已不在册（被 TTL/硬上限回收）同样是判据：
+// 那份快照对端已不可能拉完。
+//
+// 参数：
+//   - g: 组号
+//   - idle: 多久没有拉取活动算一次停滞观察（截断循环传入自身间隔）
+//   - now: 当前时刻（与 GC 同一时钟，测试可注入）
+//   - seen: 跨轮观察态，键为 peer 节点 ID；由调用方持有并复用
+//
+// 上报后即从 seen 移除：raft 收到 MsgSnapStatus(reject) 会把
+// PendingSnapshot 归零并 BecomeProbe，下一轮该 peer 要么追上、要么被
+// 重新判定需要快照并拿到新的 PendingSnapshot，两种都是新一轮观察。
+func (m *Manager) reportStalledSnapshots(g uint32, idle time.Duration, now time.Time, seen map[uint64]snapStall) {
+	gr, ok := m.groups[g]
+	if !ok {
+		return
+	}
+	st, ok := m.Status(g)
+	if !ok || st.RaftState != raft.StateLeader {
+		// 非 leader：观察态整体作废（新 leader 有自己的 Progress 视角）
+		clear(seen)
+		return
+	}
+	inSnapshot := make(map[uint64]struct{}, len(st.Progress))
+	for id, pr := range st.Progress {
+		if id == m.nodeID || pr.State != tracker.StateSnapshot {
+			continue
+		}
+		inSnapshot[id] = struct{}{}
+		last, live := m.snaps.LastBorrow(g, pr.PendingSnapshot)
+		s, had := seen[id]
+		next, report := snapStallStep(s, had, pr.PendingSnapshot, last, live, now, idle)
+		if !report {
+			seen[id] = next
+			continue
+		}
+		// 判定停滞：告知 raft 这次快照失败，peer 回到 Probe 重新探测；
+		// 若它仍落后于截断点，raft 会重新走 Snapshot() 发一份新的。
+		gr.rn.ReportSnapshot(id, raft.SnapshotFailure)
+		m.lg.Warn("快照停滞，已上报失败（对端将回到 Probe，按需重发快照）",
+			"g", g, "node", id, "pending_snapshot", pr.PendingSnapshot,
+			"idle_ticks", next.ticks, "idle", idle.String())
+		delete(seen, id)
+	}
+	// 清理已离开 StateSnapshot 的观察态（安装成功/成员被移除）
+	for id := range seen {
+		if _, ok := inSnapshot[id]; !ok {
+			delete(seen, id)
+		}
+	}
+}
+
 // truncateLoop 是截断循环本体：每 interval 对全部组执行一次截断评估
 // （truncateOnce，保留量之内空转，见 truncateOnce 注释）。ctx 取消即
 // 退出。
@@ -1014,18 +1187,32 @@ func (m *Manager) truncateOnce(g uint32) (uint64, bool) {
 func (m *Manager) truncateLoop(ctx context.Context, interval time.Duration) {
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	// 快照停滞观察态（见 reportStalledSnapshots）：本 goroutine 独占，
+	// 跨轮累积连续观察次数。
+	stalls := make(map[uint32]map[uint64]snapStall, m.Groups())
+	for g := uint32(0); g < m.Groups(); g++ {
+		stalls[g] = make(map[uint64]snapStall)
+	}
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
+			now := time.Now()
+			// 存活探测按轮缓存：同一 peer 在本轮的多个组里只探一次。
+			// 未缓存时最坏 组数×peer数×500ms 串行探测（8 组 ×4 peer 全
+			// 落后 ≈16s）会逼近 30s 的轮询间隔，把一次维护轮拖成半个周期。
+			probed := make(map[uint64]bool, len(m.peers))
 			for g := uint32(0); g < m.Groups(); g++ {
-				m.truncateOnce(g)
+				m.truncateOnceWith(g, probed)
+				// 截断与快照失败感知同节拍：两者都以「谁落后到只能靠快照」
+				// 为中心，共用一次 Status 采样周期即可，无需另起循环。
+				m.reportStalledSnapshots(g, interval, now, stalls[g])
 			}
 			// 快照视图注册表 GC：视图不关会阻止 Pebble 回收被覆盖的旧版本
 			// （磁盘膨胀），必须周期强制回收；循环节奏即 GC 心跳——默认
 			// TTL 5min ≈ 10 个 tick 后视图才被回收。
-			m.snaps.GCOnce(time.Now())
+			m.snaps.GCOnce(now)
 		}
 	}
 }
@@ -1377,14 +1564,21 @@ func (m *Manager) handlePrepareJoin(payload []byte) ([]byte, error) {
 }
 
 // handleSeedState 处理 OpSeedState 控制请求（Manager 自装，见 NewManager）：
-// payload=[4B BE 组]，响应=[1B 该组 FSM 是否非空][8B BE firstIndex]。
+// payload=[4B BE 组]，响应=[1B 该组 FSM 是否非空][1B 前 raft 期存量标记]
+// [8B BE firstIndex]。
 //
 // Join 前的种子日志档位探测（C2 修复，见 Join 注释的扩容前提）：新节点
 // 以 learner 加入前，先探种子「日志是否已压缩」——firstIndex>1 时新节点
 // 追齐走快照，单机档直写 FSM 的存量数据安全抵达；firstIndex==1 时追齐
 // 走日志重放，而存量数据根本不在日志里（当时直写 FSM），重放带不过去、
 // 快照也不触发，扩容即静默丢数据。探测读的是种子本地状态（本组日志
-// 起点 + 本组键族有无键），与请求方无关。
+// 起点 + 本组键族有无键 + 本节点档位标记），与请求方无关。
+//
+// 为什么还要回 preraft 标记（N2）：只看「FSM 非空 + 未压缩」会把**全新
+// 集群刚写了几条消息**也判成危险档——那批数据是经 raft 提交写进去的，
+// 日志里有、重放带得过去，拒绝它是误伤（默认配置下新集群写满 2 万条
+// 之前根本没法扩容）。真正危险的只有「数据不在日志里」这一种，而那
+// 恰恰就是 preraft 标记的定义。
 //
 // firstIndex 的语义与 C1 修复同源：日志从未被截断时 raft 空存储的
 // FirstIndex 恒为 1（见 TestInstallingMarkerRestartClearsRaftLog 的
@@ -1406,11 +1600,18 @@ func (m *Manager) handleSeedState(payload []byte) ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("cluster: SeedState 组 %d 扫 FSM 键: %w", g, err)
 	}
-	resp := make([]byte, 9)
+	preRaft, err := m.rs.HasPreRaft()
+	if err != nil {
+		return nil, fmt.Errorf("cluster: SeedState 组 %d 读前 raft 期标记: %w", g, err)
+	}
+	resp := make([]byte, 10)
 	if nonEmpty {
 		resp[0] = 1
 	}
-	binary.BigEndian.PutUint64(resp[1:], first)
+	if preRaft {
+		resp[1] = 1
+	}
+	binary.BigEndian.PutUint64(resp[2:], first)
 	return resp, nil
 }
 
@@ -1839,6 +2040,38 @@ func storeHasKeys(st *store.Store) (bool, error) {
 	return nonEmpty, nil
 }
 
+// storeHasFSMKeys 判定 store 里是否有**任何非 raft 元数据**的键。
+//
+// 与 storeHasKeys 的分工：后者判「目录是否绝对空」（Join 的空目录门），
+// 本函数判「有没有业务数据」——调用点在 NewManager 的 fresh 路径，此时
+// EnsureGroups 已经写下了 raft/groups，整库扫必然非空，必须把 raft/
+// 前缀这段刨掉才能问出「单机档有没有写过东西」。
+//
+// 实现：扫 raft/ 前缀两侧的两段区间（'/'=0x2f 的后继是 '0'=0x30，故
+// "raft0" 是 "raft/" 前缀的右开边界）。metric/ 等本地不复制键族也算
+// 「有数据」——这只会让标记偏保守（多打），而拒绝条件还要与「该组 FSM
+// 非空」合取，不会因此误拒。
+func storeHasFSMKeys(st *store.Store) (bool, error) {
+	ranges := []keyRange{
+		{lower: nil, upper: []byte(raftPrefix)},
+		{lower: []byte(raftPrefixEnd), upper: nil},
+	}
+	for _, r := range ranges {
+		found := false
+		err := st.Scan(r.lower, r.upper, 1, func(k, v []byte) (bool, error) {
+			found = true
+			return false, nil
+		})
+		if err != nil {
+			return false, err
+		}
+		if found {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 // encodeSeedStateReq 编码 OpSeedState 请求：[4B BE 组号]。
 func encodeSeedStateReq(g uint32) []byte {
 	req := make([]byte, 4)
@@ -1879,15 +2112,20 @@ func probeSeedState(ctx context.Context, lg *slog.Logger, o Options, seedPeers m
 			if err != nil {
 				return fmt.Errorf("cluster: 加入编排第 2 步 种子 %d 组 %d 档位探测失败: %w", peer, g, err)
 			}
-			// 响应布局：[1B FSM 非空][8B BE firstIndex]（见 transport.go
-			// op 注册表注释），长度校验防坏对端
-			if len(resp) != 9 {
-				return fmt.Errorf("cluster: 加入编排第 2 步 种子 %d 组 %d 档位响应 %d B 非法（want 9B）", peer, g, len(resp))
+			// 响应布局：[1B FSM 非空][1B 前 raft 期存量标记][8B BE
+			// firstIndex]（见 transport.go op 注册表注释），长度校验防坏对端
+			if len(resp) != 10 {
+				return fmt.Errorf("cluster: 加入编排第 2 步 种子 %d 组 %d 档位响应 %d B 非法（want 10B）", peer, g, len(resp))
 			}
 			nonEmpty := resp[0] == 1
-			first := binary.BigEndian.Uint64(resp[1:9])
-			if nonEmpty && first == 1 {
-				return fmt.Errorf("cluster: 加入编排第 2 步: 种子节点 %d 组 %d 日志未压缩（firstIndex=1）且 FSM 非空——Join 会走日志重放、静默丢失单机档存量数据。请先让种子写入越过约 2×RetainEntries（默认 10000）条并等待截断循环压缩（约 30s 一轮），再重试 Join", peer, g)
+			preRaft := resp[1] == 1
+			first := binary.BigEndian.Uint64(resp[2:10])
+			// 三者合取才拒：**前 raft 期存量数据**（不在日志里）+ 该组 FSM
+			// 确有键 + 日志未压缩（追齐走重放）。少任一条都不丢数据——
+			// 无 preraft 标记说明数据都是经 raft 提交的，重放带得过去；
+			// first>1 说明追齐走快照，直接整库带走。
+			if preRaft && nonEmpty && first == 1 {
+				return fmt.Errorf("cluster: 加入编排第 2 步: 种子节点 %d 组 %d 带前 raft 期存量数据且日志未压缩（firstIndex=1）——Join 会走日志重放、静默丢失单机档存量数据。请先让种子写入越过约 2×RetainEntries（默认 10000）条并等待截断循环压缩（约 30s 一轮），再重试 Join", peer, g)
 			}
 		}
 	}

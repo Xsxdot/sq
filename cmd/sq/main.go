@@ -242,6 +242,7 @@ func run() error {
 			RetainEntries:          cc.LogRetainEntries,
 			TruncateInterval:       cc.TruncateInterval,
 			SnapshotChunkBytes:     cc.SnapshotChunkBytes,
+			SnapshotViewTTL:        cc.SnapshotViewTTL,
 			OnApplied:              onApplied,
 			OnLeaderChange:         onLeaderChange,
 			ControlHandler:         controlHandler,

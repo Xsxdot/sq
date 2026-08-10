@@ -294,7 +294,12 @@ func TestJoinRejectsBadSeeds(t *testing.T) {
 
 // TestSeedStateProbe 锁 OpSeedState 的线协议形状（handler 侧，golden
 // 值在 TestControlOpRegistry）：请求 [4B BE 组]，响应 [1B FSM 非空]
-// [8B BE firstIndex]——Join 的种子日志档位探测（C2）的判定面。
+// [1B 前 raft 期存量标记][8B BE firstIndex]——Join 的种子日志档位探测
+// （C2 修复 + N2 收窄判据）的判定面。
+//
+// 本用例的 harness 是**空目录起的集群**（无前 raft 期存量），故 preraft
+// 恒为 0——这正是 N2 要区分的另一侧：数据都经 raft 提交，重放带得过去，
+// Join 不该被拒。带标记那一侧由 TestJoinRejectsPreRaftSeed 覆盖。
 func TestSeedStateProbe(t *testing.T) {
 	h := startSingleNodeManager(t)
 	// 空 FSM 的组（数据组 1 无键）：nonEmpty=0；日志未压缩 firstIndex=1
@@ -302,17 +307,21 @@ func TestSeedStateProbe(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(resp) != 9 {
-		t.Fatalf("响应 %d B; want 9（[1B 非空][8B firstIndex]）", len(resp))
+	if len(resp) != 10 {
+		t.Fatalf("响应 %d B; want 10（[1B 非空][1B preraft][8B firstIndex]）", len(resp))
 	}
 	if resp[0] != 0 {
 		t.Fatalf("空 FSM 的组 nonEmpty=%d; want 0", resp[0])
 	}
-	if first := binary.BigEndian.Uint64(resp[1:]); first != 1 {
+	if resp[1] != 0 {
+		t.Fatalf("空目录起的集群 preraft=%d; want 0", resp[1])
+	}
+	if first := binary.BigEndian.Uint64(resp[2:]); first != 1 {
 		t.Fatalf("未截断日志 firstIndex=%d; want 1", first)
 	}
-	// 直写一个组 0 键（单机档语义，不经 raft）：FSM 非空翻 1，日志仍
-	// 未压缩——这正是 Join 必须拒绝的档位（firstIndex=1 && FSM 非空）
+	// 直写一个组 0 键：FSM 非空翻 1，日志仍未压缩。注意 preraft 仍为 0
+	// ——标记只在 NewManager 的 fresh 路径按「启动前目录已有数据」判定，
+	// 起来之后再写不改档位（N2 的判据面就在这条分界上）
 	b := h.m.Store().NewBatch()
 	if err := b.Set(store.TopicMetaKey("SEED"), []byte("v")); err != nil {
 		t.Fatal(err)
@@ -327,7 +336,10 @@ func TestSeedStateProbe(t *testing.T) {
 	if resp[0] != 1 {
 		t.Fatalf("有键的组 nonEmpty=%d; want 1", resp[0])
 	}
-	if first := binary.BigEndian.Uint64(resp[1:]); first != 1 {
+	if resp[1] != 0 {
+		t.Fatalf("集群起来之后才写的键不该翻 preraft，得到 %d", resp[1])
+	}
+	if first := binary.BigEndian.Uint64(resp[2:]); first != 1 {
 		t.Fatalf("未截断日志 firstIndex=%d; want 1", first)
 	}
 	// 坏载荷与未知组必须显式报错（防坏对端，与 handlePrepareJoin 同纪律）
@@ -339,24 +351,48 @@ func TestSeedStateProbe(t *testing.T) {
 	}
 }
 
-// TestJoinRejectsUncompressedSeed Join 的种子日志档位探测（第 2 步，
-// C2 修复）：种子「日志未压缩（firstIndex=1）且 FSM 非空」时 Join 必须
-// 显式拒绝——此时新节点追齐走日志重放（探测锚在假想条目 index-1），
-// 而单机档直写 FSM 的存量数据不在 raft 日志里，重放带不过去、快照也
-// 不触发，扩容会静默丢数据。修复前这是文档披露（不报错、数据缺失），
-// 现在由第 2 步探测执行（先于 PrepareJoin，拒绝不留 phantom learner）。
-func TestJoinRejectsUncompressedSeed(t *testing.T) {
-	// 种子：单节点集群 + 少量直写（远低于 2×RetainEntries，截断循环
-	// 永不触发，日志保持未压缩）——FSM 非空与 firstIndex=1 双条件齐备
-	seedStore, seed := startSoloManager(t, t.TempDir(), AckQuorumMem)
-	b := seedStore.NewBatch()
-	if err := b.Set(store.TopicMetaKey("SEED-ONLY"), []byte("v")); err != nil {
+// writePreRaftData 在 dir 下**先于任何 Manager 启动**写入一批 FSM 键，
+// 模拟单机档直写：这批数据不在任何 raft 日志里，随后 NewManager 的 fresh
+// 路径会据此打下 preraft 标记。写完即关库（Pebble 同目录不可并发打开，
+// 调用方随后用 startSoloManager 重新打开同一目录）。
+func writePreRaftData(t *testing.T, dir string, topics ...string) {
+	t.Helper()
+	st, err := store.Open(dir, false, testSlog(t))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := seedStore.Apply(b); err != nil {
+	b := st.NewBatch()
+	for _, topic := range topics {
+		if err := b.Set(store.TopicMetaKey(topic), []byte("v")); err != nil {
+			st.Close()
+			t.Fatal(err)
+		}
+	}
+	if err := st.Apply(b); err != nil {
+		st.Close()
 		t.Fatal(err)
 	}
-	// 测试前提自证：日志确实未压缩（firstIndex=1），FSM 确实非空
+	st.Close()
+}
+
+// TestJoinRejectsPreRaftSeed Join 的种子档位探测（第 2 步，C2 修复 +
+// N2 收窄判据）：种子「带前 raft 期存量数据 + 该组 FSM 非空 + 日志未
+// 压缩（firstIndex=1）」三条同时成立时 Join 必须显式拒绝——此时新节点
+// 追齐走日志重放（探测锚在假想条目 index-1），而单机档直写 FSM 的存量
+// 数据不在 raft 日志里，重放带不过去、快照也不触发，扩容会静默丢数据。
+// 修复前这是文档披露（不报错、数据缺失），现在由第 2 步探测执行
+// （先于 PrepareJoin，拒绝不留 phantom learner）。
+func TestJoinRejectsPreRaftSeed(t *testing.T) {
+	// 种子：**先**直写单机档数据，**再**首次以集群模式启动——这是
+	// 「单机 → 集群升级」的真实序，NewManager 的 fresh 路径据此打标记。
+	// 写入量远低于 2×RetainEntries，截断循环永不触发，日志保持未压缩。
+	dir := t.TempDir()
+	writePreRaftData(t, dir, "SEED-ONLY")
+	seedStore, seed := startSoloManager(t, dir, AckQuorumMem)
+	// 测试前提自证：标记已打、日志确实未压缩（firstIndex=1）、FSM 非空
+	if pre, err := seed.rs.HasPreRaft(); err != nil || !pre {
+		t.Fatalf("测试前提不成立：前 raft 期标记应已打 pre=%v err=%v", pre, err)
+	}
 	if f, err := seed.groups[0].stg.FirstIndex(); err != nil || f != 1 {
 		t.Fatalf("测试前提不成立：种子 firstIndex=%d err=%v（want 1）", f, err)
 	}
@@ -376,10 +412,10 @@ func TestJoinRejectsUncompressedSeed(t *testing.T) {
 		Logger:     testSlog(t),
 	}, map[uint64]string{1: seedAddr})
 	if err == nil {
-		t.Fatal("未压缩种子（firstIndex=1 + FSM 非空）Join 应被拒绝，得到 nil")
+		t.Fatal("带前 raft 期存量的未压缩种子 Join 应被拒绝，得到 nil")
 	}
-	if !strings.Contains(err.Error(), "日志未压缩") {
-		t.Fatalf("拒绝原因应指向日志未压缩，得到: %v", err)
+	if !strings.Contains(err.Error(), "前 raft 期存量数据") {
+		t.Fatalf("拒绝原因应指向前 raft 期存量数据，得到: %v", err)
 	}
 	// 无 phantom learner：拒绝发生在 PrepareJoin 之前，种子成员表里
 	// 不得出现节点 2（voter 或 learner 都不行）
@@ -396,6 +432,51 @@ func TestJoinRejectsUncompressedSeed(t *testing.T) {
 		if l == 2 {
 			t.Fatal("拒绝后种子成员表出现 learner 2——phantom learner")
 		}
+	}
+}
+
+// TestSeedProbeAllowsPostRaftData N2 的另一侧（收窄前的误伤面）：种子是
+// **空目录起的集群**，起来之后才写入数据——数据全部经 raft 提交、日志
+// 里有，新节点靠重放就能完整追齐，档位探测必须放行。
+//
+// 为什么这条是回归而不是新特性：收窄前的判据是「FSM 非空 && firstIndex=1」，
+// 不看数据来源——全新三节点集群只要写过一条消息就再也扩不了容，直到
+// 写满约 2×RetainEntries（默认 1 万条）等来一次截断。那是纯误伤。
+//
+// 直接调 probeSeedState 而非 Join：本用例断言的是「探测放行」，放行之后
+// 的 PrepareJoin 会真的往种子成员表里塞 learner，与断言无关且有副作用。
+func TestSeedProbeAllowsPostRaftData(t *testing.T) {
+	seedStore, seed := startSoloManager(t, t.TempDir(), AckQuorumMem)
+	b := seedStore.NewBatch()
+	if err := b.Set(store.TopicMetaKey("POST-RAFT"), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := seedStore.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	// 前提自证：无 preraft 标记，但 FSM 非空且日志未压缩——正是收窄前
+	// 会被一刀切拒绝的组合
+	if pre, err := seed.rs.HasPreRaft(); err != nil || pre {
+		t.Fatalf("测试前提不成立：空目录起的集群不该有前 raft 期标记 pre=%v err=%v", pre, err)
+	}
+	if f, err := seed.groups[0].stg.FirstIndex(); err != nil || f != 1 {
+		t.Fatalf("测试前提不成立：种子 firstIndex=%d err=%v（want 1）", f, err)
+	}
+	if nonEmpty, err := groupHasKeys(seedStore, 0, seed.dataGroups); err != nil || !nonEmpty {
+		t.Fatalf("测试前提不成立：组 0 FSM 应非空 nonEmpty=%v err=%v", nonEmpty, err)
+	}
+
+	seedAddr := seed.ln.Addr().String()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	o := Options{
+		NodeID:     2,
+		Peers:      map[uint64]string{1: seedAddr, 2: "127.0.0.1:0"},
+		DataGroups: 3,
+		Logger:     testSlog(t),
+	}
+	if err := probeSeedState(ctx, testSlog(t), o, map[uint64]string{1: seedAddr}); err != nil {
+		t.Fatalf("种子数据全在日志里，档位探测应放行，得到: %v", err)
 	}
 }
 
@@ -433,4 +514,54 @@ func TestListenAddrBindsSeparateFromPeersAdvertised(t *testing.T) {
 	}
 	// 未 Start（NewManager 即完成绑定）：直接关监听器收尾，不走 kill
 	m.ln.Close()
+}
+
+// TestSnapStallStep 快照停滞判据（N1 的 leader 侧）：leader 发出 MsgSnap
+// 后 peer 的 Progress 进入 StateSnapshot，raft 的 tracker.IsPaused() 对该
+// 状态**无条件返回 true**——leader 从此既不发日志也不重发快照，退出该状态
+// 只有 MsgSnapStatus 一条路（MsgAppResp 推进 Match 那条路要求 leader 先发
+// MsgApp，而它不会发）。接收侧安装失败是 fail-stop + 重启清空重来，重启后
+// 它是空日志、Match=0，自己脱不了困。判据错了，要么该 peer 永久掉组
+// （漏报），要么正在进行的正常安装被打断重来（误报）。
+func TestSnapStallStep(t *testing.T) {
+	const idle = 30 * time.Second
+	now := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+
+	// ① 对端正在拉块（视图在册 + idle 之内有借出）：计数归零，不上报
+	s, report := snapStallStep(snapStall{index: 100, ticks: 1}, true, 100, now.Add(-time.Second), true, now, idle)
+	if report {
+		t.Fatal("对端正在拉块不得上报失败——会白白打断一次正常安装")
+	}
+	if s.ticks != 0 {
+		t.Fatalf("有拉取活动应把计数归零，得到 %d", s.ticks)
+	}
+
+	// ② 视图已不在册（被 TTL/硬上限回收）：那份快照对端已不可能拉完，
+	//    连续 snapStallTicks 轮后上报
+	s, report = snapStallStep(snapStall{}, false, 100, time.Time{}, false, now, idle)
+	if report {
+		t.Fatalf("第 1 轮不得上报（snapStallTicks=%d，误报代价是打断正常安装）", snapStallTicks)
+	}
+	if s.ticks != 1 || s.index != 100 {
+		t.Fatalf("首轮观察态应为 {index:100, ticks:1}，得到 %+v", s)
+	}
+	s, report = snapStallStep(s, true, 100, time.Time{}, false, now.Add(idle), idle)
+	if !report {
+		t.Fatalf("连续 %d 轮无拉取活动必须上报失败，否则该 peer 永久掉组", snapStallTicks)
+	}
+
+	// ③ 视图在册但最近借出已超 idle：同样算停滞
+	s, report = snapStallStep(snapStall{index: 100, ticks: 1}, true, 100, now.Add(-2*idle), true, now, idle)
+	if !report || s.ticks != snapStallTicks {
+		t.Fatalf("借出时刻超出 idle 应计一次停滞并上报，得到 report=%v %+v", report, s)
+	}
+
+	// ④ 位点变了（leader 换发了新快照）：旧位点的观察作废、重新计数
+	s, report = snapStallStep(snapStall{index: 100, ticks: snapStallTicks - 1}, true, 200, time.Time{}, false, now, idle)
+	if report {
+		t.Fatal("换发新快照后必须重新计数，不能把旧位点的观察算在新快照头上")
+	}
+	if s.index != 200 || s.ticks != 1 {
+		t.Fatalf("新位点观察态应为 {index:200, ticks:1}，得到 %+v", s)
+	}
 }

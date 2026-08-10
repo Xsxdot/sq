@@ -84,6 +84,7 @@ const (
 	defaultClusterLogRetainEntries   = 10000
 	defaultClusterTruncateInterval   = 30 * time.Second
 	defaultClusterSnapshotChunkBytes = 4 << 20
+	defaultClusterSnapshotViewTTL    = 5 * time.Minute
 )
 
 // ClusterConfig 集群模式配置段；nil = 单机模式。段一旦出现即集群模式，
@@ -106,6 +107,15 @@ type ClusterConfig struct {
 	// 默认 4MiB）：必须 < 16MiB 传输层帧上限，否则整份快照永远发不出去。
 	// 0 = 未填，按默认。
 	SnapshotChunkBytes int `yaml:"snapshot_chunk_bytes"`
+	// SnapshotViewTTL 快照视图的存活时长（snapshot_view_ttl，默认 5m）：
+	// 视图被借出（对端每拉一块）即续期，超过 TTL 无人问津即回收；从建档
+	// 起活过 TTL×10 则命中不可续期的硬上限被强制作废。
+	//
+	// 调大的代价是磁盘：持有视图会阻止 Pebble 回收被覆盖的旧版本，视图
+	// 活多久、旧版本就压多久。大库 + 慢网需要调大（否则传输还没完就被
+	// 回收，重来一遍），但请按「最慢一个 follower 拉完全量的时间」估，
+	// 不要无脑放大。0 = 未填，按默认。
+	SnapshotViewTTL time.Duration `yaml:"snapshot_view_ttl"`
 }
 
 // ClusterPeer 成员表里一个节点的描述。
@@ -256,6 +266,15 @@ func Load(path string) (*Config, error) {
 		// 比启动时挡住更难排查），启动即挡。
 		if cc.TruncateInterval < 0 {
 			return nil, fmt.Errorf("配置 cluster.truncate_interval 须为正 duration（如 30s），得到 %s", cc.TruncateInterval)
+		}
+		if cc.SnapshotViewTTL == 0 {
+			cc.SnapshotViewTTL = defaultClusterSnapshotViewTTL
+		}
+		// 非正 TTL 会让每个视图刚建完就被 GC 判定过期回收，快照传输永远
+		// 拉不完（每块都得重开视图，游标锚在已回收的 snapID 上直接失败）
+		// ——启动即挡，不留给运行时去「发现」。
+		if cc.SnapshotViewTTL < 0 {
+			return nil, fmt.Errorf("配置 cluster.snapshot_view_ttl 须为正 duration（如 5m），得到 %s", cc.SnapshotViewTTL)
 		}
 		if cc.SnapshotChunkBytes == 0 {
 			cc.SnapshotChunkBytes = defaultClusterSnapshotChunkBytes

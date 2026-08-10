@@ -133,7 +133,10 @@ func TestSnapRegistryBorrowSurvivesGC(t *testing.T) {
 		t.Fatal("应能借出视图")
 	}
 	_ = view
-	clock = clock.Add(time.Minute) // 远超 TTL（且 Get 已把 created 续期到 borrow 时刻）
+	// 超软 TTL（50ms）但不到硬上限（50ms×10=500ms）——撞硬上限走的是
+	// 作废路径（另有 TestSnapRegistryHardTTLRevokesLiveBorrow 覆盖），
+	// 本用例锁的是软 TTL 下「借出中不回收」这条不变式
+	clock = clock.Add(200 * time.Millisecond)
 	if n := reg.GCOnce(clock); n != 0 {
 		t.Fatalf("借出中的视图不得被回收，回收了 %d", n)
 	}
@@ -228,5 +231,130 @@ func TestSnapRegistryConcurrentBorrowGC(t *testing.T) {
 		if _, ok := reg.Get(id); ok {
 			t.Fatalf("全量回收后 snapID %d 仍可借出", id)
 		}
+	}
+}
+
+// TestSnapRegistryHardTTLRevokesLiveBorrow 硬上限（N3）：借出续期把软
+// TTL 变成「只要还有人拉就永不到期」，一个游标原地不动、却持续发
+// OpFetchSnapshot 的对端（有 bug 或恶意）能把视图无限期钉住——Pebble
+// 的旧版本跟着无限期不回收，磁盘只涨不落。硬上限从**建档时刻**起算、
+// 不受借出影响：命中即作废（拒绝新借出），在途借用归还的那一刻立即
+// Close，而不是等下一轮 GC。
+func TestSnapRegistryHardTTLRevokesLiveBorrow(t *testing.T) {
+	st := openClusterTestStore(t)
+	ttl := time.Minute
+	reg := newSnapRegistry(st, ttl, testSlog(t))
+	clock := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	reg.now = func() time.Time { return clock }
+
+	id := reg.Create(1, 10) // created = bornAt = clock
+	// 模拟「持续拉但永不结束」：每 0.5*ttl 借还一次，软 TTL 永不到期
+	hard := ttl * snapViewHardTTLFactor
+	for elapsed := time.Duration(0); elapsed < hard-ttl; elapsed += ttl / 2 {
+		clock = clock.Add(ttl / 2)
+		if _, ok := reg.Get(id); !ok {
+			t.Fatalf("硬上限之前应能持续借出（已过 %v）", elapsed)
+		}
+		if n := reg.GCOnce(clock); n != 0 {
+			t.Fatalf("借出中且未撞硬上限不得回收（已过 %v），回收了 %d", elapsed, n)
+		}
+		reg.Put(id)
+	}
+	// 借出中撞硬上限：不得 Close（会炸在途借用者），只作废
+	if _, ok := reg.Get(id); !ok {
+		t.Fatal("撞线前最后一次借出应成功")
+	}
+	clock = clock.Add(hard)
+	if n := reg.GCOnce(clock); n != 0 {
+		t.Fatalf("借出中撞硬上限只作废、不回收，回收了 %d", n)
+	}
+	// 作废后拒绝新借出——这是「泄漏有确定上界」的执行面
+	if _, ok := reg.Get(id); ok {
+		t.Fatal("作废后不得再借出")
+	}
+	// 在途借用归还即回收，不必等下一轮 GC
+	reg.Put(id)
+	if n := reg.GCOnce(clock); n != 0 {
+		t.Fatalf("归还时已就地回收，GC 不应再收，回收了 %d", n)
+	}
+	if _, ok := reg.Get(id); ok {
+		t.Fatal("归还回收后不得再借出")
+	}
+}
+
+// TestSnapRegistryHardTTLReclaimsIdleView 硬上限的 refs==0 分支：无借用
+// 时与软 TTL 同路径直接回收，回收理由记 hard-ttl。
+func TestSnapRegistryHardTTLReclaimsIdleView(t *testing.T) {
+	st := openClusterTestStore(t)
+	ttl := time.Minute
+	reg := newSnapRegistry(st, ttl, testSlog(t))
+	clock := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	reg.now = func() time.Time { return clock }
+
+	id := reg.Create(1, 10)
+	clock = clock.Add(ttl * snapViewHardTTLFactor)
+	if n := reg.GCOnce(clock); n != 1 {
+		t.Fatalf("无借用撞硬上限应回收 1 个，回收了 %d", n)
+	}
+	if _, ok := reg.Get(id); ok {
+		t.Fatal("回收后不得再借出")
+	}
+}
+
+// TestSnapRegistryLastBorrow LastBorrow 是 leader 侧失败感知（N1）的
+// 判据：按 (g, index) 反查最近借出时刻，leader 据此区分「对端在拉，
+// 别打断」与「没人拉，快照停滞了，报失败让它回 Probe」。
+//
+// 同位点多份视图取最近一次：同一 index 可能反复生成快照（前一份被
+// 回收后重发），只要任一份在被拉就说明对端活着。
+func TestSnapRegistryLastBorrow(t *testing.T) {
+	st := openClusterTestStore(t)
+	reg := newSnapRegistry(st, time.Minute, testSlog(t))
+	clock := time.Date(2026, 8, 10, 12, 0, 0, 0, time.UTC)
+	reg.now = func() time.Time { return clock }
+
+	// 无视图：ok=false，即「这份快照对端已不可能拉完」
+	if _, ok := reg.LastBorrow(1, 10); ok {
+		t.Fatal("无在册视图应返回 ok=false")
+	}
+	id := reg.Create(1, 10)
+	// 从未借出：返回建档时刻——给对端一个完整的启动宽限期
+	last, ok := reg.LastBorrow(1, 10)
+	if !ok || !last.Equal(clock) {
+		t.Fatalf("从未借出应返回建档时刻 %v，得到 %v ok=%v", clock, last, ok)
+	}
+	// 别的 (g,index) 不串扰
+	if _, ok := reg.LastBorrow(2, 10); ok {
+		t.Fatal("别的组不得命中")
+	}
+	if _, ok := reg.LastBorrow(1, 11); ok {
+		t.Fatal("别的位点不得命中")
+	}
+	// 借出即刷新
+	clock = clock.Add(30 * time.Second)
+	if _, ok := reg.Get(id); !ok {
+		t.Fatal("应能借出")
+	}
+	reg.Put(id)
+	last, ok = reg.LastBorrow(1, 10)
+	if !ok || !last.Equal(clock) {
+		t.Fatalf("借出后应返回借出时刻 %v，得到 %v ok=%v", clock, last, ok)
+	}
+	// 同位点第二份视图：取两者中较近的一次
+	id2 := reg.Create(1, 10) // created = clock（当前）
+	clock = clock.Add(10 * time.Second)
+	if _, ok := reg.Get(id2); !ok {
+		t.Fatal("应能借出第二份")
+	}
+	reg.Put(id2)
+	last, ok = reg.LastBorrow(1, 10)
+	if !ok || !last.Equal(clock) {
+		t.Fatalf("多份视图应取最近借出 %v，得到 %v ok=%v", clock, last, ok)
+	}
+	// 回收后 ok=false：leader 据此判定快照已不可能被拉完
+	reg.Release(id)
+	reg.Release(id2)
+	if _, ok := reg.LastBorrow(1, 10); ok {
+		t.Fatal("视图全部回收后应返回 ok=false")
 	}
 }

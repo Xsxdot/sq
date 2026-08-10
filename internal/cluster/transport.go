@@ -74,6 +74,11 @@ const ControlGroup uint32 = 0xFFFFFFFF
 // 与传输层 controlFrame 之间的协议面），取值即跨节点线协议——改动即
 // 不兼容（TestControlOpRegistry 锁死黄金值）。
 //
+//   - OpPing=0: payload 空，响应空——纯存活探测（probePeerAlive）。由
+//     Manager 自装层应答，**不下发给调用方注入的 ControlHandler**：探活
+//     是集群内协议，不该触发任何应用逻辑（旧实现让 op=0 穿透到 main 的
+//     handler，每个摊布周期回一次「未知控制 op 0」，并在测试里被 catch-all
+//     handler 当成业务事件收走）
 //   - OpForwardAppend=1: payload=[4B BE 目标组][core.EncodeMessage 字节]，
 //     响应 payload=[4B BE queueID][8B BE offset]——跨节点消息追加，
 //     offset 分配发生在 leader 侧（replication.ForwardAppend 消费）
@@ -87,16 +92,18 @@ const ControlGroup uint32 = 0xFFFFFFFF
 //     键][块字节]——按 snapID 分块拉取钉住的快照视图（Manager 内部
 //     handler 消费，见 handleFetchSnapshot）
 //   - OpSeedState=5: payload=[4B BE 组]，响应=[1B 该组 FSM 是否非空]
-//     [8B BE firstIndex]——Join 前的种子日志档位探测（Manager 内部
-//     handler 消费，见 handleSeedState）：新节点以 learner 加入前先探
-//     种子「日志是否已压缩（firstIndex>1）」，未压缩且 FSM 非空时 Join
-//     走日志重放会静默丢失单机档直写数据，必须显式拒绝（C2 修复）
+//     [1B 前 raft 期存量标记][8B BE firstIndex]——Join 前的种子日志档位
+//     探测（Manager 内部 handler 消费，见 handleSeedState）：新节点以
+//     learner 加入前先探种子档位，「带前 raft 期存量数据」「该组 FSM 非空」
+//     「日志未压缩（firstIndex=1）」三者同时成立时 Join 走日志重放会静默
+//     丢失单机档直写数据，必须显式拒绝（C2 修复，N2 收窄判据）
 //
 // 定义在本包而非 replication：Task 10 的 PrepareJoin handler 在 cluster
 // 侧装配，而依赖方向是 replication→cluster——常量放集群侧才能被双方
 // 引用（plan 原稿放 replication 的决定经终审裁定迁移，见 progress 预检
 // 注记）。Task 11 的 ControlHandler 接线在 main 装配时引用本注册表。
 const (
+	OpPing          byte = 0
 	OpForwardAppend byte = 1
 	OpForwardApply  byte = 2
 	OpPrepareJoin   byte = 3

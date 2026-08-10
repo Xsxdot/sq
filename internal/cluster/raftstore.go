@@ -28,6 +28,9 @@
 //
 //	raft/groups                  → uint32 BE 数据组数（首启写入，此后校验）
 //	raft/clean_shutdown          → 干净关机标记（StopClean 写，启动读后删）
+//	raft/preraft                 → 前 raft 期存量数据标记（单机档直写 FSM
+//	                               的数据不在任何 raft 日志里，MarkPreRaft/
+//	                               HasPreRaft，Join 的种子档位判据）
 //	raft/<g>/hs                  → HardState protobuf
 //	raft/<g>/conf                → ConfState protobuf（成员表，ConfChange
 //	                               apply 时整表覆盖写，SaveConfState）
@@ -57,8 +60,16 @@ import (
 // 后跟 '/' 定界——任意两位组号的键序严格分离（"1/" < "10/…"），
 // 前缀扫描不会跨组串扰。
 const (
+	// raftPrefix / raftPrefixEnd 圈出全部 raft 元数据键的半开区间
+	// ['raft/', 'raft0')——'/'=0x2f 的后继是 '0'=0x30，故 "raft0" 是
+	// "raft/" 前缀的右开边界。用于把 raft 元数据与 FSM 数据分开扫描
+	// （见 storeHasFSMKeys）。
+	raftPrefix    = "raft/"
+	raftPrefixEnd = "raft0"
+
 	groupsKey           = "raft/groups"
 	cleanShutdownKey    = "raft/clean_shutdown"
+	preRaftKey          = "raft/preraft"
 	groupEntPrefixFmt   = "raft/%d/ent/"
 	groupHsKeyFmt       = "raft/%d/hs"
 	groupConfFmt        = "raft/%d/conf"
@@ -536,6 +547,41 @@ func (r *raftStore) ConsumeCleanShutdown() (bool, error) {
 	}
 	r.lg.Info("干净关机标记已消费", "重启路径", "原身份回归")
 	return true, nil
+}
+
+// MarkPreRaft 写入「前 raft 期存量数据」标记并 Sync 落盘。
+//
+// 语义：本节点在**首次以集群模式启动前**，数据目录里就已有 FSM 数据
+// （单机档直写 store 写进去的）。这批数据不在任何 raft 日志里——新节点
+// 靠日志重放追齐时带不过去，只有快照能带走。标记是 Join 判定「种子档位
+// 是否危险」的必要条件（见 probeSeedState）。
+//
+// 幂等：重复调用只是重写同一字节；调用点在 NewManager 的 fresh 路径，
+// 每个数据目录一生只经过一次。
+func (r *raftStore) MarkPreRaft() error {
+	b := r.st.NewBatch()
+	if err := b.Set([]byte(preRaftKey), []byte{1}); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore MarkPreRaft: %w", err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore MarkPreRaft: %w", err)
+	}
+	r.lg.Warn("检测到前 raft 期存量数据，已打标记——该批数据不在 raft 日志里，" +
+		"本节点作为 Join 种子时须先等日志压缩（否则新节点走重放会丢这批数据）")
+	return nil
+}
+
+// HasPreRaft 返回本节点是否带「前 raft 期存量数据」标记。
+//
+// 标记只增不删（存量数据永远不会回到日志里），因此它是**档位属性**而非
+// 瞬时状态：Join 探测把它与「日志未压缩」合取，才构成拒绝条件。
+func (r *raftStore) HasPreRaft() (bool, error) {
+	_, ok, err := r.st.Get([]byte(preRaftKey))
+	if err != nil {
+		return false, fmt.Errorf("raftstore HasPreRaft: %w", err)
+	}
+	return ok, nil
 }
 
 // confStateFromEntries 从日志条目重放成员变更，按 commit 裁剪后合成

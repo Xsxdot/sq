@@ -517,9 +517,48 @@ func TestControlRoundTrip(t *testing.T) {
 	}
 }
 
+// TestControlPingNotDispatchedToUserHandler 存活探测必须止步于 Manager
+// 自装层：OpPing 空应答成功，且**不得**下发给调用方注入的 ControlHandler。
+//
+// 为什么锁死这条：摊布循环每周期都对每个对端 probePeerAlive，若探活穿透
+// 到用户 handler，生产上是每周期一条「未知控制 op」噪声，测试里则会被
+// catch-all 型 handler 当成业务事件收进断言 channel——
+// TestClusterForwardAppendWire 的间歇失败正是这么来的。
+func TestControlPingNotDispatchedToUserHandler(t *testing.T) {
+	var userCalls atomic.Int32
+	handler := func(op byte, payload []byte) ([]byte, error) {
+		userCalls.Add(1)
+		return nil, fmt.Errorf("unexpected op %d", op)
+	}
+	tc := newTestClusterN(t, AckQuorumMem, Options{ControlHandler: handler}, 2)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	resp, err := tc.mgrs[1].Control(ctx, 2, OpPing, nil)
+	if err != nil {
+		t.Fatalf("OpPing 应由 Manager 自装层空应答成功: %v", err)
+	}
+	if len(resp) != 0 {
+		t.Fatalf("OpPing 响应 %d B; want 空", len(resp))
+	}
+	if n := userCalls.Load(); n != 0 {
+		t.Fatalf("用户 ControlHandler 被探活调用了 %d 次; want 0", n)
+	}
+	// probePeerAlive 的语义面：活节点为真、Peers 表外的节点为假
+	if !tc.mgrs[1].probePeerAlive(2) {
+		t.Fatal("活节点探活应为 true")
+	}
+	if n := userCalls.Load(); n != 0 {
+		t.Fatalf("probePeerAlive 触达了用户 handler %d 次; want 0", n)
+	}
+}
+
 // TestControlOpRegistry 控制通道 op 注册表是跨节点线协议：帧里只有 1B
 // op，取值被未来版本引用——改动即协议不兼容，锁死黄金值。
 func TestControlOpRegistry(t *testing.T) {
+	if OpPing != 0 {
+		t.Fatalf("OpPing=%d; want 0（线协议黄金值）", OpPing)
+	}
 	if OpForwardAppend != 1 {
 		t.Fatalf("OpForwardAppend=%d; want 1（线协议黄金值）", OpForwardAppend)
 	}
@@ -1291,7 +1330,7 @@ type snapHarness struct {
 	dirs   []string          // 与 nodes 同序：原地重启（关 store → 同目录重开）用
 	peers  map[uint64]string // 节点 id → raft 监听地址（分区用例备用）
 	mode   AckMode
-	retain uint64 // 节点截断保留量（Options.RetainEntries 透传，重启时复刻）
+	retain uint64        // 节点截断保留量（Options.RetainEntries 透传，重启时复刻）
 	logs   []*logCapture // 与 nodes 同序：countLog 的检索源（快照路径证据）
 }
 
