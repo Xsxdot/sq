@@ -650,7 +650,7 @@ func TestClusterDLQ(t *testing.T) {
 		t.Fatalf("Send after-dlq: %v", err)
 	}
 	producer2.GracefulStop()
-	gotAfter := recvAllAck(t, consumer, 1, 60*time.Second, "DLQ 后原队列消费")
+	gotAfter := recvAllAck(t, consumer, 1, 60*time.Second, "DLQ 后原队列消费", true)
 	for id := range gotAfter {
 		t.Logf("DLQ 后原队列正常消费 msgId=%s（不停摆）", id)
 	}
@@ -769,7 +769,7 @@ func TestThreeNodeClusterE2E(t *testing.T) {
 	// 见 deliver 阶段 2 注释），因此每个阶段都用**新消费组**做全量
 	// 对账——天然把「kill/重入后一条不丢」的断言强化为全历史无丢失。
 	recvStart := time.Now()
-	got := recvAllAck(t, consumer, len(sent), 180*time.Second, "健康期消费")
+	got := recvAllAck(t, consumer, len(sent), 180*time.Second, "健康期消费", true)
 	elapsed := time.Since(recvStart)
 	rate := float64(len(got)) / elapsed.Seconds()
 	// plan 风险自记 ②：Receive 每次都过 raft 提案，消费吞吐必须有粗略
@@ -814,7 +814,7 @@ func TestThreeNodeClusterE2E(t *testing.T) {
 		}
 	}
 	t.Logf("事务已提交 %d 条 msgId=%v（两跳转发链探针）", len(txnSent), txnSent)
-	txnGot := recvAllAck(t, txnConsumer, len(txnSent), 60*time.Second, "事务提交后消费")
+	txnGot := recvAllAck(t, txnConsumer, len(txnSent), 60*time.Second, "事务提交后消费", true)
 	for id := range txnSent {
 		if !txnGot[id] {
 			t.Fatalf("事务消息 %s 未收到（事务链路断裂）", id)
@@ -881,7 +881,7 @@ func TestThreeNodeClusterE2E(t *testing.T) {
 	t.Logf("kill 后已发送 %d 条", len(postKill))
 
 	// 复用原 consumer（同组游标已越过健康期消息，只收 kill 后新增）
-	got3 := recvAllAck(t, consumer, len(postKill), 240*time.Second, "kill 后消费")
+	got3 := recvAllAck(t, consumer, len(postKill), 240*time.Second, "kill 后消费", true)
 	for id := range postKill {
 		if !got3[id] {
 			t.Errorf("kill 后消息 %s 丢失", id)
@@ -928,7 +928,7 @@ func TestThreeNodeClusterE2E(t *testing.T) {
 	// 对账：新消费组从位点 0 重放全量历史——健康期 200 + kill 后 50 +
 	// 重入后 20 全部收齐，证明三阶段无一条丢失（新组重放 = 全历史断言）。
 	consumer4 := newClusterConsumer(t, multi, "e2e-cluster-g3", topic, clusterConsumerAwaitDefault)
-	got4 := recvAllAck(t, consumer4, len(sent)+len(postKill), 240*time.Second, "三节点对账消费")
+	got4 := recvAllAck(t, consumer4, len(sent)+len(postKill), 240*time.Second, "三节点对账消费", true)
 	for id := range sent {
 		if !got4[id] {
 			t.Errorf("对账发现健康期消息丢失: %s", id)
@@ -1072,7 +1072,12 @@ func recvAll(t *testing.T, consumer rmq.SimpleConsumer, want int, window time.Du
 
 // recvAllAck 与 recvAll 同款轮询，但逐条 ack（消费位点推进，避免同组
 // 重复投递污染后续阶段断言）。
-func recvAllAck(t *testing.T, consumer rmq.SimpleConsumer, want int, window time.Duration, phase string) map[string]bool {
+//
+// strict=true 时收不满 want 条直接 Fatal（既有调用点语义）；strict=false
+// 时返回「已收集到的集合」交由调用方断言——场景测试的确认集对账器要
+// 输出更有针对性的缺失清单（见 cluster_scenario_test.go 的
+// assertAllConsumed），不能在这里用一句「只收到 X/Y 条」把缺失详情吞掉。
+func recvAllAck(t *testing.T, consumer rmq.SimpleConsumer, want int, window time.Duration, phase string, strict bool) map[string]bool {
 	t.Helper()
 	got := map[string]bool{}
 	deadline := time.Now().Add(window)
@@ -1095,10 +1100,10 @@ func recvAllAck(t *testing.T, consumer rmq.SimpleConsumer, want int, window time
 			}
 		}
 	}
-	if len(got) < want {
+	if strict && len(got) < want {
 		t.Fatalf("%s：%v 内只收到 %d/%d 条", phase, window, len(got), want)
 	}
-	t.Logf("%s：%d 轮收齐并 ack %d 条", phase, rounds, len(got))
+	t.Logf("%s：%d 轮收齐并 ack %d 条（want %d）", phase, rounds, len(got), want)
 	return got
 }
 
