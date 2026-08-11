@@ -12,7 +12,7 @@
 
 ## Global Constraints
 
-- 工作分支：`v2-b2-seglog`（在现有代码上改造，不开新分支）。
+- 工作分支：`v2-b2-seglog-shared`（由派发基线自动创建，基线 = `v2-b2-seglog` 的 tip，在现有 seglog 代码上改造）。改动经 handoff 回程同步，**不要**自行 `git push` 到 origin。
 - **raftstore_test.go 现有 12 个用例零修改通过**是 Task 4 的硬验收锚；增补用例（`TestMigrateLegacyLargeLogInChunks`、`TestTruncateLogReclaimsSegmentsPhysically`）允许适配共享形态但断言意图不变。
 - raftpb 全部字段是指针：构造用 `&raftpb.Entry{Index: &idx, Term: &term}` 形态，读用 `GetIndex()`。
 - 日志一律 `slog`（包内已有 `lg *slog.Logger` 注入模式），**禁止** `fmt.Printf`。
@@ -895,11 +895,9 @@ Expected: 两个产物构建成功（Linux e2e 与三机基准复测由主会话
 - [ ] 改动文件的文件头注释与实现一致（无「每组独立」残留表述）
 - [ ] 导出方法 doc comment 齐全；两把锁的锁序纪律写在字段声明处
 
-- [ ] **Step 5: 推送**
+- [ ] **Step 5: 完工汇报**
 
-```bash
-git push origin v2-b2-seglog
-```
+不推送（改动经 handoff 回程同步）。完工汇报里列出：各 task 的 commit 清单、全量测试结果原文（含 -race）、两个交叉编译产物的路径、instrumenting-code 自检清单勾选情况。
 
 ---
 
