@@ -38,10 +38,11 @@ type Log struct {
 	activeSize int64             // 活动段当前字节数（轮转判定：>= segMaxBytes 触发）
 	lastIndex  uint64            // 日志尾 index；0 = 空日志
 	lastHS     *raftpb.HardState // 最新已写 HardState（轮转时补写进新段首条）
-	// segMax 已关闭段号 → 该段曾经写入过的段内最大 entry index（回收判定：
-	// TruncateTo(upto) 删除 max<=upto 的段）。该值只在段刚关闭时写入一次，
-	// 此后只增不减——若关闭后发生跨段冲突重写（新领导者的写入起点落在这
-	// 个已关闭段覆盖的 index 范围内，但物理条目已经写到更晚的段），这里
+	// segMax 已关闭段号 → 该段的段内最大 entry index（回收判定：
+	// TruncateTo(upto) 删除 max<=upto 的段；无 entry 只有 HS 的段值为 0）。
+	// 只有在一个段被判定为「完全可回收资格」的那一刻才会写入这个 map，写
+	// 入之后不再修改——若关闭后发生跨段冲突重写（新领导者的写入起点落在
+	// 这个已关闭段覆盖的 index 范围内，但物理条目已经写到更晚的段），这里
 	// 记录的值会偏高（stale-high），但绝不会偏低。TruncateTo 用 max<=upto
 	// 判定可删，偏高只会让该段回收得更晚，不会在段内仍有活条目时误删——
 	// 见 TruncateTo 函数注释。
@@ -98,6 +99,17 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 		data, err := os.ReadFile(path)
 		if err != nil {
 			return nil, nil, nil, fmt.Errorf("seglog: 读段 %s 失败: %w", name, err)
+		}
+
+		if !isLast {
+			// 非末段=重启后一定是「已关闭」段，先占好 segMax 的位，哪怕它
+			// 一条 entry 都没有（纯 HS 段）也要有个 0 值。不这样做的话，
+			// 只有下面 recEntry 分支才会写 segMax，纯 HS 段就永远不会出现
+			// 在这个 map 里——TruncateTo 遍历 segMax 时根本看不到它，变成
+			// 重启后再也回收不掉的段。default 值 0 与 TruncateTo(upto>=0)
+			// 天然可回收的约定一致；下面扫到 entry 帧时会覆盖成真实的
+			// 段内最大 index。
+			segMax[seq] = 0
 		}
 
 		off := 0
@@ -323,8 +335,10 @@ func (l *Log) Append(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) erro
 // maybeRotate 在活动段达到 segMaxBytes 阈值时轮转到下一段。调用方须持有
 // l.mu（本方法只在 Append 尾部被调用一次，不单独加锁）。
 //
-// 轮转步骤：旧段 fsync → 关闭旧段 → 记录旧段的段内最大 entry index（回收
-// 判定用）→ 创建新段 → 若存在最新 HardState，立即补写一份到新段首条。
+// 轮转步骤：旧段 fsync → 关闭旧段 → 创建新段 → 若存在最新 HardState，立即
+// 补写一份到新段首条 → 全部成功后，最后一步才把旧段的段内最大 entry index
+// 登记进 segMax（授予回收资格）。任何一步失败都提前 return、不登记
+// segMax——旧段在新段真正就绪之前必须保持「不可回收」，见函数末尾注释。
 func (l *Log) maybeRotate() error {
 	if l.activeSize < segMaxBytes {
 		return nil
@@ -332,6 +346,9 @@ func (l *Log) maybeRotate() error {
 
 	oldSeq := l.activeSeq
 	oldBytes := l.activeSize
+	// 旧段关闭前实际写入过的最后一条 entry index，供轮转彻底成功后登记
+	// 进 segMax（见函数末尾）。这里只是先取值存起来，不在此处写 map。
+	oldMaxIndex := l.lastIndex
 
 	// 轮转屏障：旧段必须先 fsync 落盘、再关闭，然后才允许开新段。这样
 	// 一来，一旦发生掉电，可能出现 torn tail（部分帧未落盘）的段永远
@@ -350,17 +367,6 @@ func (l *Log) maybeRotate() error {
 	// Write/Sync 会得到一个含糊的「文件已关闭」I/O 错误，不如让「已关闭，
 	// 拒绝 Append」这个明确的 fail-stop 信号直接生效。
 	l.active = nil
-
-	// 记录旧段的段内最大 entry index，供 TruncateTo 判定该段是否整段可
-	// 删。这里取的是「轮转发生时」的 l.lastIndex，即旧段关闭前实际写入
-	// 过的最后一条 entry index——本进程生命周期内此后只增不减，不存在
-	// 更晚才发现「其实这段还有更大 index」的情况。但如果关闭之后，Raft
-	// 侧发生跨段的换届冲突重写（新写入的起始 index 落在这个已关闭段的
-	// 范围内，但物理条目已经写进了更晚的段），这里记录的值就会偏高
-	// （stale-high）：TruncateTo 的删除条件是 max<=upto，偏高只会让该段
-	// 回收得更晚，绝不会在段内仍有活条目时把它删掉——因为该值从不会被
-	// 回退修正为更小的数，也就不存在偏低、误删活数据的方向。
-	l.segMax[oldSeq] = l.lastIndex
 
 	newSeq := oldSeq + 1
 	newPath := filepath.Join(l.dir, segName(newSeq))
@@ -389,6 +395,16 @@ func (l *Log) maybeRotate() error {
 		}
 		l.activeSize += int64(n)
 	}
+
+	// 回收资格必须在新段完全就绪之后才授予，放在整个轮转流程的最后一步：
+	// 旧段已经 fsync+关闭、新段文件已经创建成功、（如果有）HS 补写也已经
+	// 写入成功——新段这时才真正具备独立承接后续写入、独立支撑重启恢复的
+	// 能力。如果中途任何一步失败（尤其是 os.OpenFile 创建新段失败，比如
+	// ENOSPC），必须提前 return 且不写这个 map：旧段此刻仍是唯一持有已
+	// fsync 数据的文件，若过早把它标记为「可回收」，独立运行的 TruncateTo
+	// goroutine 就可能把它删掉——而这时新段还没建成，进程重启会发现日志
+	// 整个丢失，是永久数据丢失而不是可恢复的 fail-stop。
+	l.segMax[oldSeq] = oldMaxIndex
 
 	l.lg.Info("seglog: 段轮转完成",
 		"oldSegment", oldSeq, "oldSegmentBytes", oldBytes, "newSegment", newSeq)

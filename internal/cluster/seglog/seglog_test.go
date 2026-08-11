@@ -238,3 +238,55 @@ func TestTruncateToDeletesOnlyClosedCoveredSegments(t *testing.T) {
 		}
 	}
 }
+
+// TestTruncateToReclaimsHSOnlySegmentAfterReopen 覆盖「纯 HS、零 entry 的
+// 已关闭段，在进程重启（Close 后重新 Open）之后仍然可以被 TruncateTo 回收」
+// ——Open 的扫描阶段必须给每个已关闭段（哪怕它一条 entry 都没有）在 segMax
+// 里占位，否则这类段永远不会出现在 TruncateTo 遍历的 map 里，变成重启后
+// 再也删不掉的段。
+func TestTruncateToReclaimsHSOnlySegmentAfterReopen(t *testing.T) {
+	old := segMaxBytes
+	// 单条 hs(1,1,0) 帧实测 15B；阈值设得比它还小，逼着这一轮「只写 HS、
+	// 不带 entry」的 Append 单独触发一次轮转——制造出一个纯 HS、零 entry
+	// 的已关闭段（seg1），正是本测试要覆盖的场景。
+	segMaxBytes = 10
+	defer func() { segMaxBytes = old }()
+	dir := t.TempDir()
+	l, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 这一轮只写 HS：seg1 变成纯 HS 段，写完立刻轮转到 seg2
+	if err := l.Append(hs(1, 1, 0), nil, false); err != nil {
+		t.Fatal(err)
+	}
+	// 再写一条 entry，让当前活动段里有实际数据（顺带也会再轮转一次，
+	// 不影响断言——active 段永远不会被 TruncateTo 删）
+	if err := l.Append(nil, []*raftpb.Entry{ent(1, 1, "x")}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := filepath.Glob(filepath.Join(dir, "*.seg"))
+	if len(before) < 2 {
+		t.Fatalf("段数 = %d; want ≥2（segMaxBytes=%d 应在纯 HS 轮后触发轮转）", len(before), segMaxBytes)
+	}
+	// 关键步骤：不复用内存里的 l，而是重新 Open——模拟进程重启，验证
+	// segMax 是靠 Open 的扫描重建出来的，不是靠内存里没丢过的状态侥幸
+	// 蒙对。
+	l2, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l2.TruncateTo(0); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := filepath.Glob(filepath.Join(dir, "*.seg"))
+	if len(after) >= len(before) {
+		t.Fatalf("重启重开后 TruncateTo(0) 未删掉纯 HS 段: before=%d after=%d", len(before), len(after))
+	}
+	if err := l2.Close(); err != nil {
+		t.Fatal(err)
+	}
+}
