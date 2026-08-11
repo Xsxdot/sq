@@ -363,7 +363,7 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 			// （vendored raft.go 的 MsgStorageAppendResp 分支：
 			// stableSnapTo + appliedTo），raft 从此不再重发 MsgSnap；而
 			// 磁盘上仍是安装中标记 + 半截数据、内存侧 MemoryStorage 从未
-			// 更新——三方分叉、永不收敛。按 Persist/applyEntry 同策略
+			// 更新——三方分叉、永不收敛。按 Persist/applyEntries 同策略
 			// fail-stop panic：进程死亡由上层重启接管。
 			//
 			// 重启后走的是哪条恢复路径（要看清代价）：panic 不会写干净
@@ -395,7 +395,7 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	//    必须与持久层同步推进（双记账）。
 	if err := gr.rs.Persist(gr.g, rd.HardState, rd.Entries, gr.syncPersist(rd)); err != nil {
 		// 持久化失败 = 内存日志与磁盘分叉：崩溃后本节点已确认的条目
-		// 会消失，与 applyEntry 的失败同属「日志/状态与多数派分叉」的
+		// 会消失，与 applyEntries 的失败同属「日志/状态与多数派分叉」的
 		// 不可恢复类。统一走 panic——进程死亡由上层重启接管（走不干净
 		// 判定）；若记 Error 后停摆返回，run 循环只是安静退出，Manager
 		// 无从感知、组永久静默卡死，比 panic 更糟。
@@ -434,14 +434,26 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	// 本轮回合的成员变更登记：Advance 后再通知（见循环外注释），
 	// notify=false 表示该变更非本节点发起，不通知（超时兜底）
 	appliedCC := make([]ccApplied, 0, 2)
+	// 普通条目段积累（apply 合批）：连续的 EntryNormal 攒进 seg，由
+	// applyEntries 合成单次引擎提交。遇到成员变更必须先冲刷已积累的段
+	// ——SaveConfState 用独立批次写成员表 + applied 位点，段若晚于它
+	// 提交会把 applied 位点倒退回段内更小的 index，位点单调性破坏。
+	var seg []*raftpb.Entry
+	flushSeg := func() {
+		gr.applyEntries(seg)
+		seg = seg[:0]
+	}
 	for _, ent := range rd.CommittedEntries {
 		// 重启重放的幂等保证：raft 可能重发已 apply 过的条目
-		// （conflict 回退重写后），跳过即可——FSM 已是该 index 的状态
+		// （conflict 回退重写后），跳过即可——FSM 已是该 index 的状态。
+		// 注意 applied 只在段冲刷/成员变更时推进，段内递增的 index 不会
+		// 被本判定误跳。
 		if ent.GetIndex() <= gr.applied.Load() {
 			continue
 		}
 		switch ent.GetType() {
 		case raftpb.EntryConfChange:
+			flushSeg()
 			// 旧格式 V1 ConfChange（旧日志可能遗留）：照常 apply，但
 			// 永不通知 waiter——V1 条目没有提案者身份，通知有跨节点
 			// id 碰撞的假成功风险；且本进程只提议 V2，V1 条目在本
@@ -458,7 +470,7 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 			// 成员表 + applied 同批落盘（同 V2 分支）：V1 路径罕见
 			// 但不能只更内存——重启后旧日志仍会被重放，内存成员表
 			// 不落盘就与持久化值分叉
-			// applyMu 临界区（同 applyEntry）：Snapshot 在同一把锁内读
+			// applyMu 临界区（同 applyEntries）：Snapshot 在同一把锁内读
 			// applied + confState，写批次与成员表必须与 applied 位点配对
 			// 提交——否则可能产出「元数据 index=N 却携带更新的成员表」
 			// 的快照，配对不变量被破坏
@@ -475,6 +487,7 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 			gr.applyMu.Unlock()
 			gr.lg.Debug("成员变更已 apply", "type", cc.GetType().String(), "node", cc.GetNodeId())
 		case raftpb.EntryConfChangeV2:
+			flushSeg()
 			var v2 raftpb.ConfChangeV2
 			v2.Reset()
 			if err := proto.Unmarshal(ent.Data, &v2); err != nil {
@@ -484,7 +497,7 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 			cs := gr.rn.ApplyConfChange(&v2)
 			// 成员表 + applied 同批落盘：截断之后日志前缀不复存在，
 			// 重启只能靠这份持久化成员表恢复（Task 3 的截断前提）
-			// applyMu 临界区（同 applyEntry）：Snapshot 在同一把锁内读
+			// applyMu 临界区（同 applyEntries）：Snapshot 在同一把锁内读
 			// applied + confState，写批次与成员表必须与 applied 位点配对
 			// 提交——否则可能产出「元数据 index=N 却携带更新的成员表」
 			// 的快照，配对不变量被破坏
@@ -509,23 +522,12 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 			}
 		case raftpb.EntryNormal:
 			// 条目数据布局：[8B 提案者][8B waiter id][batch repr]——
-			// apply 时跳过 16 字节头取批次载荷；waiter 通知限定
-			// 本节点提案（proposalWaiter 的提案者校验，跨节点条目
-			// id 碰撞不得假成功）
-			var data []byte
-			if len(ent.Data) > 16 {
-				data = ent.Data[16:]
-			}
-			if len(ent.Data) > 0 && len(ent.Data) <= 16 {
-				gr.lg.Warn("疑似损坏条目：普通条目数据 ≤16B 无批次载荷", "index", ent.GetIndex(),
-					"len", len(ent.Data), "head", fmt.Sprintf("%x", ent.Data))
-			}
-			gr.applyEntry(ent.GetIndex(), data)
-			if id, ok := proposalWaiter(ent.Data, gr.selfID); ok {
-				gr.notifyWaiter(gr.propWaiters, id)
-			}
+			// 载荷提取、waiter 通知（限定本节点提案）都在 applyEntries
+			// 内按条目粒度处理，这里只积累
+			seg = append(seg, ent)
 		}
 	}
+	flushSeg()
 	// 4. Advance——raft 库据此确认本轮 Ready 已处理，继续产下一轮
 	gr.rn.Advance()
 	// 成员变更 waiter 通知必须晚于 Advance：raft 库在 Advance 时才更新
@@ -792,7 +794,7 @@ func (gr *group) installSnapshot(ctx context.Context, snap *raftpb.Snapshot) err
 	}
 	// 第 6 步：内存侧——mem.ApplySnapshot（元数据版，Data 置空即可，
 	// 描述符只对「发送快照的节点」有意义）、applied/confState 推进。
-	// applyMu 临界区与 applyEntry 同契约：Snapshot() 在同一把锁内读
+	// applyMu 临界区与 applyEntries 同契约：Snapshot() 在同一把锁内读
 	// applied + confState，位点与成员表必须配对提交。
 	idx, tm := meta.GetIndex(), meta.GetTerm()
 	ms := &raftpb.Snapshot{Metadata: &raftpb.SnapshotMetadata{Index: &idx, Term: &tm, ConfState: meta.GetConfState()}}
@@ -927,54 +929,85 @@ func (gr *group) syncPersist(rd raft.Ready) bool {
 	return gr.mode == AckQuorumFsync && rd.MustSync
 }
 
-// applyEntry 把一条普通条目应用到 FSM：applied 位点与 FSM 数据在
-// 同一批次内原子写入共享 store（spec §5）。data 是条目载荷
-// （waiter id 之后的部分，即原始批次字节）。
-//
-// 空/短条目（选举产生的空条目等）没有 FSM 数据，只写 applied 位点
-// （单键批次）。
-//
-// apply 失败是不可恢复错误：状态机与日志分叉比进程死亡更糟——分叉后
-// 本节点 FSM 与多数派永远不一致且无法被检测修复，重启重放只会回到
-// 与日志一致的状态；直接 panic 让进程死亡、由上层重启接管才是安全
-// 的选择。这是刻意取舍，不是疏漏。
-func (gr *group) applyEntry(index uint64, data []byte) {
-	var b *store.Batch
-	var err error
-	if len(data) > 0 {
-		// 批次字节重建：坏字节在此报错——apply 路径不允许任何静默降级
-		b, err = gr.st.NewBatchFromRepr(data)
-	} else {
-		b = gr.st.NewBatch()
+// entryPayload 取普通条目的批次载荷：跳过 16B 头（[8B 提案者][8B waiter
+// id]），空/短条目（选举 no-op 等）返回 nil。1B..16B 的非空短条目按疑似
+// 损坏留痕——正常写路径不可能产出这种长度。
+func (gr *group) entryPayload(ent *raftpb.Entry) []byte {
+	if len(ent.Data) > 16 {
+		return ent.Data[16:]
 	}
-	if err != nil {
-		// 坏批次字节是严重的数据完整性问题，panic 前把载荷头与长度留痕
-		// （完整 dump 离线解码在排查时按需补充；日志头 64B 已足够定位
-		// 损坏形态，如混入的 raftstore 键族）
-		gr.lg.Error("FSM 批次重建失败，组停摆", "index", index, "len", len(data),
-			"first64", fmt.Sprintf("%x", data[:min(len(data), 64)]), "err", err)
+	if len(ent.Data) > 0 {
+		gr.lg.Warn("疑似损坏条目：普通条目数据 ≤16B 无批次载荷", "index", ent.GetIndex(),
+			"len", len(ent.Data), "head", fmt.Sprintf("%x", ent.Data))
+	}
+	return nil
+}
+
+// applyEntries 把一段连续的普通条目合并成**单次**引擎提交应用到 FSM
+// （apply 合批）：各条目的批次字节 MergeRepr 进同一批次，applied 位点只写
+// 最后一条的 index，批提交 + 推 applied 在 applyMu 临界区内一次完成。
+//
+// 为什么合批：逐条提交时每条目走一遍 Pebble 提交流水线（WAL 记录、
+// seqnum 发布、memtable 写入调度），高并发下一轮 Ready 常携带几十条
+// CommittedEntries，逐条提交把 apply 变成每条一次的固定开销；合批后
+// 该开销按轮摊销。三机压测剖面里 handleReady 的提交路径是前台热点之一。
+//
+// 语义与逐条路径逐项对齐：
+//   - applied 位点与全部 FSM 数据同批原子（spec §5）——中间条目不再有
+//     独立位点，但重启重放从上一位点起幂等重 apply，与逐条无差别；
+//   - OnApplied 钩子与 waiter 通知仍按条目粒度、按条目序触发，只是统一
+//     挪到合批提交之后——通知时数据必然已提交，读己之写不破坏；
+//   - apply 失败照旧 fail-stop panic：状态机与日志分叉比进程死亡更糟——
+//     分叉后本节点 FSM 与多数派永远不一致且无法被检测修复，重启重放只会
+//     回到与日志一致的状态；panic 让进程死亡、由上层重启接管才是安全的
+//     选择。这是刻意取舍，不是疏漏。
+//
+// 调用方（handleReady）保证段内不含 ConfChange：成员变更走独立的
+// SaveConfState 批次，遇到即先冲刷已积累的段（顺序不变量）。
+func (gr *group) applyEntries(ents []*raftpb.Entry) {
+	if len(ents) == 0 {
+		return
+	}
+	b := gr.st.NewBatch()
+	for _, ent := range ents {
+		data := gr.entryPayload(ent)
+		if len(data) == 0 {
+			continue // 空条目没有 FSM 数据，只随批推进 applied 位点
+		}
+		if err := b.MergeRepr(data); err != nil {
+			// 坏批次字节是严重的数据完整性问题，panic 前把载荷头留痕
+			// （与原逐条路径的 NewBatchFromRepr 失败同边界同策略）
+			_ = b.Close()
+			gr.lg.Error("FSM 批次合并失败，组停摆", "index", ent.GetIndex(), "len", len(data),
+				"first64", fmt.Sprintf("%x", data[:min(len(data), 64)]), "err", err)
+			panic(err)
+		}
+	}
+	last := ents[len(ents)-1].GetIndex()
+	if err := b.Set(appliedKey(gr.g), store.PutU64(last)); err != nil {
+		_ = b.Close()
+		gr.lg.Error("写 applied 位点失败，组停摆", "index", last, "err", err)
 		panic(err)
 	}
-	if err := b.Set(appliedKey(gr.g), store.PutU64(index)); err != nil {
-		b.Close()
-		gr.lg.Error("写 applied 位点失败，组停摆", "index", index, "err", err)
-		panic(err)
-	}
-	// FSM 数据与 applied 位点同批提交。apply 总是 NoSync：持久性由
-	// raft 日志与后台批量刷盘承担（spec §5），不另起 fsync。
 	// 「批提交 + 推 applied」在 applyMu 临界区内（Task 4）：快照生成在
-	// 同一把锁内读 applied 并建 ReadView，二者互斥——视图内容恰好对
-	// 应该位点，不会出现「快照声称包含它其实没有的数据」。持锁时间
-	// 只有一次批提交，无任何等待。
+	// 同一把锁内读 applied 并建 ReadView，二者互斥——视图内容恰好对应
+	// 该位点。apply 总是 NoSync：持久性由 raft 日志与后台批量刷盘承担
+	// （spec §5），不另起 fsync。
 	gr.applyMu.Lock()
 	if err := gr.st.ApplyWith(b, false); err != nil {
 		gr.applyMu.Unlock()
-		gr.lg.Error("FSM apply 失败，组停摆", "index", index, "err", err)
+		gr.lg.Error("FSM apply 失败，组停摆", "last", last, "entries", len(ents), "err", err)
 		panic(err)
 	}
-	gr.applied.Store(index)
+	gr.applied.Store(last)
 	gr.applyMu.Unlock()
-	gr.notifyApplied(data)
+	// 钩子与 waiter 通知在提交之后、按条目序逐条触发（粒度不变，见上）
+	for _, ent := range ents {
+		gr.notifyApplied(gr.entryPayload(ent))
+		if id, ok := proposalWaiter(ent.Data, gr.selfID); ok {
+			gr.notifyWaiter(gr.propWaiters, id)
+		}
+	}
 }
 
 // notifyLeaderChange 触发 OnLeaderChange 装配钩子（nil 安全）。

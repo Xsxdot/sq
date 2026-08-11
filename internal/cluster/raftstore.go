@@ -877,7 +877,7 @@ func hsKey(g uint32) []byte {
 	return []byte(fmt.Sprintf(groupHsKeyFmt, g))
 }
 
-// appliedKey 返回一组已应用位点键。写入两处：普通条目经 applyEntry 的
+// appliedKey 返回一组已应用位点键。写入两处：普通条目段经 applyEntries 的
 // FSM 批次并进（spec §5），ConfChange 条目经 SaveConfState 与成员表
 // 同批（见 SaveConfState 注释）。
 func appliedKey(g uint32) []byte {

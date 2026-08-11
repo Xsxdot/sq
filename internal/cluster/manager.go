@@ -1084,7 +1084,7 @@ func (m *Manager) truncateOnceWith(g uint32, probed map[uint64]bool) (uint64, bo
 		probed[id] = v
 		return v
 	}
-	// 成员表与位点同临界区配对——与 Task 4 applyEntry/Snapshot 同一纪律：
+	// 成员表与位点同临界区配对——与 Task 4 applyEntries/Snapshot 同一纪律：
 	// 锚点 index（源自 applied）与 confState 必须取同一 apply 时刻，否则
 	// 会产出「index=N 却携带 N+k 成员表」的截断锚点。锁内只读两个原子，
 	// 无等待；mem.Term/SaveSnapMeta 等留在锁外（与 groupStorage.Snapshot

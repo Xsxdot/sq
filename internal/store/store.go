@@ -113,9 +113,10 @@ func (b *Batch) Repr() []byte { return b.b.Repr() }
 // 零拷贝接管（b.data 直接指向传入切片），而本方法返回的批次在
 // ApplyWith 提交后会 Close 回收到 Pebble 的 batch sync.Pool，池中批次
 // 连同 b.data 一起被下一次 NewBatch 复用。若直接传调用方的切片：
-//   - applyEntry 传的是 raft 日志条目自身的 Data 缓冲（protobuf 反序列
+//   - 集群 apply 曾直接传 raft 日志条目自身的 Data 缓冲（protobuf 反序列
 //     化后 cap > len，Set 追加是原地写），条目字节与池中批次共享同一
-//     块内存；
+//     块内存（apply 合批后该热路径改走 MergeRepr，但本方法作为 repr 重建
+//     入口仍必须拷贝——调用方缓冲的生命周期不归它管）；
 //   - 之后任何一组 raftstore.Persist 复用该池中批次写 raft/<g>/hs 等
 //     键，就会原地覆盖 raft 日志条目在 MemoryStorage 里的内容，把日志
 //     写花（三节点 e2e 复现的「raft/1/hs 混入 FSM 批次」损坏，apply 时
@@ -129,6 +130,28 @@ func (s *Store) NewBatchFromRepr(data []byte) (*Batch, error) {
 		return nil, fmt.Errorf("store NewBatchFromRepr: %w", err)
 	}
 	return &Batch{b: nb}, nil
+}
+
+// MergeRepr 把一段复制批次字节合并进接收批次——集群 apply 合批的存储层
+// 入口：一轮 Ready 的多条 CommittedEntries 各携带一段批次字节，逐条合并
+// 进同一个批次后单次提交，省掉每条目一次的提交流水线与 WAL 记录。
+//
+// 别名安全：pebble 的 Batch.Apply 把参数批次的内容追加拷贝进接收批次
+// （文档明言 "It is safe to modify the contents of the arguments after
+// Apply returns"），因此这里可以用栈上零值批次零拷贝挂载 data
+// （SetRepr），全程只发生 Apply 内部那一次 memcpy——不必像
+// NewBatchFromRepr 那样先防御性拷贝。零值批次不来自 Pebble 的
+// batch 池、也绝不 Close 入池，不存在池中批次与条目缓冲共享内存的
+// 写花风险（见 NewBatchFromRepr 注释）。
+func (b *Batch) MergeRepr(data []byte) error {
+	var tmp pebble.Batch
+	if err := tmp.SetRepr(data); err != nil {
+		return fmt.Errorf("store MergeRepr: %w", err)
+	}
+	if err := b.b.Apply(&tmp, nil); err != nil {
+		return fmt.Errorf("store MergeRepr: %w", err)
+	}
+	return nil
 }
 
 // BatchTouchesPrefix 判定复制批次字节中是否存在以 prefix 开头的键——只遍历
