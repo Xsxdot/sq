@@ -7,6 +7,8 @@ package cluster
 
 import (
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"go.etcd.io/raft/v3/raftpb"
@@ -413,6 +415,57 @@ func TestPersistSurvivesReopenViaSeglog(t *testing.T) {
 	gotHS, gotEnts, _, err := rs2.Load(1)
 	if err != nil || gotHS.GetTerm() != 2 || len(gotEnts) != 1 || string(gotEnts[0].Data) != "x" {
 		t.Fatalf("重开读回 = %v,%v,%v; want term=2, 1 条目", gotHS, gotEnts, err)
+	}
+}
+
+// TestResetGroupProgressRemovesSeglogDir 组级重置必须把段目录一并删掉
+// ——半截段目录重启会被当作有效日志读回，比脏键更危险。
+func TestResetGroupProgressRemovesSeglogDir(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	idx, trm := uint64(1), uint64(1)
+	if err := rs.Persist(1, nil, []*raftpb.Entry{{Index: &idx, Term: &trm, Data: []byte("x")}}, true); err != nil {
+		t.Fatal(err)
+	}
+	segDir := filepath.Join(st.Dir(), "raftlog", "1")
+	if fis, err := os.ReadDir(segDir); err != nil || len(fis) == 0 {
+		t.Fatalf("前置失败：段目录应有文件: %v", err)
+	}
+	if err := rs.ResetGroupProgress(1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(segDir); !os.IsNotExist(err) {
+		t.Fatalf("重置后段目录应被删除，stat err = %v", err)
+	}
+	// 重置后 Load 必须是空日志形态
+	gotHS, gotEnts, _, err := rs.Load(1)
+	if err != nil || len(gotEnts) != 0 || gotHS.GetTerm() != 0 {
+		t.Fatalf("重置后 Load = %v,%v,%v; want 空", gotHS, gotEnts, err)
+	}
+}
+
+// TestForceLocalRecoverBumpsTermViaSeglog 抬 term 走 seglog 后，重开
+// raftStore 能读回抬高的 term（原 TestForceLocalRecoverBumpsTermAndConsumesPermit
+// 覆盖 Pebble 侧，此测试补 seglog 侧的持久化）。
+func TestForceLocalRecoverBumpsTermViaSeglog(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	term := uint64(4)
+	if err := rs.Persist(0, &raftpb.HardState{Term: &term}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	// 授予许可（ForceLocalRecover 前置；照抄现有 TestForceLocalRecover... 的授予段）
+	if err := rs.SaveRecoverPermit(recoverPermit{GrantedAt: "2026-08-11T00:00:00Z", Gen: "g1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.ForceLocalRecover(0); err != nil {
+		t.Fatal(err)
+	}
+	rs.CloseLogs()
+	rs2 := newRaftStore(st, testSlog(t))
+	gotHS, _, _, err := rs2.Load(0)
+	if err != nil || gotHS.GetTerm() <= 4 {
+		t.Fatalf("抬 term 后重开读回 term = %d, %v; want > 4", gotHS.GetTerm(), err)
 	}
 }
 

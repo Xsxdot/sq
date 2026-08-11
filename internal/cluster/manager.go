@@ -36,7 +36,10 @@ import (
 	"log/slog"
 	"net"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -751,9 +754,17 @@ func (m *Manager) send(g uint32, msgs []*raftpb.Message) {
 	}
 }
 
-// diskHasRaftState 判定磁盘上是否已存在 raft 日志状态：MetaGroup 的
-// applied 位点非零，或任一组的 HardState 存在，都说明本节点曾参与
-// 过集群——干净标记缺失时不得裸恢复。
+// diskHasRaftState 判定磁盘上是否已存在 raft 日志状态。
+//
+// 「曾参与集群」的判据（三者取或）：legacy HardState 键（迁移前的旧
+// 盘）、applied 位点非零（FSM 写过）、组段目录里有段文件（新形态）。
+// 只看任一即可短路——判定只回答有/无，不读内容。
+//
+// 为什么必须加第三支（seglog 段文件）：HardState 的物理归宿自 Task 5
+// 起已经从 Pebble 的 hsKey 迁到了 seglog，Persist 不再写 hsKey。若判定
+// 只看 hsKey 和 applied，一个只经 seglog 写过 HardState（例如刚选完
+// leader、日志还没来得及推进 applied）的节点会被误判为「从未参与过
+// 集群」，绕过不干净关机的裸恢复拦截——这是安全回归，不是风格问题。
 func (m *Manager) diskHasRaftState() (bool, error) {
 	app, err := m.rs.Applied(0)
 	if err != nil {
@@ -768,6 +779,34 @@ func (m *Manager) diskHasRaftState() (bool, error) {
 			return false, err
 		}
 		if ok {
+			return true, nil
+		}
+		hasSeg, err := groupHasSegFiles(m.st.Dir(), g)
+		if err != nil {
+			return false, err
+		}
+		if hasSeg {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// groupHasSegFiles 判定一组的 seglog 目录下是否存在段文件（*.seg）。
+//
+// 目录不存在视为「没有」而非错误——组从未在本进程写过日志时，
+// raftlog/<g> 目录本来就不会被创建（seglog 惰性 MkdirAll）。
+func groupHasSegFiles(storeDir string, g uint32) (bool, error) {
+	dir := filepath.Join(storeDir, "raftlog", strconv.FormatUint(uint64(g), 10))
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	for _, e := range entries {
+		if !e.IsDir() && strings.HasSuffix(e.Name(), ".seg") {
 			return true, nil
 		}
 	}
