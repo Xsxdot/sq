@@ -167,9 +167,11 @@ func (r *raftStore) getLog(g uint32) (*seglog.Log, error) {
 // 目录连同全部段文件一起删除、清掉内存缓存。之后任何 getLog(g) 都会
 // 当作全新空日志重新 Open（MkdirAll 重建空目录）。
 //
-// 调用方目前只有 ResetGroupProgress（组进度整体清零，见其注释）。
-// os.RemoveAll 对不存在的目录返回 nil，因此本方法对「从未在本进程打开
-// 过、磁盘上也从未写过」的组同样安全（no-op）。
+// 调用方有两处：ResetGroupProgress（组进度整体清零，见其注释）与
+// migrateLog（一次性迁移的幂等锚点：先清空再重写，任何后续步骤崩溃
+// 重启都从这里重新开始，见 migrateLog 注释）。os.RemoveAll 对不存在的
+// 目录返回 nil，因此本方法对「从未在本进程打开过、磁盘上也从未写过」
+// 的组同样安全（no-op）。
 func (r *raftStore) wipeLog(g uint32) error {
 	r.logsMu.Lock()
 	l, hadLog := r.logs[g]

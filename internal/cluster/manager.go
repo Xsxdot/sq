@@ -473,16 +473,15 @@ func NewManager(o Options) (*Manager, error) {
 
 	// 一次性迁移：legacy Pebble 键族 → seglog（Task 7 接线，spec §6）。
 	// 位置是安全关键，前后都不能挪：
-	//   - 不能提前到 decideRecovery 之前：判定本身只读 legacy 键
-	//     （hasRaft/legacyPending 系列），迁移一旦先做，判定读到的就不再
-	//     是磁盘的原始形态；
-	//   - 不能提前到上面 switch 与紧接着的 local-resume 抬 term 之前：
-	//     pathLocalForced 的 ForceLocalRecover 与 pathLocalResume 的
-	//     BumpTermsForLocalResume 都可能在未迁移组上写回 legacy hsKey
-	//     （bumpTermsInto 对未迁移组的处理，见其注释）——必须等抬 term
-	//     完全落盘之后再迁移，这样迁移搬走的才是「含 bump」的最终状态；
-	//     颠倒顺序会让迁移搬走抬 term 之前的旧任期，之后 bump 的写入
-	//     又会把迁移判定翻回「未迁移」，term 不单调；
+	//   - 不能提前到 decideRecovery 与随后的抬 term 分支（pathLocalForced
+	//     的 ForceLocalRecover、pathLocalResume 的 BumpTermsForLocalResume）
+	//     之前：决议要用到的判定输入（hasRaft 等）在 decideRecovery 调用
+	//     前已经算完，提前迁移不会改变这一次的判定结果；但抬 term 对
+	//     未迁移组是直接写回 legacy 盘的 hsKey（bumpTermsInto 对未迁移组
+	//     的处理，见其注释）——迁移必须等决议连同它触发的抬 term 都落盘
+	//     完成，才能把「含 bump」的最终状态一次性搬进 seglog。颠倒顺序
+	//     会让迁移搬走抬 term 之前的旧任期，之后 bump 的写入又会把迁移
+	//     判定翻回「未迁移」，term 不单调；
 	//   - 必须早于下面的 buildGroup 循环：buildGroup 的 clean 分支经
 	//     r.Load(g) 读日志，迁移完成后 Load 才会稳定命中 seglog 分支，
 	//     不再滑进 legacy 只读回退。
@@ -1469,10 +1468,21 @@ func (m *Manager) StopClean(ctx context.Context) error {
 		m.flusherStopOne.Do(func() { close(m.flusherStop) })
 		<-m.flusherDone
 	}
-	// 全部组与 flusher 都已退出，此后不会再有任何一组写 seglog——这时
-	// 关闭句柄是安全的。放在标记落盘之前：干净关机标记是「本次关机全部
-	// 机件都已妥善停当」的收尾声明，不该在还留着打开的日志文件句柄时就
-	// 先落盘（顺序参见 Task 7 的接线要求）。
+	// 截断循环（truncateLoop）也是 seglog 的写者（TruncateLog 内部经
+	// getLog 可能重开句柄）：ctx 已被上面的 m.cancel() 取消，这里等它
+	// 真正退出，否则它可能正卡在某一轮 truncateOnceWith 中途（含
+	// probePeerAlive 探测，最坏秒级），CloseLogs 清空 r.logs 后它若还在
+	// 跑，TruncateLog→getLog 会在句柄已清空的 map 上重新 Open 出一个没人
+	// 会关的新 fd——这就是 StopClean 想保证的「全部机件已妥善停当」被
+	// 悄悄破坏。nil 判断同 Start 里 Done 观察者的写法（truncateInterval
+	// <=0 时未启动该循环）。
+	if m.truncateLoopDone != nil {
+		<-m.truncateLoopDone
+	}
+	// 全部组、flusher 与截断循环都已退出，此后不会再有任何一组写
+	// seglog——这时关闭句柄是安全的。放在标记落盘之前：干净关机标记是
+	// 「本次关机全部机件都已妥善停当」的收尾声明，不该在还留着打开的
+	// 日志文件句柄时就先落盘（顺序参见 Task 7 的接线要求）。
 	m.rs.CloseLogs()
 	// 干净关机标记作为最后一次同步写（见方法注释：先写标记会让
 	// 「标记在、acked 尾部丢」的窗口被误判为干净关机）
@@ -1493,11 +1503,21 @@ func (m *Manager) StopClean(ctx context.Context) error {
 // 非干净停机路径同样要在调用方关 store 之前收掉 seglog 句柄（Task 7）：
 // 调用方的固定模式是 kill() 后紧跟着 <-m.Done()，再关 store /
 // WipeForRejoin（见 testCluster.kill、TestManagerUncleanRestartRefusesResume
-// 等全部调用点）。因此这里等全部组与 flusher 真正退出后才关句柄——
-// 提前关会撞上组的 run 循环仍在写 seglog 的窗口；等待对象与 StopClean
-// 一致（全部组 + flusher），只是不写 MarkCleanShutdown 标记。kill 本身
-// 从「立即返回」变成「等到全部机件退出才返回」，但这本就是全部调用点
-// 已有的等待，只是把它挪进了 kill 内部，不改变外部可观察行为。
+// 等全部调用点）。因此这里等全部组、flusher 与截断循环（truncateLoop）
+// 真正退出后才关句柄——CloseLogs 需要在所有写者退出后才能关句柄，提前
+// 关会撞上组的 run 循环、或 truncateLoop 的 TruncateLog→getLog 仍在写
+// /重开 seglog 的窗口；等待对象与 StopClean 一致（全部组 + flusher +
+// 截断循环），只是不写 MarkCleanShutdown 标记。kill 本身从「立即返回」
+// 变成「等到全部机件退出才返回」，但这本就是全部调用点已有的等待，只是
+// 把它挪进了 kill 内部，不改变外部可观察行为。
+//
+// 代价（有意为之，不加人工超时兜底）：这几个等待都没有超时，若某个组
+// 卡死不退出，kill() 会跟着卡死——测试里包在 kill() 外层的、针对
+// <-m.Done() 的有界超时检查因此形同虚设，卡住的组会拖成整个测试包的
+// 10 分钟超时，而不是一条定位到具体组的 t.Error。这是刻意的取舍：
+// kill() 若不等到位就返回，CloseLogs 提前关句柄本身就是 bug（见上），
+// 加超时只会把「fd 泄漏」换成「假装关成功、实际还有 goroutine 在写」，
+// 两害相权，选择让卡死暴露成慢测试而不是悄悄放过。
 func (m *Manager) kill() {
 	m.cancel()
 	if m.flusherStop != nil {
@@ -1508,6 +1528,9 @@ func (m *Manager) kill() {
 	}
 	if m.flusherDone != nil {
 		<-m.flusherDone
+	}
+	if m.truncateLoopDone != nil {
+		<-m.truncateLoopDone
 	}
 	m.rs.CloseLogs()
 }
@@ -2083,6 +2106,7 @@ func WipeForRejoin(dataDir string) error {
 // 规范对齐，不得私自偏离。
 //
 // 六步：
+//
 //  1. 旧 store 已关闭——调用方职责（pebble 持有目录句柄，不关闭
 //     WipeForRejoin 清不掉；本函数不代关，签名约定即此）。旧 Manager
 //     的 seglog 组日志句柄同理不由本函数代关：调用方走 StopClean 或
@@ -2092,19 +2116,23 @@ func WipeForRejoin(dataDir string) error {
 //     一样能删（unlink-while-open 语义，进程退出或显式 Close 时才真正
 //     释放 inode）——这里要保证的是不泄漏 fd，不是 RemoveAll 的正确性
 //     前提，fd 卫生与数据正确性是两件事
-
+//
 //  2. 轮询全部对端发 PrepareJoin：每端对**自己当前 lead** 的组做
 //     Remove→AddLearner 并返回完成组号，收齐 0..DataGroups 全组完成
 //     （30s 总时限；期间 leader 可能换手——重发即可，Remove/AddLearner
 //     幂等，见 handlePrepareJoin/rejoinGroupPrep）
+//
 //  3. WipeForRejoin 清空数据目录（含旧 raft 日志——身份由存活
 //     leader 的 ConfChange 日志重赋）
+//
 //  4. 重建本节点监听（EADDRINUSE 抢占，逻辑与注释同 harness）：kill
 //     后 Done 不保证旧传输层看门狗已关监听器，直接重绑同一地址可能
 //     撞 EADDRINUSE；先 net.Listen 抢到端口（拿到即旧监听器已关的
 //     确定性证明），再注入给 NewManager——中间无空窗
+//
 //  5. store.Open + NewManager fresh 路径启动（Wipe 后仍报
 //     ErrUncleanShutdown 即判定错误，显式报错）+ Start
+//
 //  6. 追平与升 voter 交给 leader 侧 AutoPromoteLearners 自动循环
 //     （本函数返回时节点尚是 learner，收敛由集群自动完成）
 //
