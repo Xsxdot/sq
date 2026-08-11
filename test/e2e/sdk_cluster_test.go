@@ -901,10 +901,25 @@ func TestThreeNodeClusterE2E(t *testing.T) {
 	// ---- 三节点对账：路由恢复（重入节点重新 lead 组）+ 无丢失 ----
 	// 重入节点先以 learner 追平，AutoPromote 升 voter 后摊布循环把
 	// preferred 组转回给它——轮询路由直到它的端点重新出现。
+	//
+	// 这里必须用非致命的 tryQueryRoute：重入会把被 kill 节点从它当过
+	// voter 的每个组里摘掉再以 learner 加回，成员变更期间那些组会短暂
+	// 无 leader，而 QueryRoute 对「任一队列所属组无 leader」是整体拒答
+	// （HA_NOT_AVAILABLE，见 rpc/server.go:265）——这是设计行为，客户端
+	// 换节点重试即可。用致命版 queryRoute 会让这个本就为等待而写的轮询
+	// 循环在第一次撞上选举窗口时当场 Fatal：2026-08-11 在 4 核 Linux 上
+	// 就是这么挂的，同一用例在 macOS 上因为选举窗口更短而侥幸不撞。
 	deadline := time.Now().Add(180 * time.Second)
 	rejoined := false
 	for time.Now().Before(deadline) {
-		qs := queryRoute(t, endpoints[(victimIdx+1)%3], topic)
+		qs, err := tryQueryRoute(endpoints[(victimIdx+1)%3], topic)
+		if err != nil {
+			// 选举窗口内的拒答是预期的，等下一拍——但要留痕，否则
+			// 「等满 180s 失败」时分不清是一直在拒答还是路由一直没变。
+			t.Logf("QueryRoute(%s) 暂不可答（选举窗口，将重试）: %v", endpoints[(victimIdx+1)%3], err)
+			time.Sleep(2 * time.Second)
+			continue
+		}
 		if routeEndpointCounts(qs)[endpoints[victimIdx]] > 0 {
 			rejoined = true
 			break
@@ -944,20 +959,61 @@ func TestThreeNodeClusterE2E(t *testing.T) {
 		len(sent), 50, 20, len(sent)+len(postKill))
 }
 
+// clientStartAttempts 是 SDK 客户端启动的尝试次数上限（见 retryClientStart）。
+const clientStartAttempts = 3
+
+// startClient 反复「新建实例 + Start」直到成功或用尽次数，全败时 Fatal。
+//
+// 为什么需要它：SDK 的 startUp 会做一次 QueryRoute + telemetry 握手，
+// 其中偶发 `protobuf size mismatch`（golang/protobuf#1609——SDK 在并发
+// 下改动正在序列化的 TelemetryCommand，是客户端自己的缺陷，与 broker
+// 无关；报错发生在客户端 marshal 阶段，请求根本没上路）。压测路径早就
+// 自带一份同样的重试（原 newBenchProducer），但集群/场景用例走的是这里，
+// 一直裸奔——2026-08-11 在 4 核 Linux 上 TestScenarioMinorityCannotWrite
+// 就因为这一下客户端抖动整条挂掉。现在两条路径合用本函数，同一个 SDK
+// 缺陷只需在一处应对。
+//
+// 为什么必须**重建实例**而不能对同一实例重复 Start：SDK 客户端是一次性
+// 的，startUp 失败的收尾里已经把自己关掉了，第二次 Start 只会拿到
+// `EOF, shutdown err=client has been closed`——重试永远不可能成功，白等
+// 三拍再报一个与病因无关的错。第一版就是这么写错的，Linux 上
+// TestScenarioRebootedMemNeedsPermit 的三行重试留痕把它当场钉死。
+//
+// 为什么重试不算放水：失败发生在「还没连上」的阶段，重建后仍失败才判
+// 失败，那才是真的连不上。用例的业务断言一条没动。
+func startClient[T any](t *testing.T, what string, build func() (T, error), start func(T) error, stop func(T)) T {
+	t.Helper()
+	var last error
+	for attempt := 1; attempt <= clientStartAttempts; attempt++ {
+		c, err := build()
+		if err == nil {
+			if err = start(c); err == nil {
+				return c
+			}
+			// 启动失败的实例已自我关闭，但仍挂着连接与后台协程，显式收掉
+			stop(c)
+		}
+		last = err
+		t.Logf("%s 第 %d 次启动失败（将重建重试）: %v", what, attempt, last)
+		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
+	}
+	t.Fatalf("%s 重建启动 %d 次均失败: %v", what, clientStartAttempts, last)
+	var zero T
+	return zero // 不可达：Fatalf 已 Goexit，仅为编译通过
+}
+
 // newClusterProducer 构造带集群凭据的 Producer（各用例独立 topic）。
 func newClusterProducer(t *testing.T, endpoint, topic string) rmq.Producer {
 	t.Helper()
-	p, err := rmq.NewProducer(&rmq.Config{
-		Endpoint:    endpoint,
-		Credentials: &credentials.SessionCredentials{AccessKey: clusterAK, AccessSecret: clusterSK},
-	}, rmq.WithTopics(topic))
-	if err != nil {
-		t.Fatalf("NewProducer: %v", err)
-	}
-	if err := p.Start(); err != nil {
-		t.Fatalf("producer.Start: %v", err)
-	}
-	return p
+	return startClient(t, "producer",
+		func() (rmq.Producer, error) {
+			return rmq.NewProducer(&rmq.Config{
+				Endpoint:    endpoint,
+				Credentials: &credentials.SessionCredentials{AccessKey: clusterAK, AccessSecret: clusterSK},
+			}, rmq.WithTopics(topic))
+		},
+		rmq.Producer.Start,
+		func(p rmq.Producer) { _ = p.GracefulStop() })
 }
 
 // newClusterConsumer 构造带集群凭据的 SimpleConsumer（SUB_ALL）。
@@ -975,23 +1031,26 @@ func newClusterProducer(t *testing.T, endpoint, topic string) rmq.Producer {
 // 空轮询 ≈ await 即返，数字才反映 broker 实际投递能力。
 func newClusterConsumer(t *testing.T, endpoint, group, topic string, await time.Duration) rmq.SimpleConsumer {
 	t.Helper()
-	c, err := rmq.NewSimpleConsumer(&rmq.Config{
-		Endpoint:      endpoint,
-		ConsumerGroup: group,
-		Credentials:   &credentials.SessionCredentials{AccessKey: clusterAK, AccessSecret: clusterSK},
-	},
-		rmq.WithSimpleAwaitDuration(await),
-		rmq.WithSimpleSubscriptionExpressions(map[string]*rmq.FilterExpression{topic: rmq.SUB_ALL}),
-	)
-	if err != nil {
-		t.Fatalf("NewSimpleConsumer: %v", err)
-	}
-	if await == clusterConsumerAwaitShort {
-		c.SetRequestTimeout(clusterConsumerReqTimeout) // 吞吐测量路径：压短请求超时（见函数注释）
-	}
-	if err := c.Start(); err != nil {
-		t.Fatalf("consumer.Start: %v", err)
-	}
+	c := startClient(t, "consumer",
+		func() (rmq.SimpleConsumer, error) {
+			sc, err := rmq.NewSimpleConsumer(&rmq.Config{
+				Endpoint:      endpoint,
+				ConsumerGroup: group,
+				Credentials:   &credentials.SessionCredentials{AccessKey: clusterAK, AccessSecret: clusterSK},
+			},
+				rmq.WithSimpleAwaitDuration(await),
+				rmq.WithSimpleSubscriptionExpressions(map[string]*rmq.FilterExpression{topic: rmq.SUB_ALL}),
+			)
+			if err != nil {
+				return nil, err
+			}
+			if await == clusterConsumerAwaitShort {
+				sc.SetRequestTimeout(clusterConsumerReqTimeout) // 吞吐测量路径：压短请求超时（见函数注释）
+			}
+			return sc, nil
+		},
+		rmq.SimpleConsumer.Start,
+		func(c rmq.SimpleConsumer) { _ = c.GracefulStop() })
 	return c
 }
 
@@ -1026,19 +1085,27 @@ func countLogLines(t *testing.T, logPaths []string, needle string) int {
 // 时间主导而非 broker 能力；事务转发证据在「全组同节点」时天然为 0。
 func waitRouteSpread(t *testing.T, endpoints []string, topic string, timeout time.Duration) {
 	t.Helper()
+	// 同 907 行的重入等待：摊布收敛期各组仍在选举，QueryRoute 会整体
+	// 拒答（HA_NOT_AVAILABLE），这是设计行为不是故障——轮询循环必须用
+	// 非致命版，否则等待逻辑会在第一个选举窗口就 Fatal 掉。
 	deadline := time.Now().Add(timeout)
+	last := ""
 	for time.Now().Before(deadline) {
-		qs := queryRoute(t, endpoints[0], topic)
+		qs, err := tryQueryRoute(endpoints[0], topic)
+		if err != nil {
+			last = fmt.Sprintf("路由暂不可答: %v", err)
+			time.Sleep(1 * time.Second)
+			continue
+		}
 		if len(routeEndpointCounts(qs)) == len(endpoints) {
 			t.Logf("leader 摊布已收敛：%d 条队列分布到 %d 个节点 %v",
 				len(qs), len(endpoints), routeEndpointCounts(qs))
 			return
 		}
+		last = fmt.Sprintf("当前分布 %v", routeEndpointCounts(qs))
 		time.Sleep(1 * time.Second)
 	}
-	qs := queryRoute(t, endpoints[0], topic)
-	t.Fatalf("leader 摊布 %v 内未收敛到 %d 个节点，当前分布 %v",
-		timeout, len(endpoints), routeEndpointCounts(qs))
+	t.Fatalf("leader 摊布 %v 内未收敛到 %d 个节点，%s", timeout, len(endpoints), last)
 }
 
 // recvAll 轮询消费直到收齐 want 个不同 msgId 或超时，返回收到的 msgId

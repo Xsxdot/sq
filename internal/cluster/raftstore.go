@@ -31,6 +31,10 @@
 //	raft/preraft                 → 前 raft 期存量数据标记（单机档直写 FSM
 //	                               的数据不在任何 raft 日志里，MarkPreRaft/
 //	                               HasPreRaft，Join 的种子档位判据）
+//	raft/bootgen                 → 机器世代（写入时机见 SaveBootGen 注释：
+//	                               只在能启动成功的路径上写，拒启分支绝不写）
+//	raft/local_recover_permit    → 一次性本地恢复许可（两行文本：授予时间 /
+//	                               授予时机器世代；由 ForceLocalRecover 消费）
 //	raft/<g>/hs                  → HardState protobuf
 //	raft/<g>/conf                → ConfState protobuf（成员表，ConfChange
 //	                               apply 时整表覆盖写，SaveConfState）
@@ -48,6 +52,7 @@ import (
 	"encoding/binary"
 	"fmt"
 	"log/slog"
+	"strings"
 
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -70,6 +75,8 @@ const (
 	groupsKey           = "raft/groups"
 	cleanShutdownKey    = "raft/clean_shutdown"
 	preRaftKey          = "raft/preraft"
+	bootGenKey          = "raft/bootgen"
+	recoverPermitKey    = "raft/local_recover_permit"
 	groupEntPrefixFmt   = "raft/%d/ent/"
 	groupHsKeyFmt       = "raft/%d/hs"
 	groupConfFmt        = "raft/%d/conf"
@@ -582,6 +589,182 @@ func (r *raftStore) HasPreRaft() (bool, error) {
 		return false, fmt.Errorf("raftstore HasPreRaft: %w", err)
 	}
 	return ok, nil
+}
+
+// LoadBootGen 读取盘上记录的机器世代。
+//
+// 返回：
+//   - 世代字符串、是否存在、错误
+//   - 从未写入过时返回 ("", false, nil)——首次以本版本启动的旧数据目录
+//     即此形态，恢复判定必须把它当作「世代不可比 = 保守处理」
+func (r *raftStore) LoadBootGen() (string, bool, error) {
+	data, ok, err := r.st.Get([]byte(bootGenKey))
+	if err != nil {
+		return "", false, fmt.Errorf("raftstore LoadBootGen: %w", err)
+	}
+	if !ok {
+		return "", false, nil
+	}
+	return string(data), true, nil
+}
+
+// SaveBootGen 写入本次启动的机器世代并 Sync 落盘。
+//
+// 写入时机是安全关键，调用方必须遵守：**只在决定走一条能启动成功的
+// 路径之后才调用**（clean-resume / fresh / local-resume / local-forced），
+// ErrUncleanShutdown 分支绝不调用。
+//
+// 理由：本键的语义是「本数据目录最后一次被运行中的节点写入，发生在哪个
+// 机器世代」。若拒启分支也写，序列就变成——机器重启 → 判定需要人工签字
+// → 顺手写了新世代 → 重入编排失败拒启 → 运维直接重启进程 → 此时盘上
+// 世代已等于当前世代 → 自动判定「机器没重启过、本地日志可信」→ 签字门
+// 被静默绕过。整扇安全门会因这一处顺序错误而形同虚设。
+func (r *raftStore) SaveBootGen(gen string) error {
+	b := r.st.NewBatch()
+	if err := b.Set([]byte(bootGenKey), []byte(gen)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore SaveBootGen: %w", err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore SaveBootGen: %w", err)
+	}
+	r.lg.Info("机器世代已记录", "gen", gen)
+	return nil
+}
+
+// recoverPermit 是一次性本地恢复许可的内容。
+//
+// Gen 绑定授予时的机器世代，这是许可的作废机制：机器每重启一次世代就变，
+// 旧许可自动失效。用世代而非 TTL，是为了不依赖时钟——签字只对运维当时
+// 看到的那一次事故有效。
+type recoverPermit struct {
+	GrantedAt string // 授予时间（RFC3339，只给人看）
+	Gen       string // 授予时的机器世代（作废判据）
+}
+
+// SaveRecoverPermit 写入一次性本地恢复许可并 Sync 落盘。
+//
+// 值编码为两行 UTF-8 文本（第一行授予时间、第二行授予时世代）而非
+// protobuf：运维可能要用普通工具直接查看它，可读性远比编码效率重要，
+// 而这个值一生只被写一次、读一次。
+func (r *raftStore) SaveRecoverPermit(p recoverPermit) error {
+	b := r.st.NewBatch()
+	val := p.GrantedAt + "\n" + p.Gen
+	if err := b.Set([]byte(recoverPermitKey), []byte(val)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore SaveRecoverPermit: %w", err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore SaveRecoverPermit: %w", err)
+	}
+	r.lg.Error("已写入一次性本地恢复许可——下次启动将允许带着可能残缺的本地日志恢复，可能丢失已确认的消息",
+		"grantedAt", p.GrantedAt, "gen", p.Gen)
+	return nil
+}
+
+// LoadRecoverPermit 读取一次性本地恢复许可。
+//
+// 返回：许可内容、是否存在、错误。格式不合法时按「不存在」处理并记
+// Error——一个读不懂的许可绝不能被当成有效签字。
+func (r *raftStore) LoadRecoverPermit() (recoverPermit, bool, error) {
+	data, ok, err := r.st.Get([]byte(recoverPermitKey))
+	if err != nil {
+		return recoverPermit{}, false, fmt.Errorf("raftstore LoadRecoverPermit: %w", err)
+	}
+	if !ok {
+		return recoverPermit{}, false, nil
+	}
+	parts := strings.SplitN(string(data), "\n", 2)
+	if len(parts) != 2 || parts[1] == "" {
+		r.lg.Error("本地恢复许可格式不合法，按无许可处理", "raw", string(data))
+		return recoverPermit{}, false, nil
+	}
+	return recoverPermit{GrantedAt: parts[0], Gen: parts[1]}, true, nil
+}
+
+// bumpTermsInto 把组 0..dataGroups 每组 HardState 的 Term 加 1、Vote 清空，
+// 写进给定批次（不提交——提交时机由调用方决定，这样抬 term 才能与消费许可
+// 同批原子落盘）。
+//
+// commit 位点刻意不动：它由日志重放与 leader 重新告知恢复，抬它没有意义
+// 且会与真实日志脱节。
+func (r *raftStore) bumpTermsInto(b *store.Batch, dataGroups uint32) error {
+	for g := uint32(0); g <= dataGroups; g++ {
+		hs := &raftpb.HardState{}
+		data, ok, err := r.st.Get(hsKey(g))
+		if err != nil {
+			return fmt.Errorf("组 %d 读 HardState: %w", g, err)
+		}
+		if ok {
+			if err := proto.Unmarshal(data, hs); err != nil {
+				return fmt.Errorf("组 %d 解码 HardState: %w", g, err)
+			}
+		}
+		newTerm := hs.GetTerm() + 1
+		var noVote uint64
+		hs.Term = &newTerm
+		hs.Vote = &noVote
+		enc, err := proto.Marshal(hs)
+		if err != nil {
+			return fmt.Errorf("组 %d 编码 HardState: %w", g, err)
+		}
+		if err := b.Set(hsKey(g), enc); err != nil {
+			return fmt.Errorf("组 %d 写 HardState: %w", g, err)
+		}
+		r.lg.Error("不干净关机后本地恢复：任期已抬、投票已清", "g", g, "term", newTerm)
+	}
+	return nil
+}
+
+// ForceLocalRecover 执行签字放行的本地恢复前置：抬全部组的任期、清空
+// 投票，并消费掉一次性许可。三件事在同一批次内 Sync 提交。
+//
+// 参数：
+//   - dataGroups: 数据组数；本方法处理组 0（meta 组）到 dataGroups
+//
+// 为什么必须抬 term：quorum-mem 档掉电可能丢掉投票记录——本节点在任期 T
+// 投给过 A，重启后忘了，又在 T 投给 B，于是同一任期出现两个 leader、
+// 日志分叉。这比丢数据严重，是损坏。抬任期在 raft 中永远安全（代价只是
+// 强制一次重新选举），抬完之后本节点不可能再在 T 投第二次。
+//
+// 为什么与消费许可同批：两者必须同生共死。若先抬 term 后删许可而中间
+// 崩溃，许可会被重复消费；若先删许可后抬 term 而中间崩溃，运维签的字白费
+// 且节点仍带着旧任期启动。单批原子提交让这两种半截状态都不存在。
+//
+// 注意：commit 位点不动——它由日志重放与 leader 重新告知恢复，抬它没有
+// 意义且会与真实日志脱节。抬 term 的适用范围见 needsTermBump。
+func (r *raftStore) ForceLocalRecover(dataGroups uint32) error {
+	b := r.st.NewBatch()
+	if err := r.bumpTermsInto(b, dataGroups); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ForceLocalRecover: %w", err)
+	}
+	if err := b.Delete([]byte(recoverPermitKey)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore ForceLocalRecover 删许可: %w", err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore ForceLocalRecover: %w", err)
+	}
+	r.lg.Error("一次性本地恢复许可已消费（本次生效，不再对后续任何一次不干净关机放行）", "groups", dataGroups+1)
+	return nil
+}
+
+// BumpTermsForLocalResume 为 local-resume 抬任期、清投票并 Sync 落盘。
+//
+// 与 ForceLocalRecover 的区别只有一个：本方法**不碰许可键**。local-resume
+// 本来就不需要运维签字（它要么世代未变、要么是 fsync 档），只是 mem 档下
+// 投票记录可能没落盘，所以同样要抬任期。见 needsTermBump 的注释。
+func (r *raftStore) BumpTermsForLocalResume(dataGroups uint32) error {
+	b := r.st.NewBatch()
+	if err := r.bumpTermsInto(b, dataGroups); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore BumpTermsForLocalResume: %w", err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore BumpTermsForLocalResume: %w", err)
+	}
+	return nil
 }
 
 // confStateFromEntries 从日志条目重放成员变更，按 commit 裁剪后合成

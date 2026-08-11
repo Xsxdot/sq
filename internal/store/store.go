@@ -181,6 +181,47 @@ func (s *Store) ApplyWith(b *Batch, sync bool) error {
 	return b.b.Close()
 }
 
+// walBarrier 是 SyncWAL 写进 WAL 的屏障载荷。内容只用于人肉尸检时在
+// WAL 里认出这条记录，语义上任意。取 const 而非包级 []byte 变量：
+// 这个值不该被任何人改，5Hz 一次的转换分配可以忽略。
+const walBarrier = "sq/wal-barrier"
+
+// SyncWAL 强制一次 WAL fsync：借 WAL 的顺序性，把此前所有 NoSync 提交的
+// 字节一并落盘。mem 档「后台批量刷盘」的唯一实现件（spec §2.2）。
+//
+// 返回：fsync 失败时返回错误——此时 Pebble 已处于不可恢复态，调用方应视为
+// 致命信号（下一拍所有写都会失败）。
+//
+// 为什么必须往批次里塞一条 LogData，而不能提交空批次：Pebble 的
+// commitPipeline.Commit 开头就是 `if b.Empty() { return nil }`——空批次
+// 连 WAL 都不写，更不会 fsync，整个调用是彻底的空操作。B8.2 起的
+// Manager.flusher 就栽在这里，导致 mem 档实际上从不 fsync，全集群断电后
+// 稳定丢失尾部若干条已确认消息（B11-OPEN-1）。
+//
+// 为什么用 LogData 而不是写一个真键：LogData 只进 WAL，不进 memtable、
+// 不进 sstable、不被索引，因此 5Hz 的周期屏障不会污染键空间、不产生
+// compaction 压力、也不影响任何扫描路径——恰好是「只要 fsync、不要数据」
+// 的语义。
+//
+// 也不走 ApplyWith：屏障不是一次 apply，计进 OnApplyObserve 会把这条
+// 恒定的空提交掺进 fsync 延迟直方图，污染写路径的延迟分布。
+//
+// 为什么这里绕开 Batch 类型直接用 s.db 不算破坏「Apply 是唯一写入口」：
+// LogData 不进 memtable/sstable，不产生任何键值可见性变化，因此它不是
+// 一次写，是一次刷盘。集群层在 Apply/ApplyAsync 处拦截批次做 raft 复制
+// 的前提（本文件类型注释）不受影响——屏障没有任何东西需要被复制。
+func (s *Store) SyncWAL() error {
+	b := s.db.NewBatch()
+	if err := b.LogData([]byte(walBarrier), nil); err != nil {
+		b.Close()
+		return fmt.Errorf("store SyncWAL 组装屏障: %w", err)
+	}
+	if err := b.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("store SyncWAL: %w", err)
+	}
+	return b.Close()
+}
+
 // Apply 原子提交批次并按配置刷盘。这是唯一写入口（见类型注释）。
 //
 // 成功时批次由 Apply 关闭并回收到 Pebble 内存池；调用方不再拥有此批次。

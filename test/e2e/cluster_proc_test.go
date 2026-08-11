@@ -38,6 +38,10 @@ type procCluster struct {
 	// cfgPaths 与 handles 同序：重启时原样复用（同一份配置 + 同一个数据
 	// 目录，节点身份不变，这正是「重启自愈」要验证的路径）
 	cfgPaths []string
+	// env 是逐节点附加的环境变量（形如 "K=V"），随进程重启保持。
+	// 场景用例用它注入 SQ_BOOTGEN_OVERRIDE 来模拟「机器重启过」——
+	// 进程级 e2e 起的是真 broker 进程，注不进 Go 函数，只能走环境变量。
+	env [][]string
 	peaks    *memPeakSampler
 }
 
@@ -63,6 +67,7 @@ func startProcCluster(t *testing.T, n int, mutate ...func(*config.Config)) *proc
 		dirs:     make([]string, n),
 		cfgs:     make([]*config.Config, n),
 		cfgPaths: make([]string, n),
+		env:      make([][]string, n),
 	}
 	for i := 0; i < n; i++ {
 		pc.dirs[i] = t.TempDir()
@@ -96,6 +101,9 @@ func (pc *procCluster) spawn(t *testing.T, i int, endpoint string) *brokerHandle
 		t.Fatalf("打开节点 %d 日志文件失败: %v", i+1, err)
 	}
 	cmd := exec.Command(brokerBinary, "-config", pc.cfgPaths[i])
+	if len(pc.env[i]) > 0 {
+		cmd.Env = append(os.Environ(), pc.env[i]...)
+	}
 	cmd.Stdout = logFile
 	cmd.Stderr = logFile
 	if err := cmd.Start(); err != nil {
@@ -122,6 +130,11 @@ func (pc *procCluster) multi() string {
 
 // endpointOf 返回第 i 个节点（0-based）的 gRPC 地址。
 func (pc *procCluster) endpointOf(i int) string { return pc.handles[i].endpoint }
+
+// setEnv 给第 i 个节点追加环境变量，下次 spawn 生效（重启后保持）。
+func (pc *procCluster) setEnv(i int, kv ...string) {
+	pc.env[i] = append(pc.env[i], kv...)
+}
 
 // endpoints 返回全部节点地址（0-based 同序）。
 func (pc *procCluster) endpoints() []string {
@@ -193,6 +206,10 @@ func (pc *procCluster) awaitExit(t *testing.T, i int, how string) {
 //
 // 注意：ready 判定沿用 waitBrokerReady（gRPC 可用即算就绪）；集群档的
 // 「已追上多数派」由用例自己的对账断言承担，harness 不越俎代庖。
+//
+// 只适用于「多数派仍存活」的单点重启：ready 判定依赖 waitMetaLeader 先过，
+// 而选主要 quorum——全集群停机后的整批重启请用 restartAll，逐台 restart 会
+// 在第一个节点上死锁（详见 restartAll 注释）。
 func (pc *procCluster) restart(t *testing.T, i int) {
 	t.Helper()
 	if pc.handles[i].cmd.Process != nil {
@@ -202,6 +219,32 @@ func (pc *procCluster) restart(t *testing.T, i int) {
 	pc.handles[i] = pc.spawn(t, i, ep)
 	waitBrokerReady(t, ep, pc.handles[i].waitDone, pc.handles[i].logPath)
 	t.Logf("节点 %d 已重启就绪 pid=%d", i+1, pc.handles[i].cmd.Process.Pid)
+}
+
+// restartAll 整批原地重启全部节点：先全部起进程、再逐个等就绪。
+//
+// 与 restart 的区别：全集群停机（进程全崩／真掉电后上电）后**必须先把进程
+// 全起来、再逐个等就绪**——ready 判定依赖 waitMetaLeader，而 raft 选举要
+// quorum；首个节点起来时是 1 of 3，选不出 leader，gRPC 监听不会出现。逐台
+// restart 会在第一个节点上等满 brokerStartTimeout 然后 Fatal（用例红在
+// harness 上，和被测行为无关）。restartAll 让三个进程几乎同时起，第二、三
+// 个节点一就绪多数派立刻成型、选举随即收敛。与 startProcCluster 的装配序
+// 是同一个道理（见该函数注释）。
+func (pc *procCluster) restartAll(t *testing.T) {
+	t.Helper()
+	for i := range pc.handles {
+		if pc.handles[i].cmd.Process != nil {
+			t.Fatalf("节点 %d 仍在运行，restartAll 前必须先 kill/stopGraceful", i+1)
+		}
+	}
+	for i := range pc.handles {
+		ep := pc.handles[i].endpoint
+		pc.handles[i] = pc.spawn(t, i, ep)
+	}
+	for i := range pc.handles {
+		waitBrokerReady(t, pc.handles[i].endpoint, pc.handles[i].waitDone, pc.handles[i].logPath)
+		t.Logf("节点 %d 已重启就绪 pid=%d", i+1, pc.handles[i].cmd.Process.Pid)
+	}
 }
 
 // pause SIGSTOP 第 i 个节点（假死：进程还在、端口还占着，但不再响应

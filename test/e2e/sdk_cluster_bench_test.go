@@ -46,7 +46,6 @@ import (
 	"time"
 
 	rmq "github.com/apache/rocketmq-clients/golang/v5"
-	"github.com/apache/rocketmq-clients/golang/v5/credentials"
 
 	"github.com/xushixin/sq/internal/config"
 )
@@ -54,33 +53,9 @@ import (
 // benchMaxProducers 是 producer 池上限（见 runSendLoad 注释）。
 const benchMaxProducers = 32
 
-// newBenchProducer 构造一个带集群凭据的 Producer，启动失败时重试。
-//
-// 为什么要重试：SDK 的 startUp 会做一次 QueryRoute + telemetry 握手，
-// 在负载机上偶发 protobuf size mismatch（golang/protobuf#1609——客户端
-// 侧并发缺陷，与 broker 无关）。基准跑在压满的机器上，一次客户端抖动
-// 不该让整轮测量作废；重试仍失败才判失败，那才是真的连不上。
-func newBenchProducer(t *testing.T, endpoint, topic string) rmq.Producer {
-	t.Helper()
-	var last error
-	for attempt := 1; attempt <= 3; attempt++ {
-		p, err := rmq.NewProducer(&rmq.Config{
-			Endpoint:    endpoint,
-			Credentials: &credentials.SessionCredentials{AccessKey: clusterAK, AccessSecret: clusterSK},
-		}, rmq.WithTopics(topic))
-		if err == nil {
-			if err = p.Start(); err == nil {
-				return p
-			}
-			_ = p.GracefulStop()
-		}
-		last = err
-		t.Logf("producer 启动第 %d 次失败（将重试）: %v", attempt, err)
-		time.Sleep(time.Duration(attempt) * 500 * time.Millisecond)
-	}
-	t.Fatalf("producer 连续 3 次启动失败: %v", last)
-	return nil
-}
+// 基准的 Producer 构造直接用 newClusterProducer（见 sdk_cluster_test.go）：
+// 它已经带「重建 + 重试」的启动保护，与基准这里原本自带的那份逐行等价。
+// 保留两份的唯一后果是同一个 SDK 缺陷要在两处各修一次，所以合成一处。
 
 // benchResult 一个档位的测量结果。
 type benchResult struct {
@@ -169,7 +144,7 @@ func runSendLoad(t *testing.T, endpoint, topic string, conc, total, bodyBytes in
 	}
 	producers := make([]rmq.Producer, nProd)
 	for i := 0; i < nProd; i++ {
-		producers[i] = newBenchProducer(t, endpoint, topic)
+		producers[i] = newClusterProducer(t, endpoint, topic)
 	}
 	defer func() {
 		for _, p := range producers {
@@ -298,7 +273,7 @@ func TestClusterWriteThroughput(t *testing.T) {
 	}
 	t.Run("standalone", func(t *testing.T) {
 		// 单机档也带同一套凭据：集群配置带 credentials，而 runSendLoad 的
-		// newBenchProducer 恒带凭据——两侧凭据一致才是同一条被测路径
+		// newClusterProducer 恒带凭据——两侧凭据一致才是同一条被测路径
 		endpoint := startBroker(t, func(c *config.Config) {
 			c.DefaultQueueNums = uint32(queues)
 			c.DiskWatermarkPercent = 0

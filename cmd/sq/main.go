@@ -5,9 +5,11 @@
 //   - 单机/集群二选一装配复制层：cfg.ClusterEnabled()==false 时走
 //     Standalone + StandaloneRouter + StaticRouteView（v1 逐字节行为）；
 //     集群档按下方装配序组装 cluster.Manager 并注入全部复制后端
-//   - 不干净关机（ErrUncleanShutdown）的无人值守自愈：打日志留痕后
-//     cluster.Rejoin 清空数据目录以 learner 重入——拒启等人工介入违背
-//     高可用初衷，破坏性动作的补偿是日志
+//   - 不干净关机的分级恢复（B10 + B11）：能证明本地日志完好时（机器世代
+//     未变，或 quorum-fsync 档）直接以原身份从本地日志恢复；证明不了时
+//     走 cluster.Rejoin——**先求集群接纳、拿到接纳才清空数据目录**，
+//     求不到接纳则数据分毫不动、进程拒启，并在日志里给出
+//     `sq recover --grant` 的签字出口
 //
 // 边界：只做装配与启停，不含业务逻辑；退出码非 0 表示启动失败。
 package main
@@ -50,6 +52,15 @@ import (
 )
 
 func main() {
+	// 子命令分流：只认第一个位置参数，其余一律走原有的 run()。
+	// 这样 `sq -config x.yaml` 与既有 systemd 单元完全不受影响。
+	if len(os.Args) > 1 && os.Args[1] == "recover" {
+		if err := runRecover(os.Args[2:]); err != nil {
+			slog.Error("recover 失败", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 	if err := run(); err != nil {
 		slog.Error("sq 启动失败", "err", err)
 		os.Exit(1)

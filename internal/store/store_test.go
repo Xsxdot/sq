@@ -16,6 +16,9 @@ import (
 	"log/slog"
 	"sync"
 	"testing"
+
+	"github.com/cockroachdb/pebble/v2"
+	"github.com/cockroachdb/pebble/v2/vfs"
 )
 
 func openTestStore(t *testing.T, dir string) *Store {
@@ -334,5 +337,71 @@ func TestNewBatchFromReprOwnsCopy(t *testing.T) {
 	v, ok, err := st.Get([]byte("k1"))
 	if err != nil || !ok || string(v) != "v1" {
 		t.Fatalf("Get 应读到原始值 v1，got %q ok=%v err=%v", v, ok, err)
+	}
+}
+
+// TestSyncWALPersistsNoSyncWrites 断电语义测试：NoSync 写完之后调一次
+// SyncWAL，模拟掉电（丢弃一切未 fsync 的字节）后数据必须一条不少。
+//
+// 这条用例是 mem 档「周期刷盘」这一整套持久性承诺的地基。此前 flusher 用
+// 「空批次 + pebble.Sync」实现，而 Pebble 的 commitPipeline.Commit 开头就是
+// `if b.Empty() { return nil }`——空批次根本不进 WAL、更不 fsync，周期刷盘
+// 是彻底的空操作，mem 档实际上从不 fsync。用 vfs.NewCrashableMem 的
+// CrashClone（零值配置 = 只保留已 fsync 的字节）能把这个洞钉死在单测里。
+func TestSyncWALPersistsNoSyncWrites(t *testing.T) {
+	const n = 200
+
+	// 写入 n 条 NoSync，然后按 barrier 参数决定是否做一次 WAL 屏障，
+	// 最后取崩溃克隆重开，返回幸存条数。
+	survivorsAfterCrash := func(t *testing.T, barrier bool) int {
+		t.Helper()
+		fs := vfs.NewCrashableMem()
+		db, err := pebble.Open("/db", &pebble.Options{FS: fs})
+		if err != nil {
+			t.Fatalf("打开 pebble 失败: %v", err)
+		}
+		s := &Store{db: db, sync: false, logger: slog.Default()}
+		for i := 0; i < n; i++ {
+			b := s.NewBatch()
+			if err := b.Set([]byte(fmt.Sprintf("k%06d", i)), []byte("v")); err != nil {
+				t.Fatalf("组装批次失败: %v", err)
+			}
+			if err := s.ApplyWith(b, false); err != nil {
+				t.Fatalf("NoSync 提交失败: %v", err)
+			}
+		}
+		if barrier {
+			if err := s.SyncWAL(); err != nil {
+				t.Fatalf("SyncWAL 失败: %v", err)
+			}
+		}
+		// 掉电：克隆只保留已 fsync 的字节；原库不再使用，直接丢弃
+		crashed := fs.CrashClone(vfs.CrashCloneCfg{})
+		_ = db.Close()
+
+		db2, err := pebble.Open("/db", &pebble.Options{FS: crashed})
+		if err != nil {
+			t.Fatalf("崩溃后重开 pebble 失败: %v", err)
+		}
+		defer db2.Close()
+		s2 := &Store{db: db2, sync: false, logger: slog.Default()}
+		got := 0
+		for i := 0; i < n; i++ {
+			if _, ok, err := s2.Get([]byte(fmt.Sprintf("k%06d", i))); err != nil {
+				t.Fatalf("崩溃后读取失败: %v", err)
+			} else if ok {
+				got++
+			}
+		}
+		return got
+	}
+
+	if got := survivorsAfterCrash(t, true); got != n {
+		t.Fatalf("SyncWAL 之后掉电，幸存 %d 条，要求 %d 条一条不少", got, n)
+	}
+	// 反向对照：不加屏障必须真的会丢，否则上面那条断言是被 Pebble 的
+	// 自发刷盘蒙对的，证明不了 SyncWAL 起了作用。
+	if got := survivorsAfterCrash(t, false); got == n {
+		t.Fatalf("无屏障时也一条不丢（%d 条），本用例失去判别力——请检查写入量是否够撑过一个 WAL block", got)
 	}
 }
