@@ -7,9 +7,6 @@
 //   - 处理掉电导致的 torn tail（仅末段合法）与非末段真损坏（拒绝启动）
 //
 // 边界：
-//   - 本 task 只实现单段版本；段轮转与按段回收（TruncateTo）留给 Task 4，
-//     本文件只声明并维护轮转所需字段（segMax/lastHS/activeSize），不实现
-//     轮转逻辑
 //   - 不提供随机读接口：raft 侧读日志走 MemoryStorage 双记账（spec §3）
 package seglog
 
@@ -38,12 +35,26 @@ type Log struct {
 	lg         *slog.Logger
 	active     *os.File          // 当前活动段（始终打开，Append 的写入目标）
 	activeSeq  uint64            // 活动段序号
-	activeSize int64             // 活动段当前字节数（轮转判定，Task 4 用）
+	activeSize int64             // 活动段当前字节数（轮转判定：>= segMaxBytes 触发）
 	lastIndex  uint64            // 日志尾 index；0 = 空日志
-	lastHS     *raftpb.HardState // 最新已写 HardState（轮转补写用，Task 4）
-	segMax     map[uint64]uint64 // 已关闭段号 → 段内最大 entry index（回收判定，Task 4）
-	buf        []byte            // Append 的帧组装缓冲（复用减分配）
+	lastHS     *raftpb.HardState // 最新已写 HardState（轮转时补写进新段首条）
+	// segMax 已关闭段号 → 该段曾经写入过的段内最大 entry index（回收判定：
+	// TruncateTo(upto) 删除 max<=upto 的段）。该值只在段刚关闭时写入一次，
+	// 此后只增不减——若关闭后发生跨段冲突重写（新领导者的写入起点落在这
+	// 个已关闭段覆盖的 index 范围内，但物理条目已经写到更晚的段），这里
+	// 记录的值会偏高（stale-high），但绝不会偏低。TruncateTo 用 max<=upto
+	// 判定可删，偏高只会让该段回收得更晚，不会在段内仍有活条目时误删——
+	// 见 TruncateTo 函数注释。
+	segMax map[uint64]uint64
+	buf    []byte // Append 的帧组装缓冲（复用减分配）
 }
+
+// segMaxBytes 单段字节数上限，Append 后据此判定是否轮转到下一段。
+//
+// 声明为包内变量而非常量：测试需要把它调小（如 64 字节），让小数据量的
+// 用例也能稳定触发跨段场景（轮转、HS 补写、TruncateTo）；生产环境不修改，
+// 保持默认的 64MiB。
+var segMaxBytes int64 = 64 << 20
 
 // segName 段文件名：8 位十进制序号，字典序 = 数值序。
 func segName(seq uint64) string { return fmt.Sprintf("%08d.seg", seq) }
@@ -90,6 +101,8 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 		}
 
 		off := 0
+	scan: // 供内层 switch-case 里的 break 精确跳出本段扫描（plain break 在
+		// switch 内只会跳出 switch，需要带标签才能跳出这层 for）
 		for off < len(data) {
 			typ, payload, n, ferr := readFrame(data[off:])
 			if ferr != nil {
@@ -130,8 +143,7 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 					lg.Warn("seglog: 末段 entry 解码失败，按 torn 截断到好帧边界",
 						"segment", name, "goodOffset", off, "discardedBytes", discarded)
 					tornInfo = name
-					off = len(data) // 跳出外层循环
-					goto doneSeg
+					break scan // 文件已物理截断到 off，不能再按 len(data) 继续扫描
 				}
 				idx := e.GetIndex()
 				// 后写的赢：新条目 index <= 当前已知 lastIndex，说明发生了
@@ -147,6 +159,12 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 				}
 				ents = append(ents, &e)
 				lastIndex = idx
+				// 段内最大 entry index：随着本段扫描推进单调覆盖写入，最终
+				// 落在「本段物理上最后一条 entry 帧」的 index。若本段内部
+				// 也发生过换届冲突重写（同段内先写 7..10 又写 7'），最终值
+				// 就是冲突后幸存的那条（7），天然与上面的 ents 截断结果一致，
+				// 不会偏高。跨段冲突（重写发生在更晚的段）不会回头修正本段
+				// 已经落定的值——那种情况下这里会偏高，见 segMax 字段注释。
 				segMax[seq] = idx
 			case recHardState:
 				var h raftpb.HardState
@@ -162,15 +180,13 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 					lg.Warn("seglog: 末段 hardstate 解码失败，按 torn 截断到好帧边界",
 						"segment", name, "goodOffset", off, "discardedBytes", discarded)
 					tornInfo = name
-					off = len(data)
-					goto doneSeg
+					break scan // 文件已物理截断到 off，不能再按 len(data) 继续扫描
 				}
 				// 后写的赢：同一轮或跨轮写入的 HardState 以最后一条为准。
 				hs = &h
 			}
 			off += n
 		}
-	doneSeg:
 	}
 
 	// 确定活动段：无任何段时创建 00000001.seg；否则续用最后一段。
@@ -265,7 +281,6 @@ func (l *Log) Append(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) erro
 			return fmt.Errorf("seglog: 编码 hardstate 失败: %w", err)
 		}
 		l.buf = appendFrame(l.buf, recHardState, payload)
-		l.lastHS = hs
 	}
 	for _, e := range ents {
 		payload, err := proto.Marshal(e)
@@ -283,6 +298,15 @@ func (l *Log) Append(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) erro
 		l.activeSize += int64(n)
 	}
 
+	// 只有 Write 成功之后才更新内存态：lastHS/lastIndex 必须与「已经落进
+	// 文件」的内容保持一致。若上面提前 return 了错误，这两个字段维持失败
+	// 前的旧值——但按 fail-stop 契约，Append 一旦返回错误，调用方就不应
+	// 该再信任、继续复用这个 Log 实例（本层不重试，文件写入偏移状态已经
+	// 不可信），该终止就终止、要恢复就走重新 Open 扫描，而不是指望这里的
+	// 字段还准确。
+	if hs != nil {
+		l.lastHS = hs
+	}
 	if len(ents) > 0 {
 		l.lastIndex = ents[len(ents)-1].GetIndex()
 	}
@@ -292,6 +316,82 @@ func (l *Log) Append(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) erro
 			return fmt.Errorf("seglog: fsync 活动段 %s 失败: %w", segName(l.activeSeq), err)
 		}
 	}
+
+	return l.maybeRotate()
+}
+
+// maybeRotate 在活动段达到 segMaxBytes 阈值时轮转到下一段。调用方须持有
+// l.mu（本方法只在 Append 尾部被调用一次，不单独加锁）。
+//
+// 轮转步骤：旧段 fsync → 关闭旧段 → 记录旧段的段内最大 entry index（回收
+// 判定用）→ 创建新段 → 若存在最新 HardState，立即补写一份到新段首条。
+func (l *Log) maybeRotate() error {
+	if l.activeSize < segMaxBytes {
+		return nil
+	}
+
+	oldSeq := l.activeSeq
+	oldBytes := l.activeSize
+
+	// 轮转屏障：旧段必须先 fsync 落盘、再关闭，然后才允许开新段。这样
+	// 一来，一旦发生掉电，可能出现 torn tail（部分帧未落盘）的段永远
+	// 只会是「当前活动段」，也就是全部段里的最后一段——Open 扫描时「非
+	// 末段坏帧 = 真损坏，拒绝启动」的判定前提才成立。如果不设这道屏障，
+	// 旧段可能带着未 fsync 的尾部就被认定「已关闭」，重启后一扫描就会
+	// 命中「非末段损坏」直接拒绝启动。
+	if err := l.active.Sync(); err != nil {
+		return fmt.Errorf("seglog: 轮转前 fsync 旧段 %s 失败: %w", segName(oldSeq), err)
+	}
+	if err := l.active.Close(); err != nil {
+		return fmt.Errorf("seglog: 轮转关闭旧段 %s 失败: %w", segName(oldSeq), err)
+	}
+	// 旧段已经物理关闭：先置空，避免 Close 成功但下面开新段失败时，
+	// l.active 仍指着一个已关闭的文件句柄——那样后续 Append/Sync 走到
+	// Write/Sync 会得到一个含糊的「文件已关闭」I/O 错误，不如让「已关闭，
+	// 拒绝 Append」这个明确的 fail-stop 信号直接生效。
+	l.active = nil
+
+	// 记录旧段的段内最大 entry index，供 TruncateTo 判定该段是否整段可
+	// 删。这里取的是「轮转发生时」的 l.lastIndex，即旧段关闭前实际写入
+	// 过的最后一条 entry index——本进程生命周期内此后只增不减，不存在
+	// 更晚才发现「其实这段还有更大 index」的情况。但如果关闭之后，Raft
+	// 侧发生跨段的换届冲突重写（新写入的起始 index 落在这个已关闭段的
+	// 范围内，但物理条目已经写进了更晚的段），这里记录的值就会偏高
+	// （stale-high）：TruncateTo 的删除条件是 max<=upto，偏高只会让该段
+	// 回收得更晚，绝不会在段内仍有活条目时把它删掉——因为该值从不会被
+	// 回退修正为更小的数，也就不存在偏低、误删活数据的方向。
+	l.segMax[oldSeq] = l.lastIndex
+
+	newSeq := oldSeq + 1
+	newPath := filepath.Join(l.dir, segName(newSeq))
+	f, err := os.OpenFile(newPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	if err != nil {
+		return fmt.Errorf("seglog: 轮转创建新段 %s 失败: %w", segName(newSeq), err)
+	}
+	l.active = f
+	l.activeSeq = newSeq
+	l.activeSize = 0
+
+	// HS 补写：把最新 HardState 立即写入新段首条帧。原因是 TruncateTo
+	// 按段整段删除，如果最新 HS 只存在于某个旧段里，那个旧段一旦被回收，
+	// 重启就再也读不到 HardState 了。让每次轮转都把「当时已知的最新 HS」
+	// 带一份到新段，保证「最新 HS 一定在最新（未回收）的段里」这个不变式
+	// 始终成立，回收多老的旧段都不影响 HS 的可恢复性。
+	if l.lastHS != nil {
+		payload, merr := proto.Marshal(l.lastHS)
+		if merr != nil {
+			return fmt.Errorf("seglog: 轮转补写 hardstate 编码失败: %w", merr)
+		}
+		frame := appendFrame(nil, recHardState, payload)
+		n, werr := l.active.Write(frame)
+		if werr != nil {
+			return fmt.Errorf("seglog: 轮转补写 hardstate 写入新段 %s 失败: %w", segName(newSeq), werr)
+		}
+		l.activeSize += int64(n)
+	}
+
+	l.lg.Info("seglog: 段轮转完成",
+		"oldSegment", oldSeq, "oldSegmentBytes", oldBytes, "newSegment", newSeq)
 	return nil
 }
 
@@ -321,6 +421,51 @@ func (l *Log) Close() error {
 	l.active = nil
 	if err != nil {
 		return fmt.Errorf("seglog: 关闭活动段 %s 失败: %w", segName(l.activeSeq), err)
+	}
+	return nil
+}
+
+// TruncateTo 按段回收：删除「已关闭且段内最大 entry index <= upto」的段
+// 文件，用于状态机快照/anchor 推进后释放旧日志占用的磁盘空间。
+//
+// 只删整段、不做段内部分截断——粒度足够（每段默认 64MiB，快照周期通常
+// 远小于其覆盖的日志量），避免了部分截断需要重写文件的复杂度。
+//
+// 安全性：
+//   - 只从 segMax（已关闭段的登记表）里选段，active 段永不在此列，因此
+//     正在被 Append 写入的段不会被删——不存在删除时另一端仍在写的竞态。
+//   - segMax 记录的值可能偏高（stale-high，见字段注释），偏高只会让某个
+//     段该被回收的时候还没到判定条件，绝不会造成「段里还有活条目却被
+//     删掉」——该值的偏差方向天然安全。
+//   - HS-only 段（从未写过 entry，segMax 缺省 0）在 upto>=0 时一样可以
+//     被回收：轮转补写机制保证了任意时刻更新的段都带着当时最新的 HS 副本，
+//     删掉旧的 HS-only 段不会丢失唯一的 HardState 记录。
+func (l *Log) TruncateTo(upto uint64) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+
+	var (
+		deleted    []uint64
+		freedBytes int64
+	)
+	for seq, max := range l.segMax {
+		if max > upto {
+			continue
+		}
+		path := filepath.Join(l.dir, segName(seq))
+		if fi, statErr := os.Stat(path); statErr == nil {
+			freedBytes += fi.Size()
+		}
+		if err := os.Remove(path); err != nil {
+			return fmt.Errorf("seglog: 回收段 %s 失败: %w", segName(seq), err)
+		}
+		delete(l.segMax, seq)
+		deleted = append(deleted, seq)
+	}
+
+	if len(deleted) > 0 {
+		l.lg.Info("seglog: 段回收完成",
+			"dir", l.dir, "upto", upto, "deletedSegments", deleted, "freedBytes", freedBytes)
 	}
 	return nil
 }

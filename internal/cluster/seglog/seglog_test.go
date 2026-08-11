@@ -152,3 +152,89 @@ func mustMarshalEntry(t *testing.T, e *raftpb.Entry) []byte {
 	}
 	return b
 }
+
+func TestRotationCarriesHardStateAndRecovers(t *testing.T) {
+	old := segMaxBytes
+	// 逼近零：每轮 Append 后都轮转。实测本仓库 raftpb 版本下，一条
+	// hs(3,1,0)+ent(...,"a") 帧合计 31B，第二轮 ent(...,"b") 再加 16B，
+	// 累计 47B；brief 原文给的 64 反而刚好卡在两轮总量之上，永远不触发
+	// 轮转（已用独立探针测试验证）。改用 40，落在 (31,47] 区间内，两轮
+	// 内必定触发轮转，且不影响后面的断言逻辑。
+	segMaxBytes = 40
+	defer func() { segMaxBytes = old }()
+	dir := t.TempDir()
+	l, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append(hs(3, 1, 0), []*raftpb.Entry{ent(1, 3, "a")}, false); err != nil {
+		t.Fatal(err)
+	}
+	// 这轮无 HS：轮转后的新段必须自带上一轮 HS 的补写副本
+	if err := l.Append(nil, []*raftpb.Entry{ent(2, 3, "b")}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	// 至少轮转出两段
+	segs, _ := filepath.Glob(filepath.Join(dir, "*.seg"))
+	if len(segs) < 2 {
+		t.Fatalf("段数 = %d; want ≥2（segMaxBytes=%d 应触发轮转）", len(segs), segMaxBytes)
+	}
+	// 删掉第一段模拟截断回收后，HS 仍能从后段恢复（新段首条补写的意义）
+	if err := os.Remove(segs[0]); err != nil {
+		t.Fatal(err)
+	}
+	_, gotHS, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotHS.GetTerm() != 3 {
+		t.Fatalf("删首段后 HS.Term = %d; want 3（轮转补写保住最新 HS）", gotHS.GetTerm())
+	}
+}
+
+func TestTruncateToDeletesOnlyClosedCoveredSegments(t *testing.T) {
+	old := segMaxBytes
+	// 同上：ent(i,1,"x") 每条帧实测 16B。brief 原文的 64 会让轮转发生在
+	// 第 4 条之后（4*16=64），此时段 1 的 max=4，TruncateTo(3) 找不到
+	// max<=3 的已关闭段可删,断言必挂。改用 40，落在 (32,48] 区间，轮转
+	// 发生在第 3 条之后（3*16=48），段 1 的 max=3 恰好可被 upto=3 回收。
+	segMaxBytes = 40
+	defer func() { segMaxBytes = old }()
+	dir := t.TempDir()
+	l, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := uint64(1); i <= 5; i++ {
+		if err := l.Append(nil, []*raftpb.Entry{ent(i, 1, "x")}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	before, _ := filepath.Glob(filepath.Join(dir, "*.seg"))
+	if err := l.TruncateTo(3); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := filepath.Glob(filepath.Join(dir, "*.seg"))
+	if len(after) >= len(before) {
+		t.Fatalf("TruncateTo(3) 未删任何段: before=%d after=%d", len(before), len(after))
+	}
+	// 回收后重开：条目 4..5 必须还在（active 段与未覆盖段不删）
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, _, gotEnts, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(gotEnts) == 0 || gotEnts[len(gotEnts)-1].GetIndex() != 5 {
+		t.Fatalf("回收后日志尾丢失: %+v", gotEnts)
+	}
+	for _, e := range gotEnts {
+		if e.GetIndex() > 3 {
+			continue
+		}
+	}
+}
