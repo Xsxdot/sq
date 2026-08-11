@@ -332,3 +332,44 @@ func TestForceLocalRecoverBumpsTermAndConsumesPermit(t *testing.T) {
 		t.Fatal("许可在 ForceLocalRecover 之后仍然存在——一次性许可必须被消费掉，否则下次不干净关机会被静默复用")
 	}
 }
+
+// TestPersistSurvivesReopenViaSeglog Persist 后重建 raftStore（模拟重启）
+// 能读回同样内容——seglog 路径的端到端 roundtrip。
+func TestPersistSurvivesReopenViaSeglog(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	term, vote, commit := uint64(2), uint64(1), uint64(1)
+	hs := &raftpb.HardState{Term: &term, Vote: &vote, Commit: &commit}
+	idx, trm, typ := uint64(1), uint64(2), raftpb.EntryNormal
+	if err := rs.Persist(1, hs, []*raftpb.Entry{{Index: &idx, Term: &trm, Type: &typ, Data: []byte("x")}}, true); err != nil {
+		t.Fatal(err)
+	}
+	rs.CloseLogs()
+	rs2 := newRaftStore(st, testSlog(t))
+	gotHS, gotEnts, _, err := rs2.Load(1)
+	if err != nil || gotHS.GetTerm() != 2 || len(gotEnts) != 1 || string(gotEnts[0].Data) != "x" {
+		t.Fatalf("重开读回 = %v,%v,%v; want term=2, 1 条目", gotHS, gotEnts, err)
+	}
+}
+
+// TestLoadFallsBackToLegacyKeys Pebble 里有旧日志键族（迁移前形态）时
+// Load 走 legacy 只读回退——恢复判定命令在迁移前必须能读到旧状态。
+func TestLoadFallsBackToLegacyKeys(t *testing.T) {
+	st := openClusterTestStore(t)
+	// 手工写旧键族（模拟旧版本留下的盘）
+	b := st.NewBatch()
+	term := uint64(5)
+	hsData, _ := proto.Marshal(&raftpb.HardState{Term: &term})
+	_ = b.Set(hsKey(2), hsData)
+	idx, trm := uint64(7), uint64(5)
+	entData, _ := proto.Marshal(&raftpb.Entry{Index: &idx, Term: &trm, Data: []byte("legacy")})
+	_ = b.Set(entKey(2, 7), entData)
+	if err := st.ApplyWith(b, true); err != nil {
+		t.Fatal(err)
+	}
+	rs := newRaftStore(st, testSlog(t))
+	gotHS, gotEnts, _, err := rs.Load(2)
+	if err != nil || gotHS.GetTerm() != 5 || len(gotEnts) != 1 || string(gotEnts[0].Data) != "legacy" {
+		t.Fatalf("legacy 回退读回 = %v,%v,%v; want term=5 + 1 条 legacy", gotHS, gotEnts, err)
+	}
+}
