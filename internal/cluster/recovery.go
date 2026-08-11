@@ -27,6 +27,7 @@ import (
 	"time"
 
 	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/raftpb"
 
 	"github.com/xushixin/sq/internal/store"
 )
@@ -72,7 +73,7 @@ func (p recoveryPath) String() string {
 // 区分开，否则两次都读不到会比较相等，被误判成「机器没重启过」。
 type recoveryInput struct {
 	Clean   bool    // 干净关机标记是否存在
-	HasRaft bool    // 盘上是否已有 raft 状态（任一组 HardState 或 applied 非零）
+	HasRaft bool    // 盘上是否已有 raft 状态（任一组：legacy HardState / applied 非零 / seglog 有非空段文件）
 	Mode    AckMode // 确认档位
 
 	GenNow        string // 本机当前机器世代
@@ -171,11 +172,16 @@ type RecoveryReport struct {
 //
 // 返回：报告与错误。
 //
-// 注意：本函数**只读**——不消费干净关机标记、不写机器世代、不动任何键。
-// 判定复用 decideRecovery，与 NewManager 同源，因此命令与进程给出的结论
-// 恒等一致（见本文件头注释）。
+// 注意：本函数**只读**——不消费干净关机标记、不写机器世代、不动任何键，
+// 也**不会凭空创建 seglog 的目录与段文件**（各组现场一律走 inspectGroupState
+// 采集，理由见该函数注释）。判定复用 decideRecovery，与 NewManager 同源，
+// 因此命令与进程给出的结论恒等一致（见本文件头注释）。
 func InspectRecovery(st *store.Store, dataGroups uint32, mode AckMode, bootGen BootGenFunc, lg *slog.Logger) (RecoveryReport, error) {
 	rs := newRaftStore(st, lg)
+	// 采集期间可能为「盘上确有段文件」的组打开过 seglog 句柄（见
+	// inspectGroupState）。命令是一次性进程，但 InspectRecovery 也被
+	// 单测反复调用，不关就是每组泄一个 fd——一次性入口更要自己收口。
+	defer rs.CloseLogs()
 	// 只探标记在不在，不消费它——消费是 NewManager 的副作用，命令不能替它做
 	_, hasClean, err := st.Get([]byte(cleanShutdownKey))
 	if err != nil {
@@ -194,7 +200,7 @@ func InspectRecovery(st *store.Store, dataGroups uint32, mode AckMode, bootGen B
 	hasRaft := false
 	groups := make([]GroupReport, 0, dataGroups+1)
 	for g := uint32(0); g <= dataGroups; g++ {
-		hs, ents, snapMeta, err := rs.Load(g)
+		hs, ents, snapMeta, hasSeg, err := inspectGroupState(rs, g)
 		if err != nil {
 			return RecoveryReport{}, err
 		}
@@ -211,7 +217,13 @@ func InspectRecovery(st *store.Store, dataGroups uint32, mode AckMode, bootGen B
 			gr.LastIndex = ents[n-1].GetIndex()
 			gr.LastTerm = ents[n-1].GetTerm()
 		}
-		if applied != 0 || !raft.IsEmptyHardState(hs) {
+		// 三支取或，逐字对齐 manager.go 的 diskHasRaftState：applied 非零、
+		// HardState 非空（legacy 盘从 Pebble 读到的那份）、组段目录里有
+		// 非空段文件。第三支不能省——HardState 的物理归宿已经迁到 seglog，
+		// 一个只写过条目、HardState 本轮无变更、applied 还是 0 的 follower
+		// 在前两支下会被判成「从未参与过集群」，于是命令报 fresh、进程报
+		// ErrUncleanShutdown，正是文件头注释里明令禁止的那种分歧。
+		if applied != 0 || !raft.IsEmptyHardState(hs) || hasSeg {
 			hasRaft = true
 		}
 		groups = append(groups, gr)
@@ -232,6 +244,61 @@ func InspectRecovery(st *store.Store, dataGroups uint32, mode AckMode, bootGen B
 		HasPermit: permitOK, PermitGen: permit.Gen,
 		Groups: groups,
 	}, nil
+}
+
+// inspectGroupState 只读地采集一组的现场：HardState、条目、快照锚点，
+// 外加「盘上是否已有非空段文件」这一位（供 hasRaft 的第三支判定）。
+//
+// 返回：hs（恒非 nil）、ents（可为空）、snapMeta（从未截断时为 nil）、
+// hasSeg、err。
+//
+// 为什么不能直接调 rs.Load（这正是被修掉的缺陷）：
+//
+//	Load 对已迁移的组会走 getLog → seglog.Open，而 Open 里有
+//	MkdirAll + OpenFile(O_CREATE)。对一个**从未写过日志**的组，这一下
+//	就在盘上凭空造出 raftlog/<g>/00000001.seg（0 字节）。一次只读诊断
+//	因此会改变磁盘状态，并且改变的恰恰是「这台节点是不是全新的」这个
+//	判定的输入——`sq recover` 跑一遍，全新节点就再也起不来了。
+//
+// 因此分三支，只有第三支才允许打开文件：
+//   - legacyPending：组还没迁移，loadLegacy 纯读 Pebble 键，零副作用；
+//   - 无非空段文件：直接返回空日志形态，**碰都不碰**那个目录；
+//   - 有非空段文件：允许 getLog/Load 打开。此时唯一可能的写盘动作是
+//     seglog.Open 对末段 torn tail 的物理截断——它确实是一次 mutation，
+//     但可以接受：(1) 只可能发生在已经存在真实日志内容的组上，不会像
+//     0 字节段文件那样把「全新」翻成「曾参与集群」；(2) 截断到好帧
+//     边界是语义保持的——被丢弃的字节本来就是掉电写了一半、任何读者
+//     都无法解释的残帧，下一次正常启动的 Open 也会做同样的事；
+//     (3) 幂等——截干净之后再跑多少次 InspectRecovery 都不会再动它。
+//     换句话说，这里放行的不是「诊断改了盘」，而是「诊断提前做了下次
+//     启动必然会做、且结果唯一的那一步」。句柄由调用方 CloseLogs 收口。
+func inspectGroupState(rs *raftStore, g uint32) (*raftpb.HardState, []*raftpb.Entry, *raftpb.SnapshotMetadata, bool, error) {
+	pending, err := rs.legacyPending(g)
+	if err != nil {
+		return nil, nil, nil, false, err
+	}
+	if pending {
+		hs, ents, snapMeta, err := rs.loadLegacy(g)
+		return hs, ents, snapMeta, false, err
+	}
+
+	hasSeg, err := groupHasSegFiles(rs.st.Dir(), g)
+	if err != nil {
+		return nil, nil, nil, false, fmt.Errorf("cluster: 探测组 %d 的段文件: %w", g, err)
+	}
+	if !hasSeg {
+		// 空日志形态：与 Load 对「从未持久化过」的组的返回值等价，只是
+		// 全程没有 MkdirAll/O_CREATE。锚点仍要读——它在 Pebble 里，读它
+		// 没有副作用，而报告里的「快照锚点」一列要靠它。
+		snapMeta, _, err := rs.LoadSnapMeta(g)
+		if err != nil {
+			return nil, nil, nil, false, fmt.Errorf("cluster: 读组 %d 快照元数据: %w", g, err)
+		}
+		return &raftpb.HardState{}, nil, snapMeta, false, nil
+	}
+
+	hs, ents, snapMeta, err := rs.Load(g)
+	return hs, ents, snapMeta, true, err
 }
 
 // GrantRecoverPermit 写入一次性本地恢复许可，绑定当前机器世代。

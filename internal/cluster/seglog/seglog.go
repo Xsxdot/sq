@@ -63,6 +63,57 @@ func segName(seq uint64) string { return fmt.Sprintf("%08d.seg", seq) }
 // segSuffix 段文件名后缀：完整格式为 8 位数字 + segSuffix。
 const segSuffix = ".seg"
 
+// syncDir fsync 一个目录，把「目录项本身」刷到盘上。
+//
+// 为什么需要它（POSIX 语义，不是保险起见）：fsync(file) 只保证文件的
+// **内容**落盘，不保证「这个文件名出现在它的父目录里」这件事落盘。
+// 掉电后完全可能出现「段文件的数据块都在，但目录里查不到这个名字」——
+// 对我们来说等价于整个日志凭空消失。因此每创建一个新的段文件（或新的
+// 段目录），都必须补一次父目录的 fsync。Pebble 建 WAL/SST、etcd 建 WAL
+// 段都是同款做法。
+//
+// 删除方向不需要这道保险：目录项没落盘只意味着文件"复活"，多出来的旧
+// 段会被下次 Open 正常扫描或再次回收，不丢数据（见 TruncateTo）。
+func syncDir(path string) error {
+	d, err := os.Open(path)
+	if err != nil {
+		return fmt.Errorf("seglog: 打开目录 %s 以 fsync 失败: %w", path, err)
+	}
+	if err := d.Sync(); err != nil {
+		d.Close()
+		return fmt.Errorf("seglog: fsync 目录 %s 失败: %w", path, err)
+	}
+	if err := d.Close(); err != nil {
+		return fmt.Errorf("seglog: 关闭目录句柄 %s 失败: %w", path, err)
+	}
+	return nil
+}
+
+// mkdirAllSync 等价于 os.MkdirAll，但每新建一级目录都会 fsync 它的父
+// 目录，让新目录的目录项本身也具备掉电存活能力。
+//
+// 逐级递归而不是"建完再 sync 一次"：MkdirAll 可能一口气创建 raftlog/
+// 与 raftlog/<g> 两级，只 sync 最后一级的话，raftlog 这个名字在数据
+// 目录里仍可能是未落盘的——掉电后连同它下面所有段文件一起消失。
+func mkdirAllSync(dir string) error {
+	if fi, err := os.Stat(dir); err == nil {
+		if !fi.IsDir() {
+			return fmt.Errorf("seglog: %s 已存在且不是目录", dir)
+		}
+		return nil // 已存在：目录项此前必已由创建者 sync 过，无需重复
+	}
+	parent := filepath.Dir(dir)
+	if parent != dir { // 递归终止于根目录（Dir("/") == "/"）
+		if err := mkdirAllSync(parent); err != nil {
+			return err
+		}
+	}
+	if err := os.Mkdir(dir, 0o755); err != nil && !os.IsExist(err) {
+		return fmt.Errorf("seglog: 创建目录 %s 失败: %w", dir, err)
+	}
+	return syncDir(parent)
+}
+
 // Open 打开（或创建）dir 下的组日志：按序扫描全部段、恢复日志状态、
 // 打开末段续写。
 //
@@ -75,8 +126,8 @@ const segSuffix = ".seg"
 // 注意：末段的 torn tail（掉电正常形态）在此被物理截断到好帧边界后
 // 继续——绝不静默保留坏字节，否则续写会接在坏帧后面永远读不回。
 func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry, error) {
-	if err := os.MkdirAll(dir, 0o755); err != nil {
-		return nil, nil, nil, fmt.Errorf("seglog: 创建目录 %s 失败: %w", dir, err)
+	if err := mkdirAllSync(dir); err != nil {
+		return nil, nil, nil, err
 	}
 
 	seqs, err := scanSegSeqs(dir)
@@ -207,9 +258,25 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 		activeSeq = seqs[len(seqs)-1]
 	}
 	activePath := filepath.Join(dir, segName(activeSeq))
+	// len(seqs)==0 ⇒ 这一行 O_CREATE 会**新建**首段文件；否则只是续用已
+	// 存在的末段，不产生新目录项。
+	createdFirstSeg := len(seqs) == 0
 	f, err := os.OpenFile(activePath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("seglog: 打开活动段 %s 失败: %w", segName(activeSeq), err)
+	}
+	if createdFirstSeg {
+		// 首段的目录项必须在这里就落盘，不能等到有人 Append+fsync 文件内容。
+		// 承重场景是一次性迁移（raftstore.migrateLog）：③ Persist→Append
+		// (sync=true) 只 fsync 了段文件本身，④ 随后用 Pebble Sync 批次删掉
+		// legacy 键。若首段的目录项还没落盘就在这个窗口掉电，重启后 legacy
+		// 键已经没了、段文件也查不到——整组 raft 日志永久丢失。migrateLog
+		// 走的正是 getLog → 本函数这条链，所以这道 fsync 必须在 Open 里，
+		// 而不是留给调用方补。
+		if err := syncDir(dir); err != nil {
+			f.Close()
+			return nil, nil, nil, err
+		}
 	}
 	fi, err := f.Stat()
 	if err != nil {
@@ -373,6 +440,15 @@ func (l *Log) maybeRotate() error {
 	f, err := os.OpenFile(newPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
 	if err != nil {
 		return fmt.Errorf("seglog: 轮转创建新段 %s 失败: %w", segName(newSeq), err)
+	}
+	// 新段的目录项立刻落盘，且必须早于本函数末尾授予旧段回收资格那一步：
+	// 一旦旧段进了 segMax，TruncateTo 随时可以把它删掉，届时新段就是这组
+	// 日志的唯一载体。若新段的名字此刻还没进目录，掉电后会出现「旧段被
+	// 删、新段查不到」——永久数据丢失。fsync(file) 保证不了目录项，
+	// 见 syncDir 的注释。
+	if err := syncDir(l.dir); err != nil {
+		f.Close()
+		return err
 	}
 	l.active = f
 	l.activeSeq = newSeq

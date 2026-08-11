@@ -36,9 +36,7 @@ import (
 	"log/slog"
 	"net"
 	"os"
-	"path/filepath"
 	"sort"
-	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -825,12 +823,22 @@ func (m *Manager) diskHasRaftState() (bool, error) {
 	return false, nil
 }
 
-// groupHasSegFiles 判定一组的 seglog 目录下是否存在段文件（*.seg）。
+// groupHasSegFiles 判定一组的 seglog 目录下是否存在**非空**段文件。
 //
 // 目录不存在视为「没有」而非错误——组从未在本进程写过日志时，
 // raftlog/<g> 目录本来就不会被创建（seglog 惰性 MkdirAll）。
+//
+// 为什么必须要求 size > 0（而不是只看 .seg 后缀）：0 字节的段文件里
+// 一条 HardState/Entry 帧都没有，seglog.Open 扫它得到的就是空日志，它
+// 不构成任何「曾参与集群」的证据。而 0 字节段文件恰恰是最容易凭空出现
+// 的东西——seglog.Open 用 O_CREATE 打开活动段，任何一次「打开了但还没
+// 来得及写」（含曾经的只读诊断路径、创建后即掉电）都会留下一个。若按
+// 后缀判定，这个空壳会把一台全新节点永久钉死在
+// ErrUncleanShutdown 上：进程说「你曾参与集群 + 没有干净关机标记」拒启，
+// `sq recover` 却报 fresh、--grant 拒绝写许可，运维手上没有任何出口。
+// 判据必须是「盘上有内容」，不是「盘上有文件名」。
 func groupHasSegFiles(storeDir string, g uint32) (bool, error) {
-	dir := filepath.Join(storeDir, "raftlog", strconv.FormatUint(uint64(g), 10))
+	dir := groupLogDir(storeDir, g)
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -839,7 +847,17 @@ func groupHasSegFiles(storeDir string, g uint32) (bool, error) {
 		return false, err
 	}
 	for _, e := range entries {
-		if !e.IsDir() && strings.HasSuffix(e.Name(), ".seg") {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".seg") {
+			continue
+		}
+		fi, err := e.Info()
+		if err != nil {
+			if os.IsNotExist(err) {
+				continue // 扫描期间被 TruncateTo 回收掉，等价于「没有这个文件」
+			}
+			return false, err
+		}
+		if fi.Size() > 0 {
 			return true, nil
 		}
 	}
@@ -1432,6 +1450,18 @@ func (m *Manager) flusher() {
 			// 锚点引导才能恢复；正序窗口只有「日志超前 FSM」，重放即补。
 			if err := m.rs.SyncLogs(); err != nil {
 				m.lg.Error("后台批量刷盘失败（日志段）", "err", err)
+				// 有意为之的连坐：SyncLogs 只要持续失败（哪怕坏的只是某
+				// 一个组的段文件），SyncWAL 就**全组**再也不会被执行——
+				// 顺序契约不允许「FSM 超前日志」，宁可全体停在旧位点，也
+				// 不能让某些组的 applied 跑到日志前面去。
+				//
+				// 为什么这不会变成静默的数据丢失：活跃组自己有 fail-stop
+				// 兜底——Persist 一失败，该组的 run 循环立即终止，不再确认
+				// 任何新写入。真正被这条连坐拖住的只有「已经不再写入的
+				// 空闲组」：它们的旧数据卡在页缓存里迟迟不落盘，此刻掉电
+				// 就会丢。这个窗口目前只靠上面这行 5Hz 的 Error 日志暴露，
+				// 没有额外的自动处置——按 mem 档「200ms 尾部风险」的既定
+				// 契约，它落在可接受范围内，但它是有意选择，不是疏漏。
 				continue // 日志没刷成就不刷 FSM——保住顺序契约
 			}
 			if err := m.st.SyncWAL(); err != nil {

@@ -130,6 +130,11 @@ type raftStore struct {
 // rd.Entries）交下来的指针，Load 对外返回的也是这份共享指针（未做深拷贝）；
 // 调用方必须把它们当只读数据，不得原地修改——MemoryStorage 只拷贝指针，
 // 不拷贝值。
+//
+// 切片本身（不是元素）则是写时复制的：Persist 做换届回退裁剪时，若真的
+// 裁掉了尾巴，会另分配一条新切片再拼接，绝不在原底层数组上覆盖写。这样
+// 一来，Load 之前返回给调用方的那个切片头即便还被持有，它指向的元素也不
+// 会被后来的 Persist 改掉——见 Persist 里的裁剪代码。
 type logRecovered struct {
 	hs   *raftpb.HardState
 	ents []*raftpb.Entry
@@ -145,15 +150,29 @@ func newRaftStore(st *store.Store, lg *slog.Logger) *raftStore {
 	}
 }
 
+// groupLogDir 返回一组 seglog 段目录的绝对路径：<storeDir>/raftlog/<g>。
+//
+// 唯一的路径推导点：getLog（打开）、wipeLog（删除）与 manager.go 的
+// groupHasSegFiles（探测）三处必须指向同一个目录，各写一遍
+// filepath.Join 迟早会有一处漏改，而这类不一致的表现是「探测说没有、
+// 打开却读到了」——最难查的一类不一致。
+func groupLogDir(storeDir string, g uint32) string {
+	return filepath.Join(storeDir, "raftlog", strconv.FormatUint(uint64(g), 10))
+}
+
 // getLog 惰性打开一组的段日志：首次访问时 seglog.Open 扫描恢复，句柄与
 // 恢复态入缓存；此后直接复用缓存句柄（Open 的扫描成本只承担一次）。
+//
+// 注意：seglog.Open 会 MkdirAll + O_CREATE，因此本方法**有副作用**——
+// 对一个从未写过日志的组调用它，会在盘上留下空目录与 0 字节段文件。
+// 只读路径（InspectRecovery）不得无条件调用，见 inspectGroupState。
 func (r *raftStore) getLog(g uint32) (*seglog.Log, error) {
 	r.logsMu.Lock()
 	defer r.logsMu.Unlock()
 	if l, ok := r.logs[g]; ok {
 		return l, nil
 	}
-	dir := filepath.Join(r.st.Dir(), "raftlog", strconv.FormatUint(uint64(g), 10))
+	dir := groupLogDir(r.st.Dir(), g)
 	l, hs, ents, err := seglog.Open(dir, r.lg)
 	if err != nil {
 		return nil, fmt.Errorf("raftstore 组 %d 打开段日志 %s: %w", g, dir, err)
@@ -184,7 +203,7 @@ func (r *raftStore) wipeLog(g uint32) error {
 			return fmt.Errorf("raftstore wipeLog 组 %d 关闭段日志: %w", g, err)
 		}
 	}
-	dir := filepath.Join(r.st.Dir(), "raftlog", strconv.FormatUint(uint64(g), 10))
+	dir := groupLogDir(r.st.Dir(), g)
 	if err := os.RemoveAll(dir); err != nil {
 		return fmt.Errorf("raftstore wipeLog 组 %d 删除目录 %s: %w", g, dir, err)
 	}
@@ -244,7 +263,19 @@ func (r *raftStore) Persist(g uint32, hs *raftpb.HardState, ents []*raftpb.Entry
 		for cut > 0 && rec.ents[cut-1].GetIndex() >= first {
 			cut--
 		}
-		rec.ents = append(rec.ents[:cut], ents...)
+		if cut < len(rec.ents) {
+			// 真发生了回退裁剪：必须换一条新底层数组，不能 append 回原地。
+			// 原因是 Load 返回的只是切片头的浅拷贝，元素与这里共享——若在
+			// 原数组上从 cut 位置覆盖写，一个已经拿到 [1..10] 的调用方会在
+			// 毫无察觉的情况下看到自己手里的第 8..10 项变成新领导者的条目。
+			// 代价只是换届时的一次分配（低频事件），换掉的是一个只在时序
+			// 巧合下才会显形的隐患。无裁剪的常规追加走下面的 append 原路，
+			// 热路径零额外开销。
+			kept := make([]*raftpb.Entry, cut, cut+len(ents))
+			copy(kept, rec.ents[:cut])
+			rec.ents = kept
+		}
+		rec.ents = append(rec.ents, ents...)
 	}
 	r.logsMu.Unlock()
 	return nil
@@ -254,8 +285,12 @@ func (r *raftStore) Persist(g uint32, hs *raftpb.HardState, ents []*raftpb.Entry
 //
 // 返回：
 //   - hs: 从未持久化过时为空 HardState（raft.IsEmptyHardState 为真）
-//   - ents: 按 index 升序的现存条目；截断过的组不含 ≤ 锚点 index 的
-//     条目（已被 TruncateLog 回收），可能为空
+//   - ents: 按 index 升序的现存条目，可能为空。**不保证**截断过的组
+//     一定不含 ≤ 锚点 index 的条目：本进程内 TruncateLog 之后的 Load
+//     确实读不到它们（内存视图被主动裁到锚点之后），但重启后重新 Open
+//     扫描是按段粒度回收的物理结果，同段内 index ≤ 锚点的条目会照样读
+//     回来。多读回的旧条目是安全方向——MemoryStorage 按快照锚点自行
+//     丢弃，详见 TruncateLog 的注释
 //   - snapMeta: 组的快照元数据（截断锚点）；从未截断过时为 nil
 //   - err: 读取或反序列化失败
 //
