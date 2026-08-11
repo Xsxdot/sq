@@ -1,13 +1,15 @@
-// raftstore.go 提供 raft 日志的共库持久化层：raft 日志与 FSM 数据共用
-// 同一个 store.Store，日志键全部落在 raft/ 前缀下。
+// raftstore.go 提供 raft 日志的共库持久化层。日志条目与 HardState 的
+// 物理归宿是 seglog 分段追加日志（<data_dir>/raftlog/<g>/，Task 5 迁移），
+// 其余元数据（成员表/快照锚点/组数/干净关机标记/机器世代/本地恢复许可）
+// 仍在共库 store.Store 里，键全部落在 raft/ 前缀下，与 FSM 数据同库隔离。
 //
 // 职责：
-//   - 每轮 Ready 的 HardState + Entries 单批原子持久化（Persist）
-//   - 回退覆盖语义：写入新条目后删除更高 index 的旧条目（尾截断），
-//     全部在同一个批内完成——「先写后删尾」之所以成立，正依赖单批原子性：
-//     要么新旧一致整体落盘，要么整体不落，不存在「新条目在、幽灵条目也在」
-//     的半截状态。批内次序本身无所谓（同批内无中间可见性），
-//     删尾必须与写条目同批才是语义关键。
+//   - 每轮 Ready 的 HardState + Entries 单批持久化（Persist，落盘目标是
+//     该组的 seglog 段日志）
+//   - 回退覆盖语义：seglog 是纯追加日志，物理上不做删除；新条目写入后，
+//     旧的更高 index 条目不是被物理删掉，而是在重放/读取时按「后写的赢」
+//     规则从可见结果里裁掉——覆盖语义由「同批物理删除」变成了「读时重放
+//     裁剪」，对调用方完全透明（见 Persist/Load 的注释）
 //   - 成员表的持久化（SaveConfState/LoadConfState）与重启恢复
 //     （Load + 干净关机判定）：成员表优先读持久化值，confStateFromEntries
 //     的日志重放合成仅作为旧数据目录的迁移路径
@@ -18,12 +20,14 @@
 //   - 数据组数契约（EnsureGroups）与干净关机标记（Mark/ConsumeCleanShutdown）
 //
 // 边界：
-//   - 不持有 pebble：一切写经 store 唯一写入口（NewBatch + ApplyWith），
-//     本层没有裸 db 句柄——B2 唯一写入口在集群层同样成立
+//   - 不持有 pebble：元数据的一切写经 store 唯一写入口（NewBatch +
+//     ApplyWith），本层没有裸 db 句柄——B2 唯一写入口在集群层同样成立；
+//     日志条目/HardState 的写入口则是 seglog.Log.Append（同一约束的
+//     seglog 侧对应版本，见 seglog 包）
 //   - applied 的写入两处：普通条目经 FSM apply 批次并进，ConfChange
 //     条目经 SaveConfState 与成员表同批
 //
-// 键布局（共库下以 raft/ 前缀隔离日志区与 FSM 区；键内定长二进制大端，
+// 键布局（共库下以 raft/ 前缀隔离元数据区与 FSM 区；键内定长二进制大端，
 // 保证字节序=数值序，区间扫描天然升序）：
 //
 //	raft/groups                  → uint32 BE 数据组数（首启写入，此后校验）
@@ -35,7 +39,12 @@
 //	                               只在能启动成功的路径上写，拒启分支绝不写）
 //	raft/local_recover_permit    → 一次性本地恢复许可（两行文本：授予时间 /
 //	                               授予时机器世代；由 ForceLocalRecover 消费）
-//	raft/<g>/hs                  → HardState protobuf
+//	raft/<g>/hs                  → 【仅 legacy 回退用】HardState protobuf——
+//	                               迁移前旧数据目录的读回退键；legacyPending
+//	                               命中该键存在时 loadLegacy 才会读它，迁移
+//	                               后的组 HardState 物理归宿是 seglog，
+//	                               Persist 不再写这个键（bumpTermsInto 对
+//	                               未迁移组仍会写它，见其注释）
 //	raft/<g>/conf                → ConfState protobuf（成员表，ConfChange
 //	                               apply 时整表覆盖写，SaveConfState）
 //	raft/<g>/snap                → SnapshotMetadata protobuf（快照锚点，
@@ -43,7 +52,9 @@
 //	raft/<g>/snapinstall         → SnapshotMetadata protobuf（快照安装中
 //	                               标记，先于任何数据写入落盘；存在即上次
 //	                               安装未收口，MarkInstalling/ResetGroupProgress）
-//	raft/<g>/ent/<index 8B BE>   → Entry protobuf
+//	raft/<g>/ent/<index 8B BE>   → 【仅 legacy 回退用】Entry protobuf——
+//	                               迁移前旧数据目录的读回退键，同上；迁移
+//	                               后的组 Entries 物理归宿是 seglog
 //	raft/<g>/applied             → uint64 BE applied index（普通条目经
 //	                               FSM 批次并进，ConfChange 与成员表同批）
 package cluster
@@ -113,6 +124,11 @@ type raftStore struct {
 // Persist 都会原地更新它——不这样做的话，Load 在同一进程内会一直读到
 // open 时刻的陈旧状态，看不见期间发生的 Persist（尤其是换届覆盖，见
 // Persist 的注释）。
+//
+// 别名约定（finding 5）：hs/ents 保留的是调用方（raft 库 rd.HardState/
+// rd.Entries）交下来的指针，Load 对外返回的也是这份共享指针（未做深拷贝）；
+// 调用方必须把它们当只读数据，不得原地修改——MemoryStorage 只拷贝指针，
+// 不拷贝值。
 type logRecovered struct {
 	hs   *raftpb.HardState
 	ents []*raftpb.Entry
@@ -261,10 +277,26 @@ func (r *raftStore) Load(g uint32) (*raftpb.HardState, []*raftpb.Entry, *raftpb.
 	if _, err := r.getLog(g); err != nil { // 惰性 Open；恢复态随之入缓存
 		return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 打开段日志: %w", g, err)
 	}
+
+	// hs 与 ents 必须在同一次持锁区间内一起读出：Persist/TruncateLog 都是
+	// 在持锁期间原地更新 rec.hs/rec.ents 的（见二者的注释），若解锁后才
+	// 分别取用两个字段，会撞上「先取到旧 hs、解锁后被并发 Persist 换成新
+	// ents」这类撕裂读。rec 本身也可能是 nil——getLog 与这里重新加锁取值
+	// 之间，CloseLogs 可能把 recovered 整体替换成一张新的空 map，此时按
+	// 旧组号查到的就是 nil，必须当空日志防御性处理，不能直接解引用。
+	// ents 只做切片头（指针/长度/容量）的浅拷贝：按 logRecovered 的别名
+	// 约定，底层 Entry 元素仍与内部缓存共享指针；浅拷贝拿到的是这份切片
+	// 头在锁内那一刻的快照，之后即便同一组发生新的 Persist/TruncateLog
+	// 重新指向别处，也不会影响调用方已经拿到手的这个切片头。
 	r.logsMu.Lock()
 	rec := r.recovered[g]
+	var hs *raftpb.HardState
+	var ents []*raftpb.Entry
+	if rec != nil {
+		hs = rec.hs
+		ents = rec.ents
+	}
 	r.logsMu.Unlock()
-	hs := rec.hs
 	if hs == nil {
 		hs = &raftpb.HardState{} // 调用方契约：从未持久化过时返回空 HardState 而非 nil
 	}
@@ -276,9 +308,9 @@ func (r *raftStore) Load(g uint32) (*raftpb.HardState, []*raftpb.Entry, *raftpb.
 		return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 读快照元数据: %w", g, err)
 	}
 	// 重启排障的第一行证据：组号、条目数、commit 位、锚点位。
-	r.lg.Debug("raft 日志已读回（seglog）", "g", g, "entries", len(rec.ents),
+	r.lg.Debug("raft 日志已读回（seglog）", "g", g, "entries", len(ents),
 		"commit", hs.GetCommit(), "snap", snapMeta.GetIndex())
-	return hs, rec.ents, snapMeta, nil
+	return hs, ents, snapMeta, nil
 }
 
 // legacyPending 判定一组是否仍停留在迁移前的 Pebble 键族形态：
@@ -632,9 +664,13 @@ func deleteInstallingKey(b *store.Batch, g uint32) error {
 //	raftStore 内存里还缓存着一份 rec.ents——若不在这里同步裁掉
 //	index ≤ upto 的部分，同一进程内「TruncateLog 后紧接着 Load」
 //	（如本方法的调用方 flusher/快照压缩后立即读一次）会继续读到已经
-//	物理删除的旧条目，与「磁盘已经没有它们、重启读不到」的真实状态
-//	相悖。裁剪只影响内存视图，不影响 seglog 的按段回收粒度——真实盘上
-//	仍是整段删除，此处只是让内存缓存跟上盘面事实。
+//	逻辑上不该再可见的旧条目，与「本进程已经声明截断到 upto」的意图
+//	相悖。注意方向不要理解反了：这里是缓存视图主动收窄到锚点之后，
+//	不代表盘面也精确同步到同一粒度——seglog 按整段回收，物理删除的
+//	粒度比这里粗得多，重启后重新 Open 完全可能读回比这里裁剪后更多
+//	的条目（该段里 index ≤ upto 的条目所在段还没被回收）。这是安全
+//	方向：多出来的旧条目会被重放进 MemoryStorage，MemoryStorage 自己
+//	会按快照锚点把 index ≤ upto 的部分丢弃，不会造成状态错误。
 func (r *raftStore) TruncateLog(g uint32, upto uint64) error {
 	meta, ok, err := r.LoadSnapMeta(g)
 	if err != nil {
@@ -940,6 +976,27 @@ func (r *raftStore) LoadRecoverPermit() (recoverPermit, bool, error) {
 // bumpTermsInto，把已经抬过的组再抬一次也不会破坏正确性——真正不可
 // 重复的操作（消费许可）被调用方安排在全部组都抬完之后才做，见
 // ForceLocalRecover。
+//
+// 未迁移组必须写回 legacy hsKey，不能走 r.Persist（review finding 1，
+// 务必读完）：上面那段「改走 Persist/Load」只解决了已迁移组（seglog 是
+// 权威）的问题，但对 legacyPending(g)==true 的组（这组的盘还没跑过
+// Task 7 的迁移步骤，HardState 权威仍在 Pebble 的 hsKey）会引入新坑——
+// r.Load(g) 走 legacyPending 判定确实能读到正确的旧值，可如果紧接着用
+// r.Persist(g, bumped, nil, true) 写回，Persist 无条件写 seglog，完全
+// 不看 legacyPending，于是：①legacyPending 的判定依据（hsKey 是否存在）
+// 完全没被这次写触碰，仍然是 true，②但这组真正的最新 HardState 已经
+// 只存在于 seglog 里、Pebble 的 hsKey 还是抬之前的旧值。后续任何一次
+// Load 都会因为 legacyPending==true 继续走 loadLegacy 读 Pebble，读到
+// 的还是没被抬过的旧 term——这次 bump 白做了，term 不单调，且许可已经
+// 被消费掉，「同任期不二次投票」这条不变量在这组上直接失效。更严重的
+// 是：Task 7 的迁移步骤对未迁移组的处理方式是先 os.RemoveAll 掉 seglog
+// 目录、再以 Pebble 的旧键族为准重新写一份，届时刚才悄悄写进 seglog 的
+// 这份 bump 会被连根拔起。根子在于：迁移前的盘必须整体停留在迁移前
+// 形态，半新半旧（HardState 在 seglog、legacyPending 却仍判定为
+// legacy）不是一个迁移步骤会承认的中间态。因此这里按 legacyPending(g)
+// 显式分流：为 true 时走 pre-Task-5 的写法（marshal + Set(hsKey(g)) +
+// Sync 批次提交，与 loadLegacy 的读路径配对，让整组继续待在「未迁移」
+// 这一种形态里）；为 false 时保持现状，走 r.Persist（seglog 是权威）。
 func (r *raftStore) bumpTermsInto(dataGroups uint32) error {
 	for g := uint32(0); g <= dataGroups; g++ {
 		hs, _, _, err := r.Load(g)
@@ -950,10 +1007,33 @@ func (r *raftStore) bumpTermsInto(dataGroups uint32) error {
 		var noVote uint64
 		commit := hs.GetCommit()
 		bumped := &raftpb.HardState{Term: &newTerm, Vote: &noVote, Commit: &commit}
-		if err := r.Persist(g, bumped, nil, true); err != nil {
-			return fmt.Errorf("组 %d 写 HardState: %w", g, err)
+
+		pending, err := r.legacyPending(g)
+		if err != nil {
+			return fmt.Errorf("组 %d 判定迁移状态: %w", g, err)
 		}
-		r.lg.Error("不干净关机后本地恢复：任期已抬、投票已清", "g", g, "term", newTerm)
+		if pending {
+			// 未迁移组：写回 legacy hsKey，让这组整体停留在迁移前形态
+			// （见上方 doc comment）。与 loadLegacy 的读路径配对——不走
+			// r.Persist，避免污染到 seglog 却又读不到。
+			data, err := proto.Marshal(bumped)
+			if err != nil {
+				return fmt.Errorf("组 %d 编码 HardState: %w", g, err)
+			}
+			b := r.st.NewBatch()
+			if err := b.Set(hsKey(g), data); err != nil {
+				b.Close()
+				return fmt.Errorf("组 %d 写 legacy HardState: %w", g, err)
+			}
+			if err := r.st.ApplyWith(b, true); err != nil {
+				return fmt.Errorf("组 %d 写 legacy HardState: %w", g, err)
+			}
+		} else {
+			if err := r.Persist(g, bumped, nil, true); err != nil {
+				return fmt.Errorf("组 %d 写 HardState: %w", g, err)
+			}
+		}
+		r.lg.Error("不干净关机后本地恢复：任期已抬、投票已清", "g", g, "term", newTerm, "legacy", pending)
 	}
 	return nil
 }

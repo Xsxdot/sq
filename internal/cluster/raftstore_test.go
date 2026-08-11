@@ -333,6 +333,70 @@ func TestForceLocalRecoverBumpsTermAndConsumesPermit(t *testing.T) {
 	}
 }
 
+// TestForceLocalRecoverBumpsLegacyHardStateOnUnmigratedDisk 复现 finding 1：
+// 未迁移磁盘（legacyPending==true，即组的 HardState 仍在 Pebble 的 hsKey
+// 里）上做本地恢复抬任期，bumpTermsInto 若像迁移后的组一样把结果写去
+// seglog，会被 legacyPending（只看 hsKey/entPrefix 是否存在）继续判定为
+// 「未迁移」，此后的 Load 仍旧读 Pebble 里那份没被更新的旧 HardState——
+// 这次 bump 就被静默吞掉，term 卡住不动，「不干净关机后禁止同任期二次
+// 投票」这条不变量在升级重启的场景下失效，许可却已经被消费掉。
+//
+// 断言：bump 后 Load 读到的 term 必须 > 造现场时写入的 9；连续两次
+// bump（各自配一次新许可）term 必须持续单调递增，证明每次都真正生效，
+// 不是恰好第一次巧合读对。
+func TestForceLocalRecoverBumpsLegacyHardStateOnUnmigratedDisk(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	const groups = uint32(0) // 只关心组 0，避免其它组（走 seglog 路径）的噪音
+
+	// 手工写旧键族（模拟旧版本升级重启前、尚未迁移的盘）：hsKey(0) 存在
+	// 即 legacyPending(0) 判定为 true。
+	b := st.NewBatch()
+	term, commit := uint64(9), uint64(3)
+	hsData, err := proto.Marshal(&raftpb.HardState{Term: &term, Commit: &commit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Set(hsKey(0), hsData); err != nil {
+		b.Close()
+		t.Fatal(err)
+	}
+	if err := st.ApplyWith(b, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rs.SaveRecoverPermit(recoverPermit{GrantedAt: "t1", Gen: "gen-b"}); err != nil {
+		t.Fatalf("SaveRecoverPermit: %v", err)
+	}
+	if err := rs.ForceLocalRecover(groups); err != nil {
+		t.Fatalf("ForceLocalRecover: %v", err)
+	}
+	hs, _, _, err := rs.Load(0)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if hs.GetTerm() <= term {
+		t.Fatalf("bump 后 term = %d; want > %d（bump 必须写回未迁移盘的 legacy hsKey，"+
+			"否则被 seglog 路径遮蔽，Load 读不到）", hs.GetTerm(), term)
+	}
+
+	// 再抬一次（新许可），term 必须继续单调递增——证明不是巧合读对一次。
+	prevTerm := hs.GetTerm()
+	if err := rs.SaveRecoverPermit(recoverPermit{GrantedAt: "t2", Gen: "gen-b"}); err != nil {
+		t.Fatalf("SaveRecoverPermit 第二次: %v", err)
+	}
+	if err := rs.ForceLocalRecover(groups); err != nil {
+		t.Fatalf("ForceLocalRecover 第二次: %v", err)
+	}
+	hs2, _, _, err := rs.Load(0)
+	if err != nil {
+		t.Fatalf("Load 第二次: %v", err)
+	}
+	if hs2.GetTerm() <= prevTerm {
+		t.Fatalf("第二次 bump 后 term = %d; want > %d（term 必须持续单调递增）", hs2.GetTerm(), prevTerm)
+	}
+}
+
 // TestPersistSurvivesReopenViaSeglog Persist 后重建 raftStore（模拟重启）
 // 能读回同样内容——seglog 路径的端到端 roundtrip。
 func TestPersistSurvivesReopenViaSeglog(t *testing.T) {
