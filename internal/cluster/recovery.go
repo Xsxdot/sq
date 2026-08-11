@@ -76,10 +76,10 @@ type recoveryInput struct {
 	HasRaft bool    // 盘上是否已有 raft 状态（任一组：legacy HardState / applied 非零 / seglog 有非空段文件）
 	Mode    AckMode // 确认档位
 
-	GenNow        string // 本机当前机器世代
-	GenNowOK      bool   // 当前世代是否可用（读不到时为 false）
-	GenStored     string // 盘上记录的机器世代
-	GenStoredOK   bool   // 盘上是否记录过世代（旧数据目录首次升级时为 false）
+	GenNow      string // 本机当前机器世代
+	GenNowOK    bool   // 当前世代是否可用（读不到时为 false）
+	GenStored   string // 盘上记录的机器世代
+	GenStoredOK bool   // 盘上是否记录过世代（旧数据目录首次升级时为 false）
 
 	PermitGen string // 运维许可绑定的机器世代
 	PermitOK  bool   // 是否存在运维许可
@@ -217,7 +217,9 @@ func InspectRecovery(st *store.Store, dataGroups uint32, mode AckMode, bootGen B
 			gr.LastIndex = ents[n-1].GetIndex()
 			gr.LastTerm = ents[n-1].GetTerm()
 		}
-		// 三支取或，逐字对齐 manager.go 的 diskHasRaftState：applied 非零、
+		// 三支取或，与 manager.go 的 diskHasRaftState 判据语义一致（实现
+		// 形态不同：那边直读盘上键/目录，这边用的是本轮已读回的现场）：
+		// applied 非零、
 		// HardState 非空（legacy 盘从 Pebble 读到的那份）、组段目录里有
 		// 非空段文件。第三支不能省——HardState 的物理归宿已经迁到 seglog，
 		// 一个只写过条目、HardState 本轮无变更、applied 还是 0 的 follower

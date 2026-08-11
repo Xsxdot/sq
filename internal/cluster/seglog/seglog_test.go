@@ -154,14 +154,14 @@ func mustMarshalEntry(t *testing.T, e *raftpb.Entry) []byte {
 }
 
 func TestRotationCarriesHardStateAndRecovers(t *testing.T) {
-	old := segMaxBytes
+	old := SegMaxBytes
 	// 逼近零：每轮 Append 后都轮转。实测本仓库 raftpb 版本下，一条
 	// hs(3,1,0)+ent(...,"a") 帧合计 31B，第二轮 ent(...,"b") 再加 16B，
 	// 累计 47B；brief 原文给的 64 反而刚好卡在两轮总量之上，永远不触发
 	// 轮转（已用独立探针测试验证）。改用 40，落在 (31,47] 区间内，两轮
 	// 内必定触发轮转，且不影响后面的断言逻辑。
-	segMaxBytes = 40
-	defer func() { segMaxBytes = old }()
+	SegMaxBytes = 40
+	defer func() { SegMaxBytes = old }()
 	dir := t.TempDir()
 	l, _, _, err := Open(dir, slog.Default())
 	if err != nil {
@@ -180,7 +180,7 @@ func TestRotationCarriesHardStateAndRecovers(t *testing.T) {
 	// 至少轮转出两段
 	segs, _ := filepath.Glob(filepath.Join(dir, "*.seg"))
 	if len(segs) < 2 {
-		t.Fatalf("段数 = %d; want ≥2（segMaxBytes=%d 应触发轮转）", len(segs), segMaxBytes)
+		t.Fatalf("段数 = %d; want ≥2（SegMaxBytes=%d 应触发轮转）", len(segs), SegMaxBytes)
 	}
 	// 删掉第一段模拟截断回收后，HS 仍能从后段恢复（新段首条补写的意义）
 	if err := os.Remove(segs[0]); err != nil {
@@ -196,13 +196,13 @@ func TestRotationCarriesHardStateAndRecovers(t *testing.T) {
 }
 
 func TestTruncateToDeletesOnlyClosedCoveredSegments(t *testing.T) {
-	old := segMaxBytes
+	old := SegMaxBytes
 	// 同上：ent(i,1,"x") 每条帧实测 16B。brief 原文的 64 会让轮转发生在
 	// 第 4 条之后（4*16=64），此时段 1 的 max=4，TruncateTo(3) 找不到
 	// max<=3 的已关闭段可删,断言必挂。改用 40，落在 (32,48] 区间，轮转
 	// 发生在第 3 条之后（3*16=48），段 1 的 max=3 恰好可被 upto=3 回收。
-	segMaxBytes = 40
-	defer func() { segMaxBytes = old }()
+	SegMaxBytes = 40
+	defer func() { SegMaxBytes = old }()
 	dir := t.TempDir()
 	l, _, _, err := Open(dir, slog.Default())
 	if err != nil {
@@ -245,12 +245,12 @@ func TestTruncateToDeletesOnlyClosedCoveredSegments(t *testing.T) {
 // 里占位，否则这类段永远不会出现在 TruncateTo 遍历的 map 里，变成重启后
 // 再也删不掉的段。
 func TestTruncateToReclaimsHSOnlySegmentAfterReopen(t *testing.T) {
-	old := segMaxBytes
+	old := SegMaxBytes
 	// 单条 hs(1,1,0) 帧实测 15B；阈值设得比它还小，逼着这一轮「只写 HS、
 	// 不带 entry」的 Append 单独触发一次轮转——制造出一个纯 HS、零 entry
 	// 的已关闭段（seg1），正是本测试要覆盖的场景。
-	segMaxBytes = 10
-	defer func() { segMaxBytes = old }()
+	SegMaxBytes = 10
+	defer func() { SegMaxBytes = old }()
 	dir := t.TempDir()
 	l, _, _, err := Open(dir, slog.Default())
 	if err != nil {
@@ -270,7 +270,7 @@ func TestTruncateToReclaimsHSOnlySegmentAfterReopen(t *testing.T) {
 	}
 	before, _ := filepath.Glob(filepath.Join(dir, "*.seg"))
 	if len(before) < 2 {
-		t.Fatalf("段数 = %d; want ≥2（segMaxBytes=%d 应在纯 HS 轮后触发轮转）", len(before), segMaxBytes)
+		t.Fatalf("段数 = %d; want ≥2（SegMaxBytes=%d 应在纯 HS 轮后触发轮转）", len(before), SegMaxBytes)
 	}
 	// 关键步骤：不复用内存里的 l，而是重新 Open——模拟进程重启，验证
 	// segMax 是靠 Open 的扫描重建出来的，不是靠内存里没丢过的状态侥幸

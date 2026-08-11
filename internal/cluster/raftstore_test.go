@@ -14,6 +14,7 @@ import (
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/xushixin/sq/internal/cluster/seglog"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -526,5 +527,95 @@ func TestMigrateLegacyRaftLogToSeglog(t *testing.T) {
 	// 幂等：再迁一次空操作不报错
 	if err := rs2.migrateLog(1); err != nil {
 		t.Fatalf("重复迁移应为空操作: %v", err)
+	}
+}
+
+// TestMigrateLegacyLargeLogInChunks 大体量 legacy 日志（跨多个迁移分块）
+// 迁移后内容零丢失、顺序完整——迁移分块只是内存峰值优化，任何一条
+// 条目丢失或乱序都是迁移缺陷。2500 条 > 2×migrateChunkEntries，保证
+// 至少跨 3 个分块（含最后一个非满块）。
+func TestMigrateLegacyLargeLogInChunks(t *testing.T) {
+	st := openClusterTestStore(t)
+	const total = 2500
+	b := st.NewBatch()
+	term := uint64(7)
+	hsData, _ := proto.Marshal(&raftpb.HardState{Term: &term})
+	if err := b.Set(hsKey(1), hsData); err != nil {
+		t.Fatal(err)
+	}
+	for i := uint64(1); i <= total; i++ {
+		trm := uint64(7)
+		entData, _ := proto.Marshal(&raftpb.Entry{Index: &i, Term: &trm, Data: []byte{byte(i % 251)}})
+		if err := b.Set(entKey(1, i), entData); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.ApplyWith(b, true); err != nil {
+		t.Fatal(err)
+	}
+	rs := newRaftStore(st, testSlog(t))
+	if err := rs.migrateLog(1); err != nil {
+		t.Fatal(err)
+	}
+	// 重开读回：全量条目升序连续，首尾与内容抽查一致
+	rs.CloseLogs()
+	rs2 := newRaftStore(st, testSlog(t))
+	gotHS, gotEnts, _, err := rs2.Load(1)
+	if err != nil || gotHS.GetTerm() != 7 {
+		t.Fatalf("迁移后 Load = %v, %v; want term=7", gotHS, err)
+	}
+	if len(gotEnts) != total {
+		t.Fatalf("迁移后条目数 = %d; want %d", len(gotEnts), total)
+	}
+	for i, e := range gotEnts {
+		want := uint64(i + 1)
+		if e.GetIndex() != want || e.Data[0] != byte(want%251) {
+			t.Fatalf("第 %d 条形态错误: index=%d data=%v; want index=%d data=%d",
+				i, e.GetIndex(), e.Data, want, byte(want%251))
+		}
+	}
+}
+
+// TestTruncateLogReclaimsSegmentsPhysically TruncateLog 在锚点先行守卫下
+// 必须把被覆盖的已关闭段物理删掉——e2e 层因生产段大小（64MiB）永不轮转
+// 只能观测锚点前进，物理回收的证据由本测试在接口层压低 SegMaxBytes 补足。
+func TestTruncateLogReclaimsSegmentsPhysically(t *testing.T) {
+	old := seglog.SegMaxBytes
+	seglog.SegMaxBytes = 64 // 每条 entry 帧即触发轮转，10 条产出多个已关闭段
+	defer func() { seglog.SegMaxBytes = old }()
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	for i := uint64(1); i <= 10; i++ {
+		trm := uint64(1)
+		if err := rs.Persist(1, nil, []*raftpb.Entry{{Index: &i, Term: &trm, Data: []byte("payload")}}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	segDir := filepath.Join(st.Dir(), "raftlog", "1")
+	before, err := os.ReadDir(segDir)
+	if err != nil || len(before) < 3 {
+		t.Fatalf("前置失败：应轮转出至少 3 段，得到 %d, %v", len(before), err)
+	}
+	// 锚点先行：TruncateLog 守卫要求 upto ≤ 锚点
+	idx, trm := uint64(8), uint64(1)
+	if err := rs.SaveSnapMeta(1, &raftpb.SnapshotMetadata{Index: &idx, Term: &trm}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.TruncateLog(1, 8); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadDir(segDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) >= len(before) {
+		t.Fatalf("TruncateLog(8) 未物理删段: before=%d after=%d", len(before), len(after))
+	}
+	// 回收后重启读回：日志尾（index 9、10 及 active 段内容）必须完好
+	rs.CloseLogs()
+	rs2 := newRaftStore(st, testSlog(t))
+	_, gotEnts, _, err := rs2.Load(1)
+	if err != nil || len(gotEnts) == 0 || gotEnts[len(gotEnts)-1].GetIndex() != 10 {
+		t.Fatalf("物理回收后日志尾丢失: %d 条, %v", len(gotEnts), err)
 	}
 }

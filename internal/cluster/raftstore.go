@@ -444,6 +444,11 @@ func (r *raftStore) loadLegacy(g uint32) (*raftpb.HardState, []*raftpb.Entry, *r
 // legacyPending 仍判真，从头①重来一遍——②的 RemoveAll 会把上次写了一半
 // 的 seglog 目录整个清掉，不会出现「迁移了一半的 seglog + 还没删的旧键」
 // 这种需要合并的复杂半态。
+// migrateChunkEntries 迁移分块大小（条目数）。只约束迁移路径的内存峰值，
+// 与段轮转（SegMaxBytes，按字节）无关；1024 条按最大消息体 4MiB 估算
+// 上限约 4GiB，实际消息体远小于上限，典型峰值在几十 MiB 量级。
+const migrateChunkEntries = 1024
+
 func (r *raftStore) migrateLog(g uint32) error {
 	pending, err := r.legacyPending(g)
 	if err != nil {
@@ -466,10 +471,26 @@ func (r *raftStore) migrateLog(g uint32) error {
 		return fmt.Errorf("raftstore migrateLog 组 %d 读旧日志: %w", g, err)
 	}
 
-	// ③ 写入刚清空的新 seglog（Persist 顺带保证 recovered 缓存是最新的，
-	// 见函数注释）。
-	if err := r.Persist(g, hs, ents, true); err != nil {
-		return fmt.Errorf("raftstore migrateLog 组 %d 写入 seglog: %w", g, err)
+	// ③ 分块写入刚清空的新 seglog（Persist 顺带保证 recovered 缓存是最新
+	// 的，见函数注释）。为什么分块：seglog.Append 会把一次调用的全部条目
+	// 组装进单个内存缓冲，迁移是唯一可能一次性拿到全量日志的调用方——
+	// 整块写入会让该缓冲膨胀到整份日志的大小（最坏 = 截断保留窗口内的
+	// 全部消息体）。按块追加把峰值压到块大小；HS 只随首块写一次（帧序
+	// 保证 HS 先于全部条目），只在最后一块 fsync——中途崩溃无妨，④未
+	// 提交则 legacyPending 仍真，重启从①重迁。
+	for i := 0; ; i += migrateChunkEntries {
+		end := min(i+migrateChunkEntries, len(ents))
+		var chunkHS *raftpb.HardState
+		if i == 0 {
+			chunkHS = hs
+		}
+		lastChunk := end == len(ents)
+		if err := r.Persist(g, chunkHS, ents[i:end], lastChunk); err != nil {
+			return fmt.Errorf("raftstore migrateLog 组 %d 写入 seglog（条目 %d..%d）: %w", g, i, end, err)
+		}
+		if lastChunk {
+			break
+		}
 	}
 
 	// ④ 删 legacy 键族，单批 Sync——落盘后 legacyPending 才翻假。

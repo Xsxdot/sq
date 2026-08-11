@@ -35,7 +35,7 @@ type Log struct {
 	lg         *slog.Logger
 	active     *os.File          // 当前活动段（始终打开，Append 的写入目标）
 	activeSeq  uint64            // 活动段序号
-	activeSize int64             // 活动段当前字节数（轮转判定：>= segMaxBytes 触发）
+	activeSize int64             // 活动段当前字节数（轮转判定：>= SegMaxBytes 触发）
 	lastIndex  uint64            // 日志尾 index；0 = 空日志
 	lastHS     *raftpb.HardState // 最新已写 HardState（轮转时补写进新段首条）
 	// segMax 已关闭段号 → 该段的段内最大 entry index（回收判定：
@@ -50,12 +50,12 @@ type Log struct {
 	buf    []byte // Append 的帧组装缓冲（复用减分配）
 }
 
-// segMaxBytes 单段字节数上限，Append 后据此判定是否轮转到下一段。
+// SegMaxBytes 单段字节数上限，Append 后据此判定是否轮转到下一段。
 //
 // 声明为包内变量而非常量：测试需要把它调小（如 64 字节），让小数据量的
 // 用例也能稳定触发跨段场景（轮转、HS 补写、TruncateTo）；生产环境不修改，
 // 保持默认的 64MiB。
-var segMaxBytes int64 = 64 << 20
+var SegMaxBytes int64 = 64 << 20
 
 // segName 段文件名：8 位十进制序号，字典序 = 数值序。
 func segName(seq uint64) string { return fmt.Sprintf("%08d.seg", seq) }
@@ -399,7 +399,7 @@ func (l *Log) Append(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) erro
 	return l.maybeRotate()
 }
 
-// maybeRotate 在活动段达到 segMaxBytes 阈值时轮转到下一段。调用方须持有
+// maybeRotate 在活动段达到 SegMaxBytes 阈值时轮转到下一段。调用方须持有
 // l.mu（本方法只在 Append 尾部被调用一次，不单独加锁）。
 //
 // 轮转步骤：旧段 fsync → 关闭旧段 → 创建新段 → 若存在最新 HardState，立即
@@ -407,7 +407,7 @@ func (l *Log) Append(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) erro
 // 登记进 segMax（授予回收资格）。任何一步失败都提前 return、不登记
 // segMax——旧段在新段真正就绪之前必须保持「不可回收」，见函数末尾注释。
 func (l *Log) maybeRotate() error {
-	if l.activeSize < segMaxBytes {
+	if l.activeSize < SegMaxBytes {
 		return nil
 	}
 
@@ -470,6 +470,15 @@ func (l *Log) maybeRotate() error {
 			return fmt.Errorf("seglog: 轮转补写 hardstate 写入新段 %s 失败: %w", segName(newSeq), werr)
 		}
 		l.activeSize += int64(n)
+		// 补写帧必须立即 fsync，不能等下一次批量刷盘：本函数末尾一旦把旧段
+		// 登记进 segMax，TruncateTo 随时可能删掉旧段——若此刻补写帧还悬在
+		// 页缓存里，「删旧段 + 掉电」的窗口会同时失去新旧两份 HS，重启后
+		// HardState 归零（term/vote 丢失，违反 raft 持久化契约）。普通条目
+		// 帧走 mem 档 NoSync 是因为旧副本还在；HS 补写帧是回收授权的前置，
+		// 持久性要求跟着回收动作走，不跟确认档走。
+		if serr := l.active.Sync(); serr != nil {
+			return fmt.Errorf("seglog: 轮转补写 hardstate fsync 新段 %s 失败: %w", segName(newSeq), serr)
+		}
 	}
 
 	// 回收资格必须在新段完全就绪之后才授予，放在整个轮转流程的最后一步：

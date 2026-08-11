@@ -254,7 +254,7 @@ func TestInspectRecoveryDetectsSeglogOnlyState(t *testing.T) {
 			"hasRaft 缺了 seglog 那一支，与 diskHasRaftState 不同源")
 	}
 
-	// 与进程侧逐字对齐
+	// 进程侧同判据交叉验证（实现独立，结论必须一致）
 	m := &Manager{st: st, rs: newRaftStore(st, testSlog(t)), dataGroups: 1}
 	has, err := m.diskHasRaftState()
 	if err != nil {
