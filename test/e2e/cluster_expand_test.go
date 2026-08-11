@@ -35,6 +35,8 @@ import (
 
 	"github.com/xushixin/sq/internal/cluster"
 	"github.com/xushixin/sq/internal/store"
+	"go.etcd.io/raft/v3/raftpb"
+	"google.golang.org/protobuf/proto"
 )
 
 // 进程内集群节点的监听地址：按 nodeID 记忆化（同一 id 多次调用返回
@@ -99,9 +101,23 @@ func TestExpandStandaloneToThreeNodes(t *testing.T) {
 	//    才判定「日志追齐不可能，只能 MsgSnap」。做法：每组合计提一条
 	//    marker（applied 越过 2×retain 后截断循环才动手，retain=1 需要
 	//    applied≥3），等日志被压到保留量再开始 Join。
+	//
+	//    观测面迁移：raft 日志条目迁到 seglog 后（<data_dir>/raftlog/<g>/
+	//    段文件），Pebble 里的 raft/0/ent/* 键从未存在过——旧 gate
+	//    「countEntKeys(...) <= 2」在这个仓库形态下从 t=0 起恒为真
+	//    （count 恒为 0），Join 会在截断循环真正跑起来之前就抢跑，正是
+	//    本次要修的 e2e 回归根因。改观测锚点 raft/0/snap（SnapshotMetadata
+	//    protobuf，SaveSnapMeta 写入，且只由截断/快照路径写）：它的出现
+	//    就是 truncateOnceWith 已经推进到 SaveSnapMeta 这一步的直接证据，
+	//    与旧观测点是同一竞态剖面——旧 gate 依赖的「ent 键被删」同样发生
+	//    在 SaveSnapMeta 之后、mem.Compact 之前的微秒级窗口里（TruncateLog
+	//    紧跟 SaveSnapMeta），新 gate 只是把「删除」换成了「锚点落盘」
+	//    这个更早、但因果顺序相同的信号。Index>=1 顺带确认截断点已经
+	//    越过了 bootstrap 空条目，不是残留的零值。
 	seedMarkers(t, ctx, seed, 4)
 	waitForMsg(t, 30*time.Second, func() bool {
-		return countEntKeys(t, seed, 0) <= 2
+		meta, ok := groupSnapMeta(t, seed, 0)
+		return ok && meta.GetIndex() >= 1
 	}, "种子日志未在 30s 内被截断压缩（快照触发的前提不成立）")
 
 	// ③ 两个空目录节点 Join。节点 3 的种子把已加入的节点 2 也带上：
@@ -153,11 +169,19 @@ func TestClusterTruncationKeepsLogBounded(t *testing.T) {
 	h := startThreeNodeE2E(t, withRetainEntries(500), withTruncateInterval(2*time.Second))
 	defer h.stopAll()
 	sendClusterMessages(t, h, 5000)
-	// 5000 条写入后仍远小于总量：retain=500 的截断循环（2s 周期）把
-	// 日志键数压在有界区间内，断言留有 6x 余量防慢机器抖动
+	// 观测面迁移：旧断言数 raft/0/ent/* 键，seglog 落地后该前缀在 Pebble
+	// 里从未出现过（日志条目迁到 <data_dir>/raftlog/<g>/ 段文件），count
+	// 恒为 0——「< 3000」不论截断循环是否真的在跑都恒真，测试退化成
+	// no-op。改观测截断锚点 raft/0/snap 的 Index：锚点只在 truncateOnceWith
+	// 推进保留窗口时前移，若 5000 条写入后锚点仍停在 5000-3000=2000 之下，
+	// 说明截断循环没把日志压进 retain=500 的窗口——不可能在日志真的有界
+	// 时都推不过 2000，这条边界比 retain=500 松得多，留了与原断言同等的
+	// 6x 余量防慢机器抖动。（本模块没有解码 seglog 段文件的依赖，锚点
+	// Index 是目前能拿到的、证明力最强的逻辑日志观测面）
 	waitForMsg(t, 60*time.Second, func() bool {
-		return h.countRaftEntries(t, 0) < 3000
-	}, "raft 日志未被截断，键数仍在增长")
+		meta, ok := groupSnapMeta(t, h.nodes[0], 0)
+		return ok && meta.GetIndex() > 5000-3000
+	}, "raft 日志未被截断压缩（快照锚点未推进过界，日志可能无界增长）")
 }
 
 // writeStandaloneMessages 以单机档（无 raft）直写 FSM：topic 元数据 +
@@ -335,21 +359,27 @@ func seedMarkers(t *testing.T, ctx context.Context, seed *cluster.Manager, group
 	}
 }
 
-// countEntKeys 统计指定 manager 上组 g 的 raft 日志条目键数（磁盘现存
-// 日志量的观测面：截断压缩后数量被保留量压住，未截断时随写入增长）。
-func countEntKeys(t *testing.T, m *cluster.Manager, g uint32) int {
+// groupSnapMeta 读取并解码指定 manager 上组 g 的快照锚点
+// （raft/<g>/snap，SnapshotMetadata protobuf）——seglog 落地后日志条目
+// 迁出 Pebble（迁到 <data_dir>/raftlog/<g>/ 段文件），锚点是 e2e 测试
+// 能在这个仓库形态下观测「截断/快照路径已经跑过」的唯一存留观测面
+// （原 countEntKeys 扫的 raft/<g>/ent/* 前缀恒空，已删除）。锚点只由
+// SaveSnapMeta 写（截断循环 truncateOnceWith 或安装快照两条路径），
+// 不存在返回 ok=false。
+func groupSnapMeta(t *testing.T, m *cluster.Manager, g uint32) (*raftpb.SnapshotMetadata, bool) {
 	t.Helper()
-	prefix := []byte(fmt.Sprintf("raft/%d/ent/", g))
-	keys := 0
-	err := m.Store().Scan(prefix, store.PrefixUpperBound(prefix), 0,
-		func(k, v []byte) (bool, error) {
-			keys++
-			return true, nil
-		})
+	data, ok, err := m.Store().Get([]byte(fmt.Sprintf("raft/%d/snap", g)))
 	if err != nil {
-		t.Fatalf("扫描 raft 日志键: %v", err)
+		t.Fatalf("读组 %d 快照锚点: %v", g, err)
 	}
-	return keys
+	if !ok {
+		return nil, false
+	}
+	meta := &raftpb.SnapshotMetadata{}
+	if err := proto.Unmarshal(data, meta); err != nil {
+		t.Fatalf("解码组 %d 快照锚点: %v", g, err)
+	}
+	return meta, true
 }
 
 // clusterOpt 是进程内集群 harness 的 Options 级注入点。
@@ -457,13 +487,6 @@ func (h *e2eCluster) leaderOf(t *testing.T, g uint32) *cluster.Manager {
 	}
 	t.Fatalf("组 %d 在 60s 内未选出 leader", g)
 	return nil
-}
-
-// countRaftEntries 统计节点 1 上组 g 的 raft 日志条目键数（磁盘现存
-// 日志量的观测面：截断后数量被保留量压住，全量时随写入线性增长）。
-func (h *e2eCluster) countRaftEntries(t *testing.T, g uint32) int {
-	t.Helper()
-	return countEntKeys(t, h.nodes[0], g)
 }
 
 // sendMessages 经组 0 的 leader 连续提案 n 个批次（每批一条消息键），

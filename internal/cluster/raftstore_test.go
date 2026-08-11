@@ -7,11 +7,14 @@ package cluster
 
 import (
 	"log/slog"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 
+	"github.com/xushixin/sq/internal/cluster/seglog"
 	"github.com/xushixin/sq/internal/store"
 )
 
@@ -330,5 +333,289 @@ func TestForceLocalRecoverBumpsTermAndConsumesPermit(t *testing.T) {
 	}
 	if _, ok, _ := rs.LoadRecoverPermit(); ok {
 		t.Fatal("许可在 ForceLocalRecover 之后仍然存在——一次性许可必须被消费掉，否则下次不干净关机会被静默复用")
+	}
+}
+
+// TestForceLocalRecoverBumpsLegacyHardStateOnUnmigratedDisk 复现 finding 1：
+// 未迁移磁盘（legacyPending==true，即组的 HardState 仍在 Pebble 的 hsKey
+// 里）上做本地恢复抬任期，bumpTermsInto 若像迁移后的组一样把结果写去
+// seglog，会被 legacyPending（只看 hsKey/entPrefix 是否存在）继续判定为
+// 「未迁移」，此后的 Load 仍旧读 Pebble 里那份没被更新的旧 HardState——
+// 这次 bump 就被静默吞掉，term 卡住不动，「不干净关机后禁止同任期二次
+// 投票」这条不变量在升级重启的场景下失效，许可却已经被消费掉。
+//
+// 断言：bump 后 Load 读到的 term 必须 > 造现场时写入的 9；连续两次
+// bump（各自配一次新许可）term 必须持续单调递增，证明每次都真正生效，
+// 不是恰好第一次巧合读对。
+func TestForceLocalRecoverBumpsLegacyHardStateOnUnmigratedDisk(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	const groups = uint32(0) // 只关心组 0，避免其它组（走 seglog 路径）的噪音
+
+	// 手工写旧键族（模拟旧版本升级重启前、尚未迁移的盘）：hsKey(0) 存在
+	// 即 legacyPending(0) 判定为 true。
+	b := st.NewBatch()
+	term, commit := uint64(9), uint64(3)
+	hsData, err := proto.Marshal(&raftpb.HardState{Term: &term, Commit: &commit})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.Set(hsKey(0), hsData); err != nil {
+		b.Close()
+		t.Fatal(err)
+	}
+	if err := st.ApplyWith(b, true); err != nil {
+		t.Fatal(err)
+	}
+
+	if err := rs.SaveRecoverPermit(recoverPermit{GrantedAt: "t1", Gen: "gen-b"}); err != nil {
+		t.Fatalf("SaveRecoverPermit: %v", err)
+	}
+	if err := rs.ForceLocalRecover(groups); err != nil {
+		t.Fatalf("ForceLocalRecover: %v", err)
+	}
+	hs, _, _, err := rs.Load(0)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if hs.GetTerm() <= term {
+		t.Fatalf("bump 后 term = %d; want > %d（bump 必须写回未迁移盘的 legacy hsKey，"+
+			"否则被 seglog 路径遮蔽，Load 读不到）", hs.GetTerm(), term)
+	}
+
+	// 再抬一次（新许可），term 必须继续单调递增——证明不是巧合读对一次。
+	prevTerm := hs.GetTerm()
+	if err := rs.SaveRecoverPermit(recoverPermit{GrantedAt: "t2", Gen: "gen-b"}); err != nil {
+		t.Fatalf("SaveRecoverPermit 第二次: %v", err)
+	}
+	if err := rs.ForceLocalRecover(groups); err != nil {
+		t.Fatalf("ForceLocalRecover 第二次: %v", err)
+	}
+	hs2, _, _, err := rs.Load(0)
+	if err != nil {
+		t.Fatalf("Load 第二次: %v", err)
+	}
+	if hs2.GetTerm() <= prevTerm {
+		t.Fatalf("第二次 bump 后 term = %d; want > %d（term 必须持续单调递增）", hs2.GetTerm(), prevTerm)
+	}
+}
+
+// TestPersistSurvivesReopenViaSeglog Persist 后重建 raftStore（模拟重启）
+// 能读回同样内容——seglog 路径的端到端 roundtrip。
+func TestPersistSurvivesReopenViaSeglog(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	term, vote, commit := uint64(2), uint64(1), uint64(1)
+	hs := &raftpb.HardState{Term: &term, Vote: &vote, Commit: &commit}
+	idx, trm, typ := uint64(1), uint64(2), raftpb.EntryNormal
+	if err := rs.Persist(1, hs, []*raftpb.Entry{{Index: &idx, Term: &trm, Type: &typ, Data: []byte("x")}}, true); err != nil {
+		t.Fatal(err)
+	}
+	rs.CloseLogs()
+	rs2 := newRaftStore(st, testSlog(t))
+	gotHS, gotEnts, _, err := rs2.Load(1)
+	if err != nil || gotHS.GetTerm() != 2 || len(gotEnts) != 1 || string(gotEnts[0].Data) != "x" {
+		t.Fatalf("重开读回 = %v,%v,%v; want term=2, 1 条目", gotHS, gotEnts, err)
+	}
+}
+
+// TestResetGroupProgressRemovesSeglogDir 组级重置必须把段目录一并删掉
+// ——半截段目录重启会被当作有效日志读回，比脏键更危险。
+func TestResetGroupProgressRemovesSeglogDir(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	idx, trm := uint64(1), uint64(1)
+	if err := rs.Persist(1, nil, []*raftpb.Entry{{Index: &idx, Term: &trm, Data: []byte("x")}}, true); err != nil {
+		t.Fatal(err)
+	}
+	segDir := filepath.Join(st.Dir(), "raftlog", "1")
+	if fis, err := os.ReadDir(segDir); err != nil || len(fis) == 0 {
+		t.Fatalf("前置失败：段目录应有文件: %v", err)
+	}
+	if err := rs.ResetGroupProgress(1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(segDir); !os.IsNotExist(err) {
+		t.Fatalf("重置后段目录应被删除，stat err = %v", err)
+	}
+	// 重置后 Load 必须是空日志形态
+	gotHS, gotEnts, _, err := rs.Load(1)
+	if err != nil || len(gotEnts) != 0 || gotHS.GetTerm() != 0 {
+		t.Fatalf("重置后 Load = %v,%v,%v; want 空", gotHS, gotEnts, err)
+	}
+}
+
+// TestForceLocalRecoverBumpsTermViaSeglog 抬 term 走 seglog 后，重开
+// raftStore 能读回抬高的 term（原 TestForceLocalRecoverBumpsTermAndConsumesPermit
+// 覆盖 Pebble 侧，此测试补 seglog 侧的持久化）。
+func TestForceLocalRecoverBumpsTermViaSeglog(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	term := uint64(4)
+	if err := rs.Persist(0, &raftpb.HardState{Term: &term}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	// 授予许可（ForceLocalRecover 前置；照抄现有 TestForceLocalRecover... 的授予段）
+	if err := rs.SaveRecoverPermit(recoverPermit{GrantedAt: "2026-08-11T00:00:00Z", Gen: "g1"}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.ForceLocalRecover(0); err != nil {
+		t.Fatal(err)
+	}
+	rs.CloseLogs()
+	rs2 := newRaftStore(st, testSlog(t))
+	gotHS, _, _, err := rs2.Load(0)
+	if err != nil || gotHS.GetTerm() <= 4 {
+		t.Fatalf("抬 term 后重开读回 term = %d, %v; want > 4", gotHS.GetTerm(), err)
+	}
+}
+
+// TestLoadFallsBackToLegacyKeys Pebble 里有旧日志键族（迁移前形态）时
+// Load 走 legacy 只读回退——恢复判定命令在迁移前必须能读到旧状态。
+func TestLoadFallsBackToLegacyKeys(t *testing.T) {
+	st := openClusterTestStore(t)
+	// 手工写旧键族（模拟旧版本留下的盘）
+	b := st.NewBatch()
+	term := uint64(5)
+	hsData, _ := proto.Marshal(&raftpb.HardState{Term: &term})
+	_ = b.Set(hsKey(2), hsData)
+	idx, trm := uint64(7), uint64(5)
+	entData, _ := proto.Marshal(&raftpb.Entry{Index: &idx, Term: &trm, Data: []byte("legacy")})
+	_ = b.Set(entKey(2, 7), entData)
+	if err := st.ApplyWith(b, true); err != nil {
+		t.Fatal(err)
+	}
+	rs := newRaftStore(st, testSlog(t))
+	gotHS, gotEnts, _, err := rs.Load(2)
+	if err != nil || gotHS.GetTerm() != 5 || len(gotEnts) != 1 || string(gotEnts[0].Data) != "legacy" {
+		t.Fatalf("legacy 回退读回 = %v,%v,%v; want term=5 + 1 条 legacy", gotHS, gotEnts, err)
+	}
+}
+
+// TestMigrateLegacyRaftLogToSeglog 旧盘（Pebble 日志键族）启动迁移后：
+// seglog 有全部内容、Pebble 旧键清空、再次迁移是空操作（幂等）。
+func TestMigrateLegacyRaftLogToSeglog(t *testing.T) {
+	st := openClusterTestStore(t)
+	// 造旧盘：直接写 Pebble 旧键族（与 TestLoadFallsBackToLegacyKeys 同法）
+	b := st.NewBatch()
+	term := uint64(3)
+	hsData, _ := proto.Marshal(&raftpb.HardState{Term: &term})
+	_ = b.Set(hsKey(1), hsData)
+	for i := uint64(1); i <= 3; i++ {
+		trm := uint64(3)
+		entData, _ := proto.Marshal(&raftpb.Entry{Index: &i, Term: &trm, Data: []byte{byte(i)}})
+		_ = b.Set(entKey(1, i), entData)
+	}
+	if err := st.ApplyWith(b, true); err != nil {
+		t.Fatal(err)
+	}
+	rs := newRaftStore(st, testSlog(t))
+	if err := rs.migrateLog(1); err != nil {
+		t.Fatal(err)
+	}
+	// Pebble 旧键必须清空
+	if _, ok, _ := st.Get(hsKey(1)); ok {
+		t.Fatal("迁移后 Pebble hs 键仍在")
+	}
+	// seglog 读回全部内容
+	rs.CloseLogs()
+	rs2 := newRaftStore(st, testSlog(t))
+	gotHS, gotEnts, _, err := rs2.Load(1)
+	if err != nil || gotHS.GetTerm() != 3 || len(gotEnts) != 3 {
+		t.Fatalf("迁移后 Load = %v, %d 条, %v; want term=3, 3 条", gotHS, len(gotEnts), err)
+	}
+	// 幂等：再迁一次空操作不报错
+	if err := rs2.migrateLog(1); err != nil {
+		t.Fatalf("重复迁移应为空操作: %v", err)
+	}
+}
+
+// TestMigrateLegacyLargeLogInChunks 大体量 legacy 日志（跨多个迁移分块）
+// 迁移后内容零丢失、顺序完整——迁移分块只是内存峰值优化，任何一条
+// 条目丢失或乱序都是迁移缺陷。2500 条 > 2×migrateChunkEntries，保证
+// 至少跨 3 个分块（含最后一个非满块）。
+func TestMigrateLegacyLargeLogInChunks(t *testing.T) {
+	st := openClusterTestStore(t)
+	const total = 2500
+	b := st.NewBatch()
+	term := uint64(7)
+	hsData, _ := proto.Marshal(&raftpb.HardState{Term: &term})
+	if err := b.Set(hsKey(1), hsData); err != nil {
+		t.Fatal(err)
+	}
+	for i := uint64(1); i <= total; i++ {
+		trm := uint64(7)
+		entData, _ := proto.Marshal(&raftpb.Entry{Index: &i, Term: &trm, Data: []byte{byte(i % 251)}})
+		if err := b.Set(entKey(1, i), entData); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := st.ApplyWith(b, true); err != nil {
+		t.Fatal(err)
+	}
+	rs := newRaftStore(st, testSlog(t))
+	if err := rs.migrateLog(1); err != nil {
+		t.Fatal(err)
+	}
+	// 重开读回：全量条目升序连续，首尾与内容抽查一致
+	rs.CloseLogs()
+	rs2 := newRaftStore(st, testSlog(t))
+	gotHS, gotEnts, _, err := rs2.Load(1)
+	if err != nil || gotHS.GetTerm() != 7 {
+		t.Fatalf("迁移后 Load = %v, %v; want term=7", gotHS, err)
+	}
+	if len(gotEnts) != total {
+		t.Fatalf("迁移后条目数 = %d; want %d", len(gotEnts), total)
+	}
+	for i, e := range gotEnts {
+		want := uint64(i + 1)
+		if e.GetIndex() != want || e.Data[0] != byte(want%251) {
+			t.Fatalf("第 %d 条形态错误: index=%d data=%v; want index=%d data=%d",
+				i, e.GetIndex(), e.Data, want, byte(want%251))
+		}
+	}
+}
+
+// TestTruncateLogReclaimsSegmentsPhysically TruncateLog 在锚点先行守卫下
+// 必须把被覆盖的已关闭段物理删掉——e2e 层因生产段大小（64MiB）永不轮转
+// 只能观测锚点前进，物理回收的证据由本测试在接口层压低 SegMaxBytes 补足。
+func TestTruncateLogReclaimsSegmentsPhysically(t *testing.T) {
+	old := seglog.SegMaxBytes
+	seglog.SegMaxBytes = 64 // 每条 entry 帧即触发轮转，10 条产出多个已关闭段
+	defer func() { seglog.SegMaxBytes = old }()
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	for i := uint64(1); i <= 10; i++ {
+		trm := uint64(1)
+		if err := rs.Persist(1, nil, []*raftpb.Entry{{Index: &i, Term: &trm, Data: []byte("payload")}}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	segDir := filepath.Join(st.Dir(), "raftlog", "1")
+	before, err := os.ReadDir(segDir)
+	if err != nil || len(before) < 3 {
+		t.Fatalf("前置失败：应轮转出至少 3 段，得到 %d, %v", len(before), err)
+	}
+	// 锚点先行：TruncateLog 守卫要求 upto ≤ 锚点
+	idx, trm := uint64(8), uint64(1)
+	if err := rs.SaveSnapMeta(1, &raftpb.SnapshotMetadata{Index: &idx, Term: &trm}); err != nil {
+		t.Fatal(err)
+	}
+	if err := rs.TruncateLog(1, 8); err != nil {
+		t.Fatal(err)
+	}
+	after, err := os.ReadDir(segDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(after) >= len(before) {
+		t.Fatalf("TruncateLog(8) 未物理删段: before=%d after=%d", len(before), len(after))
+	}
+	// 回收后重启读回：日志尾（index 9、10 及 active 段内容）必须完好
+	rs.CloseLogs()
+	rs2 := newRaftStore(st, testSlog(t))
+	_, gotEnts, _, err := rs2.Load(1)
+	if err != nil || len(gotEnts) == 0 || gotEnts[len(gotEnts)-1].GetIndex() != 10 {
+		t.Fatalf("物理回收后日志尾丢失: %d 条, %v", len(gotEnts), err)
 	}
 }

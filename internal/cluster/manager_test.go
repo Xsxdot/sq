@@ -72,6 +72,42 @@ func TestGroupForQueueStable(t *testing.T) {
 	}
 }
 
+// TestDiskHasRaftStateDetectsSeglogOnlyState 暴露 Task 5 迁移后的判定
+// 缺口：HardState 的物理归宿已经从 Pebble 的 hsKey 迁到 seglog，一个只
+// 经由 seglog 写过 HardState（未写 legacy hsKey、applied 仍是 0）的组，
+// 在旧判定下会被误判为「从未参与过集群」，绕过不干净关机的裸恢复拦截
+// ——这是一个活的安全回归，不是风格问题。
+func TestDiskHasRaftStateDetectsSeglogOnlyState(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	term := uint64(1)
+	if err := rs.Persist(1, &raftpb.HardState{Term: &term}, nil, true); err != nil {
+		t.Fatal(err)
+	}
+	// 前置核验：Persist 之后确实没有写 legacy hsKey，也没有推进 applied——
+	// 否则旧判定路径会“意外”通过，测试就没有暴露到目标缺口。
+	if _, ok, err := st.Get(hsKey(1)); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatalf("前置失败：Persist 不该写 legacy hsKey(1)，测试假设不成立")
+	}
+	if app, err := rs.Applied(0); err != nil {
+		t.Fatal(err)
+	} else if app != 0 {
+		t.Fatalf("前置失败：applied 应仍为 0，got %d", app)
+	}
+
+	m := &Manager{st: st, rs: rs, dataGroups: 1}
+	has, err := m.diskHasRaftState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has {
+		t.Fatal("diskHasRaftState 应识别出组 1 在 seglog 里的 HardState，返回 true——" +
+			"否则不干净关机的裸恢复拦截会被绕过")
+	}
+}
+
 // TestManagerCleanRestartResumes 单节点集群（成员表只有自己）干净关机后
 // 重启：applied 恢复、数据可读、无 ErrUncleanShutdown。
 func TestManagerCleanRestartResumes(t *testing.T) {

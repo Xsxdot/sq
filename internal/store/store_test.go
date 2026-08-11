@@ -405,3 +405,63 @@ func TestSyncWALPersistsNoSyncWrites(t *testing.T) {
 		t.Fatalf("无屏障时也一条不丢（%d 条），本用例失去判别力——请检查写入量是否够撑过一个 WAL block", got)
 	}
 }
+
+// TestBatchMergeRepr 验证把复制批次字节合并进已有批次：合并后一次提交，
+// 两侧写入都落库。这是集群 apply 合批（一轮 Ready 的多条 CommittedEntries
+// 合成单次引擎提交）的存储层地基。
+//
+// 同时断言合并是值拷贝：合并后篡改源字节不得影响批次内容——集群路径
+// 传入的是 raft 日志条目自身的 Data 缓冲，条目在 MemoryStorage 里长期
+// 存活，任何共享都会重演 NewBatchFromRepr 注释里的日志写花事故。
+func TestBatchMergeRepr(t *testing.T) {
+	st := openTestStore(t, t.TempDir())
+	defer st.Close()
+	src := st.NewBatch()
+	_ = src.Set([]byte("k-merged"), []byte("v-merged"))
+	repr := append([]byte(nil), src.Repr()...)
+	_ = src.Close()
+
+	dst := st.NewBatch()
+	_ = dst.Set([]byte("k-own"), []byte("v-own"))
+	if err := dst.MergeRepr(repr); err != nil {
+		t.Fatalf("MergeRepr: %v", err)
+	}
+	// 篡改源字节：若合并与源共享缓冲，提交出的会是篡改后的内容
+	for i := range repr {
+		repr[i] = 0xEE
+	}
+	if err := st.Apply(dst); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if v, ok, err := st.Get([]byte("k-merged")); err != nil || !ok || string(v) != "v-merged" {
+		t.Fatalf("Get(k-merged) = %q,%v,%v; want v-merged,true,nil", v, ok, err)
+	}
+	if v, ok, err := st.Get([]byte("k-own")); err != nil || !ok || string(v) != "v-own" {
+		t.Fatalf("Get(k-own) = %q,%v,%v; want v-own,true,nil", v, ok, err)
+	}
+}
+
+// TestBatchMergeReprRejectsGarbage 坏字节必须在合并时报错——与
+// NewBatchFromRepr 同边界：复制链路上的损坏在最早的边界被拦下，
+// 不进提交路径。
+func TestBatchMergeReprRejectsGarbage(t *testing.T) {
+	st := openTestStore(t, t.TempDir())
+	defer st.Close()
+	dst := st.NewBatch()
+	defer dst.Close()
+	if err := dst.MergeRepr([]byte("not-a-batch")); err == nil {
+		t.Fatal("坏批次字节应报错，得到 nil")
+	}
+}
+
+// TestStoreDirReturnsOpenDir Dir 必须返回 Open 时的目录——raftStore 靠它
+// 推导 seglog 根目录（raftlog/ 子目录与 Pebble 同住 data_dir，
+// WipeForRejoin 整删 data_dir 时才能一并覆盖）。
+func TestStoreDirReturnsOpenDir(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	defer s.Close()
+	if got := s.Dir(); got != dir {
+		t.Fatalf("Dir() = %q; want %q", got, dir)
+	}
+}

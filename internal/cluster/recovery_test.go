@@ -1,6 +1,8 @@
 package cluster
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 
 	"go.etcd.io/raft/v3/raftpb"
@@ -124,6 +126,142 @@ func TestInspectRecoveryReportsPathAndPermitNeed(t *testing.T) {
 	}
 	if rep2.NeedsPermit {
 		t.Fatal("世代未变时 NeedsPermit 应为 false")
+	}
+}
+
+// TestInspectRecoveryLeavesNoSeglogArtifacts 全新数据目录上跑一次
+// `sq recover`，磁盘必须原样不动。
+//
+// 这条断言守的是三个缺陷连成的死循环：InspectRecovery 逐组 Load →
+// getLog → seglog.Open 会 MkdirAll + O_CREATE，一次只读诊断就给每个组
+// 留下一个 0 字节的 00000001.seg；而 diskHasRaftState 只看 `.seg` 后缀，
+// 于是下次启动这台全新节点会被判成「曾参与集群」→ 不干净关机 →
+// ErrUncleanShutdown 拒启；再跑 `sq recover` 又报 fresh、`--grant` 拒绝
+// 写许可——诊断命令自己造出一个自己解不开的死结。
+func TestInspectRecoveryLeavesNoSeglogArtifacts(t *testing.T) {
+	dir := t.TempDir()
+	st := mustOpenStore(t, dir)
+	rs := newRaftStore(st, testSlog(t))
+	if err := rs.EnsureGroups(3); err != nil {
+		t.Fatalf("EnsureGroups: %v", err)
+	}
+
+	rep, err := InspectRecovery(st, 3, AckQuorumMem, func() (string, error) { return "gen-a", nil }, testSlog(t))
+	if err != nil {
+		t.Fatalf("InspectRecovery: %v", err)
+	}
+	if rep.Path != pathFresh.String() {
+		t.Fatalf("全新数据目录的判定 = %s; want %s", rep.Path, pathFresh.String())
+	}
+
+	raftlogDir := filepath.Join(st.Dir(), "raftlog")
+	if _, err := os.Stat(raftlogDir); !os.IsNotExist(err) {
+		var names []string
+		if fis, rerr := os.ReadDir(raftlogDir); rerr == nil {
+			for _, fi := range fis {
+				names = append(names, fi.Name())
+			}
+		}
+		t.Fatalf("InspectRecovery 在全新数据目录里创建了 %s（子项 %v，stat err=%v）"+
+			"——只读契约被破坏：一次诊断就把节点变成「曾参与集群」", raftlogDir, names, err)
+	}
+
+	// 只读判定必须与进程侧同源：此刻 diskHasRaftState 也应为假
+	m := &Manager{st: st, rs: rs, dataGroups: 3}
+	has, err := m.diskHasRaftState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has {
+		t.Fatal("InspectRecovery 之后 diskHasRaftState 变成了 true——命令与进程结论已经分家")
+	}
+}
+
+// TestDiskHasRaftStateIgnoresEmptySegFile 0 字节段文件不是 raft 状态。
+//
+// 空文件里没有任何一条 HardState/Entry 帧，seglog.Open 扫它得到的是空
+// 日志。把它算作「曾参与集群」，等于让任何一次创建文件失败/被打断的
+// 残留（或上一版 InspectRecovery 留下的诊断产物）永久拒绝掉一个本可以
+// 引导启动的全新节点。判据必须是「有内容」，不是「有文件名」。
+func TestDiskHasRaftStateIgnoresEmptySegFile(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	segDir := filepath.Join(st.Dir(), "raftlog", "1")
+	if err := os.MkdirAll(segDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	f, err := os.Create(filepath.Join(segDir, "00000001.seg"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	m := &Manager{st: st, rs: rs, dataGroups: 1}
+	has, err := m.diskHasRaftState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if has {
+		t.Fatal("raftlog/1 下只有一个 0 字节段文件，diskHasRaftState 必须为 false——" +
+			"否则全新节点会被空文件锁死在 ErrUncleanShutdown 上")
+	}
+}
+
+// TestInspectRecoveryDetectsSeglogOnlyState 只在 seglog 里有条目、既无
+// legacy 键也没推进 applied 的组，InspectRecovery 必须判定为「盘上已有
+// raft 状态」。
+//
+// 与 TestDiskHasRaftStateDetectsSeglogOnlyState 是同一个缺口的两侧：
+// manager.go 的 diskHasRaftState 已经补了 seglog 这一支，recovery.go 的
+// hasRaft 还停在 `applied != 0 || !IsEmptyHardState(hs)`。两处判据不同源，
+// 就会出现「命令说你不用签字、进程说你要签字」——文件头注释里承诺的
+// 恒等一致被破坏。
+func TestInspectRecoveryDetectsSeglogOnlyState(t *testing.T) {
+	dir := t.TempDir()
+	st := mustOpenStore(t, dir)
+	rs := newRaftStore(st, testSlog(t))
+	if err := rs.EnsureGroups(1); err != nil {
+		t.Fatalf("EnsureGroups: %v", err)
+	}
+	// 只写条目、不写 HardState：raft 在 follower 首次收到日志时就是这个
+	// 形态（HardState 可能同轮无变更）。applied 也仍是 0。
+	idx, trm, typ := uint64(1), uint64(1), raftpb.EntryNormal
+	if err := rs.Persist(1, nil, []*raftpb.Entry{{Index: &idx, Term: &trm, Type: &typ, Data: []byte("x")}}, true); err != nil {
+		t.Fatalf("造 seglog 条目: %v", err)
+	}
+	rs.CloseLogs()
+
+	// 前置核验：legacy 键与 applied 都不该命中，否则测试没打到目标缺口
+	if _, ok, err := st.Get(hsKey(1)); err != nil {
+		t.Fatal(err)
+	} else if ok {
+		t.Fatal("前置失败：Persist 不该写 legacy hsKey(1)")
+	}
+	if app, err := rs.Applied(0); err != nil {
+		t.Fatal(err)
+	} else if app != 0 {
+		t.Fatalf("前置失败：applied 应仍为 0，got %d", app)
+	}
+
+	rep, err := InspectRecovery(st, 1, AckQuorumMem, func() (string, error) { return "gen-a", nil }, testSlog(t))
+	if err != nil {
+		t.Fatalf("InspectRecovery: %v", err)
+	}
+	if rep.Path == pathFresh.String() {
+		t.Fatal("组 1 在 seglog 里有真实条目，InspectRecovery 却判成 fresh——" +
+			"hasRaft 缺了 seglog 那一支，与 diskHasRaftState 不同源")
+	}
+
+	// 进程侧同判据交叉验证（实现独立，结论必须一致）
+	m := &Manager{st: st, rs: newRaftStore(st, testSlog(t)), dataGroups: 1}
+	has, err := m.diskHasRaftState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !has {
+		t.Fatal("前置失败：diskHasRaftState 应为 true")
 	}
 }
 

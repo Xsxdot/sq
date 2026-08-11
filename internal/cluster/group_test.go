@@ -296,7 +296,7 @@ func TestLeaderVisibleOnlyAfterHookCompletes(t *testing.T) {
 //     appliedSnap（stableSnapTo + appliedTo）把快照标记为已持久化已
 //     应用，raft 不会重发 MsgSnap——静默续跑 = 内存（MemoryStorage 未
 //     更新）/磁盘（半截数据）/raft（自以为已到快照位点）三方分叉，
-//     永久卡死。panic 让进程死亡、由上层重启接管（与 Persist/applyEntry
+//     永久卡死。panic 让进程死亡、由上层重启接管（与 Persist/applyEntries
 //     同策略）；panic 不写干净关机标记，重启时 Start 判定不干净关机并返回
 //     ErrUncleanShutdown，恢复走整目录 WipeForRejoin + learner 重入
 //     （buildGroup 那条按组清空重来的分支属于「干净关机却留下标记」的
@@ -729,5 +729,149 @@ func TestInstallSnapshotAbortsOnShutdown(t *testing.T) {
 	// 标记仍在盘上：重启由 buildGroup 清空重来
 	if _, ok, err := rs.LoadInstalling(0); err != nil || !ok {
 		t.Fatalf("停机中止后安装中标记必须仍在盘上 ok=%v err=%v", ok, err)
+	}
+}
+
+// normalEntry 构造一条普通条目：Data = [8B 提案者][8B waiter id][batch repr]，
+// repr 是往 st 写单键 key=val 的批次字节。apply 合批测试的共用件。
+func normalEntry(t *testing.T, st *store.Store, idx, proposer, waiterID uint64, key, val string) *raftpb.Entry {
+	t.Helper()
+	b := st.NewBatch()
+	if err := b.Set([]byte(key), []byte(val)); err != nil {
+		t.Fatal(err)
+	}
+	repr := append([]byte(nil), b.Repr()...)
+	if err := b.Close(); err != nil {
+		t.Fatal(err)
+	}
+	data := make([]byte, 16, 16+len(repr))
+	binary.BigEndian.PutUint64(data[:8], proposer)
+	binary.BigEndian.PutUint64(data[8:16], waiterID)
+	data = append(data, repr...)
+	term := uint64(1)
+	return &raftpb.Entry{Index: &idx, Term: &term, Data: data}
+}
+
+// newApplyTestGroup 构造一个不启动 run 循环、不装 raft 节点的组：
+// applyEntries 是纯 FSM 路径，不触碰 rn/inbox，直接调用即可测。
+func newApplyTestGroup(t *testing.T, onApplied func(g uint32, repr []byte)) (*group, *raftStore, *store.Store) {
+	t.Helper()
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	gr := newGroup(0, 1, raft.NewMemoryStorage(), nil, rs, st,
+		func(uint32, []*raftpb.Message) {}, AckQuorumMem, nil, onApplied, testSlog(t))
+	return gr, rs, st
+}
+
+// countApplyCommits 临时接管 store.OnApplyObserve 统计引擎提交次数，
+// 测试结束恢复原值。applyEntries 是同步调用，计数无并发。
+func countApplyCommits(t *testing.T) *int {
+	t.Helper()
+	n := new(int)
+	old := store.OnApplyObserve
+	store.OnApplyObserve = func(time.Duration) { *n++ }
+	t.Cleanup(func() { store.OnApplyObserve = old })
+	return n
+}
+
+// TestApplyEntriesSingleEngineCommit apply 合批的核心承诺：一轮 Ready 的
+// 多条普通条目合成**单次**引擎提交，且每条的 FSM 数据都落库、applied
+// 位点（内存与盘上）推进到最后一条的 index。改回逐条提交会让本测试
+// 的提交计数断言失败。
+func TestApplyEntriesSingleEngineCommit(t *testing.T) {
+	gr, rs, st := newApplyTestGroup(t, nil)
+	commits := countApplyCommits(t)
+	ents := []*raftpb.Entry{
+		normalEntry(t, st, 5, 1, 101, "meta/topic/a", "va"),
+		normalEntry(t, st, 6, 1, 102, "meta/topic/b", "vb"),
+		normalEntry(t, st, 7, 1, 103, "meta/topic/c", "vc"),
+	}
+	gr.applyEntries(ents)
+	if *commits != 1 {
+		t.Fatalf("3 条普通条目产生 %d 次引擎提交，合批要求恰好 1 次", *commits)
+	}
+	for _, k := range []string{"meta/topic/a", "meta/topic/b", "meta/topic/c"} {
+		if _, ok, err := st.Get([]byte(k)); err != nil || !ok {
+			t.Fatalf("合批提交后 Get(%s) = %v,%v; want true,nil", k, ok, err)
+		}
+	}
+	if got := gr.appliedIndex(); got != 7 {
+		t.Fatalf("内存 applied = %d; want 7（最后一条的 index）", got)
+	}
+	if got := mustApplied(t, rs, 0); got != 7 {
+		t.Fatalf("盘上 applied = %d; want 7（与 FSM 数据同批原子）", got)
+	}
+}
+
+// TestApplyEntriesNotifiesWaitersAfterCommit 合批不改 waiter 语义：
+// 本节点提案的每条条目在合批提交后都各自唤醒；别节点提案的条目即使
+// waiter id 撞车也不得唤醒（假成功防线，与逐条路径一致）。
+func TestApplyEntriesNotifiesWaitersAfterCommit(t *testing.T) {
+	gr, _, st := newApplyTestGroup(t, nil)
+	chA, chB, chForeign := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	gr.mu.Lock()
+	gr.propWaiters[201] = chA
+	gr.propWaiters[202] = chB
+	gr.propWaiters[203] = chForeign
+	gr.mu.Unlock()
+	gr.applyEntries([]*raftpb.Entry{
+		normalEntry(t, st, 5, 1, 201, "k/a", "v"),
+		normalEntry(t, st, 6, 1, 202, "k/b", "v"),
+		normalEntry(t, st, 7, 9, 203, "k/c", "v"), // 提案者 9 ≠ selfID 1
+	})
+	for name, ch := range map[string]chan struct{}{"A": chA, "B": chB} {
+		select {
+		case <-ch:
+		default:
+			t.Fatalf("本节点提案 %s 的 waiter 在 applyEntries 返回后未被唤醒", name)
+		}
+	}
+	select {
+	case <-chForeign:
+		t.Fatal("别节点提案的 waiter 被唤醒——跨节点 id 撞车假成功")
+	default:
+	}
+}
+
+// TestApplyEntriesFiresOnAppliedPerEntry 合批不改 OnApplied 钩子粒度：
+// 每条条目的批次载荷各自回调一次、按条目序——meta 缓存重载靠它判定
+// 批次是否触及 meta/ 键族，合并成单次回调会丢判定粒度。
+func TestApplyEntriesFiresOnAppliedPerEntry(t *testing.T) {
+	var got [][]byte
+	var gr *group
+	var st *store.Store
+	gr, _, st = newApplyTestGroup(t, func(g uint32, repr []byte) {
+		got = append(got, append([]byte(nil), repr...))
+	})
+	ents := []*raftpb.Entry{
+		normalEntry(t, st, 5, 1, 301, "k/a", "v"),
+		normalEntry(t, st, 6, 1, 302, "k/b", "v"),
+	}
+	gr.applyEntries(ents)
+	if len(got) != 2 {
+		t.Fatalf("OnApplied 回调 %d 次; want 每条目一次共 2 次", len(got))
+	}
+	for i, ent := range ents {
+		if want := ent.Data[16:]; !strings.HasSuffix(string(got[i]), string(want)) && string(got[i]) != string(want) {
+			t.Fatalf("第 %d 次回调载荷与条目批次字节不符", i)
+		}
+	}
+}
+
+// TestApplyEntriesEmptyEntryAdvancesApplied 空条目（选举产生的 no-op）
+// 没有 FSM 数据：合批路径同样要推进 applied 位点且只提交一次。
+func TestApplyEntriesEmptyEntryAdvancesApplied(t *testing.T) {
+	gr, rs, _ := newApplyTestGroup(t, nil)
+	commits := countApplyCommits(t)
+	idx, term := uint64(3), uint64(1)
+	gr.applyEntries([]*raftpb.Entry{{Index: &idx, Term: &term}})
+	if *commits != 1 {
+		t.Fatalf("空条目产生 %d 次引擎提交; want 1（只写 applied 位点）", *commits)
+	}
+	if got := gr.appliedIndex(); got != 3 {
+		t.Fatalf("内存 applied = %d; want 3", got)
+	}
+	if got := mustApplied(t, rs, 0); got != 3 {
+		t.Fatalf("盘上 applied = %d; want 3", got)
 	}
 }
