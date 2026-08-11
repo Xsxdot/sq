@@ -1,8 +1,65 @@
 # B11-OPEN-1：mem 档本地恢复丢失已确认消息（healthy 阶段尾部）
 
 > 交接物：写给一个没有本文上下文的读者。本文记录 2026-08-11 在 Task 7 e2e 场景用例
-> 实跑中暴露的一条**已确认消息丢失**缺陷，与「静置纪律」的预期不符。根因未定位，
-> 由审核者接手；本文只负责把现象、硬数字、日志原文与已排除的假设交代清楚。
+> 实跑中暴露的一条**已确认消息丢失**缺陷，与「静置纪律」的预期不符。
+>
+> **状态：已定位、已修复、已验证（2026-08-11）。根因见第 0 节；第 1–7 节保留调查
+> 当时的原始现场，其中第 6 节有一条排除结论事后被证明是错的，已就地标注。**
+
+## 0. 根因与修复（结论）
+
+**根因：mem 档的「200ms 周期刷盘」是一个彻底的空操作，mem 档实际上从不 fsync。**
+
+`Manager.flusher()` 每 200ms 执行 `m.st.ApplyWith(m.st.NewBatch(), true)`——提交一个
+**空批次**并带 `pebble.Sync`。而 Pebble 的提交管线开头第一句就是短路：
+
+```go
+// pebble/v2@v2.1.6 commit.go:298
+func (p *commitPipeline) Commit(b *Batch, syncWAL bool, noSyncWait bool) error {
+	if b.Empty() {
+		return nil
+	}
+```
+
+空批次连 WAL 都不写，更不会触发 fsync。叠加 `syncPersist` 在 mem 档恒为 false
+（raft 日志与 HardState 也是 NoSync），**quorum-mem 档在整个运行期一次盘都不刷**，
+落盘完全依赖 Pebble WAL 缓冲写满自发外刷。断电时丢的就是最后那个没写满的
+WAL block——正好是「健康期尾部十几条已确认消息」这个形态。
+
+三个节点丢失条数与内容完全一致，是因为恢复后 raft 会向日志最长的那个节点收敛，
+最终存量 = 各节点持久化前缀的最大值。
+
+**引入时间**：`0c7aa8c`（B8.2，2026-08-08），比 B11 早两天。**B11 是暴露者不是引入者**
+——B11 的场景用例是第一次用「全集群 SIGKILL 后必须零丢失」去压这条路径。
+
+**判据（vfs 层直接数 fsync 调用次数，不再用 WAL 文件大小这种会骗人的代理指标）**：
+
+| 动作 | fsync 增量 |
+|---|---|
+| NoSync 写 1000 条 | 基线 |
+| 空批次 + `pebble.Sync` × 5 拍（旧 flusher 的精确动作） | **0** |
+| `LogData` + `pebble.Sync` × 5 拍（新实现） | **5** |
+| 非空批次 + `pebble.Sync` × 1（对照） | 1 |
+
+**修复**：新增 `store.SyncWAL()`，用 `Batch.LogData` 往批次里塞一条只进 WAL、不进
+memtable/sstable、不被索引的屏障记录，再 `pebble.Sync`。批次因此非空，提交管线不再
+短路，fsync 真正发生；同时不污染键空间、不产生 compaction 压力、不影响任何扫描路径。
+`Manager.flusher()` 改调 `store.SyncWAL()`。
+
+**回归**：`TestSyncWALPersistsNoSyncWrites`（`internal/store`）用 `vfs.NewCrashableMem`
+的 `CrashClone`（只保留已 fsync 的字节）做真掉电语义断言，并带反向对照（不加屏障
+必须真的丢，否则用例失去判别力）。e2e 侧 `TestScenarioFullProcessCrashRecoversLocally`
+新增**存量断言**：断电前后各读一次 `GET /admin/topics/{name}` 的 `queues_detail[].next_offset`
+求和，恢复后不许比断电前少。
+
+**修复前后实测（同一条 e2e 用例）**：
+
+| | kill 前存量 | 恢复后存量 | 对账 |
+|---|---|---|---|
+| 修复前 | 175（三节点一致） | **158（三节点一致，丢 17）** | FAIL，确认集 17 条未消费 |
+| 修复后 | 164（三节点一致） | **164（三节点一致，零丢失）** | PASS，确认 328 条全量消费 |
+
+---
 
 ## 1. 现象
 
@@ -134,9 +191,15 @@ go test -tags e2e ./ -run 'TestScenarioRebootedMemNeedsPermit' -v -timeout 30m
 
 ## 6. 已排除的假设
 
-1. **「静置纪律无效 / flusher 没跑」**：fsync 档同条件不丢、mem 档丢——若静置普遍
+1. ~~**「静置纪律无效 / flusher 没跑」**：fsync 档同条件不丢、mem 档丢——若静置普遍
    无效，fsync 档也会丢。且同用例内非尾部消息全部存活，只有健康期尾部（kill 前
-   最后 ~300ms 写入）丢失，与「整段 WAL 没刷」的形态不符。
+   最后 ~300ms 写入）丢失，与「整段 WAL 没刷」的形态不符。~~
+   **这条排除是错的，真正的根因就在这里（见第 0 节）。** 两条推理都不成立：
+   (a) fsync 档不丢是因为它靠 `raft.MustSync` 逐次 fsync，**根本不需要 flusher**，
+   所以它不丢证明不了 flusher 在 mem 档下有效；(b)「只有尾部丢」恰恰**就是**
+   「从不 fsync、只靠 WAL 缓冲写满自发外刷」的形态——丢的是最后一个没写满的
+   block，不是「整段 WAL 没刷」。
+   *教训：拿一条不依赖该机制的路径去为该机制作证，是无效对照。*
 2. **「grant 签字路径特有」**：local-resume（mem 档）单测同样丢 17 条，已排除。
 3. **「测试写得不对 / 断言时机错」**：静置 500ms 在 produceUntil 完全停止后才开始
    （`close(stop)` → `wg.Wait()` → `GracefulStop()` → sleep），不是边发边 kill；
@@ -162,7 +225,13 @@ go test -tags e2e ./ -run 'TestScenarioRebootedMemNeedsPermit' -v -timeout 30m
 以上三点需要读 `internal/cluster/group.go` 的 Ready 循环、`raftstore.Persist` 的
 调用时机与 `Manager.flusher()` 的 WAL 语义才能定位，超出本 task 范围。
 
-## 8. 处置
+> **事后结论**：三条全不成立，根因是第 3 条猜的方向（持久化路径）里更朴素的一环
+> ——`Manager.flusher()` 的 WAL 语义。定位它的决定性一步不是继续读代码，而是先做
+> 一次**判别实验**：`GET /admin/topics/{name}` 在断电前后各读一次每队列 `next_offset`，
+> 把假设空间一刀切成两半——存量变少 = 存储真丢（持久化/恢复路径），存量不变 =
+> 存着但投递不到（消费/位点）。实测 175 → 158，直接砍掉一半假设。
+
+## 8. 处置（调查当时；已被第 0 节的修复取代）
 
 - 两条受影响用例（`TestScenarioFullProcessCrashRecoversLocally`、
   `TestScenarioRebootedMemRecoversAfterGrant`）断言**不做任何弱化**，函数体第一行

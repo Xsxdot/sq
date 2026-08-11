@@ -51,13 +51,15 @@ backlog B11 原文说这件事「只在 fsync 档下成立」。这个判断不�
 
 ### 2.3 mem 档的损失面：已经有界，本 spec 不动它
 
-**后台批量 fsync 已实现。** `Manager.flusher()`（[manager.go:1268](../../internal/cluster/manager.go)）每 200ms 提交一个空批次并带 `pebble.Sync`——空批次不携带数据，但触发一次 WAL fsync，借 WAL 顺序性把此前所有 NoSync 写一并刷盘；全组共享一条 WAL，一个 flusher 覆盖全部组。启动条件是 [manager.go:743](../../internal/cluster/manager.go) 的 `m.mode == AckQuorumMem`。
+**后台批量 fsync 已实现。** `Manager.flusher()` 每 200ms 调一次 `store.SyncWAL()` 触发 WAL fsync，借 WAL 顺序性把此前所有 NoSync 写一并刷盘；全组共享一条 WAL，一个 flusher 覆盖全部组。启动条件是 `m.mode == AckQuorumMem`。
 
 因此 **mem 档掉电的损失面是有界的：≤ 200ms 的写入**。这个数是签字出口（§3.5）报告里那句「最多可能丢多少」的事实来源，也是它能负责任地存在的前提。
 
-本 spec 因此**不新增任何刷盘机制**：不加 `store.SyncWAL()`、不加 `syncLoop`、不加 `cluster.sync_interval`。200ms 是 `flusher()` 里的硬编码常量，不做成配置项——没有需求驱动它可配，YAGNI。
-
-> 订正留痕：brainstorm 过程中一度判定「这个兜底不存在、损失无上界」，并据此把「补周期 fsync」纳入过范围。该判定源于一次被 `head -20` 截断的 grep（前 20 行恰好被测试文件占满，`manager.go:743` 被截掉），是错的。相关口径——V2 spec §2.2、`group.go` 的档位注释、`sq.example.yaml:61`——**全部与实现一致，无需修改**。
+> **订正留痕（2026-08-11，实现期实测推翻）**：本节原文写的是「`flusher()` 提交一个**空批次**并带 `pebble.Sync`……因此损失面有界」，并据此声明「本 spec 不新增任何刷盘机制：不加 `store.SyncWAL()`」。**这个前提是假的**：Pebble 的 `commitPipeline.Commit` 开头即 `if b.Empty() { return nil }`，空批次连 WAL 都不写、更不 fsync，`flusher()` 自 B8.2 起就是彻底的空操作，quorum-mem 档运行期一次盘都不刷，**损失面根本没有界**。全集群断电后稳定丢失尾部十余条已确认消息（B11-OPEN-1，判据与修复见 [notes/2026-08-11-b11-grant-path-loss.md](../notes/2026-08-11-b11-grant-path-loss.md)）。
+>
+> 因此 B11 **确实新增了 `store.SyncWAL()`**——用 `Batch.LogData`（只进 WAL，不进 memtable/sstable、不被索引）把批次撑成非空再 `Sync`。这不是新机制，是把一个本就声称存在、实际不工作的机制修好；200ms 周期与「不做成配置项」的结论保持不变。
+>
+> 更早的一条订正留痕：brainstorm 过程中一度判定「这个兜底不存在、损失无上界」，并据此把「补周期 fsync」纳入过范围。当时以为该判定源于一次被 `head -20` 截断的 grep 而推翻了它——**结果那个「错误」的直觉在事实上是对的**：兜底代码在，但不生效，损失确实无上界。教训是：确认一个机制「存在」，不等于确认它「生效」。
 
 **mem 档的优雅停机同样是安全的。** `MarkCleanShutdown` 用 `ApplyWith(b, true)` 写标记，且契约要求它是退出前最后一次同步写（[raftstore.go:511](../../internal/cluster/raftstore.go)）。Pebble 的 Sync 提交会把 WAL 中它之前的全部 NoSync 写一并 fsync。所以 mem 档的暴露面**只有**不干净关机，正常停机一条不丢。这把本 spec 的范围收窄了一圈。
 
@@ -129,9 +131,9 @@ backlog B11 原文说这件事「只在 fsync 档下成立」。这个判断不�
 
 这一条消除了一个本来会致命的洞——不干净关机若恰好发生在快照安装中途，本地恢复会带着半截状态启动、向客户端返回缺失的消息。由于该标记是 `MarkInstalling` 用 Sync 写的，它在 mem 档掉电后同样存在，`local-forced` 也受此保护。**实现时不得为两条新路径另写一套回放逻辑**，否则这份保护会丢。
 
-### 3.4 刷盘机制不动（见 §2.3）
+### 3.4 刷盘机制：只修好，不改形态（见 §2.3 订正留痕）
 
-mem 档的 200ms 周期 fsync 已由 `Manager.flusher()` 提供，损失面已有界。本 spec 只**读取**这个事实用于签字报告，不新增、不改动、不做成配置项。
+原决策是「不动」——mem 档的 200ms 周期 fsync 已由 `Manager.flusher()` 提供，本 spec 只读取这个事实用于签字报告。实现期实测发现该机制是空操作（§2.3），因此改为：**新增 `store.SyncWAL()` 把它修好，周期、启动条件、「不做成配置项」三者一律保持原样**。签字报告里那句「最多丢 200ms」在修复后才第一次成立。
 
 ### 3.5 签字出口：一次性许可，绑定机器世代
 
@@ -220,7 +222,13 @@ raft/local_recover_permit    → 一次性本地恢复许可（两行 UTF-8：�
 
 **零丢失断言必须挑对时机。** 按 §2.2 的订正，mem 档下 commit 返回时数据可能还在进程内缓冲，紧贴 SIGKILL 发出的那一批已确认消息**本来就会丢**——断言它们不丢等于断言一个系统从来不具备的性质，用例会真红，而且红得没有意义。正确的断言形态是：发送完成后**显式静置 ≥500ms**（大于 `flusher()` 的 200ms 周期 + 余量）再 kill，此时全部已确认写入都已随周期 fsync 落盘，零丢失成立且稳定。紧贴 kill 的那一批不做任何断言。这条纪律对每一个「杀进程后对账」的用例都适用。
 
-> **前提已实测验证（2026-08-11）**：这条纪律建立在「空批次 + `pebble.Sync` 真能把此前的 NoSync 写刷出去」之上——如果空批次是空操作，`flusher()` 就是摆设，静置多久都没用。写了个探针实跑 Pebble v2.1.6：1000 条 `NoSync` 提交后 WAL 文件 65536 字节（尾部仍在进程内缓冲），随后按 `flusher()` 的精确动作打 5 拍空批次 `Sync`，WAL 涨到 134044 字节——缓冲的尾部确实被写出并 fsync 了。之后再提交一个非空 `Sync` 批次只增加 32 字节，印证前面已经刷干净。**`flusher()` 不是空操作，静置 ≥500ms 后零丢失可断言。**
+> **前提曾被证伪，已修复（2026-08-11 订正）**：这条纪律建立在「周期刷盘真能把此前的 NoSync 写刷出去」之上——刷盘若是摆设，静置多久都没用。**实测发现它当时就是摆设**：`Manager.flusher()` 提交的是**空批次** + `pebble.Sync`，而 Pebble 的 `commitPipeline.Commit` 开头即 `if b.Empty() { return nil }`，空批次连 WAL 都不写、更不 fsync；叠加 mem 档 `syncPersist` 恒 false，quorum-mem 档运行期一次盘都不刷。全集群断电稳定丢失尾部十余条已确认消息（B11-OPEN-1，证据见 [notes/2026-08-11-b11-grant-path-loss.md](../notes/2026-08-11-b11-grant-path-loss.md)）。
+>
+> 修复：新增 `store.SyncWAL()`，用 `Batch.LogData`（只进 WAL，不进 memtable/sstable、不被索引）把批次撑成非空再 `Sync`，`flusher()` 改调它。判据用 vfs 层直接数 fsync 次数：旧动作 5 拍增量 **0**，新动作 5 拍增量 **5**，非空批次对照 1。
+>
+> **（作废的旧留痕，留作教训）** 本条最初写的是「已实测验证：1000 条 NoSync 后 WAL 65536 字节，打 5 拍空批次 Sync 后涨到 134044 字节，故 flusher 生效」。**这个判据是错的**——WAL 文件长大只说明 `write(2)` 发生过，而 Pebble 的 LogWriter 本来就有独立的异步写线程，NoSync 写照样让文件变大；文件大小与 fsync 是两件事。用错的代理指标做「验证」，比不验证更坏：它把一个真缺陷盖章成了已验前提。
+>
+> 现在：**`flusher()` 真的会 fsync，静置 ≥500ms 后零丢失可断言**，且这条断言由 `TestSyncWALPersistsNoSyncWrites`（真掉电语义，带反向对照）与 e2e 的存量断言双重把守。
 
 **B10 的红线断言一条不丢**，搬到新用例：注入「世代变了」+ mem 档 + 无许可 → 断言拒启、数据目录非空、日志中出现「数据目录保持原样未清空」且**不**出现「状态目录已清空」。顺序倒置的口子照样会在这里红，只是搬到了它现在真正对应的分支上。
 
@@ -232,13 +240,13 @@ raft/local_recover_permit    → 一次性本地恢复许可（两行 UTF-8：�
 
 **e2e**：①三节点全 SIGKILL → 自动本地恢复、数据目录未清空、静置后发送的消息零丢失（替换旧用例）②mem + 世代变 + 无许可 → 拒启且数据保留 ③mem + 世代变 + 签字 → 起得来、term 抬了、数据还在 ④fsync 档 + 世代变 → 无需签字直接起来。
 
-**无新增基准**：本 spec 不改动写路径，写吞吐不受影响（§2.3）。
+**无新增基准**：本 spec 不改动写路径，写吞吐不受影响（§2.3）。`store.SyncWAL()` 的修复把 mem 档的后台 fsync 从 0 次/秒变成 5 次/秒——这是该档位设计上本来就承诺的开销，且与在途写入并发无关，不进写路径的关键区。
 
 ---
 
 ## 9. 文档同步
 
-本 spec 不改动刷盘机制，因此 V2 spec §2.2、[group.go:925](../../internal/cluster/group.go) 的档位注释、`sq.example.yaml:61` 的 ack 说明**全部保持原样**——它们本来就与实现一致（见 §2.3 的订正留痕）。
+本 spec 不改动刷盘机制的**形态**（周期、启动条件、配置面均不变），只把空操作修好，因此 V2 spec §2.2、[group.go](../../internal/cluster/group.go) 的档位注释、`sq.example.yaml:61` 的 ack 说明**全部保持原样**——它们描述的语义在修复后才第一次为真（见 §2.3 的订正留痕）。
 
 需要更新的只有两处，都因五分支恢复而起：
 

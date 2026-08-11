@@ -13,7 +13,8 @@
 ## Global Constraints
 
 - **Spec 是唯一事实来源**：`docs/superpowers/specs/2026-08-10-unclean-local-recovery-design.md`。与本计划冲突时以 spec 为准。
-- **不新增任何刷盘机制**：`Manager.flusher()` 的 200ms 周期 fsync 已存在（`manager.go:1268`），mem 档损失面已有界（≤200ms）。不加 `store.SyncWAL`、不加 `syncLoop`、不加 `cluster.sync_interval`。
+- ~~**不新增任何刷盘机制**：`Manager.flusher()` 的 200ms 周期 fsync 已存在，mem 档损失面已有界（≤200ms）。不加 `store.SyncWAL`、不加 `syncLoop`、不加 `cluster.sync_interval`。~~
+  **订正（08-11，Task 9）**：这条约束建立在一个假前提上——`flusher()` 提交的是**空批次**，被 Pebble 的 `if b.Empty() { return nil }` 短路，从来没 fsync 过，损失面根本没有界。**Task 9 因此新增了 `store.SyncWAL`**。约束改为：**不改刷盘机制的形态**（200ms 周期、启动条件、不做成配置项三者一律不变），只把这个空操作修好。`syncLoop`、`cluster.sync_interval` 仍然不加。
 - **不改动写路径**：本批不碰 `Persist`/`applyEntry`/`syncPersist`，写吞吐不受影响。
 - **B2 铁律**：一切写经 `store` 唯一写入口（`NewBatch` + `ApplyWith`），不得持有裸 `*pebble.DB`。
 - **`raft/bootgen` 只在能启动成功的路径上写**（`clean-resume`/`fresh`/`local-resume`/`local-forced`），**`ErrUncleanShutdown` 分支绝不写**。这是安全门能否成立的关键，Task 5 有专门守卫用例。
@@ -2411,6 +2412,170 @@ EOF
 
 ---
 
+### Task 9: 修复 mem 档周期刷盘的空操作（实现期订正，B11-OPEN-1 根因）
+
+**背景**：Task 7 的 e2e 场景用例实跑暴露「全集群 SIGKILL 后稳定丢失尾部十余条
+已确认消息」（B11-OPEN-1）。根因定位为 `Manager.flusher()` 提交**空批次** +
+`pebble.Sync`，而 Pebble 的 `commitPipeline.Commit` 开头即 `if b.Empty() { return nil }`
+——空批次连 WAL 都不写、更不 fsync，**mem 档运行期一次盘都不刷**，spec §2.3 的
+「损失面 ≤200ms」从未成立。缺陷由 `0c7aa8c`（B8.2）引入，早于 B11 两天；B11 是
+暴露者不是引入者。判据与完整证据见
+`docs/superpowers/notes/2026-08-11-b11-grant-path-loss.md` 第 0 节。
+
+**Files:**
+- Modify: `internal/store/store.go`（新增 `SyncWAL`）
+- Modify: `internal/cluster/manager.go`（`flusher()` 改调 `SyncWAL`）
+- Test: `internal/store/store_test.go`
+- Test: `test/e2e/cluster_scenario_test.go`（存量断言 + 判别器助手）
+
+**Interfaces:**
+- Produces: `func (s *Store) SyncWAL() error`
+
+- [ ] **Step 1: 写失败的用例**
+
+用 `vfs.NewCrashableMem` 的 `CrashClone`（零值配置 = 只保留已 fsync 的字节）做
+**真掉电语义**断言，并带反向对照——不加屏障必须真的丢，否则用例失去判别力：
+
+```go
+func TestSyncWALPersistsNoSyncWrites(t *testing.T) {
+	const n = 200
+	survivorsAfterCrash := func(t *testing.T, barrier bool) int {
+		fs := vfs.NewCrashableMem()
+		db, _ := pebble.Open("/db", &pebble.Options{FS: fs})
+		s := &Store{db: db, sync: false, logger: slog.Default()}
+		for i := 0; i < n; i++ {
+			b := s.NewBatch()
+			b.Set([]byte(fmt.Sprintf("k%06d", i)), []byte("v"))
+			s.ApplyWith(b, false)
+		}
+		if barrier {
+			if err := s.SyncWAL(); err != nil { t.Fatalf("SyncWAL 失败: %v", err) }
+		}
+		crashed := fs.CrashClone(vfs.CrashCloneCfg{})
+		db.Close()
+		db2, _ := pebble.Open("/db", &pebble.Options{FS: crashed})
+		defer db2.Close()
+		s2 := &Store{db: db2, sync: false, logger: slog.Default()}
+		got := 0
+		for i := 0; i < n; i++ {
+			if _, ok, _ := s2.Get([]byte(fmt.Sprintf("k%06d", i))); ok { got++ }
+		}
+		return got
+	}
+	if got := survivorsAfterCrash(t, true); got != n {
+		t.Fatalf("SyncWAL 之后掉电，幸存 %d 条，要求 %d 条一条不少", got, n)
+	}
+	if got := survivorsAfterCrash(t, false); got == n {
+		t.Fatalf("无屏障时也一条不丢（%d 条），本用例失去判别力", got)
+	}
+}
+```
+
+- [ ] **Step 2: 先用历史实现跑它，确认它能抓到这个 bug**
+
+先把 `SyncWAL` 写成历史形态 `return s.ApplyWith(s.NewBatch(), true)`。
+
+Run: `go test ./internal/store/ -run TestSyncWALPersistsNoSyncWrites`
+Expected: FAIL，`SyncWAL 之后掉电，幸存 0 条，要求 200 条一条不少`
+
+这一步不能跳：用例必须先对着**真实的历史缺陷**红过，才证明它测的是这件事。
+
+- [ ] **Step 3: 实现 `SyncWAL`**
+
+```go
+// walBarrier 是 SyncWAL 写进 WAL 的屏障载荷。
+var walBarrier = []byte("sq/wal-barrier")
+
+func (s *Store) SyncWAL() error {
+	b := s.db.NewBatch()
+	if err := b.LogData(walBarrier, nil); err != nil {
+		b.Close()
+		return fmt.Errorf("store SyncWAL 组装屏障: %w", err)
+	}
+	if err := b.Commit(pebble.Sync); err != nil {
+		return fmt.Errorf("store SyncWAL: %w", err)
+	}
+	return b.Close()
+}
+```
+
+用 `LogData` 而不是写真键：它只进 WAL，不进 memtable/sstable、不被索引，5Hz 的
+周期屏障因此不污染键空间、不产生 compaction 压力、不影响任何扫描路径。不走
+`ApplyWith`：屏障不是一次 apply，计进 `OnApplyObserve` 会把这条恒定的空提交掺进
+fsync 延迟直方图，污染写路径的延迟分布。
+
+- [ ] **Step 4: 跑它确认通过**
+
+Run: `go test ./internal/store/ -run TestSyncWALPersistsNoSyncWrites -v`
+Expected: PASS（含反向对照）
+
+- [ ] **Step 5: `flusher()` 改调 `SyncWAL`**
+
+```go
+case <-ticker.C:
+	if err := m.st.SyncWAL(); err != nil {
+		m.lg.Error("后台批量刷盘失败", "err", err)
+	}
+```
+
+- [ ] **Step 6: 加关键节点日志**
+
+- 失败分支：保留既有 `m.lg.Error("后台批量刷盘失败", "err", err)`——WAL sync 失败
+  即 Pebble 不可恢复态，这行是尸检第一现场。
+- **成功路径刻意不打日志**，这是本 task 唯一一处偏离「成功路径不静默」的通则，
+  必须在代码注释里写明理由：5Hz 的周期动作，即便 Debug 也会淹掉日志；这条
+  goroutine 的「在不在跑」由启动处已有的 Info 交代。
+- `SyncWAL` 自身不打日志：store 层热路径不打日志是既有边界（见文件头注释）。
+
+- [ ] **Step 7: 加注释**
+
+- `SyncWAL` doc 注释必须写清三件事：为什么**必须**往批次里塞 `LogData`（贴出
+  Pebble 的 `if b.Empty() { return nil }` 短路，并点名 B11-OPEN-1）、为什么用
+  `LogData` 而不是真键、为什么不走 `ApplyWith`。
+- `flusher()` 注释记录历史缺陷与新形态，指向 `SyncWAL` 的注释。
+- 用例注释说明 `CrashClone` 为什么是真掉电语义，以及反向对照存在的意义。
+
+- [ ] **Step 8: e2e 存量断言（把判别器固化下来）**
+
+在 `test/e2e/cluster_scenario_test.go` 加 `queueNextOffsets` / `dumpQueueOffsets`
+两个助手：读 `GET /admin/topics/{name}` 的 `queues_detail[].next_offset` 求和 =
+该节点存里实际有多少条消息。在 `TestScenarioFullProcessCrashRecoversLocally` 的
+kill 前与 `restartAll` 后各测一次，断言恢复后每个节点不许比断电前少。
+
+这条断言比消息级对账更早失败、也更能指认病灶——它把「存储真丢了」与「存着但
+投递不到」分开。同时删掉两条用例上的 `t.Skip("B11-OPEN-1…")`。
+
+- [ ] **Step 9: 全量验证**
+
+Run:
+```bash
+go build ./... && go vet ./...
+go test ./internal/store/ ./internal/cluster/
+cd test/e2e && go test -tags e2e ./ -run TestScenario -v -timeout 60m
+```
+Expected: 全绿；`TestScenarioFullProcessCrashRecoversLocally` 与
+`TestScenarioRebootedMemRecoversAfterGrant` 由红转绿。
+
+- [ ] **Step 10: 回填文档**
+
+spec §2.3 / §3.4 / §8 / §9 的「不新增刷盘机制」「空批次 Sync 生效」口径全部订正
+（保留错误留痕，不得抹掉）；notes 补第 0 节根因与修复；backlog 关闭 B11-OPEN-1。
+
+- [ ] **Step 11: 提交**
+
+```bash
+git add internal/store/store.go internal/store/store_test.go \
+        internal/cluster/manager.go test/e2e/cluster_scenario_test.go
+git commit -m "$(cat <<'EOF'
+fix(store,cluster): mem 档周期刷盘不再是空操作——空批次被 Pebble 短路，quorum-mem 运行期一次盘都不刷
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+EOF
+)"
+```
+
+---
+
 ## 自审记录
 
 **1. Spec 覆盖**
@@ -2421,17 +2586,19 @@ EOF
 | §3.2 五分支判定表 | Task 3（纯函数 + 11 组表驱动）+ Task 5（接线） |
 | §3.3 抬 term 的适用范围（四格表） | Task 4（`local-forced`）+ **Task 6b**（mem 档 `local-resume` 也抬、fsync 档不抬） |
 | §3.3b 复用 `buildGroup(clean=true)` | Task 5 的 `replay` 变量与其注释 |
-| §3.4 不动刷盘机制 | 全局约束第 2 条，无 task（刻意） |
+| §3.4 刷盘机制只修好、不改形态 | **Task 9**（原为「不动刷盘机制」，实现期实测推翻，见下） |
 | §3.5 签字出口（报告、许可作废、互斥、逐台、留痕、不破坏部署） | Task 4（许可键）+ Task 6（命令） |
 | §4 文件结构 | 本计划「文件结构」表逐行对应 |
 | §5 键布局 | Task 2（`raft/bootgen`）+ Task 4（`raft/local_recover_permit`） |
 | §6 错误处理 | Task 1（读不到）、Task 2（写失败即启动失败）、Task 4（许可格式非法、同批提交）、Task 6（Pebble 独占锁） |
 | §7 可观测性 | 各 task 的「加关键节点日志」step |
-| §8 测试策略 | Task 3、5（单测）+ **Task 6b**（抬 term 四格逐格单测）+ Task 7（e2e 四条，含「静置 ≥500ms 再 kill」的断言时机纪律） |
+| §8 测试策略 | Task 3、5（单测）+ **Task 6b**（抬 term 四格逐格单测）+ Task 7（e2e 四条，含「静置 ≥500ms 再 kill」的断言时机纪律）+ **Task 9**（掉电语义单测与 e2e 存量断言——静置纪律的前提本身要有用例守着） |
 | §9 文档同步 | Task 6（`main.go` 头注释）+ Task 8（`sq.example.yaml`） |
-| §11 验收标准 7 条 + 4b | Task 3/5/7（1–5）、Task 8（6–7）、**Task 6b**（4b 抬 term 适用范围） |
+| §11 验收标准 7 条 + 4b | Task 3/5/7（1–5）、Task 8（6–7）、**Task 6b**（4b 抬 term 适用范围）、**Task 9**（验收 2「静置后零丢失」的真正实现件） |
 
 无遗漏。
+
+> **Task 9 是 Task 7 实跑后补的订正 task**：Task 7 的 e2e 用例暴露「全集群 SIGKILL 后稳定丢失尾部十余条已确认消息」（B11-OPEN-1），根因是 `Manager.flusher()` 的空批次 `Sync` 被 Pebble 短路成空操作，mem 档运行期从不 fsync——spec 原先「§3.4 不动刷盘机制、损失面已有界」的前提整个是假的。spec §2.3/§3.4/§8/§9 已同步订正并留痕（错误留痕不抹）。执行顺序上 **Task 9 必须排在 Task 8 之前**——Task 8 要回填的验收数字依赖 Task 9 修好之后的实跑结果。
 
 > **Task 6b 是 Task 1–6 完成后补的订正 task**：Task 7 的 e2e 实测推翻了 spec 原先「NoSync 提交返回即进页缓存」的前提（Pebble 的 `WriteRecord` 只 `Signal` 一下就返回，`write(2)` 由 flusher goroutine 异步做）。spec §2.2/§3.3/§8/§11 已同步订正并留痕，本表按订正后的 spec 重新核对过。执行顺序上 **Task 6b 必须排在 Task 7 之前**——Task 7 的 mem 档场景断言依赖抬 term 后的行为。
 
