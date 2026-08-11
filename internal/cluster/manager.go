@@ -1331,10 +1331,19 @@ func (m *Manager) peerAddrs() map[uint64]string {
 	return peers
 }
 
-// flusher 是 AckQuorumMem 档的后台刷盘 goroutine：每 200ms 提交一个
-// 空批次并带 pebble.Sync。空批次不携带数据，但会触发一次 WAL fsync，
-// 借 WAL 顺序性把此前所有 NoSync 写入一并刷盘（spec §2.2「后台批量
-// fsync」的最简实现）。全组共享一条 WAL，一个 flusher 即覆盖全部组。
+// flusher 是 AckQuorumMem 档的后台刷盘 goroutine：每 200ms 调一次
+// store.SyncWAL 触发 WAL fsync，借 WAL 顺序性把此前所有 NoSync 写入
+// 一并刷盘（spec §2.2「后台批量 fsync」的最简实现）。全组共享一条
+// WAL，一个 flusher 即覆盖全部组。
+//
+// 曾经的实现是「提交空批次 + pebble.Sync」，而 Pebble 会在
+// commitPipeline.Commit 开头把空批次直接短路返回，既不写 WAL 也不
+// fsync——mem 档因此实际上从不刷盘，全集群断电稳定丢尾（B11-OPEN-1）。
+// 刷盘动作现在收在 store.SyncWAL 里，理由与判据见该方法注释。
+//
+// 成功路径不打日志：5Hz 的周期动作，即便 Debug 也会淹掉日志；这条
+// goroutine 的「在不在跑」由启动处的 Info 一行交代，出问题时看下面
+// 的 Error。
 func (m *Manager) flusher() {
 	ticker := time.NewTicker(200 * time.Millisecond)
 	defer ticker.Stop()
@@ -1344,7 +1353,7 @@ func (m *Manager) flusher() {
 		case <-m.flusherStop:
 			return
 		case <-ticker.C:
-			if err := m.st.ApplyWith(m.st.NewBatch(), true); err != nil {
+			if err := m.st.SyncWAL(); err != nil {
 				// WAL sync 失败即 pebble 不可恢复态，下一拍所有写都会炸，
 				// 这行日志是尸检第一现场
 				m.lg.Error("后台批量刷盘失败", "err", err)

@@ -375,7 +375,6 @@ func TestScenarioFullProcessCrashRecoversLocally(t *testing.T) {
 	if testing.Short() {
 		t.Skip("场景测试耗时，-short 跳过")
 	}
-	t.Skip("B11-OPEN-1：mem 档本地恢复（local-resume）丢失已确认消息，根因未定位，证据见 docs/superpowers/notes/2026-08-11-b11-grant-path-loss.md")
 	pc := startProcCluster(t, 3)
 	const topic, group = "scn-full-crash", "scn-full-crash-g"
 	ensureTopic(t, pc.endpoints(), topic)
@@ -403,6 +402,8 @@ func TestScenarioFullProcessCrashRecoversLocally(t *testing.T) {
 	// 让 200ms 周期 fsync 至少跑满一轮，把上面这批确认集变成可断言的
 	time.Sleep(500 * time.Millisecond)
 
+	beforeKill := dumpQueueOffsets(t, pc, topic, "kill 前")
+
 	// 断电：同时 SIGKILL 全部节点
 	for i := range pc.handles {
 		pc.kill(t, i)
@@ -410,6 +411,18 @@ func TestScenarioFullProcessCrashRecoversLocally(t *testing.T) {
 	// 上电：整批原地重启（先全起进程、再逐个等就绪——逐台 restart 会在
 	// 第一个节点上死锁，见 restartAll 注释）
 	pc.restartAll(t)
+
+	// 存量断言：静置 ≥500ms 后断电，恢复后每个节点的落库条数必须一条不少。
+	// 这条比下面的消息级对账更早失败、也更能指认病灶——它把「存储真丢了」
+	// 与「存着但投递不到」分开。B11-OPEN-1（mem 档周期刷盘是空操作）就是
+	// 这条数字对比钉死的。
+	afterRecover := dumpQueueOffsets(t, pc, topic, "恢复后")
+	for i := range afterRecover {
+		if afterRecover[i] < beforeKill[i] {
+			t.Errorf("节点 %d 断电恢复后落库条数从 %d 掉到 %d，丢了 %d 条已落库消息",
+				i+1, beforeKill[i], afterRecover[i], beforeKill[i]-afterRecover[i])
+		}
+	}
 
 	// 等路由全部可答再发：本地恢复后各组需重新选主，produceUntil 容忍
 	// 选举窗口内的发送失败（失败不登记），但恢复可写的证据要等路由就绪
@@ -520,7 +533,6 @@ func TestScenarioRebootedMemRecoversAfterGrant(t *testing.T) {
 	if testing.Short() {
 		t.Skip("场景测试耗时，-short 跳过")
 	}
-	t.Skip("B11-OPEN-1：grant 恢复路径丢失已确认消息，根因未定位，证据见 docs/superpowers/notes/2026-08-11-b11-grant-path-loss.md")
 	pc := startProcCluster(t, 3)
 	const topic, group = "scn-reboot-grant", "scn-reboot-grant-g"
 	ensureTopic(t, pc.endpoints(), topic)
@@ -870,6 +882,57 @@ func TestScenarioProducerExitsRightAfterCommit(t *testing.T) {
 	consumer := newClusterConsumer(t, pc.multi(), group, topic, clusterConsumerAwaitShort)
 	got := recvAllAck(t, consumer, cs.size(), 180*time.Second, "producer-exit 对账", false)
 	cs.assertAllConsumed(t, got)
+}
+
+// queueNextOffsets 读某节点上该 topic 每个队列的 next_offset（= 该队列已存
+// 消息条数）。诊断用：sum(next_offset) 就是这个节点存里实际有多少条消息，
+// 与「确认集大小」直接可比。
+//
+// 这是「丢没丢」与「投递得到吗」的判别器：崩溃前后各测一次，
+//   - 恢复后总数 < 崩溃前总数 → 消息真从存储里没了（持久化/恢复路径问题）
+//   - 恢复后总数 = 崩溃前总数 → 消息还在，是投递侧看不到（消费/位点问题）
+//
+// B11-OPEN-1 就是靠这两组数字定位的：175 → 158，全部三个节点同样少 17 条，
+// 证明是存储侧真丢而非投递侧看不到，根因是 mem 档周期刷盘（空批次 + Sync）
+// 被 Pebble 短路成空操作，mem 档实际从不 fsync。
+func queueNextOffsets(t *testing.T, adminBase, topic string) (map[uint32]uint64, uint64) {
+	t.Helper()
+	resp, err := http.Get(adminBase + "/admin/topics/" + topic)
+	if err != nil {
+		t.Fatalf("读 %s 的 topic 详情失败: %v", adminBase, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("读 %s 的 topic 详情 HTTP %d", adminBase, resp.StatusCode)
+	}
+	var out struct {
+		QueuesDetail []struct {
+			QueueID    uint32 `json:"queue_id"`
+			NextOffset uint64 `json:"next_offset"`
+		} `json:"queues_detail"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
+		t.Fatalf("解析 topic 详情失败: %v", err)
+	}
+	m := make(map[uint32]uint64, len(out.QueuesDetail))
+	var total uint64
+	for _, q := range out.QueuesDetail {
+		m[q.QueueID] = q.NextOffset
+		total += q.NextOffset
+	}
+	return m, total
+}
+
+// dumpQueueOffsets 把三个节点的队列位点全打出来，返回各节点的合计条数。
+func dumpQueueOffsets(t *testing.T, pc *procCluster, topic, phase string) []uint64 {
+	t.Helper()
+	totals := make([]uint64, 0, len(pc.handles))
+	for i := range pc.handles {
+		m, total := queueNextOffsets(t, "http://"+pc.cfgs[i].AdminListen, topic)
+		t.Logf("[存量/%s] 节点 %d 队列位点 %v 合计 %d 条", phase, i+1, m, total)
+		totals = append(totals, total)
+	}
+	return totals
 }
 
 // adminSend 走 admin HTTP 向指定节点发一条测试消息，返回 msg_id 与是否
