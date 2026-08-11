@@ -31,6 +31,12 @@ TruncateLog/SaveConfState/ResetGroupProgress/MarkInstalling/...`）签名与
 
 ## 2. 评审中已定的三个分叉
 
+> **修订（2026-08-11）**：第三行「每组独立日志」的定案已被三机实测推翻——
+> fsync 档高并发因失去跨组 group commit 回退 47%（conc=256：2432 vs main
+> 4589 msg/s），「影响有限」的判断不成立。修订设计（全组共享单段文件链、
+> 帧带组号、sync 领导者 group commit）见
+> `2026-08-11-raftlog-shared-seglog-design.md`，本表其余两行定案不变。
+
 | 分叉 | 决定 | 理由 |
 |---|---|---|
 | 总路线 | B2 先行，A 挂起 | B2 风险最低、恢复路径零语义变化；A 会把进程 crash 降格为断电级事件（两节点同 crash 从自动恢复变成永久卡死等签字），且恢复路径重设计的评审成本按最高档预算（该路径已修过 C1/B10/B11 三个深坑） |
