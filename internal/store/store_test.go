@@ -453,3 +453,15 @@ func TestBatchMergeReprRejectsGarbage(t *testing.T) {
 		t.Fatal("坏批次字节应报错，得到 nil")
 	}
 }
+
+// TestStoreDirReturnsOpenDir Dir 必须返回 Open 时的目录——raftStore 靠它
+// 推导 seglog 根目录（raftlog/ 子目录与 Pebble 同住 data_dir，
+// WipeForRejoin 整删 data_dir 时才能一并覆盖）。
+func TestStoreDirReturnsOpenDir(t *testing.T) {
+	dir := t.TempDir()
+	s := openTestStore(t, dir)
+	defer s.Close()
+	if got := s.Dir(); got != dir {
+		t.Fatalf("Dir() = %q; want %q", got, dir)
+	}
+}

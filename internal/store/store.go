@@ -37,6 +37,7 @@ var OnApplyObserve func(d time.Duration)
 // core 与本层其余代码不动——这是 spec §3 Command 化写路径的落地形态。
 type Store struct {
 	db     *pebble.DB
+	dir    string
 	sync   bool
 	logger *slog.Logger
 }
@@ -51,7 +52,7 @@ func Open(dir string, syncWrites bool, logger *slog.Logger) (*Store, error) {
 	// 之后各调用点不再逐条重复这对键值。
 	l := logger.With("mod", "store")
 	l.Info("store 已打开", "dir", dir, "sync", syncWrites)
-	return &Store{db: db, sync: syncWrites, logger: l}, nil
+	return &Store{db: db, dir: dir, sync: syncWrites, logger: l}, nil
 }
 
 // Close 关闭底层库。之后任何操作都会 panic（Pebble 语义），不做二次防护。
@@ -59,6 +60,11 @@ func (s *Store) Close() error {
 	s.logger.Info("store 关闭")
 	return s.db.Close()
 }
+
+// Dir 返回本库的磁盘目录（Open 时传入的路径）。集群层用它推导
+// raft 日志段文件的根目录（<dir>/raftlog/），使日志文件与 Pebble
+// 同住 data_dir——WipeForRejoin 整删 data_dir 时二者一并清空。
+func (s *Store) Dir() string { return s.dir }
 
 // Get 读取 key。返回值是拷贝，可长期持有。不存在返回 (nil, false, nil)。
 func (s *Store) Get(key []byte) ([]byte, bool, error) {
