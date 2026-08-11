@@ -490,3 +490,41 @@ func TestLoadFallsBackToLegacyKeys(t *testing.T) {
 		t.Fatalf("legacy 回退读回 = %v,%v,%v; want term=5 + 1 条 legacy", gotHS, gotEnts, err)
 	}
 }
+
+// TestMigrateLegacyRaftLogToSeglog 旧盘（Pebble 日志键族）启动迁移后：
+// seglog 有全部内容、Pebble 旧键清空、再次迁移是空操作（幂等）。
+func TestMigrateLegacyRaftLogToSeglog(t *testing.T) {
+	st := openClusterTestStore(t)
+	// 造旧盘：直接写 Pebble 旧键族（与 TestLoadFallsBackToLegacyKeys 同法）
+	b := st.NewBatch()
+	term := uint64(3)
+	hsData, _ := proto.Marshal(&raftpb.HardState{Term: &term})
+	_ = b.Set(hsKey(1), hsData)
+	for i := uint64(1); i <= 3; i++ {
+		trm := uint64(3)
+		entData, _ := proto.Marshal(&raftpb.Entry{Index: &i, Term: &trm, Data: []byte{byte(i)}})
+		_ = b.Set(entKey(1, i), entData)
+	}
+	if err := st.ApplyWith(b, true); err != nil {
+		t.Fatal(err)
+	}
+	rs := newRaftStore(st, testSlog(t))
+	if err := rs.migrateLog(1); err != nil {
+		t.Fatal(err)
+	}
+	// Pebble 旧键必须清空
+	if _, ok, _ := st.Get(hsKey(1)); ok {
+		t.Fatal("迁移后 Pebble hs 键仍在")
+	}
+	// seglog 读回全部内容
+	rs.CloseLogs()
+	rs2 := newRaftStore(st, testSlog(t))
+	gotHS, gotEnts, _, err := rs2.Load(1)
+	if err != nil || gotHS.GetTerm() != 3 || len(gotEnts) != 3 {
+		t.Fatalf("迁移后 Load = %v, %d 条, %v; want term=3, 3 条", gotHS, len(gotEnts), err)
+	}
+	// 幂等：再迁一次空操作不报错
+	if err := rs2.migrateLog(1); err != nil {
+		t.Fatalf("重复迁移应为空操作: %v", err)
+	}
+}

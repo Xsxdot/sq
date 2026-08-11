@@ -68,6 +68,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"time"
 
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
@@ -377,6 +378,79 @@ func (r *raftStore) loadLegacy(g uint32) (*raftpb.HardState, []*raftpb.Entry, *r
 	r.lg.Debug("raft 日志已读回（legacy）", "g", g, "entries", len(ents), "commit", hs.GetCommit(),
 		"snap", snapMeta.GetIndex())
 	return hs, ents, snapMeta, nil
+}
+
+// migrateLog 把一组的 raft 日志（HardState + Entries）从迁移前的 Pebble
+// 键族形态一次性搬进 seglog（Task 7 接线，spec §6）。调用点见 NewManager：
+// 必须在恢复判定（decideRecovery，只读 legacy 键）与可能抬 term 的分支
+// （ForceLocalRecover/BumpTermsForLocalResume，见 bumpTermsInto 对未迁移
+// 组写回 legacy hsKey 的注释）之后、buildGroup 装配循环之前逐组调用——
+// 判定先于迁移，抬 term 也先于迁移，这样迁移搬走的才是「含 bump」的
+// 最终状态，不会被后续的 legacy 写坏迁移判定，也不会被判定读到迁移后的
+// 假状态。
+//
+// 语义（①是幂等锚点，任何一步之后崩溃，重启重迁都安全）：
+//  1. legacyPending(g) 为假：组早已迁移过（或天生就在 seglog，从未见过
+//     legacy 键），no-op，只打 Debug。
+//  2. 为真：os.RemoveAll 整个 seglog 目录、清掉内存缓存（复用 wipeLog，
+//     "清半截"）——保证接下来写入的是一份干净的新 seglog，不会跟上次
+//     半途而废的迁移残留混在一起。
+//  3. loadLegacy(g) 只读旧值（不写，遵守 Load 的 legacy 回退只读契约），
+//     经 r.Persist(g, hs, ents, true) 写进刚清空的新 seglog——Persist 内部
+//     调用 Append，HS 先于条目、fsync（seglog.Log.Append 保证的帧序），
+//     并且会同步更新 r.recovered 缓存，migrateLog 返回后同进程内的
+//     Load(g) 立刻能读到迁移后的内容，不会因为缓存陈旧看到假的空日志。
+//  4. Pebble 单批 Sync 删 hsKey(g) + DeleteRange(entPrefix(g))——这一步
+//     落盘之后 legacyPending(g) 才会翻假，是「迁移生效」的唯一判据。
+//
+// 崩溃安全：③④之间任一步崩溃，Pebble 旧键仍在（④还没提交），下次启动
+// legacyPending 仍判真，从头①重来一遍——②的 RemoveAll 会把上次写了一半
+// 的 seglog 目录整个清掉，不会出现「迁移了一半的 seglog + 还没删的旧键」
+// 这种需要合并的复杂半态。
+func (r *raftStore) migrateLog(g uint32) error {
+	pending, err := r.legacyPending(g)
+	if err != nil {
+		return fmt.Errorf("raftstore migrateLog 组 %d 判定迁移状态: %w", g, err)
+	}
+	if !pending {
+		r.lg.Debug("组无需迁移（已在 seglog，或从未见过 legacy 键）", "g", g)
+		return nil
+	}
+	start := time.Now()
+
+	// ① 清半截：整个目录 + 内存缓存一起清空（幂等锚点，见函数注释）。
+	if err := r.wipeLog(g); err != nil {
+		return fmt.Errorf("raftstore migrateLog 组 %d 清理旧 seglog: %w", g, err)
+	}
+
+	// ② 只读旧值。
+	hs, ents, _, err := r.loadLegacy(g)
+	if err != nil {
+		return fmt.Errorf("raftstore migrateLog 组 %d 读旧日志: %w", g, err)
+	}
+
+	// ③ 写入刚清空的新 seglog（Persist 顺带保证 recovered 缓存是最新的，
+	// 见函数注释）。
+	if err := r.Persist(g, hs, ents, true); err != nil {
+		return fmt.Errorf("raftstore migrateLog 组 %d 写入 seglog: %w", g, err)
+	}
+
+	// ④ 删 legacy 键族，单批 Sync——落盘后 legacyPending 才翻假。
+	b := r.st.NewBatch()
+	if err := b.Delete(hsKey(g)); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore migrateLog 组 %d 删 legacy HardState 键: %w", g, err)
+	}
+	if err := b.DeleteRange(entKey(g, 0), store.PrefixUpperBound(entPrefix(g))); err != nil {
+		b.Close()
+		return fmt.Errorf("raftstore migrateLog 组 %d 删 legacy 条目键: %w", g, err)
+	}
+	if err := r.st.ApplyWith(b, true); err != nil {
+		return fmt.Errorf("raftstore migrateLog 组 %d 提交删除批次: %w", g, err)
+	}
+
+	r.lg.Info("legacy raft 日志已迁移到 seglog", "g", g, "entries", len(ents), "elapsed", time.Since(start))
+	return nil
 }
 
 // Applied 读取一组的已应用位点；从未写入过时返回 0。

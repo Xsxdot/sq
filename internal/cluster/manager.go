@@ -471,6 +471,40 @@ func NewManager(o Options) (*Manager, error) {
 		}
 	}
 
+	// 一次性迁移：legacy Pebble 键族 → seglog（Task 7 接线，spec §6）。
+	// 位置是安全关键，前后都不能挪：
+	//   - 不能提前到 decideRecovery 之前：判定本身只读 legacy 键
+	//     （hasRaft/legacyPending 系列），迁移一旦先做，判定读到的就不再
+	//     是磁盘的原始形态；
+	//   - 不能提前到上面 switch 与紧接着的 local-resume 抬 term 之前：
+	//     pathLocalForced 的 ForceLocalRecover 与 pathLocalResume 的
+	//     BumpTermsForLocalResume 都可能在未迁移组上写回 legacy hsKey
+	//     （bumpTermsInto 对未迁移组的处理，见其注释）——必须等抬 term
+	//     完全落盘之后再迁移，这样迁移搬走的才是「含 bump」的最终状态；
+	//     颠倒顺序会让迁移搬走抬 term 之前的旧任期，之后 bump 的写入
+	//     又会把迁移判定翻回「未迁移」，term 不单调；
+	//   - 必须早于下面的 buildGroup 循环：buildGroup 的 clean 分支经
+	//     r.Load(g) 读日志，迁移完成后 Load 才会稳定命中 seglog 分支，
+	//     不再滑进 legacy 只读回退。
+	migrated := 0
+	for g := uint32(0); g <= o.DataGroups; g++ {
+		pending, err := m.rs.legacyPending(g)
+		if err != nil {
+			return nil, fmt.Errorf("cluster: 组 %d 判定迁移状态: %w", g, err)
+		}
+		if err := m.rs.migrateLog(g); err != nil {
+			return nil, fmt.Errorf("cluster: 组 %d 迁移 legacy 日志到 seglog: %w", g, err)
+		}
+		if pending {
+			migrated++
+		}
+	}
+	if migrated > 0 {
+		m.lg.Info("legacy raft 日志迁移完成", "migratedGroups", migrated, "totalGroups", o.DataGroups+1)
+	} else {
+		m.lg.Debug("无 legacy 日志，跳过迁移", "totalGroups", o.DataGroups+1)
+	}
+
 	// 世代只在能启动成功的路径上落盘（拒启分支已在上面 return）。
 	// 语义是「本数据目录最后一次被运行中的节点写入，发生在哪个世代」，
 	// 顺序写反即安全门失效——理由详见 SaveBootGen 的注释。
@@ -1370,10 +1404,12 @@ func (m *Manager) peerAddrs() map[uint64]string {
 	return peers
 }
 
-// flusher 是 AckQuorumMem 档的后台刷盘 goroutine：每 200ms 调一次
-// store.SyncWAL 触发 WAL fsync，借 WAL 顺序性把此前所有 NoSync 写入
-// 一并刷盘（spec §2.2「后台批量 fsync」的最简实现）。全组共享一条
-// WAL，一个 flusher 即覆盖全部组。
+// flusher 是 AckQuorumMem 档的后台刷盘 goroutine：每 200ms 一拍，先
+// SyncLogs 刷全部已打开的组 seglog、再 SyncWAL 刷 FSM 的 Pebble WAL
+// （顺序契约见 tick 分支内注释，spec §5）。借 WAL 顺序性把此前所有
+// NoSync 写入一并刷盘（spec §2.2「后台批量 fsync」的最简实现）。全组
+// 共享一条 WAL，一个 flusher 即覆盖全部组；seglog 则逐组独立文件，
+// SyncLogs 内部按组循环。
 //
 // 曾经的实现是「提交空批次 + pebble.Sync」，而 Pebble 会在
 // commitPipeline.Commit 开头把空批次直接短路返回，既不写 WAL 也不
@@ -1392,6 +1428,13 @@ func (m *Manager) flusher() {
 		case <-m.flusherStop:
 			return
 		case <-ticker.C:
+			// 顺序契约（spec §5）：先刷日志段、再刷 FSM WAL。反序的崩溃
+			// 窗口会出现「FSM 声称 applied=N 而日志不认识 N」——那需要
+			// 锚点引导才能恢复；正序窗口只有「日志超前 FSM」，重放即补。
+			if err := m.rs.SyncLogs(); err != nil {
+				m.lg.Error("后台批量刷盘失败（日志段）", "err", err)
+				continue // 日志没刷成就不刷 FSM——保住顺序契约
+			}
 			if err := m.st.SyncWAL(); err != nil {
 				// WAL sync 失败即 pebble 不可恢复态，下一拍所有写都会炸，
 				// 这行日志是尸检第一现场
@@ -1426,6 +1469,11 @@ func (m *Manager) StopClean(ctx context.Context) error {
 		m.flusherStopOne.Do(func() { close(m.flusherStop) })
 		<-m.flusherDone
 	}
+	// 全部组与 flusher 都已退出，此后不会再有任何一组写 seglog——这时
+	// 关闭句柄是安全的。放在标记落盘之前：干净关机标记是「本次关机全部
+	// 机件都已妥善停当」的收尾声明，不该在还留着打开的日志文件句柄时就
+	// 先落盘（顺序参见 Task 7 的接线要求）。
+	m.rs.CloseLogs()
 	// 干净关机标记作为最后一次同步写（见方法注释：先写标记会让
 	// 「标记在、acked 尾部丢」的窗口被误判为干净关机）
 	var markErr error
@@ -1441,11 +1489,27 @@ func (m *Manager) StopClean(ctx context.Context) error {
 // kill 是测试后门：模拟进程宕机——取消运行 ctx 且不写干净关机标记，
 // 同时停止后台刷盘 goroutine（否则 flusher 会在 store 关闭后继续提交）。
 // 幂等：重复调用安全（StopClean 已停过时不再重复 close flusherStop）。
+//
+// 非干净停机路径同样要在调用方关 store 之前收掉 seglog 句柄（Task 7）：
+// 调用方的固定模式是 kill() 后紧跟着 <-m.Done()，再关 store /
+// WipeForRejoin（见 testCluster.kill、TestManagerUncleanRestartRefusesResume
+// 等全部调用点）。因此这里等全部组与 flusher 真正退出后才关句柄——
+// 提前关会撞上组的 run 循环仍在写 seglog 的窗口；等待对象与 StopClean
+// 一致（全部组 + flusher），只是不写 MarkCleanShutdown 标记。kill 本身
+// 从「立即返回」变成「等到全部机件退出才返回」，但这本就是全部调用点
+// 已有的等待，只是把它挪进了 kill 内部，不改变外部可观察行为。
 func (m *Manager) kill() {
 	m.cancel()
 	if m.flusherStop != nil {
 		m.flusherStopOne.Do(func() { close(m.flusherStop) })
 	}
+	for _, gr := range m.groups {
+		<-gr.done()
+	}
+	if m.flusherDone != nil {
+		<-m.flusherDone
+	}
+	m.rs.CloseLogs()
 }
 
 // Done 返回一个在全部组与后台刷盘 goroutine 完全退出后关闭的 channel。
@@ -2020,7 +2084,15 @@ func WipeForRejoin(dataDir string) error {
 //
 // 六步：
 //  1. 旧 store 已关闭——调用方职责（pebble 持有目录句柄，不关闭
-//     WipeForRejoin 清不掉；本函数不代关，签名约定即此）
+//     WipeForRejoin 清不掉；本函数不代关，签名约定即此）。旧 Manager
+//     的 seglog 组日志句柄同理不由本函数代关：调用方走 StopClean 或
+//     kill() 都已经在等到 <-Done() 之前把 m.rs.CloseLogs() 收口（Task 7，
+//     见二者实现），本函数被调用时不存在残留打开的 seglog 句柄。即便
+//     真有遗漏，WipeForRejoin 的 os.RemoveAll 在 unix 下对仍打开的文件
+//     一样能删（unlink-while-open 语义，进程退出或显式 Close 时才真正
+//     释放 inode）——这里要保证的是不泄漏 fd，不是 RemoveAll 的正确性
+//     前提，fd 卫生与数据正确性是两件事
+
 //  2. 轮询全部对端发 PrepareJoin：每端对**自己当前 lead** 的组做
 //     Remove→AddLearner 并返回完成组号，收齐 0..DataGroups 全组完成
 //     （30s 总时限；期间 leader 可能换手——重发即可，Remove/AddLearner
