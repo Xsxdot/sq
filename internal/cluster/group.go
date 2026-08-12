@@ -1542,6 +1542,15 @@ func (gr *group) notifyApplied(data []byte) {
 	}
 }
 
+// ProposalHeaderLen 提案头长度：[8B 提案者 nodeID][8B waiter id]。
+//
+// 单拷贝契约（与 replication.Cluster.Apply/ApplyAsync 互引）：调用方
+// 构造 data 时必须预留前 ProposalHeaderLen 字节（内容任意，通常为零），
+// 载荷从 data[ProposalHeaderLen:] 开始；group.propose 只回填这 16B，
+// 不再二次分配拷贝。这样批次字节从 store.Batch.Repr 到 raft 日志条目
+// 全程只发生一次 memcpy（消息体上限 4MB，第二次整拷不可忽略）。
+const ProposalHeaderLen = 16
+
 // propose 提交一条提案并阻塞直到它在本节点 apply 完成。
 //
 // 等 apply 而非等 commit（读己之写）：propose 返回后调用方立即可读
@@ -1549,7 +1558,8 @@ func (gr *group) notifyApplied(data []byte) {
 // 只等 commit 会让「写入后立即可读」落空。
 //
 // 实现：分配自增提案 id → 注册 waiter（propWaiters）→ 提案者与 id
-// 各 8B 大端前置到批次字节前 → rn.Propose → 等 waiter 通知或 ctx 超时。
+// 各 8B 大端回填进 data 的保留头 → rn.Propose → 等 waiter 通知或
+// ctx 超时。
 //
 // 非 leader 的提案路径（ErrNotLeader，见 raftConfig 的
 // DisableProposalForwarding 契约）：
@@ -1564,13 +1574,23 @@ func (gr *group) notifyApplied(data []byte) {
 // 参数：
 //   - ctx: 控制等待；超时/取消后 waiter 被移除（条目可能仍会被提交，
 //     调用方已放弃等待，apply 时 notify 找不到它即可）
-//   - batchRepr: store.Batch.Repr() 的物理字节（提案载荷）
+//   - data: 前 ProposalHeaderLen 字节为保留提案头（由本函数回填，调用
+//     方不得填写有效内容），data[ProposalHeaderLen:] 为提案载荷
+//     （store.Batch.Repr() 的物理字节）。所有权随调用移交：rn.Propose
+//     之后 raft 长期持有该切片，调用方不得再读写。契约详见
+//     ProposalHeaderLen 常量注释与 replication.Cluster.Apply。
 //
 // 返回：
 //   - nil：条目已 apply
 //   - error：Propose 失败、ctx 超时/取消，或 ErrNotLeader（调用方带
 //     上下文处理，协议面按可重试码翻译）
-func (gr *group) propose(ctx context.Context, batchRepr []byte) error {
+func (gr *group) propose(ctx context.Context, data []byte) error {
+	// 保留头缺失属编程错误（调用方没按单拷贝契约构造缓冲），fail-stop
+	// 直接报错，绝不能把载荷前 16B 当头覆盖掉。
+	if len(data) < ProposalHeaderLen {
+		return fmt.Errorf("cluster: 提案缓冲长度 %d 小于保留头 %d（调用方未按单拷贝契约预留）",
+			len(data), ProposalHeaderLen)
+	}
 	// 快速失败：已探明 leader 是他人（follower 提案在 DisableProposal
 	// Forwarding 下必被丢弃），立即返回 ErrNotLeader 让客户端经
 	// Leader(g) 重试——等待 raft 处理周期或等到超时都是客户端不可
@@ -1590,11 +1610,11 @@ func (gr *group) propose(ctx context.Context, batchRepr []byte) error {
 	// 提案头布局（终审 R4）：[8B 提案者 nodeID][8B waiter id]——apply
 	// 时据此回调对应 waiter，且只有提案者为本节点的条目才被唤醒
 	// （waiter id 是每节点独立计数器，跨节点可能撞车，裸 id 通知会
-	// 把别节点丢失的提案误判成自己的成功）
-	data := make([]byte, 16+len(batchRepr))
+	// 把别节点丢失的提案误判成自己的成功）。
+	// 只回填调用方预留的保留头，不再分配新缓冲——第二次整拷在此消除
+	// （单拷贝契约，见 ProposalHeaderLen 注释）。
 	binary.BigEndian.PutUint64(data[:8], gr.selfID)
 	binary.BigEndian.PutUint64(data[8:16], id)
-	copy(data[16:], batchRepr)
 
 	if err := gr.rn.Propose(ctx, data); err != nil {
 		gr.removeWaiter(gr.propWaiters, id)

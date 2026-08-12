@@ -63,6 +63,12 @@ const (
 	// 会把 buf 撑大，若无上限则每个 peer 的发送 goroutine 都可能永久
 	// 钉住一块大内存——超限即重置为小容量。
 	maxRetainedBufCap = 4 << 20
+
+	// readBufShrinkCap 接收侧复用缓冲的缩容阈值：正常 raft 帧远小于
+	// 4MiB（消息体上限 4MB 是逻辑消息，且多数帧是心跳/小追加），超过
+	// 即视为「偶发大帧撑大了缓冲」，处理完当帧就释放，避免长命连接
+	// 钉住最多 maxFrameLen 的内存（见 shrinkReadBuf）。
+	readBufShrinkCap = 4 << 20
 )
 
 // ControlGroup 是控制通道的保留组号：业务组号上限 64（Task 1 数据组
@@ -445,6 +451,16 @@ func (t *transport) appendEnvelope(buf []byte, env envelope, peerID uint64) []by
 // readLoop 单连接的读帧循环：io.ReadFull 读帧长→读帧体→拆组号→
 // proto.Unmarshal 到新分配的 &raftpb.Message{} → deliver。
 //
+// 帧体缓冲每连接复用（grow-only + 超限缩容），不再每帧 make——高频
+// 分配进 GC 是纯税。复用的安全性论证：
+//   - raft 帧路径：proto.Unmarshal 默认把 bytes 字段拷贝进新分配的
+//     内存，msg 不引用 body，下一帧覆写缓冲不影响已投递消息；
+//   - 控制帧路径：controlFrame 把 payload 子切片交给 handler，handler
+//     可能保留引用，但控制帧是本连接的最后一帧——controlFrame 返回后
+//     readLoop 即 return（defer 关连接），缓冲此后不再复用，安全；
+//   - 分区丢弃路径：body 读完即弃，无人保留引用。
+// 若未来让控制帧后继续循环，必须先给控制帧路径改回独立分配。
+//
 // 坏帧（帧长越界、反序列化失败）记 Warn 后退出循环（defer 关连接），
 // 等对端重拨——不能让一个坏字节流永久毒化读循环。
 //
@@ -456,6 +472,9 @@ func (t *transport) readLoop(conn net.Conn) {
 	defer t.unregisterConn(conn) // delete-then-close，与 sendLoop 同风格
 	remote := conn.RemoteAddr().String()
 	header := make([]byte, 4)
+	// 帧体复用缓冲：容量只增不减（处理完一帧后超过 readBufShrinkCap
+	// 才缩，见循环尾），与 writeLoop 的发送侧 buf 复用同思路
+	var buf []byte
 	for {
 		if _, err := io.ReadFull(conn, header); err != nil {
 			return // 对端断开或看门狗关连接：正常退出
@@ -465,7 +484,10 @@ func (t *transport) readLoop(conn net.Conn) {
 			t.lg.Warn("坏帧：帧长越界，断开连接", "remote", remote, "frameLen", frameLen)
 			return
 		}
-		body := make([]byte, int(frameLen)) // 帧体 = 组号 + payload
+		if cap(buf) < int(frameLen) {
+			buf = make([]byte, int(frameLen))
+		}
+		body := buf[:int(frameLen)] // 帧体 = 组号 + payload
 		if _, err := io.ReadFull(conn, body); err != nil {
 			return
 		}
@@ -474,12 +496,15 @@ func (t *transport) readLoop(conn net.Conn) {
 			// 测试分区：整段丢弃入站帧（raft 与控制帧一起丢，等价于
 			// 网络不可达；见 setPartitioned）。连接保持读消耗，对端
 			// 写不积压，恢复投递立即生效。
+			buf = shrinkReadBuf(buf)
 			continue
 		}
 		if group == ControlGroup {
 			// 控制通道帧：不进 raft 消息流。请求/响应是短连接 RPC 的
 			// 一次往返——应答写回同一条连接后本循环退出（defer 关连接），
 			// 与 raft 流水消息互不交织（见 ControlGroup 注释）。
+			// 缓冲复用安全性依赖「控制帧是本连接最后一帧」——handler 可
+			// 能保留 payload 引用，这里 return 后缓冲不再被覆写。
 			t.controlFrame(conn, remote, body)
 			return
 		}
@@ -490,8 +515,23 @@ func (t *transport) readLoop(conn net.Conn) {
 		}
 		// deliver 可能阻塞（上层归组入队）；这正是 TCP 背压的体现——
 		// 读端慢，写端自然阻塞，而非本地丢弃。
+		// Unmarshal 已把 body 内容拷进 msg（bytes 字段默认拷贝），此后
+		// body/buf 可安全覆写或释放。
 		t.deliver(group, msg)
+		buf = shrinkReadBuf(buf)
 	}
+}
+
+// shrinkReadBuf 防大帧钉住内存：一帧处理完毕后，若复用缓冲的容量超过
+// readBufShrinkCap（单帧上限是 maxFrameLen 16MiB，一条曾收过大帧的
+// 连接会一直钉着这块内存），直接释放让下一帧按需重新分配。调用前提：
+// 本帧内容已消费完毕（Unmarshal 已拷贝 / 丢弃路径已弃用），无人再引用
+// 缓冲。
+func shrinkReadBuf(buf []byte) []byte {
+	if cap(buf) > readBufShrinkCap {
+		return nil
+	}
+	return buf
 }
 
 // unregisterConn 把连接从看门狗集合中摘除（读/写循环退出时调用）。

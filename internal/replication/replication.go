@@ -304,35 +304,58 @@ func NewCluster(m *cluster.Manager) *Cluster {
 	return &Cluster{m: m, l: slog.Default().With("mod", "replication")}
 }
 
+// reserveProposal 把批次字节拷进「预留 cluster.ProposalHeaderLen 提案头」
+// 的新缓冲——单拷贝契约的调用方半边（另一半见 cluster.ProposalHeaderLen
+// 与 Manager.ProposeReserved 注释）：前 16B 留白由 group.propose 回填
+// 提案者/waiter id，本函数不写它们；缓冲所有权随 ProposeReserved 移交
+// raft，构造后本包不再读写。
+//
+// 这一次拷贝不可省：Repr 返回的底层内存归批次所有（Task 1 约定），
+// Close 回收前必须拷出；把「必要的一次拷贝」直接拷进带头缓冲，原先
+// group.propose 里的第二次整拷（消息体上限 4MB）就此消除。
+func reserveProposal(repr []byte) []byte {
+	data := make([]byte, cluster.ProposalHeaderLen+len(repr))
+	copy(data[cluster.ProposalHeaderLen:], repr)
+	return data
+}
+
 // Apply 把批次字节提进所属 raft 组并阻塞到本节点 apply 完成。
 //
-// 先拷贝 Repr 字节再 Close：Repr 返回的底层内存归批次所有（Task 1
-// 约定），raft 库会长期持有日志条目，批次回收前必须完成拷贝。
+// 先经 reserveProposal 拷出 Repr 字节（带 16B 保留头，单拷贝契约）再
+// Close：Repr 返回的底层内存归批次所有（Task 1 约定），raft 库会长期
+// 持有日志条目，批次回收前必须完成拷贝。
 // Close 失败仅记 Warn 不阻断提案——字节已取出，Close 只是回收内存池。
 // 非 leader 等 Propose 错误原样上抛，不做翻译（见文件头边界说明）。
 func (r *Cluster) Apply(ctx context.Context, group uint32, b *store.Batch) error {
-	repr := append([]byte(nil), b.Repr()...)
+	data := reserveProposal(b.Repr())
 	if err := b.Close(); err != nil {
 		r.l.Warn("复制前回收批次失败（字节已取出，不阻断提案）", "group", group, "err", err)
 	}
-	return r.m.Propose(ctx, group, repr)
+	return r.m.ProposeReserved(ctx, group, data)
 }
 
 // ApplyAsync 拷贝 repr 并立即返回，等待挪到 Pending.Wait——produce 热
-// 路径的锁外等待形态。
+// 路径的锁外等待形态。拷贝同 Apply 走 reserveProposal（单拷贝契约）。
 //
 // 与单机档同形不同机制：集群档的「定序」发生在 raft 内部批量（并发
 // 在途提案经 Ready 循环合并推进），这里拆出 goroutine 只为把等待挪出
 // 调用方队列锁；Wait 阻塞到本节点 apply（quorum+本地）完成，读己之写
 // 语义与 Apply 一致。批次归属同 Apply：字节取出后 Close（失败仅记
 // Warn，不阻断提案）。
+//
+// goroutine 为什么必须保留（勿「优化」成调用方同步 Propose）：调用方
+// produce.Append 在持有队列锁 qs.mu 时调用本方法，依赖它立即返回才能
+// 把 fsync/quorum 等待挪到锁外；而 rn.Propose 在 leader 未知（选举窗口）
+// 时会阻塞到 leader 产生——同步执行会让选举窗口内 qs.mu 被长期占住，
+// 是行为回退。rn.Propose 没有非阻塞变体，等待无法拆进 Wait，故保留
+// goroutine，本轮只消除第二次整拷。
 func (r *Cluster) ApplyAsync(ctx context.Context, group uint32, b *store.Batch) (Pending, error) {
-	repr := append([]byte(nil), b.Repr()...)
+	data := reserveProposal(b.Repr())
 	if err := b.Close(); err != nil {
 		r.l.Warn("复制前回收批次失败（字节已取出，不阻断提案）", "group", group, "err", err)
 	}
 	ch := make(chan error, 1)
-	go func() { ch <- r.m.Propose(ctx, group, repr) }()
+	go func() { ch <- r.m.ProposeReserved(ctx, group, data) }()
 	return chanPending(ch), nil
 }
 

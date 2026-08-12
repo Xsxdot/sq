@@ -1592,12 +1592,30 @@ func (m *Manager) GroupForQueue(topic string, queueID uint32) uint32 {
 
 // Propose 向指定组提交一条提案并阻塞直到它在本节点 apply 完成
 // （读己之写语义，见 group.propose）。
+//
+// 兼容包装：接收裸载荷，内部代为分配「预留 ProposalHeaderLen 头」的
+// 缓冲再走 ProposeReserved。热路径（replication.Cluster.Apply/
+// ApplyAsync）应直接构造预留头缓冲调 ProposeReserved，避免这里的
+// 额外一次分配拷贝；低频调用方（测试、工具路径）用本方法即可。
 func (m *Manager) Propose(ctx context.Context, g uint32, batchRepr []byte) error {
+	data := make([]byte, ProposalHeaderLen+len(batchRepr))
+	copy(data[ProposalHeaderLen:], batchRepr)
+	return m.ProposeReserved(ctx, g, data)
+}
+
+// ProposeReserved 单拷贝提案入口：data 前 ProposalHeaderLen 字节为保留
+// 提案头（由 group.propose 回填），data[ProposalHeaderLen:] 为批次载荷。
+//
+// 契约（与 group.propose、replication.Cluster.Apply 互引，详见
+// ProposalHeaderLen 常量注释）：
+//   - 调用方构造 data 时预留头部 16B，不得填写有效内容；
+//   - 所有权随调用移交——raft 会长期持有该切片，调用方此后不得读写。
+func (m *Manager) ProposeReserved(ctx context.Context, g uint32, data []byte) error {
 	gr, ok := m.groups[g]
 	if !ok {
 		return fmt.Errorf("cluster: 未知数据组 %d（有效范围 [0, %d]）", g, m.Groups()-1)
 	}
-	return gr.propose(ctx, batchRepr)
+	return gr.propose(ctx, data)
 }
 
 // IsLeader 返回本节点当前是否为指定组的 leader。

@@ -106,6 +106,16 @@ func newTestGroupWithHook(t *testing.T, hook func(g uint32, leader uint64, isSel
 	return gr
 }
 
+// proposePayload 按 group.propose 的单拷贝契约（前 ProposalHeaderLen
+// 字节保留头由 propose 回填）包装裸载荷：测试侧模拟真实调用方
+// （replication.reserveProposal）的缓冲构造形态。每次调用新分配缓冲
+// ——所有权随 propose 移交 raft，不可跨调用复用。
+func proposePayload(ctx context.Context, gr *group, payload []byte) error {
+	data := make([]byte, ProposalHeaderLen+len(payload))
+	copy(data[ProposalHeaderLen:], payload)
+	return gr.propose(ctx, data)
+}
+
 // TestGroupSingleNodeProposeApply 单节点单组最小闭环：propose 的批次
 // 字节 apply 进共享 store，且 applied_index 与 FSM 写同批落盘（spec §5
 // 原子性承诺的直接断言）。
@@ -123,7 +133,7 @@ func TestGroupSingleNodeProposeApply(t *testing.T) {
 	if err := b.Close(); err != nil { // 提案路径只取字节，原批次弃用
 		t.Fatal(err)
 	}
-	if err := gr.propose(ctx, repr); err != nil {
+	if err := proposePayload(ctx, gr, repr); err != nil {
 		t.Fatal(err)
 	}
 	// propose 返回即本节点已 apply：立即可读，且 applied_index 已持久化
@@ -146,7 +156,7 @@ func TestGroupProposeCtxTimeout(t *testing.T) {
 	gr := startLoneGroupOfThree(t, 0, rs, st) // 成员表 {1,2,3} 只起节点 1：永无 quorum
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if err := gr.propose(ctx, []byte("x")); err == nil {
+	if err := proposePayload(ctx, gr, []byte("x")); err == nil {
 		t.Fatal("无 quorum 的 propose 应超时报错，得到 nil")
 	}
 	gr.mu.Lock()
@@ -405,7 +415,9 @@ func BenchmarkProposeQuorumFsync(b *testing.B) {
 	}
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		if err := gr.propose(context.Background(), repr); err != nil {
+		// 每轮新分配带头缓冲（proposePayload 内部）：单拷贝契约下缓冲
+		// 所有权移交 raft，不能像旧形态那样跨提案复用同一切片
+		if err := proposePayload(context.Background(), gr, repr); err != nil {
 			b.Fatal(err)
 		}
 	}
