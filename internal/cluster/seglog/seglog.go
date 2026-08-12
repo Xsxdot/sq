@@ -419,20 +419,21 @@ func (l *Log) Append(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) erro
 		return fmt.Errorf("seglog: 已关闭，拒绝 Append")
 	}
 
+	// 帧组装走 appendFrameMarshal：protobuf 序列化经 MarshalAppend 直接
+	// 续写进 l.buf，省掉每条记录「Marshal 到临时切片再整拷进 buf」的一次
+	// 分配 + 一次拷贝；盘上帧格式与 appendFrame 逐字节相同（见
+	// appendFrameMarshal 注释与对照测试），Open 扫描回读不受影响。
 	l.buf = l.buf[:0]
+	var err error
 	if hs != nil {
-		payload, err := proto.Marshal(hs)
-		if err != nil {
+		if l.buf, err = appendFrameMarshal(l.buf, recHardState, hs); err != nil {
 			return fmt.Errorf("seglog: 编码 hardstate 失败: %w", err)
 		}
-		l.buf = appendFrame(l.buf, recHardState, payload)
 	}
 	for _, e := range ents {
-		payload, err := proto.Marshal(e)
-		if err != nil {
+		if l.buf, err = appendFrameMarshal(l.buf, recEntry, e); err != nil {
 			return fmt.Errorf("seglog: 编码 entry(index=%d) 失败: %w", e.GetIndex(), err)
 		}
-		l.buf = appendFrame(l.buf, recEntry, payload)
 	}
 
 	if len(l.buf) > 0 {

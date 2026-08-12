@@ -15,6 +15,8 @@ import (
 	"encoding/binary"
 	"errors"
 	"hash/crc32"
+
+	"google.golang.org/protobuf/proto"
 )
 
 // 记录类型（帧的 1B type 字段）。
@@ -38,6 +40,11 @@ var errTornFrame = errors.New("seglog: torn frame")
 var castagnoli = crc32.MakeTable(crc32.Castagnoli)
 
 // appendFrame 把一条记录帧追加到 dst 并返回新切片（append 语义）。
+//
+// 调用方：轮转时的 HardState 补写（低频路径）与 frame_test 的格式对照。
+// Append 热路径已迁移到 appendFrameMarshal（免去先 Marshal 到临时切片
+// 再整拷进 buf 的一次分配 + 一次拷贝），两者写出的帧逐字节相同——
+// 见 TestAppendFrameMarshalMatchesAppendFrame。
 func appendFrame(dst []byte, typ byte, payload []byte) []byte {
 	var hdr [frameHeaderLen]byte
 	binary.BigEndian.PutUint32(hdr[0:4], uint32(1+len(payload)))
@@ -47,6 +54,37 @@ func appendFrame(dst []byte, typ byte, payload []byte) []byte {
 	dst = append(dst, hdr[:]...)
 	dst = append(dst, typ)
 	return append(dst, payload...)
+}
+
+// appendFrameMarshal 把 msg 的 protobuf 序列化直接编码为一条记录帧追加
+// 到 dst 并返回新切片（append 语义），盘上格式与 appendFrame 逐字节
+// 相同（回归对照见 TestAppendFrameMarshalMatchesAppendFrame）。
+//
+// 为什么单独存在：appendFrame 要求调用方先 proto.Marshal 出独立的
+// payload 切片，每条记录多一次分配 + 一次整拷。这里先在 dst 预留
+// 9B（8B 帧头 + 1B type），用 MarshalAppend 让 payload 直接续写进
+// dst，再回填帧头——len = 1+payloadLen，CRC 按与 appendFrame 完全一致
+// 的顺序（先 type 字节后 payload，Castagnoli 表；crc32.Update 的链式
+// 结果等价于对拼接区间一次 Checksum）。
+//
+// 失败时返回 (原 dst 截回追加前的长度, err)：预留头不残留，调用方
+// fail-stop 即可，无需回滚。
+func appendFrameMarshal(dst []byte, typ byte, msg proto.Message) ([]byte, error) {
+	base := len(dst)
+	// 预留 8B 帧头 + 1B type；帧头此刻为零值占位，payload 长度要等
+	// MarshalAppend 写完才知道，之后回填
+	dst = append(dst, 0, 0, 0, 0, 0, 0, 0, 0, typ)
+	out, err := proto.MarshalOptions{}.MarshalAppend(dst, msg)
+	if err != nil {
+		return dst[:base], err
+	}
+	payloadLen := len(out) - base - frameHeaderLen - 1
+	binary.BigEndian.PutUint32(out[base:base+4], uint32(1+payloadLen))
+	// CRC 覆盖 type 字节 + payload 区间（即帧头之后的全部本帧字节），
+	// 与 appendFrame 的两段 Update 完全同序
+	crc := crc32.Checksum(out[base+frameHeaderLen:], castagnoli)
+	binary.BigEndian.PutUint32(out[base+4:base+8], crc)
+	return out, nil
 }
 
 // readFrame 从 buf 头部解一帧。

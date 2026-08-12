@@ -7,6 +7,10 @@ import (
 	"bytes"
 	"errors"
 	"testing"
+
+	"google.golang.org/protobuf/proto"
+
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 func TestFrameRoundTrip(t *testing.T) {
@@ -35,6 +39,50 @@ func TestFrameTornDetection(t *testing.T) {
 	bad[len(bad)-1] ^= 0x01
 	if _, _, _, err := readFrame(bad); !errors.Is(err, errTornFrame) {
 		t.Fatalf("CRC 损坏应判 errTornFrame，得到 %v", err)
+	}
+}
+
+// TestAppendFrameMarshalMatchesAppendFrame 锁死盘上格式：Append 热路径
+// 迁移到 appendFrameMarshal（MarshalAppend 直接续写 buf）后，写出的帧
+// 必须与旧路径「proto.Marshal 到临时切片 + appendFrame」逐字节相同——
+// 帧头长度、CRC、type、payload 全部一致，段文件格式不因优化改变。
+func TestAppendFrameMarshalMatchesAppendFrame(t *testing.T) {
+	term, vote, commit, index := uint64(7), uint64(3), uint64(42), uint64(43)
+	hs := &raftpb.HardState{Term: &term, Vote: &vote, Commit: &commit}
+	ent := &raftpb.Entry{Term: &term, Index: &index,
+		Data: []byte("batch-repr-bytes")}
+	empty := &raftpb.Entry{} // 零值消息：payload 长度为 0 的边界
+
+	cases := []struct {
+		name string
+		typ  byte
+		msg  proto.Message
+	}{
+		{"hardstate", recHardState, hs},
+		{"entry", recEntry, ent},
+		{"empty-entry", recEntry, empty},
+	}
+	for _, tc := range cases {
+		payload, err := proto.Marshal(tc.msg)
+		if err != nil {
+			t.Fatalf("%s: 旧路径 Marshal 失败: %v", tc.name, err)
+		}
+		old := appendFrame(nil, tc.typ, payload)
+		// 前缀非空的 dst 也要对齐（Append 里 HS 帧后续写 entry 帧的形态）
+		newBuf, err := appendFrameMarshal([]byte("prefix"), tc.typ, tc.msg)
+		if err != nil {
+			t.Fatalf("%s: appendFrameMarshal 失败: %v", tc.name, err)
+		}
+		if !bytes.Equal(newBuf[len("prefix"):], old) {
+			t.Fatalf("%s: 新旧路径帧字节不一致\nold=%x\nnew=%x",
+				tc.name, old, newBuf[len("prefix"):])
+		}
+		// 回读校验：新路径帧必须能被 readFrame 原样解出
+		typ, got, _, err := readFrame(newBuf[len("prefix"):])
+		if err != nil || typ != tc.typ || !bytes.Equal(got, payload) {
+			t.Fatalf("%s: 新路径帧回读 = %d,%x,%v; want %d,%x,nil",
+				tc.name, typ, got, err, tc.typ, payload)
+		}
 	}
 }
 
