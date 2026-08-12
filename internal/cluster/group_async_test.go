@@ -209,3 +209,61 @@ func TestSnapshotInstallExcludesApply(t *testing.T) {
 		t.Fatalf("陈旧条目不该落库（快照已覆盖该组状态），读到 %q", v)
 	}
 }
+
+// TestOutboundNotBlockedByPersist 本改造的收益命题，落成一条可证伪的
+// 用例：一轮 Ready 里的网络消息必须在本地 append 消息**入队之前**就已外发。
+//
+// 旧路径（同步 Ready）里这是不可能的——持久化在 group.go:396、外发在
+// :417，leader 做 fsync 的那 1.8ms 里 MsgApp 一个字节都发不出去，确认链
+// 于是变成「leader fsync → 网络 → follower fsync」两次串行相加，这正是
+// quorum-fsync 档 +69% raft 机制税的来源。
+//
+// 本用例不测吞吐（那是三机实测的事），只测**顺序**：顺序对了，流水线
+// 深度才有可能 > 1。别拿它当性能测试误判。
+//
+// 三条形态约束，缺一条判别力就没了：
+//  1. 为什么先灌满 appendCh：通道容量是 64（localQueueDepth），不满的话
+//     即便有人把 dispatchReady 改成「先入队、再外发」，入队进一个有空位
+//     的通道也不会阻塞，sent 照样立刻到达，用例抓不住顺序颠倒。灌满后
+//     入队必然阻塞，外发若排在入队之后，sent 永远等不到，用例才真的红。
+//  2. 为什么不能有消费者：任何从 appendCh 收消息的 goroutine 都会腾出
+//     位置，阻塞中的入队随即成功、外发照常执行——判别条件当场失效
+//     （上一版「取一条卡 gate 模拟慢 fsync」的写法实测对调顺序后仍然
+//     全绿，缺陷就在这里）。整个 dispatchReady 期间通道必须保持满，
+//     谁也不许收。后人若想补回一个「更逼真」的消费者，请先读这段。
+//  3. 为什么 dispatchReady 要在独立 goroutine 里调、且收工靠 cancel：
+//     顺序正确时 send 先执行、紧接着 enqueueLocal 就阻塞在满通道上不
+//     返回——主协程直调根本走不到断言行，正确实现反而红。阻塞中的
+//     enqueueLocal 只有 ctx 取消这一个出口，因此断言无论成败都要
+//     cancel 并等 done，不留悬挂协程。
+func TestOutboundNotBlockedByPersist(t *testing.T) {
+	gr, _, _ := newApplyTestGroup(t, nil)
+	sent := make(chan struct{}, 1) // 有缓冲：send 发生时主协程还没在收
+	gr.send = func(uint32, []*raftpb.Message) { sent <- struct{}{} }
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 灌满 appendCh，且不起任何消费者（形态约束 1、2）
+	for i := 0; i < cap(gr.appendCh); i++ {
+		gr.appendCh <- localMsg{m: msgTo(raft.LocalAppendThread, raftpb.MsgStorageAppend)}
+	}
+
+	appendTyp, appendTo := raftpb.MsgStorageAppend, raft.LocalAppendThread
+	rd := raft.Ready{MustSync: true, Messages: []*raftpb.Message{
+		msgTo(2, raftpb.MsgApp),
+		{Type: &appendTyp, To: &appendTo},
+	}}
+
+	done := make(chan struct{})
+	go func() { defer close(done); gr.dispatchReady(ctx, rd) }()
+	// 收工保障（形态约束 3）：t.Fatal 走 Goexit，只有 defer 能在失败路径
+	// 上也放行阻塞中的 enqueueLocal 并等 dispatchReady 返回，不留悬挂协程
+	defer func() { cancel(); <-done }()
+
+	select {
+	case <-sent:
+	case <-time.After(2 * time.Second):
+		t.Fatal("持久化入队已阻塞、MsgApp 却还没发出——外发被排在了本地写入之后，流水线深度仍是 1")
+	}
+}

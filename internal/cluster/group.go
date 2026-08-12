@@ -408,6 +408,19 @@ func (gr *group) run(ctx context.Context) {
 	go func() { defer stages.Done(); gr.runApply(ctx) }()
 	defer func() {
 		stages.Wait()
+		// 组退出汇总：本地阶段的阻塞总量是「存储侧跟不上」的唯一量化
+		// 信号——它不为零就意味着主循环被拖住过、本组 tick 受过影响。
+		// 只在退出时打一次（热路径零日志），长期非零由运维按 search_logs
+		// 检索这条文案定位。
+		ab, pb := gr.appendBlockNanos.Load(), gr.applyBlockNanos.Load()
+		if ab > 0 || pb > 0 || gr.respDropped.Load() > 0 {
+			gr.lg.Warn("本地存储阶段存在阻塞或丢弃（存储侧跟不上主循环）",
+				"append_blocked", time.Duration(ab).Round(time.Millisecond).String(),
+				"apply_blocked", time.Duration(pb).Round(time.Millisecond).String(),
+				"append_handled", gr.appendCount.Load(),
+				"apply_handled", gr.applyCount.Load(),
+				"resp_dropped", gr.respDropped.Load())
+		}
 		close(gr.doneCh)
 	}()
 	// 存生命周期 ctx：读屏障的合流驱动 goroutine 以它为父 ctx，组退出时
