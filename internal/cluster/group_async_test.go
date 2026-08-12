@@ -14,6 +14,7 @@ package cluster
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -110,5 +111,101 @@ func TestDispatchReadyCarriesMustSync(t *testing.T) {
 		case <-time.After(time.Second):
 			t.Fatal("append 通道没收到消息")
 		}
+	}
+}
+
+// TestSnapshotInstallExcludesApply 快照安装期间 apply 阶段必须让路。
+//
+// 为什么这条是 async 独有的：旧路径里安装与 apply 都在 Ready 循环内串行
+// 执行，物理上不可能重叠；async 之后它们是两条协程，raft 也明确允许不同
+// target 的本地消息乱序处理。若不互斥，一批安装前入队的 MsgStorageApply
+// 会在 wipeGroupKeys 之后落地，把陈旧数据写回刚被快照覆盖的键——静默的
+// 状态机分叉，没有任何报错。
+//
+// 断言两件事：
+//  1. 安装未完成时 applyOnce 不得推进（互斥真的生效）；
+//  2. 安装完成后那批陈旧条目被整批跳过（index ≤ applied 的既有守卫兜住），
+//     FSM 里不留任何陈旧键。
+func TestSnapshotInstallExcludesApply(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	gr := newGroup(0, 1, raft.NewMemoryStorage(), nil, rs, st,
+		func(uint32, []*raftpb.Message) {}, AckQuorumMem, nil, nil, testSlog(t))
+	rn := raft.StartNode(raftConfig(1, gr.stg), []raft.Peer{{ID: 1}})
+	gr.rn = rn
+	defer rn.Stop()
+
+	// 拉块回调阻塞在 gate 上：安装卡在第 4 步，安装临界区一直持有
+	gate := make(chan struct{})
+	// 收尾兜底（defer 在安装协程启动后注册）：失败路径 t.Fatal 会跳过
+	// 下方的放行，必须先放 gate 并等安装协程收工，否则 t.Cleanup 关闭
+	// store 与安装协程竞争（pebble: closed panic 会掩盖真正的断言失败）。
+	var gateOnce sync.Once
+	gr.control = func(ctx context.Context, nodeID uint64, op byte, payload []byte) ([]byte, error) {
+		<-gate
+		// 一块即完成：done=true，游标无意义，块内无键
+		// （snapFetchResp 是 group_test.go 的既有拼包助手）
+		return snapFetchResp(true, nil, nil), nil
+	}
+
+	idx, tm := uint64(100), uint64(2)
+	snap := &raftpb.Snapshot{
+		Data: encodeSnapDescriptor(snapDescriptor{ID: 7, Leader: 1, Index: idx}),
+		Metadata: &raftpb.SnapshotMetadata{
+			Index: &idx, Term: &tm, ConfState: &raftpb.ConfState{},
+		},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	installDone := make(chan struct{})
+	go func() {
+		defer close(installDone)
+		gr.appendOnce(ctx, storageAppendWithSnap(snap))
+	}()
+	defer func() {
+		gateOnce.Do(func() { close(gate) })
+		<-installDone
+	}()
+
+	// 陈旧条目：index 远低于快照位点，安装完成后必须被整批跳过
+	stale := []*raftpb.Entry{normalEntry(t, st, 5, 1, 101, "meta/topic/stale", "old")}
+	applyTyp, applyTo := raftpb.MsgStorageApply, raft.LocalApplyThread
+	applyMsg := &raftpb.Message{Type: &applyTyp, To: &applyTo, Entries: stale}
+
+	applyDone := make(chan struct{})
+	go func() {
+		defer close(applyDone)
+		gr.applyOnce(ctx, applyMsg)
+	}()
+
+	// 安装被 gate 卡住期间，apply 必须进不去
+	select {
+	case <-applyDone:
+		t.Fatal("安装未完成时 apply 就跑完了——两条阶段没有互斥，陈旧条目会覆盖快照数据")
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	gateOnce.Do(func() { close(gate) }) // 放行安装
+	select {
+	case <-installDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("快照安装未在 10s 内完成")
+	}
+	select {
+	case <-applyDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("安装完成后 apply 仍未放行——互斥没有释放")
+	}
+
+	if got := gr.applied.Load(); got != idx {
+		t.Fatalf("applied 应停在快照位点 %d，得到 %d——陈旧条目推进了位点", idx, got)
+	}
+	v, ok, err := st.Get([]byte("meta/topic/stale"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ok {
+		t.Fatalf("陈旧条目不该落库（快照已覆盖该组状态），读到 %q", v)
 	}
 }

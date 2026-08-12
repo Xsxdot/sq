@@ -193,6 +193,25 @@ type group struct {
 	// 提交 + Store(applied)，apply 路径绝不可在锁内阻塞等待。
 	applyMu sync.Mutex
 
+	// installMu 串行化「快照安装（append 阶段）」与「条目 apply
+	// （apply 阶段）」。
+	//
+	// 为什么 async 之后才需要：旧路径里两者都在 Ready 循环内顺序执行，
+	// 物理上不可能重叠；async 把它们拆成两条协程，而 raft 明确允许不同
+	// target 的本地消息乱序处理（raft.go:165-166）。安装会整体重写本组
+	// FSM（wipeGroupKeys → 拉块 → 收口批次），一批安装前入队的
+	// MsgStorageApply 若在安装之后落地，会把陈旧数据写回刚被覆盖的键。
+	//
+	// 与 applyMu 的分工（两把锁不嵌套、粒度不同，别合并）：
+	//   - applyMu 是**短**临界区，只覆盖「批提交 + 推 applied」，与快照
+	//     生成（groupStorage.Snapshot）互斥，保证视图与位点配对；
+	//   - installMu 是**长**临界区，覆盖整个安装（分钟级）与整批 apply，
+	//     只解决"安装 vs apply"这一件事。
+	//
+	// 陈旧批次不需要额外处理：安装收口时 applied 已跳到快照位点，
+	// applyPhase 里 index ≤ applied 的既有守卫会把整批跳掉。
+	installMu sync.Mutex
+
 	doneCh chan struct{} // run 循环完全退出后关闭，测试/调用方同步用
 
 	// installing 标记本组正在安装快照（appendOnce 的快照分支进出时
@@ -579,7 +598,10 @@ func (gr *group) appendOnce(ctx context.Context, lm localMsg) {
 	//    raft.go:167-170「MsgStorageAppend carries ... snapshots to apply」）。
 	//    安装期间保持 tick——见 installSnapshotWithRetry。
 	if snap := m.GetSnapshot(); !raft.IsEmptySnap(snap) {
+		// 安装持 installMu：整个安装期间 apply 阶段不得落地（见字段注释）
+		gr.installMu.Lock()
 		err := gr.installSnapshotWithRetry(ctx, snap)
+		gr.installMu.Unlock()
 		if err != nil && ctx.Err() != nil {
 			// 停机途中的安装失败不是故障：安装中标记已在盘上，重启时
 			// buildGroup 清空重来。此处 panic 只会把一次正常停机变成一次
@@ -652,7 +674,20 @@ func (gr *group) runApply(ctx context.Context) {
 // 与重试是 batch③ 的兜底缓解。
 func (gr *group) applyOnce(ctx context.Context, m *raftpb.Message) {
 	gr.applyCount.Add(1)
+	// 与快照安装互斥（installMu）：安装重写整个 FSM，期间落地的一批
+	// 陈旧条目会把旧数据写回刚被覆盖的键——静默状态机分叉。
+	// 安装期 apply 会在这里排队：分钟级安装下这是正常现象，但必须可见
+	// ——否则现场只表现为「读屏障迟迟不放行」而查不到原因。
+	if !gr.installMu.TryLock() {
+		start := time.Now()
+		gr.installMu.Lock()
+		if d := time.Since(start); d >= localQueueBlockWarn {
+			gr.lg.Warn("apply 阶段等待快照安装让路", "waited", d.Round(time.Millisecond).String(),
+				"entries", len(m.GetEntries()))
+		}
+	}
 	appliedCC := gr.applyPhase(m.GetEntries())
+	gr.installMu.Unlock()
 	gr.deliverResponses(ctx, m.GetResponses(), "apply")
 	for _, cc := range appliedCC {
 		if cc.notify {
