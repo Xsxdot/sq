@@ -409,7 +409,7 @@ func allZero(b []byte) bool {
 //   - sync: true 时写完 fsync（quorum-fsync 档 MustSync 轮）；false 时
 //     只 write() 进内核页缓存（mem 档持久性等位，进程 crash 不丢）
 //
-// 失败即返回错误，调用方（raftStore.Persist → group.handleReady）按
+// 失败即返回错误，调用方（raftStore.Persist → group.appendOnce）按
 // fail-stop 处理；本层不重试——写失败后文件偏移状态不可信。
 func (l *Log) Append(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) error {
 	l.mu.Lock()

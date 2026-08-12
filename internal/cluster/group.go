@@ -1,8 +1,8 @@
-// group.go 提供单组运行体：tick 驱动、Ready 四步契约、真实 FSM apply
-// 与 waiter 双命名空间。
+// group.go 提供单组运行体：tick 驱动、Ready 分发 + 本地 append/apply
+// 两阶段、真实 FSM apply 与 waiter 双命名空间。
 //
 // 职责：
-//   - 驱动单个 raft 组的生命周期：tick、消息步进、Ready 循环
+//   - 驱动单个 raft 组的生命周期：tick、消息步进、Ready 分发
 //   - propose/proposeConfChange 阻塞至条目在本节点 apply 完成（读己之写）
 //   - applied 位点与 FSM 数据同批原子写入共享 store（spec §5）
 //   - 按确认档位决定日志持久化是否带 fsync
@@ -10,6 +10,8 @@
 // 边界：
 //   - 不管组间路由与成员编排——Manager 的事（Task 5 组装）
 //   - 不做快照与日志截断——batch④，日志无界增长、追齐走全量重放
+//   - 不在主循环内做存储写入——日志落盘与 FSM apply 分属两条本地阶段
+//     协程，见 dispatchReady
 //   - AckQuorumMem 的后台批量 fsync 不在本层——全组共享一条 WAL，
 //     一个 flusher 即可，由 Manager 持有
 //   - 传输层生命周期（拨号/断线/关闭日志）归属 Manager 层（Task 3 约定）
@@ -85,8 +87,38 @@ var (
 	maxSnapshotBytes  int64 = 256 << 30
 )
 
-// group 是一个 raft 组运行体：tick 驱动选举/心跳，Ready 循环执行
-// 「持久化 → 发送 → apply → Advance」契约，FSM 为共享 store。
+// localMsg 是投进本地存储阶段的一条消息及其配套判定。
+//
+// mustSync 只对 MsgStorageAppend 有意义：async 之后写入点已经拿不到
+// Ready，而 fsync 档的同步判定（mode==AckQuorumFsync && rd.MustSync）
+// 必须逐轮成立，因此判定在主循环现场算好、随消息配对传下去。载体变了，
+// 判定本身一个字没变（设计文档 §4）。
+//
+// 为什么不改成「带 Responses 就 sync」（raft 契约的字面要求）：那比
+// MustSync 严格——commit-only 的轮次也会被 fsync，等于退回 2026-08-08
+// 「每提案少一次 fsync」优化之前的形态。MustSync 为假意味着无新条目且
+// term/vote 未变，此时 Responses 里的 MsgStorageAppendResp 确认的是**更早
+// 轮次**已经 fsync 过的条目，commit 位点丢了由重放重新推导——与旧路径
+// syncPersist 的既有论证完全同构。
+type localMsg struct {
+	m        *raftpb.Message
+	mustSync bool
+}
+
+const (
+	// localQueueDepth 两条本地存储通道的容量。取 64：单组在途 Ready
+	// 受 MaxInflightMsgs(256) 与 MaxCommittedSizePerReady(=MaxSizePerMsg,
+	// 1MiB) 双重约束，64 轮在途已远超稳态需要；再大只是把「存储侧跟不上」
+	// 从阻塞变成静默堆积内存，反而更难发现。
+	localQueueDepth = 64
+	// localQueueBlockWarn 入队阻塞多久算异常。50ms ≈ 半个 tick（100ms）
+	// ——超过它意味着本组的选举计时器已经开始受影响，必须留痕。
+	localQueueBlockWarn = 50 * time.Millisecond
+)
+
+// group 是一个 raft 组运行体：tick 驱动选举/心跳，Ready 循环按 m.To
+// 分发（网络消息立即外发，本地存储消息经 appendCh/applyCh 交给两条
+// 阶段协程），FSM 为共享 store。
 type group struct {
 	g  uint32
 	rn raft.Node // 由装配方在 newGroup 之后创建并赋值（Config.Storage 要包了快照生成器的 stg）
@@ -125,6 +157,31 @@ type group struct {
 	// （protoimpl.MessageState）。消息全链路用指针传递，避免按值拷贝
 	// 触发 vet copylocks 检查，也省一次拷贝开销。
 	inbox   chan *raftpb.Message
+	// 本地存储阶段的两条通道（AsyncStorageWrites）：主循环按 m.To 分发，
+	// append/apply 两条协程各自消费。
+	//
+	// **满则阻塞，绝不丢**——这与 inbox 的「满则丢」契约正好相反，是
+	// raft 的硬要求：同一 target 的本地消息必须可靠、有序处理
+	// （raft/v3@v3.7.0/raft.go:163-165）。丢一条 MsgStorageAppend 等于
+	// 静默丢日志，且 raft 会一直等那条永远不来的 MsgStorageAppendResp
+	// ——组静默卡死，没有任何报错。阻塞会传导到主循环并停掉本组 tick，
+	// 因此 enqueueLocal 对阻塞留痕（见其注释）。
+	appendCh chan localMsg
+	applyCh  chan localMsg
+	// 本地阶段可观测性（Task 4 补全语义，字段在此一次性声明避免二次改
+	// 结构体）：累计入队阻塞时长、累计处理条数、单次处理耗时峰值。
+	appendBlockNanos atomic.Uint64
+	applyBlockNanos  atomic.Uint64
+	appendCount      atomic.Uint64
+	applyCount       atomic.Uint64
+	respDropped      atomic.Uint64
+	// syncCount/batchCount 是 append 合批的效果计数：syncCount 是真正
+	// 落盘的次数，batchCount 是合批的批数。appendCount/syncCount 就是
+	// 「一次 fsync 摊了多少条 MsgStorageAppend」——三机实测里这个比值
+	// 从 4.11 跌到 1.60 正是异步化劣化的根因，退出汇总里打出来，
+	// 下次不必再去数 /proc/diskstats 才知道合批有没有生效。
+	syncCount  atomic.Uint64
+	batchCount atomic.Uint64
 	applied atomic.Uint64 // 已 apply 的最高条目 index（重启重放幂等的基础）
 	lead    atomic.Uint64 // 当前 leader 节点 ID，SoftState 变化时更新
 	// lastTerm 是最近一次非空 HardState 的 term 缓存（currentTerm 的
@@ -143,11 +200,30 @@ type group struct {
 	// 提交 + Store(applied)，apply 路径绝不可在锁内阻塞等待。
 	applyMu sync.Mutex
 
+	// installMu 串行化「快照安装（append 阶段）」与「条目 apply
+	// （apply 阶段）」。
+	//
+	// 为什么 async 之后才需要：旧路径里两者都在 Ready 循环内顺序执行，
+	// 物理上不可能重叠；async 把它们拆成两条协程，而 raft 明确允许不同
+	// target 的本地消息乱序处理（raft.go:165-166）。安装会整体重写本组
+	// FSM（wipeGroupKeys → 拉块 → 收口批次），一批安装前入队的
+	// MsgStorageApply 若在安装之后落地，会把陈旧数据写回刚被覆盖的键。
+	//
+	// 与 applyMu 的分工（两把锁不嵌套、粒度不同，别合并）：
+	//   - applyMu 是**短**临界区，只覆盖「批提交 + 推 applied」，与快照
+	//     生成（groupStorage.Snapshot）互斥，保证视图与位点配对；
+	//   - installMu 是**长**临界区，覆盖整个安装（分钟级）与整批 apply，
+	//     只解决"安装 vs apply"这一件事。
+	//
+	// 陈旧批次不需要额外处理：安装收口时 applied 已跳到快照位点，
+	// applyPhase 里 index ≤ applied 的既有守卫会把整批跳掉。
+	installMu sync.Mutex
+
 	doneCh chan struct{} // run 循环完全退出后关闭，测试/调用方同步用
 
-	// installing 标记本组正在安装快照（handleReady 的快照分支进出时
-	// 置位/清位）。安装期 Ready 循环不消费 inbox，step 必须改为「满则
-	// 丢弃」——见 step 注释的 I5 说明。
+	// installing 标记本组正在安装快照（appendOnce 的快照分支进出时
+	// 置位/清位）。安装期主循环可能阻塞在本地通道入队上而不再消费
+	// inbox，step 必须改为「满则丢弃」——见 step 注释的 I5 说明。
 	installing atomic.Bool
 	// installDrops 累计安装期因 inbox 满而丢弃的消息数（可观测性：
 	// 安装结束时打点，长期非零说明安装耗时已长到影响心跳投递）。
@@ -222,6 +298,8 @@ func newGroup(g uint32, selfID uint64, storage *raft.MemoryStorage, snaps *snapR
 		onApplied:      onApplied,
 		lg:             lg.With("mod", "group", "g", g),
 		inbox:          make(chan *raftpb.Message, 1024),
+		appendCh:       make(chan localMsg, localQueueDepth),
+		applyCh:        make(chan localMsg, localQueueDepth),
 		propWaiters:    make(map[uint64]chan struct{}),
 		ccWaiters:      make(map[uint64]chan struct{}),
 		readWaiters:    make(map[uint64]*readWait),
@@ -279,7 +357,7 @@ func newGroup(g uint32, selfID uint64, storage *raft.MemoryStorage, snaps *snapR
 // PreVote（raft thesis §9.6）消除长安装后的立即竞选中击：快照安装期间
 // run 循环阻塞、心跳无法被 Step，electionElapsed 攒满整个安装周期，而
 // promotable() 因 in-progress snapshot 为 false 不会中途竞选；安装一结束
-// Advance 后第一个 tick 即触发竞选，旧任期下直接 term bump、白白换一次
+// 第一个 tick 即触发竞选，旧任期下直接 term bump、白白换一次
 // 主（生产级快照 = 分钟级 chunk RTT，每次安装都换主）。PreVote 先跑一轮
 // 预选（以 r.Term+1 发 MsgPreVote 但不递增任期，raft 源码「Never change
 // our term in response to a PreVote」）：掉队节点的预选被拒，term 不动。
@@ -300,18 +378,58 @@ func raftConfig(id uint64, storage raft.Storage) *raft.Config {
 		// 见 raftConfig 注释：预选阶段挡掉掉队节点的 term bump（安装攒满
 		// electionElapsed → 安装后立即竞选换主）
 		PreVote: true,
+		// 异步存储写入（AsyncStorageWrites）：日志写入与状态机应用改由
+		// MsgStorageAppend/MsgStorageApply 两条本地消息表达，写入与
+		// Ready 迭代解耦。打开它是本仓库攻 quorum-fsync 档 raft 机制税
+		// 的手段——非 async 模式下 node.run 投出 Ready 后必须等 advancec
+		// 才产下一轮，于是 leader 做 fsync 的那段时间里 MsgApp 一个字节
+		// 都发不出去，确认链是「leader fsync → 网络 → follower fsync」
+		// 两次串行相加。打开后 leader 可在自己 fsync 完成前就 replicate
+		// （raft 只要求 commit 前 durable，不要求 replicate 前 durable）。
+		//
+		// 单点开关：所有装配路径（StartNode/RestartNode）与全部单元测试
+		// 都经本函数取配置，此处置位即全局生效。**不提供配置项**——两套
+		// Ready 处理路径长期共存必然腐化，且会制造「两条路径只测了一条」
+		// 的虚假安全感（设计文档 §4）。
+		AsyncStorageWrites: true,
 	}
 }
 
-// run 驱动组循环：tick 驱动选举/心跳、消息步进、Ready 处理，
+// run 驱动组循环：tick 驱动选举/心跳、消息步进、Ready 分发，
 // 直至 ctx 取消退出。
 //
+// 本循环内不做任何存储写入——写入全部经 appendCh/applyCh 交给两条
+// 阶段协程，这正是流水线深度的来源。
+//
 // 注意：tick 与心跳是高频路径，本循环内零日志（热循环规则）；
-// 关键节点日志全部落在 handleReady/propose 等低频路径上。
+// 关键节点日志全部落在 dispatchReady/阶段协程/propose 等低频路径上。
 func (gr *group) run(ctx context.Context) {
 	ticker := time.NewTicker(100 * time.Millisecond) // ElectionTick=10 → 选举超时约 1s
 	defer ticker.Stop()
-	defer close(gr.doneCh)
+	// 两条本地存储阶段协程与主循环同生命周期：doneCh 必须在三者**全部**
+	// 退出之后才关闭，否则测试里 <-gr.done() 返回时仍有协程在碰 store/rs，
+	// -race 下是稳定的 use-after-close。
+	var stages sync.WaitGroup
+	stages.Add(2)
+	go func() { defer stages.Done(); gr.runAppend(ctx) }()
+	go func() { defer stages.Done(); gr.runApply(ctx) }()
+	defer func() {
+		stages.Wait()
+		// 组退出汇总：本地阶段的阻塞总量是「存储侧跟不上」的唯一量化
+		// 信号——它不为零就意味着主循环被拖住过、本组 tick 受过影响。
+		// 只在退出时打一次（热路径零日志），长期非零由运维按 search_logs
+		// 检索这条文案定位。
+		ab, pb := gr.appendBlockNanos.Load(), gr.applyBlockNanos.Load()
+		if ab > 0 || pb > 0 || gr.respDropped.Load() > 0 {
+			gr.lg.Warn("本地存储阶段存在阻塞或丢弃（存储侧跟不上主循环）",
+				"append_blocked", time.Duration(ab).Round(time.Millisecond).String(),
+				"apply_blocked", time.Duration(pb).Round(time.Millisecond).String(),
+				"append_handled", gr.appendCount.Load(),
+				"apply_handled", gr.applyCount.Load(),
+				"resp_dropped", gr.respDropped.Load())
+		}
+		close(gr.doneCh)
+	}()
 	// 存生命周期 ctx：读屏障的合流驱动 goroutine 以它为父 ctx，组退出时
 	// 在途的 read-index 轮次随之取消，不会挂着等到 barrierTimeout。
 	gr.lifeCtx = ctx
@@ -325,230 +443,446 @@ func (gr *group) run(ctx context.Context) {
 		case m := <-gr.inbox:
 			_ = gr.rn.Step(ctx, m)
 		case rd := <-gr.rn.Ready():
-			gr.handleReady(ctx, rd)
+			gr.dispatchReady(ctx, rd)
 		}
 	}
 }
 
-// handleReady 执行 etcd/raft 的 Ready 四步契约。关键顺序（正确性所在）：
-//  0. 快照分支在最前（raft 契约：快照必须先于本轮条目应用，见分支内注释）；
-//  1. Entries/HardState 先持久化（quorum-fsync 档带 fsync）再发送 Messages——
-//     否则本节点确认过的日志可能在崩溃后消失，违反 raft 假设；
-//  2. 发送 Messages；
-//  3. CommittedEntries apply（FSM 数据与 applied 位点同批原子）后才 Advance；
-//  4. Advance——只有在此之后 raft 库才认为本轮处理完毕，继续产下一轮 Ready。
+// dispatchReady 处理一轮 Ready：网络消息立即外发，两条本地存储消息可靠
+// 入队，读状态与 leader 变更就地处理。**没有 Advance**——async 模式下
+// node.run 的 advancec 恒为 nil，调用 Advance 会永久阻塞（raft/v3@v3.7.0/
+// node.go:435-441、:555-560）；raft 认为「本轮处理完毕」的信号改由本地
+// 阶段投递 m.Responses 承担。
 //
-// AckQuorumMem 档刻意放松第 1 步的 fsync：NoSync 落盘 + Manager 层后台
-// 周期批量 fsync 兜底，这正是 spec §2.2 要实测的取舍，配套规则见 Task 5。
-func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
-	// 0. 快照：raft 判定本节点落后过多，leader 发来了 MsgSnap。
-	//    安装期间本组暂停处理普通条目（raft 契约），但必须保持 tick——
-	//    否则选举计时器停摆，安装完成后本节点会被判定失联。
-	//    rn.Tick() 可跨 goroutine 调用（内部走 channel，满则丢）。
-	if !raft.IsEmptySnap(rd.Snapshot) {
-		err := gr.installSnapshotWithRetry(ctx, rd.Snapshot)
-		if err != nil && ctx.Err() != nil {
-			// 停机途中的安装失败不是故障：安装中标记（第 2 步）已在盘上，
-			// 重启时 buildGroup 清空重来。此处 panic 只会把一次正常停机
-			// 变成一次崩溃退出。直接返回本轮——run 循环下一次 select 即
-			// 走 ctx.Done() 分支退出。
-			gr.lg.Warn("快照安装随停机中止（安装中标记已在盘上，重启清空重来）",
-				"g", gr.g, "index", rd.Snapshot.Metadata.GetIndex(), "err", err)
+// 顺序即收益（本改造的全部意义所在）：
+//  1. **先外发网络消息**——leader 的 MsgApp 从此不再排在自己的 fsync
+//     后面，follower 可以与 leader 并行落盘。这一步不需要任何前置条件：
+//     async 下 rd.Messages 里的网络消息「can be sent immediately」，因为
+//     一切以持久化为前提的消息都被移进了本地消息的 Responses 里
+//     （raft/v3@v3.7.0/node.go:98-110）。
+//  2. 入队 append（携带本轮 MustSync）、入队 apply。
+//  3. 读状态回流与 leader 变更。
+//
+// 为什么 leader 变更放在入队之后：入队本身就是排序动作——写入已经进了
+// FIFO，不可能被后续轮次的写入越过。这比旧路径（持久化**完成**后才公布
+// 新 leader）弱一档，是 async 的固有代价：raft 自身的安全性由 MsgVoteResp
+// 随 Responses 在 fsync 之后投递来保证（vote 落盘先于响应投票请求），
+// 本节点公布 leader 身份只影响本进程内的路由与钩子。
+//
+// rd.Entries/HardState/Snapshot/CommittedEntries 在 async 下**一律不直接
+// 消费**——它们已被复制进两条本地消息，直接用会双写/双 apply。
+func (gr *group) dispatchReady(ctx context.Context, rd raft.Ready) {
+	var outbound []*raftpb.Message
+	var locals []localMsg
+	for _, m := range rd.Messages {
+		switch m.GetTo() {
+		case raft.LocalAppendThread:
+			locals = append(locals, localMsg{m: m, mustSync: rd.MustSync})
+		case raft.LocalApplyThread:
+			locals = append(locals, localMsg{m: m})
+		default:
+			outbound = append(outbound, m)
+		}
+	}
+	// 1. 网络消息立即外发（transport 发送永不阻塞——满则丢，raft 心跳
+	//    重试兜底，Task 3 契约）。外发前先登记本轮的 MsgSnap 定向台账
+	//    ——这是 leader 侧唯一能知道「哪份快照发给了哪个 peer」的时刻。
+	if len(outbound) > 0 {
+		gr.noteSnapSends(outbound)
+		gr.send(gr.g, outbound)
+	}
+	// 2. 本地存储消息按原序可靠入队。入队失败只可能是组正在退出
+	//    （enqueueLocal 已留痕），此时直接收工——后续消息也没有归宿。
+	for _, lm := range locals {
+		ch := gr.applyCh
+		stage := "apply"
+		if lm.m.GetTo() == raft.LocalAppendThread {
+			ch, stage = gr.appendCh, "append"
+		}
+		if !gr.enqueueLocal(ctx, ch, lm, stage) {
 			return
 		}
-		if err != nil {
-			// 安装失败是不可恢复状态：绝不能 Advance 后静默续跑——
-			// Advance 把 MsgStorageAppendResp（携带快照）步进给 raft
-			// 内核，内核的 appliedSnap 即刻把快照标记为已持久化已应用
-			// （vendored raft.go 的 MsgStorageAppendResp 分支：
-			// stableSnapTo + appliedTo），raft 从此不再重发 MsgSnap；而
-			// 磁盘上仍是安装中标记 + 半截数据、内存侧 MemoryStorage 从未
-			// 更新——三方分叉、永不收敛。按 Persist/applyEntries 同策略
-			// fail-stop panic：进程死亡由上层重启接管。
-			//
-			// 重启后走的是哪条恢复路径（要看清代价）：panic 不会写干净
-			// 关机标记，因此重启时 Start 判定为不干净关机，直接返回
-			// ErrUncleanShutdown——恢复手段是整目录 WipeForRejoin +
-			// 以 learner 经存活 leader 重新加入，而**不是** buildGroup 里
-			// 那条按组清空重来的分支（那条只在干净关机却留下安装中标记
-			// 时才可能命中，即停机途中止的安装，见本函数上方的 ctx 分支）。
-			// 代价是整节点全量重新同步，所以 installSnapshotWithRetry 的
-			// 重试窗口必须真的够长（snapInstallRetryWindow），别让一次
-			// 网络抖动升级成一次全量重同步。keepTicking 已由
-			// installSnapshotWithRetry 收敛。
-			//
-			// 本地清空重来只是恢复的一半（N1）：本节点重启后是空日志，而
-			// leader 侧该 peer 的 Progress 仍停在 StateSnapshot——
-			// tracker.IsPaused() 对该状态无条件返回 true，leader 既不发
-			// 日志也不重发快照，节点会永久静默掉组。另一半由 leader 侧的
-			// reportStalledSnapshots（Manager 截断循环）补齐：观察到对端
-			// 长期不来拉视图即 ReportSnapshot(SnapshotFailure)，raft 收到
-			// MsgSnapStatus 后 BecomeProbe，重新探测并按需重发快照。
-			// 两侧缺一，这条 panic 就是"周期性自杀 + 永久掉组"。
-			gr.lg.Error("快照安装失败，组停摆（等待重启；leader 侧由失败感知重驱动）", "g", gr.g,
-				"index", rd.Snapshot.Metadata.GetIndex(), "err", err)
-			panic(err)
-		}
 	}
-	// 1. 持久化：HardState + Entries 单批原子（rs.Persist），sync 与否
-	//    由确认档位逐轮判定；MemoryStorage 是 raft 库读取日志的视图，
-	//    必须与持久层同步推进（双记账）。
-	if err := gr.rs.Persist(gr.g, rd.HardState, rd.Entries, gr.syncPersist(rd)); err != nil {
-		// 持久化失败 = 内存日志与磁盘分叉：崩溃后本节点已确认的条目
-		// 会消失，与 applyEntries 的失败同属「日志/状态与多数派分叉」的
-		// 不可恢复类。统一走 panic——进程死亡由上层重启接管（走不干净
-		// 判定）；若记 Error 后停摆返回，run 循环只是安静退出，Manager
-		// 无从感知、组永久静默卡死，比 panic 更糟。
-		gr.lg.Error("日志持久化失败，组停摆", "err", err)
-		panic(err)
-	}
-	if !raft.IsEmptyHardState(rd.HardState) {
-		_ = gr.mem.SetHardState(rd.HardState)
-		// 缓存本轮的 term（currentTerm 的数据源）：空 HardState 的轮次
-		// 不进这里，lastTerm 因此永远停留在「最近一次真实任期」
-		gr.lastTerm.Store(rd.HardState.GetTerm())
-	}
-	_ = gr.mem.Append(rd.Entries)
-	// 2. 发送 Messages：经注入的 send 回调外发（transport 发送永不
-	//    阻塞——满则丢，raft 心跳重试兜底，Task 3 契约）。
-	//    外发前先登记本轮的 MsgSnap 定向台账——这是 leader 侧唯一能
-	//    知道「哪份快照发给了哪个 peer」的时刻（见 noteSnapSends）。
-	gr.noteSnapSends(rd.Messages)
-	gr.send(gr.g, rd.Messages)
-	// 2.5 读状态回流：raft 已确认本节点在当前任期仍是 leader，给出的
-	//     readIndex 是本轮读屏障的下界。放在 apply 之前处理只是为了拿到
-	//     index；真正放行由 index<=applied 决定，apply 之后还会再扫一次。
+	// 3. 读状态回流：raft 已确认本节点在当前任期仍是 leader，给出的
+	//    readIndex 是本轮读屏障的下界。真正放行由 index<=applied 决定，
+	//    apply 阶段每批之后还会再扫一次（见 applyOnce）。
 	gr.stepReadStates(rd.ReadStates)
-	// leader 变更观测：SoftState 变化是切换的第一信号（当选与失联都在此）
+	// 4. leader 变更观测：SoftState 变化是切换的第一信号。
+	//    顺序即屏障（batch③ 评审 m1）：先跑钩子（同步失效计数器缓存），
+	//    再让 lead.Store 把 leader 身份对外可见。反过来会留下
+	//    「IsLeader 已放行、缓存尚未失效」的窗口，并发 Append 拿到
+	//    陈旧 offset 覆写已 quorum 提交的消息。
 	if rd.SoftState != nil {
-		// 顺序即屏障（batch③ 评审 m1）：先跑钩子（同步失效计数器缓存），
-		// 再让 lead.Store 把 leader 身份对外可见。反过来会留下
-		// 「IsLeader 已放行、缓存尚未失效」的窗口，并发 Append 拿到
-		// 陈旧 offset 覆写已 quorum 提交的消息。日志同样挪到 Store 之后，
-		// 别让一次 stdout 写入撑大窗口。
 		gr.notifyLeaderChange(rd.SoftState.Lead)
 		gr.lead.Store(rd.SoftState.Lead)
 		gr.lg.Info("组 leader 变更", "lead", rd.SoftState.Lead, "term", gr.currentTerm())
 	}
-	// 3. CommittedEntries apply
-	// 本轮回合的成员变更登记：Advance 后再通知（见循环外注释），
-	// notify=false 表示该变更非本节点发起，不通知（超时兜底）
-	appliedCC := make([]ccApplied, 0, 2)
-	// 普通条目段积累（apply 合批）：连续的 EntryNormal 攒进 seg，由
-	// applyEntries 合成单次引擎提交。遇到成员变更必须先冲刷已积累的段
-	// ——SaveConfState 用独立批次写成员表 + applied 位点，段若晚于它
-	// 提交会把 applied 位点倒退回段内更小的 index，位点单调性破坏。
-	var seg []*raftpb.Entry
-	flushSeg := func() {
-		gr.applyEntries(seg)
-		seg = seg[:0]
+}
+
+// enqueueLocal 把一条本地存储消息可靠投递进指定阶段通道，返回是否成功。
+//
+// 参数：
+//   - ch: 目标通道（gr.appendCh 或 gr.applyCh）
+//   - lm: 待投递消息
+//   - stage: 阶段名（"append"/"apply"），只用于日志
+//
+// 返回：true = 已入队；false = 组正在退出（ctx 已取消），调用方应收工。
+//
+// 与 gr.step（inbox）的契约正好相反：**满则阻塞，绝不丢**。raft 要求同一
+// target 的本地消息可靠有序处理，丢一条即静默卡死（设计文档 §5.1）。
+// 代价是阻塞会传导到主循环、停掉本组 tick，因此阻塞必须留痕——没有这条
+// 日志，「存储侧跟不上」在现场只表现为莫名其妙的换主。
+func (gr *group) enqueueLocal(ctx context.Context, ch chan<- localMsg, lm localMsg, stage string) bool {
+	// 快路径：稳态下通道永远不满，一次非阻塞发送即完成，零日志零计时
+	select {
+	case ch <- lm:
+		return true
+	default:
 	}
-	for _, ent := range rd.CommittedEntries {
-		// 重启重放的幂等保证：raft 可能重发已 apply 过的条目
-		// （conflict 回退重写后），跳过即可——FSM 已是该 index 的状态。
-		// 注意 applied 只在段冲刷/成员变更时推进，段内递增的 index 不会
-		// 被本判定误跳。
-		if ent.GetIndex() <= gr.applied.Load() {
+	start := time.Now()
+	select {
+	case ch <- lm:
+		d := time.Since(start)
+		gr.blockNanosOf(stage).Add(uint64(d))
+		if d >= localQueueBlockWarn {
+			gr.lg.Warn("本地存储通道阻塞（队列满，主循环被拖住，本组 tick 已受影响)",
+				"stage", stage, "blocked", d.Round(time.Millisecond).String(),
+				"cap", cap(ch), "type", lm.m.GetType().String())
+		}
+		return true
+	case <-ctx.Done():
+		gr.respDropped.Add(1)
+		gr.lg.Warn("本地存储消息随停机丢弃（组正在退出）",
+			"stage", stage, "type", lm.m.GetType().String(),
+			"entries", len(lm.m.GetEntries()))
+		return false
+	}
+}
+
+// blockNanosOf 返回阶段对应的阻塞时长累计器（可观测性打点用）。
+func (gr *group) blockNanosOf(stage string) *atomic.Uint64 {
+	if stage == "append" {
+		return &gr.appendBlockNanos
+	}
+	return &gr.applyBlockNanos
+}
+
+// hardStateOf 从 MsgStorageAppend 还原 HardState，无状态变更时返回 nil。
+//
+// raft 的构造契约（raft/v3@v3.7.0/rawnode.go:230-241）：HardState 有变化
+// 时 Term/Vote/Commit **三者同时赋值**，无变化时三者同时不赋值。因此看
+// 任一字段是否为 nil 即可判定，不必逐个比较。
+//
+// 三个值按值拷贝而不是共享 m 的指针：mem.SetHardState 会长期持有这份
+// 结构，而消息的生命周期由 raft 决定——共享指针是"能跑但说不清"的那类
+// 依赖，一次拷贝三个 uint64 的代价可以忽略。
+func hardStateOf(m *raftpb.Message) *raftpb.HardState {
+	if m.Term == nil && m.Vote == nil && m.Commit == nil {
+		return nil
+	}
+	term, vote, commit := m.GetTerm(), m.GetVote(), m.GetCommit()
+	return &raftpb.HardState{Term: &term, Vote: &vote, Commit: &commit}
+}
+
+// runAppend 是 append 阶段的协程主体：串行消费 appendCh，**按批落盘**。
+//
+// 串行是契约要求（同一 target 的本地消息不得重排），也正是攒批的来源
+// ——主循环不再等它，raft 于是能连着产出多轮 Ready，本协程一轮一轮
+// 消费时每轮的 Entries 自然更大。
+//
+// 但「轮次更大」不等于「落盘更少」：拿到一条就立刻 fsync 一条的话，
+// 异步化反而把同步路径下的隐式 group commit 拆掉了——同步路径里主循环
+// 阻塞在 fsync 内，阻塞期间新提案在 raft unstable log 堆积，下一轮 Ready
+// 因此自带一个大批次。2026-08-12 三机实测量出了这笔账：fsync 摊薄比从
+// 4.11 条/次跌到 1.60，吞吐最差一格 −48.9%（见设计文档顶部实测结论）。
+//
+// 所以这里必须自带 group commit：取到一条后先非阻塞抽干队列，整批
+// 只落一次盘（见 appendBatch）。
+func (gr *group) runAppend(ctx context.Context) {
+	gr.lg.Info("append 阶段启动", "queue_cap", cap(gr.appendCh))
+	defer func() {
+		syncs, appends := gr.syncCount.Load(), gr.appendCount.Load()
+		amort := float64(0)
+		if syncs > 0 {
+			amort = float64(appends) / float64(syncs)
+		}
+		gr.lg.Info("append 阶段退出", "handled", appends,
+			"batches", gr.batchCount.Load(), "fsyncs", syncs,
+			"amortization", amort, // 条/次：合批是否真的生效，看这个数
+			"blocked_total", time.Duration(gr.appendBlockNanos.Load()).Round(time.Millisecond).String())
+	}()
+	batch := make([]localMsg, 0, localQueueDepth)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case lm := <-gr.appendCh:
+			batch = gr.drainAppend(append(batch[:0], lm))
+			gr.appendBatch(ctx, batch)
+		}
+	}
+}
+
+// drainAppend 非阻塞地把 appendCh 里**已经排队**的消息续到 batch 尾部，
+// 队列空即返回。
+//
+// 参数：
+//   - batch: 已含至少一条消息的批（调用方保证非空）
+//
+// 返回：续入后的批，长度不超过 localQueueDepth
+//
+// 注意：只收已排队的，绝不等待新消息——等待会把延迟押在「下一条何时到」
+// 上，正是 group commit 最容易写坏的地方。队列里有多少就攒多少，队列空
+// 就立刻落盘：负载高时批自然大，负载低时批就是 1 条、延迟不受影响。
+func (gr *group) drainAppend(batch []localMsg) []localMsg {
+	for len(batch) < localQueueDepth {
+		select {
+		case lm := <-gr.appendCh:
+			batch = append(batch, lm)
+		default:
+			return batch
+		}
+	}
+	return batch
+}
+
+// appendBatch 处理一批 MsgStorageAppend：批内逐条只写不刷，最后**合并
+// 成一次 fsync**，再统一投递响应。
+//
+// 参数：
+//   - ctx: 用于响应投递与停机判定
+//   - batch: 待处理的一批本地 append 消息，按到达顺序
+//
+// 顺序即不变量（设计文档 §5.2）：响应投回的那一刻，raft 就认为日志已
+// stable 并立刻去 MemoryStorage 读它。所以**整批的响应必须全部晚于那次
+// fsync**——批内任何一条提前投递，raft 都可能读到尚未落盘的日志。
+//
+// 携带快照的消息不参与合批：快照会整体重置日志，与普通条目混在一批里
+// 落盘说不清先后。遇到它就先把已累积的部分收口，快照单独走 appendOnce
+// 的原路径（含 installMu 互斥与自身的响应投递），之后再重新开批。
+func (gr *group) appendBatch(ctx context.Context, batch []localMsg) {
+	gr.batchCount.Add(1)
+	start, needSync := 0, false
+	// flush 把 batch[start:end] 这一段收口：先落盘（若该段有一条要求
+	// 同步），再按序投递该段全部响应。
+	flush := func(end int) {
+		if start >= end {
+			start = end
+			return
+		}
+		if needSync {
+			gr.syncBatch()
+		}
+		for _, lm := range batch[start:end] {
+			gr.deliverResponses(ctx, lm.m.GetResponses(), "append")
+		}
+		start, needSync = end, false
+	}
+	for i, lm := range batch {
+		if snap := lm.m.GetSnapshot(); !raft.IsEmptySnap(snap) {
+			flush(i)
+			gr.appendOnce(ctx, lm) // 快照独立处理，自带计数与响应投递
+			start = i + 1
 			continue
 		}
-		switch ent.GetType() {
-		case raftpb.EntryConfChange:
-			flushSeg()
-			// 旧格式 V1 ConfChange（旧日志可能遗留）：照常 apply，但
-			// 永不通知 waiter——V1 条目没有提案者身份，通知有跨节点
-			// id 碰撞的假成功风险；且本进程只提议 V2，V1 条目在本
-			// 进程内不可能有对应 waiter（重启后 ccWaiters 为空）。
-			// 不通知 = 保守超时 = 安全方向。
-			var cc raftpb.ConfChange
-			cc.Reset()
-			// v3 的 raftpb 是 protobuf-go v2 生成：需要显式 Unmarshal
-			if err := proto.Unmarshal(ent.Data, &cc); err != nil {
-				gr.lg.Error("ConfChange 解码失败，组停摆", "index", ent.GetIndex(), "err", err)
-				panic(err)
-			}
-			cs := gr.rn.ApplyConfChange(&cc)
-			// 成员表 + applied 同批落盘（同 V2 分支）：V1 路径罕见
-			// 但不能只更内存——重启后旧日志仍会被重放，内存成员表
-			// 不落盘就与持久化值分叉
-			// applyMu 临界区（同 applyEntries）：Snapshot 在同一把锁内读
-			// applied + confState，写批次与成员表必须与 applied 位点配对
-			// 提交——否则可能产出「元数据 index=N 却携带更新的成员表」
-			// 的快照，配对不变量被破坏
-			gr.applyMu.Lock()
-			if gr.rs != nil {
-				if err := gr.rs.SaveConfState(gr.g, cs, ent.GetIndex()); err != nil {
-					gr.applyMu.Unlock()
-					gr.lg.Error("成员表持久化失败，组停摆", "index", ent.GetIndex(), "err", err)
-					panic(err)
-				}
-				gr.confState.Store(cs) // Storage.Snapshot() 现场取用（Task 4）
-			}
-			gr.applied.Store(ent.GetIndex())
-			gr.applyMu.Unlock()
-			gr.lg.Debug("成员变更已 apply", "type", cc.GetType().String(), "node", cc.GetNodeId())
-		case raftpb.EntryConfChangeV2:
-			flushSeg()
-			var v2 raftpb.ConfChangeV2
-			v2.Reset()
-			if err := proto.Unmarshal(ent.Data, &v2); err != nil {
-				gr.lg.Error("ConfChangeV2 解码失败，组停摆", "index", ent.GetIndex(), "err", err)
-				panic(err)
-			}
-			cs := gr.rn.ApplyConfChange(&v2)
-			// 成员表 + applied 同批落盘：截断之后日志前缀不复存在，
-			// 重启只能靠这份持久化成员表恢复（Task 3 的截断前提）
-			// applyMu 临界区（同 applyEntries）：Snapshot 在同一把锁内读
-			// applied + confState，写批次与成员表必须与 applied 位点配对
-			// 提交——否则可能产出「元数据 index=N 却携带更新的成员表」
-			// 的快照，配对不变量被破坏
-			gr.applyMu.Lock()
-			if gr.rs != nil {
-				if err := gr.rs.SaveConfState(gr.g, cs, ent.GetIndex()); err != nil {
-					gr.applyMu.Unlock()
-					gr.lg.Error("成员表持久化失败，组停摆", "index", ent.GetIndex(), "err", err)
-					panic(err)
-				}
-				gr.confState.Store(cs) // Storage.Snapshot() 现场取用（Task 4）
-			}
-			gr.applied.Store(ent.GetIndex())
-			gr.applyMu.Unlock()
-			// 成员变更的 waiter 通知放到 Advance 之后（见循环外注释）：
-			// 这里只登记（id, 是否本节点发起），不直接通知；登记与
-			// 通知都不是状态写入，留在锁外
-			ccid, ours := ccWaiterInfo(&v2, gr.selfID)
-			appliedCC = append(appliedCC, ccApplied{id: ccid, notify: ours})
-			if ch := v2.GetChanges(); len(ch) > 0 {
-				gr.lg.Debug("成员变更已 apply", "type", ch[0].GetType().String(), "node", ch[0].GetNodeId())
-			}
-		case raftpb.EntryNormal:
-			// 条目数据布局：[8B 提案者][8B waiter id][batch repr]——
-			// 载荷提取、waiter 通知（限定本节点提案）都在 applyEntries
-			// 内按条目粒度处理，这里只积累
-			seg = append(seg, ent)
+		gr.appendCount.Add(1)
+		// sync=false：批内只写不刷，刷由下面的 flush 统一做一次
+		gr.persistPhase(hardStateOf(lm.m), lm.m.GetEntries(), false)
+		// 判据必须是「本条 raft 要求同步」，不能是「批非空」——后者会把
+		// 「只有 commit 前进、没有新日志」的轮次也拖去落盘，白白吃掉
+		// 2026-08-08 那次优化的成果。
+		if gr.mode == AckQuorumFsync && lm.mustSync {
+			needSync = true
 		}
 	}
-	flushSeg()
-	// 4. Advance——raft 库据此确认本轮 Ready 已处理，继续产下一轮
-	gr.rn.Advance()
-	// 成员变更 waiter 通知必须晚于 Advance：raft 库在 Advance 时才更新
-	// 内部 applied 位点，FSM 层 apply（ApplyConfChange）发生时它仍停在
-	// 上一条。若此时就通知，编排层（Remove→AddLearner 背靠背提案）紧
-	// 接着提出的下一条 ConfChange 会落在「pendingConfIndex > applied」
-	// 校验窗口内，被 raft 静默替换成空普通条目——替换不可观察、ccWaiter
-	// 永不通知，调用方只能等超时（Task 7 集成测试抓到的缺口）。
+	flush(len(batch))
+}
+
+// syncBatch 执行一次合批落盘，失败按不可恢复处理。
+//
+// 与 persistPhase 同一条 fail-stop 纪律：fsync 失败意味着「日志到底有没有
+// 落盘」无法判定，而响应马上就要投给 raft、让它认为日志已 stable。此时
+// 静默续跑就是让内存态与盘上状态分叉，只能就地停摆等重启重来。
+func (gr *group) syncBatch() {
+	if err := gr.rs.Sync(gr.g); err != nil {
+		gr.lg.Error("日志合批落盘失败，组停摆", "err", err)
+		panic(err)
+	}
+	gr.syncCount.Add(1)
+}
+
+// appendOnce 处理一条 MsgStorageAppend：快照安装（若有）→ 持久化 →
+// 双记账 → 投递响应。
+//
+// 顺序即不变量（设计文档 §5.2）：raft 判定「日志已 stable」的那一刻就是
+// 响应投回的那一刻，此后它会立刻去 MemoryStorage 读这些条目。任何一步
+// 提前投递响应，raft 都会读到还不存在的日志。
+func (gr *group) appendOnce(ctx context.Context, lm localMsg) {
+	m := lm.m
+	gr.appendCount.Add(1)
+	// 0. 快照：async 下快照随 MsgStorageAppend 到达（raft/v3@v3.7.0/
+	//    raft.go:167-170「MsgStorageAppend carries ... snapshots to apply」）。
+	//    安装期间保持 tick——见 installSnapshotWithRetry。
+	if snap := m.GetSnapshot(); !raft.IsEmptySnap(snap) {
+		// 安装持 installMu：整个安装期间 apply 阶段不得落地（见字段注释）
+		gr.installMu.Lock()
+		err := gr.installSnapshotWithRetry(ctx, snap)
+		gr.installMu.Unlock()
+		if err != nil && ctx.Err() != nil {
+			// 停机途中的安装失败不是故障：安装中标记已在盘上，重启时
+			// buildGroup 清空重来。此处 panic 只会把一次正常停机变成一次
+			// 崩溃退出。直接返回——**且不投递响应**：响应一旦投出，raft
+			// 就认为快照已持久化已应用。
+			gr.lg.Warn("快照安装随停机中止（安装中标记已在盘上，重启清空重来）",
+				"index", snap.Metadata.GetIndex(), "err", err)
+			return
+		}
+		if err != nil {
+			// 安装失败是不可恢复状态：绝不能投递响应后静默续跑——
+			// MsgStorageAppendResp（携带快照）一旦步进给 raft 内核，内核的
+			// appliedSnap（stableSnapTo + appliedTo）即刻把快照标记为已持久
+			// 化已应用，raft 从此不再重发 MsgSnap；而磁盘上仍是安装中标记 +
+			// 半截数据、内存侧 MemoryStorage 从未更新——三方分叉、永不收敛。
+			// 按 Persist/applyEntries 同策略 fail-stop panic。
+			//
+			// （本段与旧路径唯一的差别是「Advance 步进响应」变成「投递
+			// Responses 步进响应」——触发分叉的机制换了名字，后果一字不变。
+			// 重启后的恢复路径、leader 侧 reportStalledSnapshots 的兜底
+			// 责任，全部与旧注释所述一致，见 installSnapshotWithRetry。）
+			gr.lg.Error("快照安装失败，组停摆（等待重启；leader 侧由失败感知重驱动）",
+				"index", snap.Metadata.GetIndex(), "err", err)
+			panic(err)
+		}
+	}
+	// 1. 持久化 + 双记账。sync 判定：档位 × 本轮 MustSync，语义与旧路径
+	//    的 syncPersist 完全一致，只是 MustSync 换了载体（见 localMsg）。
 	//
-	// 注意：晚于 Advance 只是把窗口收窄，并非闭合——raft 内部 applied
-	// 的推进要等节点 goroutine 消费 advancec 后才发生，µs 级残余窗口内
-	// 背靠背的两条 ConfChange 仍可能被静默替换；proposeConfChange 对
-	// 空条目替换的检测与重试是 batch③ 的兜底缓解。
+	//    本方法现在只服务携带快照的消息（普通条目走 appendBatch 的合批
+	//    路径）。这里的落盘同样计入 syncCount，退出汇总的摊薄比才是全口径。
+	sync := gr.mode == AckQuorumFsync && lm.mustSync
+	gr.persistPhase(hardStateOf(m), m.GetEntries(), sync)
+	if sync {
+		gr.syncCount.Add(1)
+	}
+	// 2. 投递响应——必须严格晚于第 1 步（本函数 doc comment）
+	gr.deliverResponses(ctx, m.GetResponses(), "append")
+}
+
+// runApply 是 apply 阶段的协程主体：串行消费 applyCh。
+//
+// 与 append 阶段并行运行是刻意的（设计文档 §5.3）：MsgStorageApply 的
+// 写入**不要求** durable 即可投递响应，apply 因此可以比 append 跑得松。
+// 把两者合成一条协程会让 FSM 写入重新挡住日志 fsync，收益折半。
+func (gr *group) runApply(ctx context.Context) {
+	gr.lg.Info("apply 阶段启动", "queue_cap", cap(gr.applyCh))
+	defer func() {
+		gr.lg.Info("apply 阶段退出", "handled", gr.applyCount.Load(),
+			"blocked_total", time.Duration(gr.applyBlockNanos.Load()).Round(time.Millisecond).String())
+	}()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case lm := <-gr.applyCh:
+			gr.applyOnce(ctx, lm.m)
+		}
+	}
+}
+
+// applyOnce 处理一条 MsgStorageApply：apply 条目 → 投递响应 → 唤醒
+// 成员变更与读屏障等待者。
+//
+// **通知必须晚于响应投递**，这是 Advance 消失后 ccWaiter 时序的新落点：
+// 旧路径里 raft 内部 applied 位点在 Advance 时才推进（Advance 负责把
+// MsgStorageApplyResp 步进内核），若在此之前通知，编排层
+// （Remove→AddLearner 背靠背提案）紧接着提出的下一条 ConfChange 会落在
+// 「pendingConfIndex > applied」校验窗口内，被 raft 静默替换成空普通条目
+// ——替换不可观察、ccWaiter 永不通知，调用方只能等超时（Task 7 集成
+// 测试抓到的缺口）。async 下承担这件事的是 deliverResponses，因此通知
+// 挪到它之后，职责一一对应。
+//
+// 同旧路径：晚于响应投递只是把窗口收窄，并非闭合——raft 内部 applied
+// 的推进要等节点 goroutine 消费 recvc 后才发生，µs 级残余窗口内背靠背的
+// 两条 ConfChange 仍可能被静默替换；proposeConfChange 对空条目替换的检测
+// 与重试是 batch③ 的兜底缓解。
+func (gr *group) applyOnce(ctx context.Context, m *raftpb.Message) {
+	gr.applyCount.Add(1)
+	// 与快照安装互斥（installMu）：安装重写整个 FSM，期间落地的一批
+	// 陈旧条目会把旧数据写回刚被覆盖的键——静默状态机分叉。
+	// 安装期 apply 会在这里排队：分钟级安装下这是正常现象，但必须可见
+	// ——否则现场只表现为「读屏障迟迟不放行」而查不到原因。
+	if !gr.installMu.TryLock() {
+		start := time.Now()
+		gr.installMu.Lock()
+		if d := time.Since(start); d >= localQueueBlockWarn {
+			gr.lg.Warn("apply 阶段等待快照安装让路", "waited", d.Round(time.Millisecond).String(),
+				"entries", len(m.GetEntries()))
+		}
+	}
+	appliedCC := gr.applyPhase(m.GetEntries())
+	gr.installMu.Unlock()
+	gr.deliverResponses(ctx, m.GetResponses(), "apply")
 	for _, cc := range appliedCC {
 		if cc.notify {
 			gr.notifyWaiter(gr.ccWaiters, cc.id)
 		}
 	}
-	// 读屏障放行必须晚于 apply：applied 是本轮 apply 推进的，早于它扫描
-	// 只会白扫一遍，屏障要多等一整轮 Ready 才放行。
+	// 读屏障放行必须晚于 apply：applied 是本批 apply 推进的，早于它扫描
+	// 只会白扫一遍，屏障要多等一整批才放行。
 	gr.notifyReadWaiters(gr.applied.Load())
+}
+
+// deliverResponses 投递一条本地存储消息的响应集合。
+//
+// 参数：
+//   - resps: m.Responses，可能为空
+//   - stage: 阶段名（"append"/"apply"），只用于日志
+//
+// 路由是本改造最容易踩死的一处（设计文档 §5.1）：
+//
+//	| 响应目标        | 去向        | 可靠性                     |
+//	|-----------------|-------------|----------------------------|
+//	| 本节点（selfID）| gr.rn.Step  | **可靠有序**，满则阻塞不丢 |
+//	| 其他 peer       | gr.send     | 可丢，raft 心跳重试兜底    |
+//
+// **自指响应绝不能走 gr.send**：Manager.send 对自指消息走 gr.step →
+// inbox，而 inbox 在快照安装期是显式丢弃、组退出时也丢弃。丢一条
+// MsgStorageAppendResp 就是 raft 永远等不到的那一条——组静默卡死，没有
+// 任何报错。gr.rn.Step 走 node.recvc，满则阻塞、不丢；且不会与主循环
+// 死锁——node.run 的 select 始终可以消费 recvc，即便主循环正阻塞在
+// 本地通道入队上。
+//
+// 对端响应先发、自指响应后步进：follower 的 MsgAppResp 在关键路径上，
+// 早一个调度周期就早一点确认；自指响应之间的相对顺序原样保留（raft 要求
+// MsgStorageAppendResp 排在 msgsAfterAppend 里的自指 MsgAppResp 之后，
+// 见 rawnode.go:245-253 的性能说明）。
+func (gr *group) deliverResponses(ctx context.Context, resps []*raftpb.Message, stage string) {
+	if len(resps) == 0 {
+		return
+	}
+	var peer []*raftpb.Message
+	for _, m := range resps {
+		if m.GetTo() != gr.selfID {
+			peer = append(peer, m)
+		}
+	}
+	if len(peer) > 0 {
+		gr.send(gr.g, peer)
+	}
+	for _, m := range resps {
+		if m.GetTo() != gr.selfID {
+			continue
+		}
+		if err := gr.rn.Step(ctx, m); err != nil {
+			// 只可能是 ctx 取消或节点已 Stop（组正在退出）。稳态下不可能
+			// 走到这里——真走到了说明有响应没被 raft 收到，必须留痕：
+			// 它的症状是组静默卡死，届时这条日志是唯一现场。
+			gr.respDropped.Add(1)
+			gr.lg.Warn("本地响应步进失败（组正在退出？未收到该响应的组会静默卡死）",
+				"stage", stage, "type", m.GetType().String(), "err", err)
+			return
+		}
+	}
 }
 
 // keepTicking 在快照安装期间保持本组的选举计时器走动，返回停止函数。
@@ -608,10 +942,10 @@ func (gr *group) keepTicking() (stop func()) {
 // snap 必须为指针：v3.7 的 raftpb.Snapshot 内嵌互斥锁
 // （protoimpl.MessageState），按值传递触发 vet copylocks。
 //
-// 失败语义：任一步失败返回错误，handleReady 按 fail-stop 策略 panic
+// 失败语义：任一步失败返回错误，appendOnce 按 fail-stop 策略 panic
 // （进程死亡由上层重启接管）。为什么不能「放弃本轮等 raft 重发」：
-// Advance 会把携带快照的 MsgStorageAppendResp 步进给 raft 内核，内核
-// 的 appliedSnap（stableSnapTo + appliedTo）把快照标记为已持久化已
+// 投递 Responses 会把携带快照的 MsgStorageAppendResp 步进给 raft 内核，
+// 内核的 appliedSnap（stableSnapTo + appliedTo）把快照标记为已持久化已
 // 应用，raft 不会重发 MsgSnap——静默续跑是内存/磁盘/raft 三方分叉的
 // 永久卡死（vendored raft.go MsgStorageAppendResp 分支）。
 //
@@ -619,7 +953,7 @@ func (gr *group) keepTicking() (stop func()) {
 // 关机并返回 ErrUncleanShutdown，恢复手段是整目录 WipeForRejoin + 以
 // learner 重新加入。buildGroup 里那条「见安装中标记即按组清空重来」的
 // 分支走的是另一种情形——干净关机却留下了标记（停机途中止的安装，见
-// handleReady 的 ctx 分支）；标记（第 2 步，Sync）先于任何数据写入，
+// appendOnce 的 ctx 分支）；标记（第 2 步，Sync）先于任何数据写入，
 // 失败必然发生在第 2 步之后、收口批次删标记之前，标记恒在盘上，那条
 // 路径上的清空重来永远成立。
 
@@ -694,7 +1028,7 @@ var (
 //   - ctx: 组运行上下文；取消即立即放弃重试并返回最后一次错误
 //   - snap: raft 交下来的快照（元数据 + 描述符 Data）
 //
-// 返回：全部尝试都失败时返回最后一次错误；调用方（handleReady）据
+// 返回：全部尝试都失败时返回最后一次错误；调用方（appendOnce）据
 // ctx 是否已取消区分「停机中止」与「真故障 fail-stop」。
 //
 // 注意：本方法返回后 installing 必然已清位、keepTicking 必然已收敛
@@ -898,35 +1232,159 @@ func (gr *group) pullSnapshotChunks(ctx context.Context, desc snapDescriptor) er
 	return nil
 }
 
-// ccApplied 记录本轮已 apply 的成员变更条目：id 用于 Advance 后唤醒
-// ccWaiters；notify 为 false（变更不是本节点发起）时不通知——跨节点
+// ccApplied 记录本轮已 apply 的成员变更条目：id 用于响应投递后唤醒
+// ccWaiters（applyOnce：deliverResponses 之后才通知）；notify 为 false
+// （变更不是本节点发起）时不通知——跨节点
 // 条目 id 碰撞时通知会造成假成功（apply 的是别节点发起的变更）。
 type ccApplied struct {
 	id     uint64
 	notify bool
 }
 
-// syncPersist 判定本轮 Ready 持久化是否带 fsync。
+// persistPhase 执行「日志持久化 + MemoryStorage 双记账」，是 raft 存储
+// 契约里 append 侧的全部写入动作。
 //
-// quorum-fsync 档跟随 raft 的 MustSync 判定（raft.MustSync）：
-// 「本轮有条目」或「term/vote 有变化」才要求同步落盘——term/vote/条目
-// 是对外确认前必须 durable 的持久态（raft 契约）。commit-only 的
-// HardState 轮（提交位点推进、无新条目）不再白刷一次盘：commit 位点的
-// NoSync 写入由下一轮条目的 fsync 顺带落盘（共享同一 WAL 的 Pebble
-// 批次追加式累积）；本档不存在后台刷盘 goroutine 兜底（flusher 仅
-// quorum-mem 档启动）。崩溃后 commit/applied 位点由日志重放重新推导
-// （单节点重提交路径 + 幂等重 apply），不违反「已确认条目不丢」。
-// 旧判定「有条目或有 HardState 就刷」把 commit 轮也 fsync，每提案
-// 多一次盘。
-// 基准证据（BenchmarkProposeQuorumFsync，单节点 quorum-fsync 串行
-// 提案延迟，-benchtime 3s ×5 取中位）：改前 ~8.4ms/op → 改后
-// ~4.1ms/op，约 2x（实测 ~1.82x，未锁频笔记本上三倍有效数字不成立）
-// ——每次提案少一次 fsync。该基准是 in-flight=1 的延迟度量，不做
-// ops/s 换算：吞吐 ≈ fsync 速率 × 并发，WAL group commit 在并发下
-// 摊销这次 fsync。
-// quorum-mem 档永不 Sync（NoSync 落盘 + Manager 层后台批量 fsync 兜底）。
-func (gr *group) syncPersist(rd raft.Ready) bool {
-	return gr.mode == AckQuorumFsync && rd.MustSync
+// 参数：
+//   - hs: 本轮的 HardState，nil 或空表示无状态变更
+//   - ents: 本轮要追加/覆盖的日志条目，可为空
+//   - sync: 本次写入是否带 fsync（quorum-fsync 档的 MustSync 轮）
+//
+// 顺序即不变量（spec §5.2）：先 rs.Persist 落盘，再推 mem（raft 库读
+// 日志的易失视图）。调用方必须在本方法返回**之后**才投递响应给 raft
+// ——响应一旦投出，raft 就认为这些条目已 stable 并会立刻去 mem 读它们。
+//
+// 失败一律 panic（fail-stop）：持久化失败 = 内存日志与磁盘分叉，崩溃后
+// 本节点已确认的条目会消失。记 Error 后静默返回只会让组永久卡死，比
+// 进程死亡更糟——进程死亡由上层重启接管（走不干净关机判定）。
+func (gr *group) persistPhase(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) {
+	if err := gr.rs.Persist(gr.g, hs, ents, sync); err != nil {
+		gr.lg.Error("日志持久化失败，组停摆", "entries", len(ents), "sync", sync, "err", err)
+		panic(err)
+	}
+	if !raft.IsEmptyHardState(hs) {
+		_ = gr.mem.SetHardState(hs)
+		// 缓存本轮的 term（currentTerm 的数据源）：空 HardState 的轮次
+		// 不进这里，lastTerm 因此永远停留在「最近一次真实任期」
+		gr.lastTerm.Store(hs.GetTerm())
+	}
+	_ = gr.mem.Append(ents)
+}
+
+// applyPhase 把一批已提交条目应用到 FSM，返回本批登记的成员变更 waiter。
+//
+// 参数：
+//   - ents: 已提交待应用的条目（async 下来自 MsgStorageApply.Entries）
+//
+// 返回：
+//   - 本批 apply 掉的 ConfChangeV2 登记（id + 是否本节点发起）。**通知
+//     由调用方做**，不在本方法内——通知时机与 raft 内部 applied 位点的
+//     推进强相关（见调用方注释），是调用方的责任。
+//
+// 两条顺序不变量（原 handleReady 的注释原样保留）：
+//   - 普通条目攒段合批，遇成员变更必须先冲刷已积累的段——SaveConfState
+//     用独立批次写成员表 + applied 位点，段若晚于它提交会把 applied 位点
+//     倒退回段内更小的 index，位点单调性破坏；
+//   - 跳过 index ≤ applied 的条目：raft 可能重发已 apply 过的条目
+//     （conflict 回退重写后），FSM 已是该 index 的状态。
+func (gr *group) applyPhase(ents []*raftpb.Entry) []ccApplied {
+	// 本轮回合的成员变更登记：由调用方在正确时机通知（见调用点注释），
+	// notify=false 表示该变更非本节点发起，不通知（超时兜底）
+	appliedCC := make([]ccApplied, 0, 2)
+	// 普通条目段积累（apply 合批）：连续的 EntryNormal 攒进 seg，由
+	// applyEntries 合成单次引擎提交。遇到成员变更必须先冲刷已积累的段
+	// ——SaveConfState 用独立批次写成员表 + applied 位点，段若晚于它
+	// 提交会把 applied 位点倒退回段内更小的 index，位点单调性破坏。
+	var seg []*raftpb.Entry
+	flushSeg := func() {
+		gr.applyEntries(seg)
+		seg = seg[:0]
+	}
+	for _, ent := range ents {
+		// 重启重放的幂等保证：raft 可能重发已 apply 过的条目
+		// （conflict 回退重写后），跳过即可——FSM 已是该 index 的状态。
+		// 注意 applied 只在段冲刷/成员变更时推进，段内递增的 index 不会
+		// 被本判定误跳。
+		if ent.GetIndex() <= gr.applied.Load() {
+			continue
+		}
+		switch ent.GetType() {
+		case raftpb.EntryConfChange:
+			flushSeg()
+			// 旧格式 V1 ConfChange（旧日志可能遗留）：照常 apply，但
+			// 永不通知 waiter——V1 条目没有提案者身份，通知有跨节点
+			// id 碰撞的假成功风险；且本进程只提议 V2，V1 条目在本
+			// 进程内不可能有对应 waiter（重启后 ccWaiters 为空）。
+			// 不通知 = 保守超时 = 安全方向。
+			var cc raftpb.ConfChange
+			cc.Reset()
+			// v3 的 raftpb 是 protobuf-go v2 生成：需要显式 Unmarshal
+			if err := proto.Unmarshal(ent.Data, &cc); err != nil {
+				gr.lg.Error("ConfChange 解码失败，组停摆", "index", ent.GetIndex(), "err", err)
+				panic(err)
+			}
+			cs := gr.rn.ApplyConfChange(&cc)
+			// 成员表 + applied 同批落盘（同 V2 分支）：V1 路径罕见
+			// 但不能只更内存——重启后旧日志仍会被重放，内存成员表
+			// 不落盘就与持久化值分叉
+			// applyMu 临界区（同 applyEntries）：Snapshot 在同一把锁内读
+			// applied + confState，写批次与成员表必须与 applied 位点配对
+			// 提交——否则可能产出「元数据 index=N 却携带更新的成员表」
+			// 的快照，配对不变量被破坏
+			gr.applyMu.Lock()
+			if gr.rs != nil {
+				if err := gr.rs.SaveConfState(gr.g, cs, ent.GetIndex()); err != nil {
+					gr.applyMu.Unlock()
+					gr.lg.Error("成员表持久化失败，组停摆", "index", ent.GetIndex(), "err", err)
+					panic(err)
+				}
+				gr.confState.Store(cs) // Storage.Snapshot() 现场取用（Task 4）
+			}
+			gr.applied.Store(ent.GetIndex())
+			gr.applyMu.Unlock()
+			gr.lg.Debug("成员变更已 apply", "type", cc.GetType().String(), "node", cc.GetNodeId())
+		case raftpb.EntryConfChangeV2:
+			flushSeg()
+			var v2 raftpb.ConfChangeV2
+			v2.Reset()
+			if err := proto.Unmarshal(ent.Data, &v2); err != nil {
+				gr.lg.Error("ConfChangeV2 解码失败，组停摆", "index", ent.GetIndex(), "err", err)
+				panic(err)
+			}
+			cs := gr.rn.ApplyConfChange(&v2)
+			// 成员表 + applied 同批落盘：截断之后日志前缀不复存在，
+			// 重启只能靠这份持久化成员表恢复（Task 3 的截断前提）
+			// applyMu 临界区（同 applyEntries）：Snapshot 在同一把锁内读
+			// applied + confState，写批次与成员表必须与 applied 位点配对
+			// 提交——否则可能产出「元数据 index=N 却携带更新的成员表」
+			// 的快照，配对不变量被破坏
+			gr.applyMu.Lock()
+			if gr.rs != nil {
+				if err := gr.rs.SaveConfState(gr.g, cs, ent.GetIndex()); err != nil {
+					gr.applyMu.Unlock()
+					gr.lg.Error("成员表持久化失败，组停摆", "index", ent.GetIndex(), "err", err)
+					panic(err)
+				}
+				gr.confState.Store(cs) // Storage.Snapshot() 现场取用（Task 4）
+			}
+			gr.applied.Store(ent.GetIndex())
+			gr.applyMu.Unlock()
+			// 成员变更的 waiter 通知放到本方法之外（见调用点注释）：
+			// 这里只登记（id, 是否本节点发起），不直接通知；登记与
+			// 通知都不是状态写入，留在锁外
+			ccid, ours := ccWaiterInfo(&v2, gr.selfID)
+			appliedCC = append(appliedCC, ccApplied{id: ccid, notify: ours})
+			if ch := v2.GetChanges(); len(ch) > 0 {
+				gr.lg.Debug("成员变更已 apply", "type", ch[0].GetType().String(), "node", ch[0].GetNodeId())
+			}
+		case raftpb.EntryNormal:
+			// 条目数据布局：[8B 提案者][8B waiter id][batch repr]——
+			// 载荷提取、waiter 通知（限定本节点提案）都在 applyEntries
+			// 内按条目粒度处理，这里只积累
+			seg = append(seg, ent)
+		}
+	}
+	flushSeg()
+	return appliedCC
 }
 
 // entryPayload 取普通条目的批次载荷：跳过 16B 头（[8B 提案者][8B waiter
@@ -962,7 +1420,7 @@ func (gr *group) entryPayload(ent *raftpb.Entry) []byte {
 //     回到与日志一致的状态；panic 让进程死亡、由上层重启接管才是安全的
 //     选择。这是刻意取舍，不是疏漏。
 //
-// 调用方（handleReady）保证段内不含 ConfChange：成员变更走独立的
+// 调用方（applyPhase）保证段内不含 ConfChange：成员变更走独立的
 // SaveConfState 批次，遇到即先冲刷已积累的段（顺序不变量）。
 func (gr *group) applyEntries(ents []*raftpb.Entry) {
 	if len(ents) == 0 {
@@ -1213,7 +1671,7 @@ func (gr *group) proposeConfChange(ctx context.Context, typ raftpb.ConfChangeTyp
 // 所有组的消息投递——raft 重试与上层编排是丢弃的兜底。
 //
 // 安装期改为「满则丢弃」（I5）：上面那条 inflight 不变量只覆盖稳态——
-// Ready 循环在快照安装期间整段不消费 inbox，而 leader 的心跳按
+// 安装期主循环可能阻塞在本地通道入队上而不再消费 inbox，而 leader 的心跳按
 // HeartbeatTick 持续到达（100ms tick ≈ 10 条/秒），与 inflight 无关地
 // 单向累积；生产级快照是分钟级操作，约 100 秒即填满 1024 的队列，此后
 // step 阻塞的是**整条连接**的读循环，同连接上其余所有组的消息投递一起
@@ -1258,7 +1716,7 @@ func (gr *group) isLeader() bool {
 // ——而 leader 变更（SoftState 变化）恰恰常常与 HardState 变化不在
 // 同一轮（当选那一轮 SoftState 先变、HardState 下一轮才落盘），直接
 // 取值会在日志里打出 term=0，误导排查（backlog「首轮 leader 日志
-// term=0」）。lastTerm 在 HardState 非空的那一轮更新（见 handleReady），
+// term=0」）。lastTerm 在 HardState 非空的那一轮更新（见 persistPhase），
 // 是「最近真实任期」的准确缓存。
 func (gr *group) currentTerm() uint64 {
 	return gr.lastTerm.Load()
