@@ -342,3 +342,108 @@ func TestReopenActiveSizeIsLogicalEnd(t *testing.T) {
 		t.Fatalf("续写后条目形态错误: %+v", ents)
 	}
 }
+
+// TestPreallocatedActiveSegmentKeepsLogicalActiveSize 预分配生效时，活动段
+// 的物理大小是 SegMaxBytes，而 activeSize 必须仍是逻辑末尾。
+//
+// 这是 spec §2.3 那条顺序约束的守门人：preallocActive 必须发生在
+// activeSize 定下来之后。写反了顺序，activeSize 一开就是 SegMaxBytes，
+// 重启即触发轮转。
+//
+// 平台限制（spec §2.3 已声明）：只在预分配真正生效的平台（Linux）可观测，
+// 因此断言以 l.prealloc 为前提；macOS 上本用例只验证「未预分配时物理
+// 大小仍等于逻辑大小」，写反顺序照样绿——Linux 侧验收不可跳过。
+func TestPreallocatedActiveSegmentKeepsLogicalActiveSize(t *testing.T) {
+	old := SegMaxBytes
+	SegMaxBytes = 1 << 20 // 1MiB：远大于本用例写入量，确保不触发轮转
+	defer func() { SegMaxBytes = old }()
+
+	dir := t.TempDir()
+	l, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append(hs(1, 1, 0), []*raftpb.Entry{ent(1, 1, "a")}, true); err != nil {
+		t.Fatal(err)
+	}
+	written := l.activeSize
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	l2, _, ents, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	if len(ents) != 1 {
+		t.Fatalf("重开后恢复 %d 条目; want 1", len(ents))
+	}
+	if l2.activeSize != written {
+		t.Fatalf("重开后 activeSize = %d; want %d（逻辑末尾，不是物理大小）", l2.activeSize, written)
+	}
+
+	fi, err := os.Stat(filepath.Join(dir, segName(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l2.prealloc {
+		if fi.Size() != SegMaxBytes {
+			t.Fatalf("预分配生效但段物理大小 = %d; want %d", fi.Size(), SegMaxBytes)
+		}
+	} else if fi.Size() != written {
+		t.Fatalf("未预分配时段物理大小 = %d; want %d", fi.Size(), written)
+	}
+}
+
+// TestRotationTruncatesClosedSegmentToLogicalSize 已关闭段绝不能带预分配
+// 零尾——非末段遇到坏帧走的是「真损坏，拒绝启动」，零尾会让每次重启都
+// 撞上它。轮转关段前必须截回逻辑大小。
+//
+// 断言方式是端到端的：轮转后重开必须成功且条目齐全。若关段带零尾，Open
+// 会在扫描非末段时直接返回错误——这比断言文件大小更贴近真实故障形态，
+// 且两个平台都能观测（macOS 上不预分配、天然无零尾，用例退化为对现有
+// 轮转路径的回归保护）。
+func TestRotationTruncatesClosedSegmentToLogicalSize(t *testing.T) {
+	old := SegMaxBytes
+	SegMaxBytes = 256 // 小段：几条 entry 即触发轮转
+	defer func() { SegMaxBytes = old }()
+
+	dir := t.TempDir()
+	l, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 写到至少产生两次轮转，确保存在「已关闭段」
+	for i := uint64(1); i <= 12; i++ {
+		if err := l.Append(hs(1, 1, i-1), []*raftpb.Entry{ent(i, 1, "payload-payload")}, true); err != nil {
+			t.Fatalf("第 %d 次 Append 失败: %v", i, err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	seqs, err := scanSegSeqs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seqs) < 2 {
+		t.Fatalf("前置条件不成立：只有 %d 个段，未发生轮转", len(seqs))
+	}
+
+	// 已关闭段（除末段外）的物理大小必须等于其逻辑内容——用「重开成功」
+	// 断言，因为零尾会让非末段扫描判定为真损坏
+	_, _, ents, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatalf("轮转后重开失败（已关闭段疑似带零尾）: %v", err)
+	}
+	if len(ents) != 12 {
+		t.Fatalf("重开后恢复 %d 条目; want 12", len(ents))
+	}
+	for i, e := range ents {
+		if e.GetIndex() != uint64(i+1) {
+			t.Fatalf("条目 %d 的 index = %d; want %d", i, e.GetIndex(), i+1)
+		}
+	}
+}

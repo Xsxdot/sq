@@ -53,6 +53,13 @@ type Log struct {
 	// 见 TruncateTo 函数注释。
 	segMax map[uint64]uint64
 	buf    []byte // Append 的帧组装缓冲（复用减分配）
+	// prealloc 当前活动段是否已预分配到 SegMaxBytes。
+	//
+	// 它是 datasync 的使用前提，不是性能开关：文件大小仍在增长时
+	// fdatasync 不保证「文件长了」这件事落盘，掉电后已写入的尾部字节
+	// 读不回来。非 Linux 平台、以及 fallocate 返回 ENOTSUP 的文件系统上
+	// 恒为 false，落盘全程走完整 fsync，行为与本特性落地之前一致。
+	prealloc bool
 }
 
 // SegMaxBytes 单段字节数上限，Append 后据此判定是否轮转到下一段。
@@ -314,13 +321,26 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 		segMax:     segMax,
 	}
 
+	// 活动段补分配。必须在 l 构造完成、activeSize 已定之后——顺序写反
+	// 会让 activeSize 取到预分配后的物理大小（SegMaxBytes），重启即触发
+	// 轮转（spec §2.3）。
+	//
+	// 重启后段文件的物理大小已被扫描截回逻辑末尾（零尾走 torn tail 分支
+	// 物理截断），这里重新扩回 SegMaxBytes，让重启后的段重新获得「写入
+	// 不改变文件大小」这个前提。
+	if err := l.preallocActive(); err != nil {
+		f.Close()
+		return nil, nil, nil, err
+	}
+
 	commit := uint64(0)
 	if hs != nil {
 		commit = hs.GetCommit()
 	}
 	lg.Info("seglog: 打开完成",
 		"segments", len(seqs), "entries", len(ents), "lastIndex", lastIndex,
-		"hsCommit", commit, "tornTruncated", tornInfo != "", "tornSegment", tornInfo)
+		"hsCommit", commit, "tornTruncated", tornInfo != "", "tornSegment", tornInfo,
+		"prealloc", l.prealloc)
 
 	return l, hs, ents, nil
 }
@@ -407,8 +427,8 @@ func (l *Log) Append(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) erro
 	}
 
 	if sync {
-		if err := l.active.Sync(); err != nil {
-			return fmt.Errorf("seglog: fsync 活动段 %s 失败: %w", segName(l.activeSeq), err)
+		if err := l.syncActive(); err != nil {
+			return err
 		}
 	}
 
@@ -433,12 +453,26 @@ func (l *Log) maybeRotate() error {
 	// 进 segMax（见函数末尾）。这里只是先取值存起来，不在此处写 map。
 	oldMaxIndex := l.lastIndex
 
+	// 关段前把物理大小截回逻辑大小：已关闭段绝不能带预分配零尾——Open
+	// 扫描对非末段坏帧的判定是「真损坏，拒绝启动」，零尾会让每一次重启
+	// 都撞上它，整组日志永久打不开。
+	//
+	// 未预分配时物理大小本就等于 oldBytes，Truncate 是空操作，但仍然
+	// 无条件执行：让两个平台走同一条代码路径，别留「只在 Linux 上执行
+	// 的那几行」这种只在生产环境才跑到的分支。
+	if err := l.active.Truncate(oldBytes); err != nil {
+		return fmt.Errorf("seglog: 轮转前截断旧段 %s 到 %d 字节失败: %w",
+			segName(oldSeq), oldBytes, err)
+	}
 	// 轮转屏障：旧段必须先 fsync 落盘、再关闭，然后才允许开新段。这样
 	// 一来，一旦发生掉电，可能出现 torn tail（部分帧未落盘）的段永远
 	// 只会是「当前活动段」，也就是全部段里的最后一段——Open 扫描时「非
 	// 末段坏帧 = 真损坏，拒绝启动」的判定前提才成立。如果不设这道屏障，
 	// 旧段可能带着未 fsync 的尾部就被认定「已关闭」，重启后一扫描就会
 	// 命中「非末段损坏」直接拒绝启动。
+	//
+	// 这里必须是完整 fsync，不能走 syncActive：上一行的 Truncate 刚改过
+	// 文件大小，fdatasync 不保证 inode 元数据落盘。
 	if err := l.active.Sync(); err != nil {
 		return fmt.Errorf("seglog: 轮转前 fsync 旧段 %s 失败: %w", segName(oldSeq), err)
 	}
@@ -473,6 +507,12 @@ func (l *Log) maybeRotate() error {
 	l.activeSeq = newSeq
 	l.activeSize = 0
 
+	// 新段预分配。放在 activeSize 归零之后、HS 补写之前：补写要用
+	// WriteAt(l.activeSize)，此刻偏移必须已经是 0。
+	if err := l.preallocActive(); err != nil {
+		return err
+	}
+
 	// HS 补写：把最新 HardState 立即写入新段首条帧。原因是 TruncateTo
 	// 按段整段删除，如果最新 HS 只存在于某个旧段里，那个旧段一旦被回收，
 	// 重启就再也读不到 HardState 了。让每次轮转都把「当时已知的最新 HS」
@@ -490,14 +530,15 @@ func (l *Log) maybeRotate() error {
 				segName(newSeq), l.activeSize, werr)
 		}
 		l.activeSize += int64(n)
-		// 补写帧必须立即 fsync，不能等下一次批量刷盘：本函数末尾一旦把旧段
+		// 补写帧必须立即落盘，不能等下一次批量刷盘：本函数末尾一旦把旧段
 		// 登记进 segMax，TruncateTo 随时可能删掉旧段——若此刻补写帧还悬在
 		// 页缓存里，「删旧段 + 掉电」的窗口会同时失去新旧两份 HS，重启后
 		// HardState 归零（term/vote 丢失，违反 raft 持久化契约）。普通条目
 		// 帧走 mem 档 NoSync 是因为旧副本还在；HS 补写帧是回收授权的前置，
 		// 持久性要求跟着回收动作走，不跟确认档走。
-		if serr := l.active.Sync(); serr != nil {
-			return fmt.Errorf("seglog: 轮转补写 hardstate fsync 新段 %s 失败: %w", segName(newSeq), serr)
+		// 走 syncActive：此刻新段刚预分配完、写入未改变文件大小。
+		if serr := l.syncActive(); serr != nil {
+			return fmt.Errorf("seglog: 轮转补写 hardstate 落盘新段 %s 失败: %w", segName(newSeq), serr)
 		}
 	}
 
@@ -512,7 +553,49 @@ func (l *Log) maybeRotate() error {
 	l.segMax[oldSeq] = oldMaxIndex
 
 	l.lg.Info("seglog: 段轮转完成",
-		"oldSegment", oldSeq, "oldSegmentBytes", oldBytes, "newSegment", newSeq)
+		"oldSegment", oldSeq, "oldSegmentBytes", oldBytes, "newSegment", newSeq,
+		"truncatedTo", oldBytes)
+	return nil
+}
+
+// preallocActive 把当前活动段预分配到 SegMaxBytes，并刷新 prealloc 标志。
+//
+// 调用方须持有 l.mu。调用时机有两处：Open 打开活动段之后（且必须在
+// activeSize 定下来之后——顺序写反会让 activeSize 变成 SegMaxBytes，
+// 重启即触发轮转），以及 maybeRotate 创建新段之后。
+//
+// 失败语义：文件系统不支持时 prealloc=false、返回 nil，落盘退回 fsync，
+// 功能不受影响——预分配是纯性能优化，不是正确性前提。只有真 I/O 错误
+// （ENOSPC 等）才上抛。
+func (l *Log) preallocActive() error {
+	ok, err := preallocate(l.active, SegMaxBytes)
+	if err != nil {
+		return err
+	}
+	l.prealloc = ok
+	if !ok {
+		// 降级是低频且影响性能画像的事实，必须留痕：否则线上看到落盘慢
+		// 于预期时，无从判断是盘慢还是根本没走上预分配这条路。
+		l.lg.Info("seglog: 预分配未生效，落盘退回完整 fsync",
+			"dir", l.dir, "segment", segName(l.activeSeq))
+	}
+	return nil
+}
+
+// syncActive 把活动段落盘。调用方须持有 l.mu。
+//
+// 已预分配时用 datasync（不同步 inode 元数据，实测单次 1.82ms → 0.61ms）；
+// 未预分配时文件大小仍在增长，必须用完整 fsync。
+//
+// 注意：轮转屏障那次落盘**不能**走本方法——它紧跟在 Truncate 之后，
+// 那一刻文件大小刚变，必须完整 fsync（见 maybeRotate）。
+func (l *Log) syncActive() error {
+	if l.prealloc {
+		return datasync(l.active)
+	}
+	if err := l.active.Sync(); err != nil {
+		return fmt.Errorf("seglog: fsync 活动段 %s 失败: %w", segName(l.activeSeq), err)
+	}
 	return nil
 }
 
@@ -524,10 +607,7 @@ func (l *Log) Sync() error {
 	if l.active == nil {
 		return fmt.Errorf("seglog: 已关闭，拒绝 Sync")
 	}
-	if err := l.active.Sync(); err != nil {
-		return fmt.Errorf("seglog: fsync 活动段 %s 失败: %w", segName(l.activeSeq), err)
-	}
-	return nil
+	return l.syncActive()
 }
 
 // Close 关闭活动段句柄。之后任何 Append/Sync 返回错误。
