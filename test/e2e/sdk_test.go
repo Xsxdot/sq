@@ -268,6 +268,34 @@ func writeBrokerConfig(t *testing.T, mutate ...func(*config.Config)) (cfgPath, e
 	return cfgPath, fmt.Sprintf("%s:%d", cfg.AdvertiseHost, cfg.AdvertisePort)
 }
 
+// rewriteBrokerConfig 就地改写已有的 broker 配置文件（保留 data_dir、端口等
+// 全部既有取值），供「同一份数据目录、跨代换配置重启」的用例使用。
+//
+// 为什么不能再调一次 writeBrokerConfig：它内部 t.TempDir() + pickPort()
+// 会给出全新的数据目录与端口，第二代进程就读不到第一代写下的数据了——
+// 而跨档位互读要验证的恰恰是"同一份盘上数据被另一档位的进程读出来"。
+func rewriteBrokerConfig(t *testing.T, cfgPath string, mutate ...func(*config.Config)) {
+	t.Helper()
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("读 broker 配置失败: %v", err)
+	}
+	cfg := &config.Config{}
+	if err := yaml.Unmarshal(raw, cfg); err != nil {
+		t.Fatalf("解析 broker 配置失败: %v", err)
+	}
+	for _, f := range mutate {
+		f(cfg)
+	}
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("序列化 broker 配置失败: %v", err)
+	}
+	if err := os.WriteFile(cfgPath, out, 0o600); err != nil {
+		t.Fatalf("写 broker 配置失败: %v", err)
+	}
+}
+
 // launchBroker 按给定配置启动一个 broker 进程并等待其开始接受连接。
 //
 // 不注册任何 Cleanup：进程生命周期由调用方负责——常规用例经 startBroker
