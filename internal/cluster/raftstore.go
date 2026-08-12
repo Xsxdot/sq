@@ -230,6 +230,29 @@ func (r *raftStore) wipeLog(g uint32) error {
 //     完全透明（Load 的返回值与旧实现等价）。
 //   - Append 本身失败即返回错误（fail-stop，见 seglog.Log.Append 注释），
 //     本层不重试。
+// Sync 把组 g 的活动段刷到盘。
+//
+// 参数：
+//   - g: 组号
+//
+// 返回：段日志打开失败或 fsync 失败时的错误
+//
+// 用途是 append 阶段的合批落盘：批内每条 MsgStorageAppend 各自
+// `Persist(sync=false)` 只写不刷，最后由本方法统一刷一次。这与
+// 「最后一条 Persist(sync=true)」在盘上完全等价——`seglog.Log.Append`
+// 的 sync 分支做的就是 `Sync` 做的这件事（`syncActive`），而中途若发生
+// 段轮转，`maybeRotate` 自己会在关旧段前把旧段 fsync 掉，不依赖这里。
+func (r *raftStore) Sync(g uint32) error {
+	l, err := r.getLog(g)
+	if err != nil {
+		return fmt.Errorf("raftstore Sync 组 %d 打开段日志: %w", g, err)
+	}
+	if err := l.Sync(); err != nil {
+		return fmt.Errorf("raftstore Sync 组 %d: %w", g, err)
+	}
+	return nil
+}
+
 func (r *raftStore) Persist(g uint32, hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) error {
 	l, err := r.getLog(g)
 	if err != nil {

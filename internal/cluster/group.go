@@ -175,6 +175,13 @@ type group struct {
 	appendCount      atomic.Uint64
 	applyCount       atomic.Uint64
 	respDropped      atomic.Uint64
+	// syncCount/batchCount 是 append 合批的效果计数：syncCount 是真正
+	// 落盘的次数，batchCount 是合批的批数。appendCount/syncCount 就是
+	// 「一次 fsync 摊了多少条 MsgStorageAppend」——三机实测里这个比值
+	// 从 4.11 跌到 1.60 正是异步化劣化的根因，退出汇总里打出来，
+	// 下次不必再去数 /proc/diskstats 才知道合批有没有生效。
+	syncCount  atomic.Uint64
+	batchCount atomic.Uint64
 	applied atomic.Uint64 // 已 apply 的最高条目 index（重启重放幂等的基础）
 	lead    atomic.Uint64 // 当前 leader 节点 ID，SoftState 变化时更新
 	// lastTerm 是最近一次非空 HardState 的 term 缓存（currentTerm 的
@@ -577,25 +584,131 @@ func hardStateOf(m *raftpb.Message) *raftpb.HardState {
 	return &raftpb.HardState{Term: &term, Vote: &vote, Commit: &commit}
 }
 
-// runAppend 是 append 阶段的协程主体：串行消费 appendCh。
+// runAppend 是 append 阶段的协程主体：串行消费 appendCh，**按批落盘**。
 //
 // 串行是契约要求（同一 target 的本地消息不得重排），也正是攒批的来源
 // ——主循环不再等它，raft 于是能连着产出多轮 Ready，本协程一轮一轮
 // 消费时每轮的 Entries 自然更大。
+//
+// 但「轮次更大」不等于「落盘更少」：拿到一条就立刻 fsync 一条的话，
+// 异步化反而把同步路径下的隐式 group commit 拆掉了——同步路径里主循环
+// 阻塞在 fsync 内，阻塞期间新提案在 raft unstable log 堆积，下一轮 Ready
+// 因此自带一个大批次。2026-08-12 三机实测量出了这笔账：fsync 摊薄比从
+// 4.11 条/次跌到 1.60，吞吐最差一格 −48.9%（见设计文档顶部实测结论）。
+//
+// 所以这里必须自带 group commit：取到一条后先非阻塞抽干队列，整批
+// 只落一次盘（见 appendBatch）。
 func (gr *group) runAppend(ctx context.Context) {
 	gr.lg.Info("append 阶段启动", "queue_cap", cap(gr.appendCh))
 	defer func() {
-		gr.lg.Info("append 阶段退出", "handled", gr.appendCount.Load(),
+		syncs, appends := gr.syncCount.Load(), gr.appendCount.Load()
+		amort := float64(0)
+		if syncs > 0 {
+			amort = float64(appends) / float64(syncs)
+		}
+		gr.lg.Info("append 阶段退出", "handled", appends,
+			"batches", gr.batchCount.Load(), "fsyncs", syncs,
+			"amortization", amort, // 条/次：合批是否真的生效，看这个数
 			"blocked_total", time.Duration(gr.appendBlockNanos.Load()).Round(time.Millisecond).String())
 	}()
+	batch := make([]localMsg, 0, localQueueDepth)
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case lm := <-gr.appendCh:
-			gr.appendOnce(ctx, lm)
+			batch = gr.drainAppend(append(batch[:0], lm))
+			gr.appendBatch(ctx, batch)
 		}
 	}
+}
+
+// drainAppend 非阻塞地把 appendCh 里**已经排队**的消息续到 batch 尾部，
+// 队列空即返回。
+//
+// 参数：
+//   - batch: 已含至少一条消息的批（调用方保证非空）
+//
+// 返回：续入后的批，长度不超过 localQueueDepth
+//
+// 注意：只收已排队的，绝不等待新消息——等待会把延迟押在「下一条何时到」
+// 上，正是 group commit 最容易写坏的地方。队列里有多少就攒多少，队列空
+// 就立刻落盘：负载高时批自然大，负载低时批就是 1 条、延迟不受影响。
+func (gr *group) drainAppend(batch []localMsg) []localMsg {
+	for len(batch) < localQueueDepth {
+		select {
+		case lm := <-gr.appendCh:
+			batch = append(batch, lm)
+		default:
+			return batch
+		}
+	}
+	return batch
+}
+
+// appendBatch 处理一批 MsgStorageAppend：批内逐条只写不刷，最后**合并
+// 成一次 fsync**，再统一投递响应。
+//
+// 参数：
+//   - ctx: 用于响应投递与停机判定
+//   - batch: 待处理的一批本地 append 消息，按到达顺序
+//
+// 顺序即不变量（设计文档 §5.2）：响应投回的那一刻，raft 就认为日志已
+// stable 并立刻去 MemoryStorage 读它。所以**整批的响应必须全部晚于那次
+// fsync**——批内任何一条提前投递，raft 都可能读到尚未落盘的日志。
+//
+// 携带快照的消息不参与合批：快照会整体重置日志，与普通条目混在一批里
+// 落盘说不清先后。遇到它就先把已累积的部分收口，快照单独走 appendOnce
+// 的原路径（含 installMu 互斥与自身的响应投递），之后再重新开批。
+func (gr *group) appendBatch(ctx context.Context, batch []localMsg) {
+	gr.batchCount.Add(1)
+	start, needSync := 0, false
+	// flush 把 batch[start:end] 这一段收口：先落盘（若该段有一条要求
+	// 同步），再按序投递该段全部响应。
+	flush := func(end int) {
+		if start >= end {
+			start = end
+			return
+		}
+		if needSync {
+			gr.syncBatch()
+		}
+		for _, lm := range batch[start:end] {
+			gr.deliverResponses(ctx, lm.m.GetResponses(), "append")
+		}
+		start, needSync = end, false
+	}
+	for i, lm := range batch {
+		if snap := lm.m.GetSnapshot(); !raft.IsEmptySnap(snap) {
+			flush(i)
+			gr.appendOnce(ctx, lm) // 快照独立处理，自带计数与响应投递
+			start = i + 1
+			continue
+		}
+		gr.appendCount.Add(1)
+		// sync=false：批内只写不刷，刷由下面的 flush 统一做一次
+		gr.persistPhase(hardStateOf(lm.m), lm.m.GetEntries(), false)
+		// 判据必须是「本条 raft 要求同步」，不能是「批非空」——后者会把
+		// 「只有 commit 前进、没有新日志」的轮次也拖去落盘，白白吃掉
+		// 2026-08-08 那次优化的成果。
+		if gr.mode == AckQuorumFsync && lm.mustSync {
+			needSync = true
+		}
+	}
+	flush(len(batch))
+}
+
+// syncBatch 执行一次合批落盘，失败按不可恢复处理。
+//
+// 与 persistPhase 同一条 fail-stop 纪律：fsync 失败意味着「日志到底有没有
+// 落盘」无法判定，而响应马上就要投给 raft、让它认为日志已 stable。此时
+// 静默续跑就是让内存态与盘上状态分叉，只能就地停摆等重启重来。
+func (gr *group) syncBatch() {
+	if err := gr.rs.Sync(gr.g); err != nil {
+		gr.lg.Error("日志合批落盘失败，组停摆", "err", err)
+		panic(err)
+	}
+	gr.syncCount.Add(1)
 }
 
 // appendOnce 处理一条 MsgStorageAppend：快照安装（若有）→ 持久化 →
@@ -643,7 +756,14 @@ func (gr *group) appendOnce(ctx context.Context, lm localMsg) {
 	}
 	// 1. 持久化 + 双记账。sync 判定：档位 × 本轮 MustSync，语义与旧路径
 	//    的 syncPersist 完全一致，只是 MustSync 换了载体（见 localMsg）。
-	gr.persistPhase(hardStateOf(m), m.GetEntries(), gr.mode == AckQuorumFsync && lm.mustSync)
+	//
+	//    本方法现在只服务携带快照的消息（普通条目走 appendBatch 的合批
+	//    路径）。这里的落盘同样计入 syncCount，退出汇总的摊薄比才是全口径。
+	sync := gr.mode == AckQuorumFsync && lm.mustSync
+	gr.persistPhase(hardStateOf(m), m.GetEntries(), sync)
+	if sync {
+		gr.syncCount.Add(1)
+	}
 	// 2. 投递响应——必须严格晚于第 1 步（本函数 doc comment）
 	gr.deliverResponses(ctx, m.GetResponses(), "append")
 }

@@ -39,6 +39,75 @@ func storageAppendWithSnap(snap *raftpb.Snapshot) localMsg {
 	return localMsg{m: &raftpb.Message{Type: &typ, To: &to, Snapshot: snap}}
 }
 
+// storageAppendAt 构造一条携带单条日志的 MsgStorageAppend。
+//
+// mustSync 对应 raft 本轮的 MustSync 判定（fsync 档下才有意义）；
+// Responses 留空——本文件里用它的两个用例只关心落盘与 fsync 次数。
+func storageAppendAt(index, term uint64, mustSync bool) localMsg {
+	typ := raftpb.MsgStorageAppend
+	to := raft.LocalAppendThread
+	idx, tm := index, term
+	etyp := raftpb.EntryNormal
+	return localMsg{
+		m: &raftpb.Message{Type: &typ, To: &to, Entries: []*raftpb.Entry{
+			{Index: &idx, Term: &tm, Type: &etyp, Data: []byte("x")},
+		}},
+		mustSync: mustSync,
+	}
+}
+
+// TestAppendBatchSingleFsync append 合批的核心承诺：一批抽干的
+// MsgStorageAppend 合成**恰好一次** fsync。
+//
+// 为什么这条是整个改造的验收锚：2026-08-12 三机实测证明，异步化本身
+// 是负收益——同步路径下「主循环阻塞在 fsync 里」本就是一次隐式 group
+// commit，异步化把它拆掉后，同样的提案流被切得更碎、一条一 fsync，
+// 摊薄比反而从 4.11 条/次跌到 1.60。本用例守的就是「批内只落一次盘」，
+// 改回逐条 sync 会让 fsync 计数变成 8。
+func TestAppendBatchSingleFsync(t *testing.T) {
+	gr, _, _ := newApplyTestGroup(t, nil)
+	gr.mode = AckQuorumFsync
+
+	var batch []localMsg
+	for i := uint64(1); i <= 8; i++ {
+		batch = append(batch, storageAppendAt(i, 1, true))
+	}
+	gr.appendBatch(context.Background(), batch)
+
+	if got := gr.syncCount.Load(); got != 1 {
+		t.Fatalf("8 条 append 产生 %d 次 fsync，合批要求恰好 1 次", got)
+	}
+	if got := gr.appendCount.Load(); got != 8 {
+		t.Fatalf("appendCount = %d; want 8（合批不能吞掉逐条计数）", got)
+	}
+	// 落盘内容不能因为合批而少写：8 条都要在 MemoryStorage 里
+	last, err := gr.mem.LastIndex()
+	if err != nil || last != 8 {
+		t.Fatalf("mem.LastIndex = %d, %v; want 8, nil", last, err)
+	}
+}
+
+// TestAppendBatchNoFsyncWhenNoneRequires 合批不得凭空制造 fsync：
+// 批内没有任何一条要求同步时，一次盘都不能落。
+//
+// 这条守的是 2026-08-08 那次优化的成果——「只有 commit 前进、没有新日志」
+// 的轮次本来就不该 fsync。用「批非空」代替「批内有 MustSync」做判据，
+// 会把这类轮次重新拖回落盘，本用例即刻变红。
+func TestAppendBatchNoFsyncWhenNoneRequires(t *testing.T) {
+	gr, _, _ := newApplyTestGroup(t, nil)
+	gr.mode = AckQuorumFsync
+
+	var batch []localMsg
+	for i := uint64(1); i <= 4; i++ {
+		batch = append(batch, storageAppendAt(i, 1, false))
+	}
+	gr.appendBatch(context.Background(), batch)
+
+	if got := gr.syncCount.Load(); got != 0 {
+		t.Fatalf("批内无一条要求同步，却落了 %d 次盘; want 0", got)
+	}
+}
+
 // TestDispatchReadyRoutesByTarget 分发的核心契约：本地存储消息按 m.To
 // 进两条本地通道，其余消息才交给 send 外发。
 //
@@ -141,7 +210,17 @@ func TestSnapshotInstallExcludesApply(t *testing.T) {
 	// 下方的放行，必须先放 gate 并等安装协程收工，否则 t.Cleanup 关闭
 	// store 与安装协程竞争（pebble: closed panic 会掩盖真正的断言失败）。
 	var gateOnce sync.Once
+	// entered 在安装真正进入临界区（已持 installMu）后关闭。
+	//
+	// 必须有这个握手：control 回调是在 installMu 之内被调用的，而下面的
+	// apply 协程只要抢在安装拿到锁之前跑到 TryLock，就会合法地一路跑完，
+	// 「安装期间 apply 必须让路」的断言当场误报。这不是实现的问题，是
+	// 用例自己的启动顺序竞态——实测约 1/10 概率红。等到 entered 之后再
+	// 启动 apply，顺序就确定了，断言本身一字未改、判别力不变。
+	entered := make(chan struct{})
+	var enteredOnce sync.Once
 	gr.control = func(ctx context.Context, nodeID uint64, op byte, payload []byte) ([]byte, error) {
+		enteredOnce.Do(func() { close(entered) })
 		<-gate
 		// 一块即完成：done=true，游标无意义，块内无键
 		// （snapFetchResp 是 group_test.go 的既有拼包助手）
@@ -167,6 +246,13 @@ func TestSnapshotInstallExcludesApply(t *testing.T) {
 		gateOnce.Do(func() { close(gate) })
 		<-installDone
 	}()
+
+	// 等安装真正进了临界区再启动 apply（见 entered 的注释）
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("安装未在 10s 内进入临界区")
+	}
 
 	// 陈旧条目：index 远低于快照位点，安装完成后必须被整批跳过
 	stale := []*raftpb.Entry{normalEntry(t, st, 5, 1, 101, "meta/topic/stale", "old")}
