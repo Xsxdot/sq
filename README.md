@@ -82,6 +82,7 @@ default_max_attempts: 16       # 新订阅组默认最大投递次数，超过�
 retention_check_interval: 5m   # 过期清理扫描间隔（Go duration 格式）
 disk_watermark_percent: 85     # 磁盘使用率超过即拒写保读；0=关闭。状态可在控制台
                                # 总览页与 /metrics 的 sq_write_blocked 观察
+                               # 集群模式下 raft 段文件预分配占用见 sq.example.yaml
 log_level: info
 # —— M5a 认证与管理面 ——
 admin_listen: ":8082"          # Admin HTTP 监听地址；"" = 关闭管理面（含 /metrics）
