@@ -58,7 +58,10 @@ txn_max_checks: 15
 # 节点身份：node_id 必须出现在下方 peers 的 id 中；raft_listen 是本节点
 # raft 组间复制流量的监听地址（与 grpc_listen 必须不同端口）。
 # data_groups 数据组数：首启时持久化进盘、此后不可变（改配置不改盘上事实）。
-# 容量下界 = data_groups × 64MiB（3 组 192MiB / 16 组 1GiB / 64 组上限 4GiB）：
+# 容量下界 =（data_groups + 1）× 64MiB（3 组 256MiB / 16 组 1.06GiB /
+# 64 组上限 4.06GiB）。**+1 是元数据组**：它和数据组一样有自己的一条
+# seglog，一样预分配——实测 data_groups=3 时 raftlog/ 下是 0/1/2/3 四个
+# 目录共 257MiB。
 # 每组活动段一次性预分配到 64MiB（SegMaxBytes），与实际写入量无关——为的是
 # 同步落盘不必同步 inode 元数据（实测单次 1.82ms → 0.61ms）。这是下界不是
 # 上界，已关闭未回收的段另计；配大 data_groups 时 disk_watermark_percent
