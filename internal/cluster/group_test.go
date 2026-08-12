@@ -300,14 +300,14 @@ func TestLeaderVisibleOnlyAfterHookCompletes(t *testing.T) {
 //     同策略）；panic 不写干净关机标记，重启时 Start 判定不干净关机并返回
 //     ErrUncleanShutdown，恢复走整目录 WipeForRejoin + learner 重入
 //     （buildGroup 那条按组清空重来的分支属于「干净关机却留下标记」的
-//     停机中止情形，见 handleReady 的 ctx 分支）。
+//     停机中止情形，见 appendOnce 的 ctx 分支）。
 //   - 为什么标记必然在盘上：installSnapshot 第 2 步 MarkInstalling
 //     （Sync）先于任何数据写入，本测试在拉块（第 4 步）注入必败回调，
 //     失败发生在删标记的收口批次（第 5 步）之前——标记必须仍在。
-//   - 为什么直接调 handleReady 而非走 run 循环：panic 发生在 run
-//     goroutine 内时测试进程无法 recover（goroutine 的 panic 不可跨
-//     协程捕获）；handleReady 是 panic 的抛出处，直接在测试协程调用
-//     即可捕获断言，生产行为不变（run 循环原样抛出）。
+//   - 为什么直接调 appendOnce 而非走 run 循环：panic 发生在阶段协程内时
+//     测试进程无法 recover（goroutine 的 panic 不可跨协程捕获）；
+//     appendOnce 是 panic 的抛出处，直接在测试协程调用即可捕获断言，
+//     生产行为不变。
 //
 // 断言：panic 确实发生（且是安装第 4 步的拉块错误）、标记在位点
 // 100 仍在盘上、内存侧未推进（mem 无快照、applied 仍为 0）——三方
@@ -340,12 +340,10 @@ func TestInstallSnapshotFailurePanicsAndKeepsMarker(t *testing.T) {
 			Index: &idx, Term: &tm, ConfState: &raftpb.ConfState{},
 		},
 	}
-	rd := raft.Ready{Snapshot: snap}
-
 	var recovered any
 	func() {
 		defer func() { recovered = recover() }()
-		gr.handleReady(context.Background(), rd)
+		gr.appendOnce(context.Background(), storageAppendWithSnap(snap))
 	}()
 	if recovered == nil {
 		t.Fatal("快照安装失败必须 panic（fail-stop）——raft 已把快照视为持久化，静默续跑是内存/磁盘/raft 三方分叉")
@@ -718,7 +716,7 @@ func TestInstallSnapshotAbortsOnShutdown(t *testing.T) {
 	var recovered any
 	func() {
 		defer func() { recovered = recover() }()
-		gr.handleReady(ctx, raft.Ready{Snapshot: snap})
+		gr.appendOnce(ctx, storageAppendWithSnap(snap))
 	}()
 	if recovered != nil {
 		t.Fatalf("停机途中的安装失败不得 panic，得到: %v", recovered)

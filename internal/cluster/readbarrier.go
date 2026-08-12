@@ -89,9 +89,9 @@ func (gr *group) readIndexOnce(ctx context.Context) error {
 }
 
 // stepReadStates 消费本轮 Ready 回流的读状态：填 index，若 applied 已经
-// 追过就地放行。在 handleReady 的 apply 之前调用——本轮 apply 之后还会
-// 再调一次 notifyReadWaiters，两处配合覆盖「回流早于 apply」与「回流晚于
-// apply」两种顺序。
+// 追过就地放行。在 dispatchReady 的本地入队之后调用——apply 阶段每批之后
+// 还会再调一次 notifyReadWaiters，两处配合覆盖「回流早于 apply」与「回流
+// 晚于 apply」两种顺序。
 func (gr *group) stepReadStates(rss []raft.ReadState) {
 	if len(rss) == 0 {
 		return
@@ -121,7 +121,7 @@ func (gr *group) stepReadStates(rss []raft.ReadState) {
 }
 
 // notifyReadWaiters 放行所有 readIndex 已被 applied 追过的等待者。
-// 在 handleReady 的 apply 循环之后调用（applied 刚被推进）。
+// 在 applyOnce 的 applyPhase 之后调用（applied 刚被推进）。
 func (gr *group) notifyReadWaiters(applied uint64) {
 	gr.mu.Lock()
 	defer gr.mu.Unlock()

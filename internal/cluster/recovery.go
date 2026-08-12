@@ -326,7 +326,8 @@ func GrantRecoverPermit(st *store.Store, now time.Time, bootGen BootGenFunc, lg 
 // needsTermBump 判定某条恢复路径是否必须在回放前抬任期、清投票。
 //
 // 判据是**投票记录是不是同步落盘的**，不是「机器有没有重启」：
-//   - fsync 档：syncPersist 跟随 raft.MustSync，term/vote 每次变更都已 fsync，
+//   - fsync 档：appendOnce 按「档位 × 本轮 MustSync」判定（MustSync 随
+//     localMsg 配对传递，见 group.go），term/vote 每次变更都已 fsync，
 //     投票不可能丢，抬了纯属白白多付一次选举
 //   - mem 档：HardState 走 Pebble 的 NoSync——commit 返回时数据可能还在
 //     进程内的 WAL 缓冲里（write(2) 由 flusher goroutine 异步执行），

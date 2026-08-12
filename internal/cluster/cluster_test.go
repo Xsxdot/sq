@@ -229,7 +229,7 @@ func TestLeaderChangeFiresExactlyOncePerGroup(t *testing.T) {
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
-	// 收敛后等最后的钩子事件入队：lead 原子先于钩子更新（handleReady
+	// 收敛后等最后的钩子事件入队：lead 原子先于钩子更新（dispatchReady
 	// 先 Store 再 notify），最后一场转移的当选事件可能晚于收敛观测
 	time.Sleep(time.Second)
 	drain := func(ch chan leaderEvt) map[uint32]int {
