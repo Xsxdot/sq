@@ -98,16 +98,18 @@ func TestReopenTruncatesTornTail(t *testing.T) {
 	if err := l.Append(nil, []*raftpb.Entry{ent(2, 1, "will-be-torn")}, false); err != nil {
 		t.Fatal(err)
 	}
+	// 逻辑末尾必须在 Close 之前取自 activeSize，不能事后用 Stat().Size()：
+	// 预分配生效时段文件的物理大小恒为 SegMaxBytes，拿它减 3 只会削掉一点
+	// 零尾，最后一条帧毫发无损——掉电模拟当场失效，用例变成永远绿的空壳。
+	// 这正是 seglog.go 里「凡是需要『写了多少』的地方绝不用 Stat().Size()」
+	// 那条不变量在测试侧的同款要求。
+	written := l.activeSize
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// 掉电模拟：把末段截掉最后 3 字节，第二条帧变 torn
+	// 掉电模拟：把末段截到逻辑末尾前 3 字节，第二条帧变 torn
 	seg := filepath.Join(dir, "00000001.seg")
-	fi, err := os.Stat(seg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Truncate(seg, fi.Size()-3); err != nil {
+	if err := os.Truncate(seg, written-3); err != nil {
 		t.Fatal(err)
 	}
 	l2, _, gotEnts, err := Open(dir, slog.Default())
