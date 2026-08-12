@@ -41,11 +41,22 @@ type Credential struct {
 
 // Config 为 sq 全部运行配置。零值无意义，必须经 Load 构造。
 type Config struct {
-	GRPCListen             string `yaml:"grpc_listen"`              // gRPC 监听地址，默认 :8081
-	AdvertiseHost          string `yaml:"advertise_host"`           // 路由响应中的对外地址，默认 127.0.0.1
-	AdvertisePort          int    `yaml:"advertise_port"`           // 默认 8081
-	DataDir                string `yaml:"data_dir"`                 // Pebble 数据目录
-	Fsync                  string `yaml:"fsync"`                    // sync|async
+	GRPCListen    string `yaml:"grpc_listen"`    // gRPC 监听地址，默认 :8081
+	AdvertiseHost string `yaml:"advertise_host"` // 路由响应中的对外地址，默认 127.0.0.1
+	AdvertisePort int    `yaml:"advertise_port"` // 默认 8081
+	DataDir       string `yaml:"data_dir"`       // Pebble 数据目录
+	Fsync         string `yaml:"fsync"`          // sync|async
+	// MessageEncoding 消息落盘/跨节点转发的编码档位：json|binary，缺省 json。
+	//
+	// json = 历史格式（整条 JSON，Body 走 base64，+33% 体积）；
+	// binary = v1 混合格式（Body 原始字节直落）。取值与 core.EncodingJSON/
+	// core.EncodingBinary 一一对应（此处用字面量与 fsync/ack 同风格，
+	// 保持 config 包不依赖 core）。
+	//
+	// ⚠️ 开启 binary 必须在**全集群升级完成之后**：解码永远双格式，但旧版本
+	// 进程不认识 v1，混版期提前开启会让旧节点解不开转发来的消息。两步纪律
+	// 见 README「升级注意」。
+	MessageEncoding        string `yaml:"message_encoding"`
 	AutoCreateTopic        bool   `yaml:"auto_create_topic"`        // QueryRoute/Send 未知 topic 时自动建
 	DefaultQueueNums       uint32 `yaml:"default_queue_nums"`       // 自动建 topic 的队列数
 	DefaultMaxAttempts     int32  `yaml:"default_max_attempts"`     // 新订阅组默认最大投递次数
@@ -139,6 +150,7 @@ func Load(path string) (*Config, error) {
 	cfg := &Config{
 		GRPCListen: ":8081", AdvertiseHost: "127.0.0.1", AdvertisePort: 8081,
 		DataDir: "./data", Fsync: "sync",
+		MessageEncoding: "json",
 		AutoCreateTopic: true, DefaultQueueNums: 16, // 16：队列数决定消费并行度（每队列一路消费）；写吞吐自队列内 group commit 后与队列数基本无关
 
 		DefaultMaxAttempts: 16, LogLevel: "info",
@@ -183,6 +195,12 @@ func Load(path string) (*Config, error) {
 	}
 	if cfg.Fsync != "sync" && cfg.Fsync != "async" {
 		return nil, fmt.Errorf("配置 fsync 只接受 sync|async，得到 %q", cfg.Fsync)
+	}
+	// 非法档位必须挡在启动期：静默回落默认档会让运维以为 binary 已生效，
+	// 而"盘上格式与预期不符"不会报错、不会丢数据，只是什么也没省下——
+	// 这类偏差事后几乎不可能被发现。
+	if cfg.MessageEncoding != "json" && cfg.MessageEncoding != "binary" {
+		return nil, fmt.Errorf("配置 message_encoding 只接受 json|binary，得到 %q", cfg.MessageEncoding)
 	}
 	// 队列数必须在启动时挡住，不能等到运行时才发作：
 	//   - 写 0（或漏填成 0）时，每一次 EnsureTopic 都会失败，而这个失败会一路

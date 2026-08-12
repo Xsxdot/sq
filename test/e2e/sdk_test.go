@@ -224,11 +224,15 @@ func writeBrokerConfig(t *testing.T, mutate ...func(*config.Config)) (cfgPath, e
 	// QueryRoute 返回的 endpoints 就是 SDK 后续做 telemetry/send/receive 的目标，
 	// 对不上时表现为握手超时而不是「路由错」，很难定位。
 	cfg := &config.Config{
-		GRPCListen:         fmt.Sprintf("127.0.0.1:%d", port),
-		AdvertiseHost:      "127.0.0.1",
-		AdvertisePort:      port,
-		DataDir:            filepath.Join(dir, "data"),
-		Fsync:              "sync",
+		GRPCListen:    fmt.Sprintf("127.0.0.1:%d", port),
+		AdvertiseHost: "127.0.0.1",
+		AdvertisePort: port,
+		DataDir:       filepath.Join(dir, "data"),
+		Fsync:         "sync",
+		// 与 DefaultMaxAttempts/RetentionCheckInterval 同款陷阱：本结构体
+		// 不走 config.Load 的默认值，零值会序列化成 message_encoding: ""
+		// 并被 Load 的白名单拒绝，broker 直接起不来。取值同 Load 的缺省。
+		MessageEncoding:    "json",
 		AutoCreateTopic:    true,
 		DefaultQueueNums:   4,
 		DefaultMaxAttempts: 16,

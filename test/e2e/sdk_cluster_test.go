@@ -120,6 +120,7 @@ func clusterNodeConfig(t *testing.T, dir string, nodeID uint64, grpcPort, raftPo
 		AdvertisePort:          grpcPort,
 		DataDir:                filepath.Join(dir, "data"),
 		Fsync:                  "sync",
+		MessageEncoding:        "json", // 同 writeBrokerConfig：字面量不走 Load 默认值，空串会被拒
 		AutoCreateTopic:        true,
 		DefaultQueueNums:       6, // plan：保证三组都有队列
 		DefaultMaxAttempts:     16,
