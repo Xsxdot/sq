@@ -17,6 +17,7 @@ import (
 	"fmt"
 	"hash/fnv"
 	"log/slog"
+	"strconv"
 	"sync"
 	"time"
 
@@ -73,7 +74,12 @@ func New(rep replication.Replicator, rt replication.Router, st *store.Store,
 	}
 }
 
-func qkey(topic string, q uint32) string { return fmt.Sprintf("%s/%d", topic, q) }
+// qkey 拼 (topic, queue) 的 map 键。每条消息写入都要拼一次，是热路径——
+// 手工拼接绕开 fmt.Sprintf 的反射与临时分配（pprof 实测热点）；键无人解析，
+// 仅作 map key，语义与原 Sprintf 完全一致。
+func qkey(topic string, q uint32) string {
+	return topic + "/" + strconv.FormatUint(uint64(q), 10)
+}
 
 // InvalidateCounters 使全部 offset/seq 计数缓存失效（集群档组 leader 变更时
 // 由 OnLeaderChange 钩子触发；单机档无变更事件，正常不会调用）。

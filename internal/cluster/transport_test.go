@@ -50,6 +50,48 @@ func TestTransportDeliverAcrossNodes(t *testing.T) {
 	}
 }
 
+// TestTransportBatchedFramesDecodeIndividually 发送侧合批的承重测试：
+// 先把一批消息全部入队再 Start——writeLoop 建连后首轮即面对满队列，
+// 非阻塞抽干后编成连续多帧、一次（或少数几次）写出。接收端 readLoop
+// 未改，必须能从连续字节流中逐帧解出每条消息，组号与消息体一一对应
+// 且保序（帧格式逐字节不变是合批的前提契约）。
+func TestTransportBatchedFramesDecodeIndividually(t *testing.T) {
+	ln1, _ := net.Listen("tcp", "127.0.0.1:0")
+	ln2, _ := net.Listen("tcp", "127.0.0.1:0")
+	type rec struct {
+		g   uint32
+		idx uint64
+	}
+	const n = 200
+	got := make(chan rec, n)
+	t2 := newTransport(2, ln2, nil,
+		func(g uint32, m *raftpb.Message) { got <- rec{g, m.GetIndex()} }, nil, testSlog(t))
+	t1 := newTransport(1, ln1, map[uint64]string{2: ln2.Addr().String()},
+		func(uint32, *raftpb.Message) {}, nil, testSlog(t))
+	from, to := uint64(1), uint64(2)
+	typ := raftpb.MsgHeartbeat
+	// Start 前全部入队：确保 writeLoop 拿到第一条时队列里已有大量积压，
+	// 抽干路径真正被锻炼到（而非退化成一条一写）。
+	for i := uint64(0); i < n; i++ {
+		idx := i
+		t1.Send(uint32(i%5), []*raftpb.Message{{Type: &typ, From: &from, To: &to, Index: &idx}})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	t1.Start(ctx)
+	t2.Start(ctx)
+	for i := uint64(0); i < n; i++ {
+		select {
+		case r := <-got:
+			if r.g != uint32(i%5) || r.idx != i {
+				t.Fatalf("第 %d 条解出 (g=%d idx=%d); want (g=%d idx=%d)——合批破坏了帧边界或保序", i, r.g, r.idx, uint32(i%5), i)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatalf("5s 内仅收到 %d/%d 条（含首次拨号重试窗口）", i, n)
+		}
+	}
+}
+
 // TestTransportDropsWhenPeerDown 对端未监听时 Send 不阻塞不报错——
 // 丢消息是 raft 传输层的合法行为，阻塞才是灾难（会卡死 Ready 循环）。
 func TestTransportDropsWhenPeerDown(t *testing.T) {
