@@ -392,23 +392,8 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 	}
 	// 1. 持久化：HardState + Entries 单批原子（rs.Persist），sync 与否
 	//    由确认档位逐轮判定；MemoryStorage 是 raft 库读取日志的视图，
-	//    必须与持久层同步推进（双记账）。
-	if err := gr.rs.Persist(gr.g, rd.HardState, rd.Entries, gr.syncPersist(rd)); err != nil {
-		// 持久化失败 = 内存日志与磁盘分叉：崩溃后本节点已确认的条目
-		// 会消失，与 applyEntries 的失败同属「日志/状态与多数派分叉」的
-		// 不可恢复类。统一走 panic——进程死亡由上层重启接管（走不干净
-		// 判定）；若记 Error 后停摆返回，run 循环只是安静退出，Manager
-		// 无从感知、组永久静默卡死，比 panic 更糟。
-		gr.lg.Error("日志持久化失败，组停摆", "err", err)
-		panic(err)
-	}
-	if !raft.IsEmptyHardState(rd.HardState) {
-		_ = gr.mem.SetHardState(rd.HardState)
-		// 缓存本轮的 term（currentTerm 的数据源）：空 HardState 的轮次
-		// 不进这里，lastTerm 因此永远停留在「最近一次真实任期」
-		gr.lastTerm.Store(rd.HardState.GetTerm())
-	}
-	_ = gr.mem.Append(rd.Entries)
+	//    必须与持久层同步推进（双记账）。全部动作见 persistPhase。
+	gr.persistPhase(rd.HardState, rd.Entries, gr.syncPersist(rd))
 	// 2. 发送 Messages：经注入的 send 回调外发（transport 发送永不
 	//    阻塞——满则丢，raft 心跳重试兜底，Task 3 契约）。
 	//    外发前先登记本轮的 MsgSnap 定向台账——这是 leader 侧唯一能
@@ -430,104 +415,9 @@ func (gr *group) handleReady(ctx context.Context, rd raft.Ready) {
 		gr.lead.Store(rd.SoftState.Lead)
 		gr.lg.Info("组 leader 变更", "lead", rd.SoftState.Lead, "term", gr.currentTerm())
 	}
-	// 3. CommittedEntries apply
-	// 本轮回合的成员变更登记：Advance 后再通知（见循环外注释），
-	// notify=false 表示该变更非本节点发起，不通知（超时兜底）
-	appliedCC := make([]ccApplied, 0, 2)
-	// 普通条目段积累（apply 合批）：连续的 EntryNormal 攒进 seg，由
-	// applyEntries 合成单次引擎提交。遇到成员变更必须先冲刷已积累的段
-	// ——SaveConfState 用独立批次写成员表 + applied 位点，段若晚于它
-	// 提交会把 applied 位点倒退回段内更小的 index，位点单调性破坏。
-	var seg []*raftpb.Entry
-	flushSeg := func() {
-		gr.applyEntries(seg)
-		seg = seg[:0]
-	}
-	for _, ent := range rd.CommittedEntries {
-		// 重启重放的幂等保证：raft 可能重发已 apply 过的条目
-		// （conflict 回退重写后），跳过即可——FSM 已是该 index 的状态。
-		// 注意 applied 只在段冲刷/成员变更时推进，段内递增的 index 不会
-		// 被本判定误跳。
-		if ent.GetIndex() <= gr.applied.Load() {
-			continue
-		}
-		switch ent.GetType() {
-		case raftpb.EntryConfChange:
-			flushSeg()
-			// 旧格式 V1 ConfChange（旧日志可能遗留）：照常 apply，但
-			// 永不通知 waiter——V1 条目没有提案者身份，通知有跨节点
-			// id 碰撞的假成功风险；且本进程只提议 V2，V1 条目在本
-			// 进程内不可能有对应 waiter（重启后 ccWaiters 为空）。
-			// 不通知 = 保守超时 = 安全方向。
-			var cc raftpb.ConfChange
-			cc.Reset()
-			// v3 的 raftpb 是 protobuf-go v2 生成：需要显式 Unmarshal
-			if err := proto.Unmarshal(ent.Data, &cc); err != nil {
-				gr.lg.Error("ConfChange 解码失败，组停摆", "index", ent.GetIndex(), "err", err)
-				panic(err)
-			}
-			cs := gr.rn.ApplyConfChange(&cc)
-			// 成员表 + applied 同批落盘（同 V2 分支）：V1 路径罕见
-			// 但不能只更内存——重启后旧日志仍会被重放，内存成员表
-			// 不落盘就与持久化值分叉
-			// applyMu 临界区（同 applyEntries）：Snapshot 在同一把锁内读
-			// applied + confState，写批次与成员表必须与 applied 位点配对
-			// 提交——否则可能产出「元数据 index=N 却携带更新的成员表」
-			// 的快照，配对不变量被破坏
-			gr.applyMu.Lock()
-			if gr.rs != nil {
-				if err := gr.rs.SaveConfState(gr.g, cs, ent.GetIndex()); err != nil {
-					gr.applyMu.Unlock()
-					gr.lg.Error("成员表持久化失败，组停摆", "index", ent.GetIndex(), "err", err)
-					panic(err)
-				}
-				gr.confState.Store(cs) // Storage.Snapshot() 现场取用（Task 4）
-			}
-			gr.applied.Store(ent.GetIndex())
-			gr.applyMu.Unlock()
-			gr.lg.Debug("成员变更已 apply", "type", cc.GetType().String(), "node", cc.GetNodeId())
-		case raftpb.EntryConfChangeV2:
-			flushSeg()
-			var v2 raftpb.ConfChangeV2
-			v2.Reset()
-			if err := proto.Unmarshal(ent.Data, &v2); err != nil {
-				gr.lg.Error("ConfChangeV2 解码失败，组停摆", "index", ent.GetIndex(), "err", err)
-				panic(err)
-			}
-			cs := gr.rn.ApplyConfChange(&v2)
-			// 成员表 + applied 同批落盘：截断之后日志前缀不复存在，
-			// 重启只能靠这份持久化成员表恢复（Task 3 的截断前提）
-			// applyMu 临界区（同 applyEntries）：Snapshot 在同一把锁内读
-			// applied + confState，写批次与成员表必须与 applied 位点配对
-			// 提交——否则可能产出「元数据 index=N 却携带更新的成员表」
-			// 的快照，配对不变量被破坏
-			gr.applyMu.Lock()
-			if gr.rs != nil {
-				if err := gr.rs.SaveConfState(gr.g, cs, ent.GetIndex()); err != nil {
-					gr.applyMu.Unlock()
-					gr.lg.Error("成员表持久化失败，组停摆", "index", ent.GetIndex(), "err", err)
-					panic(err)
-				}
-				gr.confState.Store(cs) // Storage.Snapshot() 现场取用（Task 4）
-			}
-			gr.applied.Store(ent.GetIndex())
-			gr.applyMu.Unlock()
-			// 成员变更的 waiter 通知放到 Advance 之后（见循环外注释）：
-			// 这里只登记（id, 是否本节点发起），不直接通知；登记与
-			// 通知都不是状态写入，留在锁外
-			ccid, ours := ccWaiterInfo(&v2, gr.selfID)
-			appliedCC = append(appliedCC, ccApplied{id: ccid, notify: ours})
-			if ch := v2.GetChanges(); len(ch) > 0 {
-				gr.lg.Debug("成员变更已 apply", "type", ch[0].GetType().String(), "node", ch[0].GetNodeId())
-			}
-		case raftpb.EntryNormal:
-			// 条目数据布局：[8B 提案者][8B waiter id][batch repr]——
-			// 载荷提取、waiter 通知（限定本节点提案）都在 applyEntries
-			// 内按条目粒度处理，这里只积累
-			seg = append(seg, ent)
-		}
-	}
-	flushSeg()
+	// 3. CommittedEntries apply（见 applyPhase）；本轮登记的成员变更
+	//    waiter 在 Advance 之后通知（见下）
+	appliedCC := gr.applyPhase(rd.CommittedEntries)
 	// 4. Advance——raft 库据此确认本轮 Ready 已处理，继续产下一轮
 	gr.rn.Advance()
 	// 成员变更 waiter 通知必须晚于 Advance：raft 库在 Advance 时才更新
@@ -904,6 +794,152 @@ func (gr *group) pullSnapshotChunks(ctx context.Context, desc snapDescriptor) er
 type ccApplied struct {
 	id     uint64
 	notify bool
+}
+
+// persistPhase 执行「日志持久化 + MemoryStorage 双记账」，是 raft 存储
+// 契约里 append 侧的全部写入动作。
+//
+// 参数：
+//   - hs: 本轮的 HardState，nil 或空表示无状态变更
+//   - ents: 本轮要追加/覆盖的日志条目，可为空
+//   - sync: 本次写入是否带 fsync（quorum-fsync 档的 MustSync 轮）
+//
+// 顺序即不变量（spec §5.2）：先 rs.Persist 落盘，再推 mem（raft 库读
+// 日志的易失视图）。调用方必须在本方法返回**之后**才投递响应给 raft
+// ——响应一旦投出，raft 就认为这些条目已 stable 并会立刻去 mem 读它们。
+//
+// 失败一律 panic（fail-stop）：持久化失败 = 内存日志与磁盘分叉，崩溃后
+// 本节点已确认的条目会消失。记 Error 后静默返回只会让组永久卡死，比
+// 进程死亡更糟——进程死亡由上层重启接管（走不干净关机判定）。
+func (gr *group) persistPhase(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) {
+	if err := gr.rs.Persist(gr.g, hs, ents, sync); err != nil {
+		gr.lg.Error("日志持久化失败，组停摆", "entries", len(ents), "sync", sync, "err", err)
+		panic(err)
+	}
+	if !raft.IsEmptyHardState(hs) {
+		_ = gr.mem.SetHardState(hs)
+		// 缓存本轮的 term（currentTerm 的数据源）：空 HardState 的轮次
+		// 不进这里，lastTerm 因此永远停留在「最近一次真实任期」
+		gr.lastTerm.Store(hs.GetTerm())
+	}
+	_ = gr.mem.Append(ents)
+}
+
+// applyPhase 把一批已提交条目应用到 FSM，返回本批登记的成员变更 waiter。
+//
+// 参数：
+//   - ents: 已提交待应用的条目（async 下来自 MsgStorageApply.Entries）
+//
+// 返回：
+//   - 本批 apply 掉的 ConfChangeV2 登记（id + 是否本节点发起）。**通知
+//     由调用方做**，不在本方法内——通知时机与 raft 内部 applied 位点的
+//     推进强相关（见调用方注释），是调用方的责任。
+//
+// 两条顺序不变量（原 handleReady 的注释原样保留）：
+//   - 普通条目攒段合批，遇成员变更必须先冲刷已积累的段——SaveConfState
+//     用独立批次写成员表 + applied 位点，段若晚于它提交会把 applied 位点
+//     倒退回段内更小的 index，位点单调性破坏；
+//   - 跳过 index ≤ applied 的条目：raft 可能重发已 apply 过的条目
+//     （conflict 回退重写后），FSM 已是该 index 的状态。
+func (gr *group) applyPhase(ents []*raftpb.Entry) []ccApplied {
+	// 本轮回合的成员变更登记：由调用方在正确时机通知（见调用点注释），
+	// notify=false 表示该变更非本节点发起，不通知（超时兜底）
+	appliedCC := make([]ccApplied, 0, 2)
+	// 普通条目段积累（apply 合批）：连续的 EntryNormal 攒进 seg，由
+	// applyEntries 合成单次引擎提交。遇到成员变更必须先冲刷已积累的段
+	// ——SaveConfState 用独立批次写成员表 + applied 位点，段若晚于它
+	// 提交会把 applied 位点倒退回段内更小的 index，位点单调性破坏。
+	var seg []*raftpb.Entry
+	flushSeg := func() {
+		gr.applyEntries(seg)
+		seg = seg[:0]
+	}
+	for _, ent := range ents {
+		// 重启重放的幂等保证：raft 可能重发已 apply 过的条目
+		// （conflict 回退重写后），跳过即可——FSM 已是该 index 的状态。
+		// 注意 applied 只在段冲刷/成员变更时推进，段内递增的 index 不会
+		// 被本判定误跳。
+		if ent.GetIndex() <= gr.applied.Load() {
+			continue
+		}
+		switch ent.GetType() {
+		case raftpb.EntryConfChange:
+			flushSeg()
+			// 旧格式 V1 ConfChange（旧日志可能遗留）：照常 apply，但
+			// 永不通知 waiter——V1 条目没有提案者身份，通知有跨节点
+			// id 碰撞的假成功风险；且本进程只提议 V2，V1 条目在本
+			// 进程内不可能有对应 waiter（重启后 ccWaiters 为空）。
+			// 不通知 = 保守超时 = 安全方向。
+			var cc raftpb.ConfChange
+			cc.Reset()
+			// v3 的 raftpb 是 protobuf-go v2 生成：需要显式 Unmarshal
+			if err := proto.Unmarshal(ent.Data, &cc); err != nil {
+				gr.lg.Error("ConfChange 解码失败，组停摆", "index", ent.GetIndex(), "err", err)
+				panic(err)
+			}
+			cs := gr.rn.ApplyConfChange(&cc)
+			// 成员表 + applied 同批落盘（同 V2 分支）：V1 路径罕见
+			// 但不能只更内存——重启后旧日志仍会被重放，内存成员表
+			// 不落盘就与持久化值分叉
+			// applyMu 临界区（同 applyEntries）：Snapshot 在同一把锁内读
+			// applied + confState，写批次与成员表必须与 applied 位点配对
+			// 提交——否则可能产出「元数据 index=N 却携带更新的成员表」
+			// 的快照，配对不变量被破坏
+			gr.applyMu.Lock()
+			if gr.rs != nil {
+				if err := gr.rs.SaveConfState(gr.g, cs, ent.GetIndex()); err != nil {
+					gr.applyMu.Unlock()
+					gr.lg.Error("成员表持久化失败，组停摆", "index", ent.GetIndex(), "err", err)
+					panic(err)
+				}
+				gr.confState.Store(cs) // Storage.Snapshot() 现场取用（Task 4）
+			}
+			gr.applied.Store(ent.GetIndex())
+			gr.applyMu.Unlock()
+			gr.lg.Debug("成员变更已 apply", "type", cc.GetType().String(), "node", cc.GetNodeId())
+		case raftpb.EntryConfChangeV2:
+			flushSeg()
+			var v2 raftpb.ConfChangeV2
+			v2.Reset()
+			if err := proto.Unmarshal(ent.Data, &v2); err != nil {
+				gr.lg.Error("ConfChangeV2 解码失败，组停摆", "index", ent.GetIndex(), "err", err)
+				panic(err)
+			}
+			cs := gr.rn.ApplyConfChange(&v2)
+			// 成员表 + applied 同批落盘：截断之后日志前缀不复存在，
+			// 重启只能靠这份持久化成员表恢复（Task 3 的截断前提）
+			// applyMu 临界区（同 applyEntries）：Snapshot 在同一把锁内读
+			// applied + confState，写批次与成员表必须与 applied 位点配对
+			// 提交——否则可能产出「元数据 index=N 却携带更新的成员表」
+			// 的快照，配对不变量被破坏
+			gr.applyMu.Lock()
+			if gr.rs != nil {
+				if err := gr.rs.SaveConfState(gr.g, cs, ent.GetIndex()); err != nil {
+					gr.applyMu.Unlock()
+					gr.lg.Error("成员表持久化失败，组停摆", "index", ent.GetIndex(), "err", err)
+					panic(err)
+				}
+				gr.confState.Store(cs) // Storage.Snapshot() 现场取用（Task 4）
+			}
+			gr.applied.Store(ent.GetIndex())
+			gr.applyMu.Unlock()
+			// 成员变更的 waiter 通知放到本方法之外（见调用点注释）：
+			// 这里只登记（id, 是否本节点发起），不直接通知；登记与
+			// 通知都不是状态写入，留在锁外
+			ccid, ours := ccWaiterInfo(&v2, gr.selfID)
+			appliedCC = append(appliedCC, ccApplied{id: ccid, notify: ours})
+			if ch := v2.GetChanges(); len(ch) > 0 {
+				gr.lg.Debug("成员变更已 apply", "type", ch[0].GetType().String(), "node", ch[0].GetNodeId())
+			}
+		case raftpb.EntryNormal:
+			// 条目数据布局：[8B 提案者][8B waiter id][batch repr]——
+			// 载荷提取、waiter 通知（限定本节点提案）都在 applyEntries
+			// 内按条目粒度处理，这里只积累
+			seg = append(seg, ent)
+		}
+	}
+	flushSeg()
+	return appliedCC
 }
 
 // syncPersist 判定本轮 Ready 持久化是否带 fsync。
