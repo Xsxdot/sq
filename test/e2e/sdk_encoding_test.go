@@ -10,6 +10,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"testing"
 	"time"
@@ -26,6 +27,12 @@ import (
 // 这是单测覆盖不到的一环——单测里两种格式的字节是同一个进程造出来的，
 // 而这里第一代进程只会写 JSON、第二代进程只会写二进制，盘上真真正正
 // 是混存的，解码分流走的是真实的 Pebble 读路径。
+//
+// Body 断言为什么必须逐字节：Body 别名（decode 时子切片引用 Pebble value，
+// 迭代器移动后内存被复用）是本改动最危险的失效模式，表现是「消息内容随机
+// 变成别人的」而消息 ID 完全正常。单测 TestV1BodyIsCopied 只覆盖同进程内的
+// 字节复用，覆盖不到 Pebble 迭代器的真实生命周期——只有让 binary 档数据成批
+// 走真实读路径、并逐字节比对消费端拿到的 Body 才兜得住。
 func TestMessageEncodingCrossGeneration(t *testing.T) {
 	const topic = "e2e-encoding"
 	const group = "e2e-encoding-g"
@@ -64,11 +71,17 @@ func TestMessageEncodingCrossGeneration(t *testing.T) {
 	genB := sendMessages(t, endpoint, topic, perGen)
 	t.Logf("第二代（binary）已写入 %d 条", len(genB))
 
-	// ---- 消费：两代写入的消息必须全部收到 ----
-	want := make(map[string]bool, perGen*2)
-	for _, id := range append(append([]string{}, genA...), genB...) {
-		want[id] = false
+	// ---- 消费：两代写入的消息必须全部收到，且 Body 逐字节正确 ----
+	// sendMessages 的 Body 是 "recovery payload #<i>"，与返回的 msgId 按
+	// 发送顺序一一对应，因此期望 Body 由各代自身的下标推导，不依赖发送端。
+	want := make(map[string]string, perGen*2)
+	for i, id := range genA {
+		want[id] = fmt.Sprintf("recovery payload #%d", i)
 	}
+	for i, id := range genB {
+		want[id] = fmt.Sprintf("recovery payload #%d", i)
+	}
+	seen := make(map[string]bool, len(want))
 	consumer := newSimpleConsumer(t, endpoint, group, topic)
 	deadline := time.Now().Add(60 * time.Second)
 	got := 0
@@ -79,8 +92,17 @@ func TestMessageEncodingCrossGeneration(t *testing.T) {
 		}
 		for _, mv := range mvs {
 			id := mv.GetMessageId()
-			if seen, ok := want[id]; ok && !seen {
-				want[id] = true
+			wantBody, ok := want[id]
+			if !ok {
+				continue // 非本用例的消息
+			}
+			if body := string(mv.GetBody()); body != wantBody {
+				// 不等即为别名失效：binary 档解码把 Body 子切片引用到
+				// Pebble value，迭代器移动后内存被复用。
+				t.Fatalf("消息 %s Body 不一致: 实得 %q, 应为 %q", id, body, wantBody)
+			}
+			if !seen[id] {
+				seen[id] = true
 				got++
 			}
 			if err := consumer.Ack(context.Background(), mv); err != nil {
@@ -88,8 +110,8 @@ func TestMessageEncodingCrossGeneration(t *testing.T) {
 			}
 		}
 	}
-	for id, seen := range want {
-		if !seen {
+	for id := range want {
+		if !seen[id] {
 			t.Errorf("消息 %s 未被消费到（换档后存量/增量丢失）", id)
 		}
 	}
