@@ -290,3 +290,55 @@ func TestTruncateToReclaimsHSOnlySegmentAfterReopen(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// TestReopenActiveSizeIsLogicalEnd 重开后 activeSize 必须等于已写入的有效
+// 字节数（逻辑末尾），而不是文件的物理大小。
+//
+// 现状下两者恰好相等（扫描遇到坏帧会物理截断到好帧边界，Stat 发生在扫描
+// 之后），所以本用例现在就该绿——它的价值是**回归锚**：预分配落地后
+// 物理大小恒为 SegMaxBytes，届时这条断言是唯一挡住「轮转判定读到 64MB
+// 立即轮转」的东西。
+func TestReopenActiveSizeIsLogicalEnd(t *testing.T) {
+	dir := t.TempDir()
+	l, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append(hs(1, 1, 0), []*raftpb.Entry{ent(1, 1, "a"), ent(2, 1, "b")}, true); err != nil {
+		t.Fatal(err)
+	}
+	written := l.activeSize
+	if written == 0 {
+		t.Fatal("前置条件不成立：写入后 activeSize 仍为 0")
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	l2, _, ents, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	if l2.activeSize != written {
+		t.Fatalf("重开后 activeSize = %d; want %d（逻辑末尾）", l2.activeSize, written)
+	}
+	if len(ents) != 2 {
+		t.Fatalf("重开后恢复 %d 条目; want 2", len(ents))
+	}
+
+	// 续写必须接在逻辑末尾之后，不覆盖已有帧
+	if err := l2.Append(nil, []*raftpb.Entry{ent(3, 1, "c")}, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := l2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, _, ents, err = Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 3 || ents[2].GetIndex() != 3 || string(ents[2].Data) != "c" {
+		t.Fatalf("续写后条目形态错误: %+v", ents)
+	}
+}

@@ -30,12 +30,17 @@ import (
 // goroutine，内部单互斥串行化——三者频率都低（每轮 Ready / 200ms /
 // 30s），锁竞争可忽略。
 type Log struct {
-	mu         sync.Mutex
-	dir        string
-	lg         *slog.Logger
-	active     *os.File          // 当前活动段（始终打开，Append 的写入目标）
-	activeSeq  uint64            // 活动段序号
-	activeSize int64             // 活动段当前字节数（轮转判定：>= SegMaxBytes 触发）
+	mu        sync.Mutex
+	dir       string
+	lg        *slog.Logger
+	active    *os.File // 当前活动段（始终打开，Append 的写入目标）
+	activeSeq uint64   // 活动段序号
+	// activeSize 活动段已写入的有效字节数。两个用途：
+	//   1. 轮转判定（>= SegMaxBytes 触发）
+	//   2. 下一次写入的偏移（WriteAt 的第二参数）
+	// 预分配后文件的物理大小恒为 SegMaxBytes，与本字段不再相等——凡是
+	// 需要「写了多少」的地方一律用本字段，绝不用 Stat().Size()。
+	activeSize int64
 	lastIndex  uint64            // 日志尾 index；0 = 空日志
 	lastHS     *raftpb.HardState // 最新已写 HardState（轮转时补写进新段首条）
 	// segMax 已关闭段号 → 该段的段内最大 entry index（回收判定：
@@ -141,6 +146,16 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 		lastIndex uint64
 		segMax    = make(map[uint64]uint64)
 		tornInfo  string // 非空表示发生了 torn 截断，写入 Info 日志用
+
+		// activeLogicalEnd 活动段（= 最后一段）扫描结束时的偏移，即已写入的
+		// 有效字节数。它是 activeSize 的唯一来源。
+		//
+		// 为什么不用 f.Stat().Size()：现状下两者恰好相等（扫描遇到坏帧会
+		// 物理截断到好帧边界），但那让「轮转判定的输入」依赖「扫描一定会
+		// 物理截断零尾」这个不写在任何地方的副作用。预分配落地后物理大小
+		// 恒为 SegMaxBytes，这条隐式依赖一旦被后人改动截断策略就会静默
+		// 踩塌轮转。显式取扫描结果，依赖关系从隐含变成明写。
+		activeLogicalEnd int64
 	)
 
 	for i, seq := range seqs {
@@ -250,6 +265,9 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 			}
 			off += n
 		}
+		if isLast {
+			activeLogicalEnd = int64(off)
+		}
 	}
 
 	// 确定活动段：无任何段时创建 00000001.seg；否则续用最后一段。
@@ -261,7 +279,10 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 	// len(seqs)==0 ⇒ 这一行 O_CREATE 会**新建**首段文件；否则只是续用已
 	// 存在的末段，不产生新目录项。
 	createdFirstSeg := len(seqs) == 0
-	f, err := os.OpenFile(activePath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	// 不带 O_APPEND：预分配后 EOF 就是 SegMaxBytes，O_APPEND 会把每次写
+	// 都定位到段尾。写入位置改由 activeSize 显式给出（WriteAt），两个
+	// 平台走同一条写路径——未预分配时 WriteAt(activeSize) 与顺序追加等价。
+	f, err := os.OpenFile(activePath, os.O_WRONLY|os.O_CREATE, 0o644)
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("seglog: 打开活动段 %s 失败: %w", segName(activeSeq), err)
 	}
@@ -278,11 +299,6 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 			return nil, nil, nil, err
 		}
 	}
-	fi, err := f.Stat()
-	if err != nil {
-		f.Close()
-		return nil, nil, nil, fmt.Errorf("seglog: stat 活动段 %s 失败: %w", segName(activeSeq), err)
-	}
 	// 活动段自身不计入 segMax（segMax 只记「已关闭」段），delete 掉活动段号
 	// 若上面扫描时误记（例如活动段就是唯一段）。
 	delete(segMax, activeSeq)
@@ -292,7 +308,7 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 		lg:         lg,
 		active:     f,
 		activeSeq:  activeSeq,
-		activeSize: fi.Size(),
+		activeSize: activeLogicalEnd,
 		lastIndex:  lastIndex,
 		lastHS:     hs,
 		segMax:     segMax,
@@ -370,9 +386,9 @@ func (l *Log) Append(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) erro
 	}
 
 	if len(l.buf) > 0 {
-		n, err := l.active.Write(l.buf)
+		n, err := l.active.WriteAt(l.buf, l.activeSize)
 		if err != nil {
-			return fmt.Errorf("seglog: 写活动段 %s 失败: %w", segName(l.activeSeq), err)
+			return fmt.Errorf("seglog: 写活动段 %s 偏移 %d 失败: %w", segName(l.activeSeq), l.activeSize, err)
 		}
 		l.activeSize += int64(n)
 	}
@@ -437,7 +453,10 @@ func (l *Log) maybeRotate() error {
 
 	newSeq := oldSeq + 1
 	newPath := filepath.Join(l.dir, segName(newSeq))
-	f, err := os.OpenFile(newPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+	// 不带 O_APPEND：预分配后 EOF 就是 SegMaxBytes，O_APPEND 会把每次写
+	// 都定位到段尾。写入位置改由 activeSize 显式给出（WriteAt），两个
+	// 平台走同一条写路径——未预分配时 WriteAt(activeSize) 与顺序追加等价。
+	f, err := os.OpenFile(newPath, os.O_WRONLY|os.O_CREATE, 0o644)
 	if err != nil {
 		return fmt.Errorf("seglog: 轮转创建新段 %s 失败: %w", segName(newSeq), err)
 	}
@@ -465,9 +484,10 @@ func (l *Log) maybeRotate() error {
 			return fmt.Errorf("seglog: 轮转补写 hardstate 编码失败: %w", merr)
 		}
 		frame := appendFrame(nil, recHardState, payload)
-		n, werr := l.active.Write(frame)
+		n, werr := l.active.WriteAt(frame, l.activeSize)
 		if werr != nil {
-			return fmt.Errorf("seglog: 轮转补写 hardstate 写入新段 %s 失败: %w", segName(newSeq), werr)
+			return fmt.Errorf("seglog: 轮转补写 hardstate 写入新段 %s 偏移 %d 失败: %w",
+				segName(newSeq), l.activeSize, werr)
 		}
 		l.activeSize += int64(n)
 		// 补写帧必须立即 fsync，不能等下一次批量刷盘：本函数末尾一旦把旧段
