@@ -10,8 +10,9 @@
 // 边界：
 //   - 不管组间路由与成员编排——Manager 的事（Task 5 组装）
 //   - 不做快照与日志截断——batch④，日志无界增长、追齐走全量重放
-//   - 不在主循环内做存储写入——日志落盘与 FSM apply 分属两条本地阶段
-//     协程，见 dispatchReady
+//   - 主循环内的存储写入只有 mem 档 append 的内联快路径（无 fsync、
+//     内存级写入）——fsync 档日志落盘与两档的 FSM apply 分属两条本地
+//     阶段协程，见 dispatchReady
 //   - AckQuorumMem 的后台批量 fsync 不在本层——全组共享一条 WAL，
 //     一个 flusher 即可，由 Manager 持有
 //   - 传输层生命周期（拨号/断线/关闭日志）归属 Manager 层（Task 3 约定）
@@ -398,8 +399,10 @@ func raftConfig(id uint64, storage raft.Storage) *raft.Config {
 // run 驱动组循环：tick 驱动选举/心跳、消息步进、Ready 分发，
 // 直至 ctx 取消退出。
 //
-// 本循环内不做任何存储写入——写入全部经 appendCh/applyCh 交给两条
-// 阶段协程，这正是流水线深度的来源。
+// fsync 档下本循环内不做任何存储写入——写入全部经 appendCh/applyCh
+// 交给两条阶段协程，这正是流水线深度的来源。mem 档的 append 是唯一
+// 例外：无 fsync 的内存级写入在主循环内联完成，省掉通道分发税（见
+// dispatchReady 第 2 步的论证），apply 两档都仍走独立协程。
 //
 // 注意：tick 与心跳是高频路径，本循环内零日志（热循环规则）；
 // 关键节点日志全部落在 dispatchReady/阶段协程/propose 等低频路径上。
@@ -460,7 +463,8 @@ func (gr *group) run(ctx context.Context) {
 //     async 下 rd.Messages 里的网络消息「can be sent immediately」，因为
 //     一切以持久化为前提的消息都被移进了本地消息的 Responses 里
 //     （raft/v3@v3.7.0/node.go:98-110）。
-//  2. 入队 append（携带本轮 MustSync）、入队 apply。
+//  2. 处理 append（fsync 档入队合批、mem 档就地内联，均携带本轮
+//     MustSync）、入队 apply。
 //  3. 读状态回流与 leader 变更。
 //
 // 为什么 leader 变更放在入队之后：入队本身就是排序动作——写入已经进了
@@ -491,15 +495,49 @@ func (gr *group) dispatchReady(ctx context.Context, rd raft.Ready) {
 		gr.noteSnapSends(outbound)
 		gr.send(gr.g, outbound)
 	}
-	// 2. 本地存储消息按原序可靠入队。入队失败只可能是组正在退出
-	//    （enqueueLocal 已留痕），此时直接收工——后续消息也没有归宿。
+	// 2. 本地存储消息按原序处理。append 消息按档位分流：
+	//
+	//    mem 档 → 就地内联 appendOnce，不进 appendCh。为什么：mem 档的
+	//    sync 判定（mode==AckQuorumFsync && mustSync）恒为假，append 合批
+	//    永远不会触发，走通道纯付「主循环 → appendCh → runAppend 协程 →
+	//    响应 Step」一整圈调度分发税——2026-08-12 三机实测这笔税就是
+	//    mem 档 −3.3%~−4.5% 的全部来源，而内联只是一次内存级写入。
+	//    内联的正确性论证，三条：
+	//     a) 有序性：mem 档下**所有** append 消息都内联（含携带快照的
+	//        ——appendOnce 自带快照分支），appendCh 在 mem 档恒空，同
+	//        target 的处理顺序由主循环的串行性天然保证。绝不允许「普通
+	//        条目内联、快照进通道」的混合形态：那会让同 target 的消息
+	//        分属两条执行流，快照与其后条目乱序，违反 raft 本地消息契约。
+	//     b) 无死锁：deliverResponses 的自指响应走 gr.rn.Step（node 的
+	//        recvc），node.run 的 select 在独立 goroutine 里始终可消费
+	//        recvc（即便它正等着投递下一轮 Ready），主循环内联调用不自锁。
+	//     c) 快照内联安装会阻塞主循环（分钟级）——这正是 async 改造前的
+	//        旧时序，配套机制现成且仍然生效：installSnapshotWithRetry
+	//        内部的 keepTicking（独立协程代打 tick，选举计时器不停摆）与
+	//        installing 标记（step 满则丢，不拖死同连接上其它组）。期间
+	//        若 apply 协程正持 installMu，内联安装只是排队等它放锁——
+	//        apply 侧不依赖主循环推进，等待有限、无环路死锁。
+	//
+	//    fsync 档 → 仍走 appendCh，由 runAppend 合批落盘（合批是 fsync
+	//    档 +38.3% 的来源）——两档各取自己的最优形态，行为互不影响。
+	//
+	//    apply 消息两档都走 applyCh：Pebble 提交可能慢，留在独立协程才
+	//    保得住「apply 不挡下一轮 Ready」的流水线。
+	//
+	//    入队失败只可能是组正在退出（enqueueLocal 已留痕），此时直接
+	//    收工——后续消息也没有归宿。
 	for _, lm := range locals {
-		ch := gr.applyCh
-		stage := "apply"
 		if lm.m.GetTo() == raft.LocalAppendThread {
-			ch, stage = gr.appendCh, "append"
+			if gr.mode == AckQuorumMem {
+				gr.appendOnce(ctx, lm) // 内联快路径：无 fsync，内存级写入
+				continue
+			}
+			if !gr.enqueueLocal(ctx, gr.appendCh, lm, "append") {
+				return
+			}
+			continue
 		}
-		if !gr.enqueueLocal(ctx, ch, lm, stage) {
+		if !gr.enqueueLocal(ctx, gr.applyCh, lm, "apply") {
 			return
 		}
 	}
@@ -598,6 +636,12 @@ func hardStateOf(m *raftpb.Message) *raftpb.HardState {
 //
 // 所以这里必须自带 group commit：取到一条后先非阻塞抽干队列，整批
 // 只落一次盘（见 appendBatch）。
+//
+// mem 档下本协程照常启动但恒空转：append 消息全部在 dispatchReady 内联
+// 处理、不进 appendCh（内联快路径，见 dispatchReady 第 2 步的论证）。
+// 空转无害且不做特判——按档位决定起不起协程只会让两档的生命周期形态
+// 分叉，多出一条没人测的路径。退出汇总里 batches=0、fsyncs=0 属正常
+// （handled 取自 appendCount，内联路径也计入，是全口径数）。
 func (gr *group) runAppend(ctx context.Context) {
 	gr.lg.Info("append 阶段启动", "queue_cap", cap(gr.appendCh))
 	defer func() {
@@ -714,6 +758,12 @@ func (gr *group) syncBatch() {
 // appendOnce 处理一条 MsgStorageAppend：快照安装（若有）→ 持久化 →
 // 双记账 → 投递响应。
 //
+// 两类调用方（契约相同，执行 goroutine 不同）：
+//   - fsync 档：runAppend/appendBatch 只把**携带快照**的消息交来（普通
+//     条目走合批路径），在 append 阶段协程内执行；
+//   - mem 档：**所有** append 消息都由主循环在 dispatchReady 内联调用
+//     本方法（内联快路径，正确性论证见 dispatchReady 第 2 步）。
+//
 // 顺序即不变量（设计文档 §5.2）：raft 判定「日志已 stable」的那一刻就是
 // 响应投回的那一刻，此后它会立刻去 MemoryStorage 读这些条目。任何一步
 // 提前投递响应，raft 都会读到还不存在的日志。
@@ -757,8 +807,9 @@ func (gr *group) appendOnce(ctx context.Context, lm localMsg) {
 	// 1. 持久化 + 双记账。sync 判定：档位 × 本轮 MustSync，语义与旧路径
 	//    的 syncPersist 完全一致，只是 MustSync 换了载体（见 localMsg）。
 	//
-	//    本方法现在只服务携带快照的消息（普通条目走 appendBatch 的合批
-	//    路径）。这里的落盘同样计入 syncCount，退出汇总的摊薄比才是全口径。
+	//    fsync 档只把携带快照的消息交来（普通条目走 appendBatch 的合批
+	//    路径），mem 档全部消息都从这里过（内联，sync 恒假）。这里的落盘
+	//    同样计入 syncCount，退出汇总的摊薄比才是全口径。
 	sync := gr.mode == AckQuorumFsync && lm.mustSync
 	gr.persistPhase(hardStateOf(m), m.GetEntries(), sync)
 	if sync {
