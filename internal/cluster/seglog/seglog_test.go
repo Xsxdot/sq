@@ -4,9 +4,12 @@
 package seglog
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
@@ -445,5 +448,129 @@ func TestRotationTruncatesClosedSegmentToLogicalSize(t *testing.T) {
 		if e.GetIndex() != uint64(i+1) {
 			t.Fatalf("条目 %d 的 index = %d; want %d", i, e.GetIndex(), i+1)
 		}
+	}
+}
+
+// recordHandler 收集 slog 记录，用于断言日志级别。
+type recordHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *recordHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recordHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+func (h *recordHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordHandler) WithGroup(string) slog.Handler      { return h }
+
+// hasMsgAtLevel 是否存在指定级别、消息包含 sub 的记录。
+func (h *recordHandler) hasMsgAtLevel(lv slog.Level, sub string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Level == lv && strings.Contains(r.Message, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestZeroTailLogsDebugNotWarn 预分配产生的全零尾部必须记 Debug，不能记
+// Warn——每次干净重启都打 Warn 会让「检测到 torn tail」这条线上告警彻底
+// 失去意义。
+func TestZeroTailLogsDebugNotWarn(t *testing.T) {
+	old := SegMaxBytes
+	SegMaxBytes = 1 << 20
+	defer func() { SegMaxBytes = old }()
+
+	dir := t.TempDir()
+	l, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append(hs(1, 1, 0), []*raftpb.Entry{ent(1, 1, "a")}, true); err != nil {
+		t.Fatal(err)
+	}
+	written := l.activeSize
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 无论平台是否支持预分配，都人为补一段全零尾巴，让本用例在两个平台
+	// 上都能观测到零尾分支
+	f, err := os.OpenFile(filepath.Join(dir, segName(1)), os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(written + 4096); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	h := &recordHandler{}
+	l2, _, ents, err := Open(dir, slog.New(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	if len(ents) != 1 {
+		t.Fatalf("零尾不得影响恢复：得到 %d 条目; want 1", len(ents))
+	}
+	if l2.activeSize != written {
+		t.Fatalf("零尾截断后 activeSize = %d; want %d", l2.activeSize, written)
+	}
+	if h.hasMsgAtLevel(slog.LevelWarn, "torn tail") {
+		t.Fatal("全零尾部被记为 Warn torn tail——干净重启不得触发该告警")
+	}
+	if !h.hasMsgAtLevel(slog.LevelDebug, "预分配零尾") {
+		t.Fatal("全零尾部未记 Debug 预分配零尾")
+	}
+}
+
+// TestGenuineTornTailStillLogsWarn 非全零的尾部字节仍是真 torn write，
+// 必须保留 Warn——本用例守住「不要为了消噪把真告警一起消掉」。
+func TestGenuineTornTailStillLogsWarn(t *testing.T) {
+	dir := t.TempDir()
+	l, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append(hs(1, 1, 0), []*raftpb.Entry{ent(1, 1, "a")}, true); err != nil {
+		t.Fatal(err)
+	}
+	written := l.activeSize
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 追加半条帧的非零垃圾：模拟掉电时最后一次 write 只落盘一部分
+	f, err := os.OpenFile(filepath.Join(dir, segName(1)), os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{0x00, 0x00, 0x01, 0xff, 0xde, 0xad}, written); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	h := &recordHandler{}
+	l2, _, ents, err := Open(dir, slog.New(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	if len(ents) != 1 {
+		t.Fatalf("torn tail 截断后得到 %d 条目; want 1", len(ents))
+	}
+	if !h.hasMsgAtLevel(slog.LevelWarn, "torn tail") {
+		t.Fatal("真 torn tail 未记 Warn——告警被消噪消掉了")
 	}
 }

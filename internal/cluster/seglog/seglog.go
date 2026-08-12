@@ -198,16 +198,27 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 					return nil, nil, nil, fmt.Errorf(
 						"seglog: 段 %s 偏移 %d 帧损坏且非末段——真损坏，拒绝启动", name, off)
 				}
-				// 末段 torn tail：掉电时最后一次 write() 可能只落盘一部分，
-				// 是正常形态。物理截断到好帧边界后继续——绝不静默保留坏
-				// 字节，否则续写会接在坏帧后面，这段坏字节永远读不回。
+				// 末段坏帧：两种成因，必须分开记。
+				//   - 全零：预分配段尾的零填充，每次干净重启的正常形态
+				//   - 非全零：掉电时最后一次 write() 只落盘一部分，真 torn write
+				// 不分开的话，Warn 会被干净重启淹没成噪声，真事故里就没人信它了。
+				//
+				// 两种成因的**处理动作完全一致**：物理截断到好帧边界。绝不
+				// 静默保留坏字节——续写虽然按 activeSize 偏移覆盖写，但残留
+				// 在逻辑末尾之后的字节会让下次扫描再次撞上同一分支。
 				discarded := len(data) - off
+				zeroTail := allZero(data[off:])
 				if err := os.Truncate(path, int64(off)); err != nil {
 					return nil, nil, nil, fmt.Errorf("seglog: 截断段 %s 到偏移 %d 失败: %w", name, off, err)
 				}
-				lg.Warn("seglog: 检测到 torn tail，已截断到好帧边界",
-					"segment", name, "goodOffset", off, "discardedBytes", discarded)
-				tornInfo = name
+				if zeroTail {
+					lg.Debug("seglog: 预分配零尾，截断到逻辑末尾",
+						"segment", name, "goodOffset", off, "zeroBytes", discarded)
+				} else {
+					lg.Warn("seglog: 检测到 torn tail，已截断到好帧边界",
+						"segment", name, "goodOffset", off, "discardedBytes", discarded)
+					tornInfo = name
+				}
 				break
 			}
 
@@ -369,6 +380,25 @@ func scanSegSeqs(dir string) ([]uint64, error) {
 	}
 	sort.Slice(seqs, func(i, j int) bool { return seqs[i] < seqs[j] })
 	return seqs, nil
+}
+
+// allZero 判定切片是否全零。
+//
+// 用途：区分「预分配段尾的零填充」与「掉电导致的真 torn write」。两者都
+// 让 readFrame 报坏帧，但前者是每次干净重启的正常形态、后者是需要告警的
+// 异常——不分开记，Warn 就会被干净重启淹没成噪声。
+//
+// 全零并不能百分之百证明是预分配（真 torn write 也可能恰好落在一段零
+// 扇区上），但那种情况按「零尾」处理同样安全：截断行为完全一致，只是
+// 少一条告警。反方向才危险（把真损坏当零尾静默掉），而非零字节一定
+// 走告警分支，那个方向不会误判。
+func allZero(b []byte) bool {
+	for _, c := range b {
+		if c != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // Append 追加一轮 Ready 的 HardState 与条目。
