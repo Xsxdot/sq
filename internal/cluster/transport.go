@@ -2,7 +2,9 @@
 // + 发送 goroutine，accept 循环为每连接开读 goroutine，帧带组号信封。
 //
 // 职责：
-//   - Send 按目标节点入队，发送 goroutine 内做序列化与写帧（信封帧）
+//   - Send 按目标节点入队，发送 goroutine 内做序列化与写帧（信封帧）；
+//     发送侧非阻塞合批：一次抽干已排队的信封编成连续多帧、一次写出
+//     （见 writeLoop），对读端逐字节透明
 //   - 断线 500ms 退避重拨，坏帧（超长/不可反序列化）断开等对端重拨
 //   - 控制通道：ControlGroup 保留组号帧不进 raft 消息流，同一连接上
 //     应答后关闭（短连接 RPC，见 ControlGroup 注释）
@@ -51,6 +53,16 @@ const (
 
 	// redialBackoff 断线后重拨间隔。
 	redialBackoff = 500 * time.Millisecond
+
+	// maxBatchBytes 发送侧一次合批写出的字节上限（约 1MiB，对齐 raft
+	// MaxSizePerMsg——正常单条 MsgApp 不会超过它）。达到上限即停止抽取、
+	// 先写出；单帧超过上限时独立成批照发，绝不截断消息。
+	maxBatchBytes = 1 << 20
+
+	// maxRetainedBufCap 批间保留的发送缓冲容量上限（4MiB）：一次雪崩批
+	// 会把 buf 撑大，若无上限则每个 peer 的发送 goroutine 都可能永久
+	// 钉住一块大内存——超限即重置为小容量。
+	maxRetainedBufCap = 4 << 20
 )
 
 // ControlGroup 是控制通道的保留组号：业务组号上限 64（Task 1 数据组
@@ -373,31 +385,61 @@ func (t *transport) sendLoop(ctx context.Context, peerID uint64, addr string) {
 	}
 }
 
-// writeLoop 已连接状态下的写帧循环：从队列取信封 → proto.Marshal →
-// 写帧头+帧体。任一写失败即返回，由 sendLoop 负责关连接与重拨。
+// writeLoop 已连接状态下的写帧循环：取到第一条信封后**非阻塞**抽干队列中
+// 已排队的信封（select default 即返回，绝不等待新消息——等待会把延迟押在
+// 下一条何时到上），多条各自 Marshal 后编成连续多帧写进同一个 buf，一次
+// conn.Write 写出。合批消掉了每条消息一个 syscall + 一个 TCP 小包的开销；
+// 多帧连续字节对读端透明（帧格式逐字节不变，readLoop 逐帧解出）。
+// 任一写失败即返回，由 sendLoop 负责关连接与重拨。
 func (t *transport) writeLoop(ctx context.Context, conn net.Conn, q chan envelope,
 	peerID uint64, drops *atomic.Uint64, lastDropLog *time.Time) error {
-	buf := make([]byte, 0, 4096) // 帧缓冲复用，避免每帧一次分配
+	buf := make([]byte, 0, 4096) // 帧缓冲跨批复用，避免每帧一次分配
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case env := <-q:
-			payload, err := proto.Marshal(env.msg)
-			if err != nil {
-				// 序列化失败（对正常消息不可达）只影响本条，继续投递后续。
-				t.lg.Error("发送消息序列化失败，丢弃", "self", t.self, "peer", peerID, "err", err)
-				continue
+			buf = t.appendEnvelope(buf[:0], env, peerID)
+			// 非阻塞抽干：只收编已排队的信封，队列一空立即写出。
+			// 达到字节上限即停止抽取（上限判断在取下一条之前，单帧
+			// 超限时独立成批照发，不截断）。
+		drain:
+			for len(buf) < maxBatchBytes {
+				select {
+				case env = <-q:
+					buf = t.appendEnvelope(buf, env, peerID)
+				default:
+					break drain
+				}
 			}
-			buf = encodeFrame(buf, env.group, payload)
+			if len(buf) == 0 {
+				continue // 本批全部序列化失败（对正常消息不可达）：无可写
+			}
 			if _, err := conn.Write(buf); err != nil {
 				return err
+			}
+			// 防大内存钉住：雪崩批把 buf 撑过上限后重置为小容量，
+			// 否则每个 peer 的发送 goroutine 都可能永久占着一块大缓冲。
+			if cap(buf) > maxRetainedBufCap {
+				buf = make([]byte, 0, 4096)
 			}
 			if ctx.Err() == nil { // 恰逢取消时跳过上报（关机后不打日志）
 				t.logDrops(peerID, drops, lastDropLog)
 			}
 		}
 	}
+}
+
+// appendEnvelope 把一条信封序列化后以帧格式续写进 buf（append 语义，不清空
+// 已有内容），返回续写后的 buf。序列化失败只跳过该条（对正常消息不可达，
+// 记 Error 后原样返回 buf），保持「单条失败不拖累批内其余消息」的语义。
+func (t *transport) appendEnvelope(buf []byte, env envelope, peerID uint64) []byte {
+	payload, err := proto.Marshal(env.msg)
+	if err != nil {
+		t.lg.Error("发送消息序列化失败，丢弃", "self", t.self, "peer", peerID, "err", err)
+		return buf
+	}
+	return appendFrame(buf, env.group, payload)
 }
 
 // readLoop 单连接的读帧循环：io.ReadFull 读帧长→读帧体→拆组号→
@@ -509,14 +551,20 @@ func (t *transport) controlFrame(conn net.Conn, remote string, body []byte) {
 // 日志可相互印证。
 var errControlUnassembled = errors.New("控制通道未装配")
 
-// encodeFrame 组装一帧：[4B 帧长][4B 组号][payload]，帧长 = 4+len(payload)。
-// buf 为可复用缓冲，返回组装后的帧切片。
+// encodeFrame 组装单独一帧：[4B 帧长][4B 组号][payload]，帧长 = 4+len(payload)。
+// buf 为可复用缓冲，**先重置再写入**（buf[:0] 语义），返回只含本帧的切片；
+// 多帧续写请用 appendFrame（append 语义，不清空）。
 func encodeFrame(buf []byte, group uint32, payload []byte) []byte {
-	buf = buf[:0]
+	return appendFrame(buf[:0], group, payload)
+}
+
+// appendFrame 以 append 语义把一帧续写进 buf（不清空已有内容），帧布局与
+// encodeFrame 逐字节相同——发送侧合批即靠它把多帧编成连续字节、一次写出，
+// 读端 readLoop 无需感知帧边界之外的任何变化。
+func appendFrame(buf []byte, group uint32, payload []byte) []byte {
 	buf = binary.BigEndian.AppendUint32(buf, uint32(4+len(payload)))
 	buf = binary.BigEndian.AppendUint32(buf, group)
-	buf = append(buf, payload...)
-	return buf
+	return append(buf, payload...)
 }
 
 // logDrops 周期上报队列满丢弃计数：丢弃点是高频热路径，逐条 Debug 会

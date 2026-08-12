@@ -174,6 +174,45 @@ func TestAuthMultiCredential(t *testing.T) {
 	}
 }
 
+// TestAuthSignatureCache 钉住签名缓存的三条行为契约：
+//  1. 同一 date 的第二次校验（缓存命中路径）仍正确放行——缓存值本身必须对；
+//  2. date 变化后缓存正确失效：新 date 用旧 date 的签名必须被拒、
+//     用新 date 的正确签名必须放行；
+//  3. 缓存命中路径下错签名仍被拒——缓存的是期望值，不是"放行"结论。
+func TestAuthSignatureCache(t *testing.T) {
+	u, _ := NewAuthInterceptors([]config.Credential{{AccessKey: "ak1", SecretKey: "sk1"}}, slog.Default())
+	d1, d2 := "20260812T120000Z", "20260812T120001Z"
+
+	// 第一次校验：填充缓存
+	if err := callUnary(t, u, signedCtx("ak1", "sk1", d1)); err != nil {
+		t.Fatalf("首次校验应放行: %v", err)
+	}
+	// 同 date 二次校验：缓存命中路径仍正确
+	if err := callUnary(t, u, signedCtx("ak1", "sk1", d1)); err != nil {
+		t.Fatalf("同 date 二次校验（缓存命中）应放行: %v", err)
+	}
+	// 缓存命中路径下错签名必须被拒（拿错误 secret 签同一 date）
+	if status.Code(callUnary(t, u, signedCtx("ak1", "wrong", d1))) != codes.Unauthenticated {
+		t.Fatal("缓存命中路径下错签名必须被拒")
+	}
+	// date 变化：拿旧 date 的签名冒充新 date 必须被拒（缓存必须失效重算）
+	staleSig := sdkCtx("ak1", "sk1", d1, false) // 先按 d1 算签名……
+	md, _ := metadata.FromIncomingContext(staleSig)
+	md = md.Copy()
+	md.Set("x-mq-date-time", d2) // ……再把 datetime 换成 d2，签名与 date 不配套
+	if status.Code(callUnary(t, u, metadata.NewIncomingContext(context.Background(), md))) != codes.Unauthenticated {
+		t.Fatal("date 变化后沿用旧签名必须被拒")
+	}
+	// 新 date 的正确签名放行（缓存重算后写回）
+	if err := callUnary(t, u, signedCtx("ak1", "sk1", d2)); err != nil {
+		t.Fatalf("新 date 正确签名应放行: %v", err)
+	}
+	// 回到旧 date：缓存已被 d2 覆盖，需重算——依然正确
+	if err := callUnary(t, u, signedCtx("ak1", "sk1", d1)); err != nil {
+		t.Fatalf("回到旧 date 应重算并放行: %v", err)
+	}
+}
+
 // fakeServerStream 只提供 Context()，其余方法不会被拦截器触碰。
 type fakeServerStream struct {
 	grpc.ServerStream

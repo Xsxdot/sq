@@ -121,7 +121,9 @@ func New(rep replication.Replicator, rt replication.Router, st *store.Store,
 // 自行 Lock/Unlock——绝不能在持有 d.mu 时去 Lock 队列锁，否则与
 // receiveOnce 内部逻辑组合可能出现锁序不一致的死锁风险。
 func (d *Deliverer) lockQueue(group, topic string, q uint32) *sync.Mutex {
-	k := fmt.Sprintf("%s/%s/%d", group, topic, q)
+	// 每次取件与每 100ms 的兜底轮询都要拼一次键，是热路径——手工拼接绕开
+	// fmt.Sprintf 的反射与临时分配；键无人解析，仅作 map key，语义不变。
+	k := group + "/" + topic + "/" + strconv.FormatUint(uint64(q), 10)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	m, ok := d.qmu[k]
