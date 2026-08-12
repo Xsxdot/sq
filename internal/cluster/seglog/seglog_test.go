@@ -4,9 +4,12 @@
 package seglog
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"google.golang.org/protobuf/proto"
@@ -95,16 +98,18 @@ func TestReopenTruncatesTornTail(t *testing.T) {
 	if err := l.Append(nil, []*raftpb.Entry{ent(2, 1, "will-be-torn")}, false); err != nil {
 		t.Fatal(err)
 	}
+	// 逻辑末尾必须在 Close 之前取自 activeSize，不能事后用 Stat().Size()：
+	// 预分配生效时段文件的物理大小恒为 SegMaxBytes，拿它减 3 只会削掉一点
+	// 零尾，最后一条帧毫发无损——掉电模拟当场失效，用例变成永远绿的空壳。
+	// 这正是 seglog.go 里「凡是需要『写了多少』的地方绝不用 Stat().Size()」
+	// 那条不变量在测试侧的同款要求。
+	written := l.activeSize
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
-	// 掉电模拟：把末段截掉最后 3 字节，第二条帧变 torn
+	// 掉电模拟：把末段截到逻辑末尾前 3 字节，第二条帧变 torn
 	seg := filepath.Join(dir, "00000001.seg")
-	fi, err := os.Stat(seg)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Truncate(seg, fi.Size()-3); err != nil {
+	if err := os.Truncate(seg, written-3); err != nil {
 		t.Fatal(err)
 	}
 	l2, _, gotEnts, err := Open(dir, slog.Default())
@@ -288,5 +293,286 @@ func TestTruncateToReclaimsHSOnlySegmentAfterReopen(t *testing.T) {
 	}
 	if err := l2.Close(); err != nil {
 		t.Fatal(err)
+	}
+}
+
+// TestReopenActiveSizeIsLogicalEnd 重开后 activeSize 必须等于已写入的有效
+// 字节数（逻辑末尾），而不是文件的物理大小。
+//
+// 现状下两者恰好相等（扫描遇到坏帧会物理截断到好帧边界，Stat 发生在扫描
+// 之后），所以本用例现在就该绿——它的价值是**回归锚**：预分配落地后
+// 物理大小恒为 SegMaxBytes，届时这条断言是唯一挡住「轮转判定读到 64MB
+// 立即轮转」的东西。
+func TestReopenActiveSizeIsLogicalEnd(t *testing.T) {
+	dir := t.TempDir()
+	l, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append(hs(1, 1, 0), []*raftpb.Entry{ent(1, 1, "a"), ent(2, 1, "b")}, true); err != nil {
+		t.Fatal(err)
+	}
+	written := l.activeSize
+	if written == 0 {
+		t.Fatal("前置条件不成立：写入后 activeSize 仍为 0")
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	l2, _, ents, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	if l2.activeSize != written {
+		t.Fatalf("重开后 activeSize = %d; want %d（逻辑末尾）", l2.activeSize, written)
+	}
+	if len(ents) != 2 {
+		t.Fatalf("重开后恢复 %d 条目; want 2", len(ents))
+	}
+
+	// 续写必须接在逻辑末尾之后，不覆盖已有帧
+	if err := l2.Append(nil, []*raftpb.Entry{ent(3, 1, "c")}, true); err != nil {
+		t.Fatal(err)
+	}
+	if err := l2.Close(); err != nil {
+		t.Fatal(err)
+	}
+	_, _, ents, err = Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ents) != 3 || ents[2].GetIndex() != 3 || string(ents[2].Data) != "c" {
+		t.Fatalf("续写后条目形态错误: %+v", ents)
+	}
+}
+
+// TestPreallocatedActiveSegmentKeepsLogicalActiveSize 预分配生效时，活动段
+// 的物理大小是 SegMaxBytes，而 activeSize 必须仍是逻辑末尾。
+//
+// 这是 spec §2.3 那条顺序约束的守门人：preallocActive 必须发生在
+// activeSize 定下来之后。写反了顺序，activeSize 一开就是 SegMaxBytes，
+// 重启即触发轮转。
+//
+// 平台限制（spec §2.3 已声明）：只在预分配真正生效的平台（Linux）可观测，
+// 因此断言以 l.prealloc 为前提；macOS 上本用例只验证「未预分配时物理
+// 大小仍等于逻辑大小」，写反顺序照样绿——Linux 侧验收不可跳过。
+func TestPreallocatedActiveSegmentKeepsLogicalActiveSize(t *testing.T) {
+	old := SegMaxBytes
+	SegMaxBytes = 1 << 20 // 1MiB：远大于本用例写入量，确保不触发轮转
+	defer func() { SegMaxBytes = old }()
+
+	dir := t.TempDir()
+	l, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append(hs(1, 1, 0), []*raftpb.Entry{ent(1, 1, "a")}, true); err != nil {
+		t.Fatal(err)
+	}
+	written := l.activeSize
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	l2, _, ents, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	if len(ents) != 1 {
+		t.Fatalf("重开后恢复 %d 条目; want 1", len(ents))
+	}
+	if l2.activeSize != written {
+		t.Fatalf("重开后 activeSize = %d; want %d（逻辑末尾，不是物理大小）", l2.activeSize, written)
+	}
+
+	fi, err := os.Stat(filepath.Join(dir, segName(1)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if l2.prealloc {
+		if fi.Size() != SegMaxBytes {
+			t.Fatalf("预分配生效但段物理大小 = %d; want %d", fi.Size(), SegMaxBytes)
+		}
+	} else if fi.Size() != written {
+		t.Fatalf("未预分配时段物理大小 = %d; want %d", fi.Size(), written)
+	}
+}
+
+// TestRotationTruncatesClosedSegmentToLogicalSize 已关闭段绝不能带预分配
+// 零尾——非末段遇到坏帧走的是「真损坏，拒绝启动」，零尾会让每次重启都
+// 撞上它。轮转关段前必须截回逻辑大小。
+//
+// 断言方式是端到端的：轮转后重开必须成功且条目齐全。若关段带零尾，Open
+// 会在扫描非末段时直接返回错误——这比断言文件大小更贴近真实故障形态，
+// 且两个平台都能观测（macOS 上不预分配、天然无零尾，用例退化为对现有
+// 轮转路径的回归保护）。
+func TestRotationTruncatesClosedSegmentToLogicalSize(t *testing.T) {
+	old := SegMaxBytes
+	SegMaxBytes = 256 // 小段：几条 entry 即触发轮转
+	defer func() { SegMaxBytes = old }()
+
+	dir := t.TempDir()
+	l, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 写到至少产生两次轮转，确保存在「已关闭段」
+	for i := uint64(1); i <= 12; i++ {
+		if err := l.Append(hs(1, 1, i-1), []*raftpb.Entry{ent(i, 1, "payload-payload")}, true); err != nil {
+			t.Fatalf("第 %d 次 Append 失败: %v", i, err)
+		}
+	}
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	seqs, err := scanSegSeqs(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seqs) < 2 {
+		t.Fatalf("前置条件不成立：只有 %d 个段，未发生轮转", len(seqs))
+	}
+
+	// 已关闭段（除末段外）的物理大小必须等于其逻辑内容——用「重开成功」
+	// 断言，因为零尾会让非末段扫描判定为真损坏
+	_, _, ents, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatalf("轮转后重开失败（已关闭段疑似带零尾）: %v", err)
+	}
+	if len(ents) != 12 {
+		t.Fatalf("重开后恢复 %d 条目; want 12", len(ents))
+	}
+	for i, e := range ents {
+		if e.GetIndex() != uint64(i+1) {
+			t.Fatalf("条目 %d 的 index = %d; want %d", i, e.GetIndex(), i+1)
+		}
+	}
+}
+
+// recordHandler 收集 slog 记录，用于断言日志级别。
+type recordHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *recordHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h *recordHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+func (h *recordHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *recordHandler) WithGroup(string) slog.Handler      { return h }
+
+// hasMsgAtLevel 是否存在指定级别、消息包含 sub 的记录。
+func (h *recordHandler) hasMsgAtLevel(lv slog.Level, sub string) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, r := range h.records {
+		if r.Level == lv && strings.Contains(r.Message, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// TestZeroTailLogsDebugNotWarn 预分配产生的全零尾部必须记 Debug，不能记
+// Warn——每次干净重启都打 Warn 会让「检测到 torn tail」这条线上告警彻底
+// 失去意义。
+func TestZeroTailLogsDebugNotWarn(t *testing.T) {
+	old := SegMaxBytes
+	SegMaxBytes = 1 << 20
+	defer func() { SegMaxBytes = old }()
+
+	dir := t.TempDir()
+	l, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append(hs(1, 1, 0), []*raftpb.Entry{ent(1, 1, "a")}, true); err != nil {
+		t.Fatal(err)
+	}
+	written := l.activeSize
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 无论平台是否支持预分配，都人为补一段全零尾巴，让本用例在两个平台
+	// 上都能观测到零尾分支
+	f, err := os.OpenFile(filepath.Join(dir, segName(1)), os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Truncate(written + 4096); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	h := &recordHandler{}
+	l2, _, ents, err := Open(dir, slog.New(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	if len(ents) != 1 {
+		t.Fatalf("零尾不得影响恢复：得到 %d 条目; want 1", len(ents))
+	}
+	if l2.activeSize != written {
+		t.Fatalf("零尾截断后 activeSize = %d; want %d", l2.activeSize, written)
+	}
+	if h.hasMsgAtLevel(slog.LevelWarn, "torn tail") {
+		t.Fatal("全零尾部被记为 Warn torn tail——干净重启不得触发该告警")
+	}
+	if !h.hasMsgAtLevel(slog.LevelDebug, "预分配零尾") {
+		t.Fatal("全零尾部未记 Debug 预分配零尾")
+	}
+}
+
+// TestGenuineTornTailStillLogsWarn 非全零的尾部字节仍是真 torn write，
+// 必须保留 Warn——本用例守住「不要为了消噪把真告警一起消掉」。
+func TestGenuineTornTailStillLogsWarn(t *testing.T) {
+	dir := t.TempDir()
+	l, _, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := l.Append(hs(1, 1, 0), []*raftpb.Entry{ent(1, 1, "a")}, true); err != nil {
+		t.Fatal(err)
+	}
+	written := l.activeSize
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	// 追加半条帧的非零垃圾：模拟掉电时最后一次 write 只落盘一部分
+	f, err := os.OpenFile(filepath.Join(dir, segName(1)), os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteAt([]byte{0x00, 0x00, 0x01, 0xff, 0xde, 0xad}, written); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatal(err)
+	}
+
+	h := &recordHandler{}
+	l2, _, ents, err := Open(dir, slog.New(h))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	if len(ents) != 1 {
+		t.Fatalf("torn tail 截断后得到 %d 条目; want 1", len(ents))
+	}
+	if !h.hasMsgAtLevel(slog.LevelWarn, "torn tail") {
+		t.Fatal("真 torn tail 未记 Warn——告警被消噪消掉了")
 	}
 }
