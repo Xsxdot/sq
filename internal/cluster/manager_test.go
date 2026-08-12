@@ -455,6 +455,28 @@ func TestJoinRejectsPreRaftSeed(t *testing.T) {
 	dir := t.TempDir()
 	writePreRaftData(t, dir, "SEED-ONLY")
 	seedStore, seed := startSoloManager(t, dir, AckQuorumMem)
+	// 等组 0 的引导 ConfChange（AddNode 1）apply 落盘后再往下走：
+	// startSoloManager 在 Start 之后直接返回，不等任何就绪信号，而
+	// SaveConfState 要到 run 循环异步 apply 那条 ConfChange 时才发生。
+	// 下面三条前提断言都不依赖它，但用例末尾的 phantom learner 断言
+	// 要直读 LoadConfState(0)——平时 Join 那段耗时足够 apply 完成，
+	// 调度一紧就会撞上「成员表尚未落盘」的假失败。
+	{
+		deadline := time.Now().Add(30 * time.Second)
+		for {
+			_, ok, err := seed.rs.LoadConfState(0)
+			if err != nil {
+				t.Fatalf("读种子成员表: %v", err)
+			}
+			if ok {
+				break
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("种子组 0 的引导 ConfChange 未在 30s 内落盘（LoadConfState 持续 ok=false）")
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	}
 	// 测试前提自证：标记已打、日志确实未压缩（firstIndex=1）、FSM 非空
 	if pre, err := seed.rs.HasPreRaft(); err != nil || !pre {
 		t.Fatalf("测试前提不成立：前 raft 期标记应已打 pre=%v err=%v", pre, err)
