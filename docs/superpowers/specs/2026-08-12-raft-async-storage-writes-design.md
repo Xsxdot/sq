@@ -1,7 +1,35 @@
 # raft 异步存储写入（AsyncStorageWrites）设计
 
 日期：2026-08-12
-状态：已评审（brainstorm 定案）
+状态：**已实测——验收未通过，本方案单独落地会全面劣化，不合入**（2026-08-12 三机实测）
+
+> **实测结论（Task 6，同批机器 main=`1b2e680` vs async=`1f002b3`，轮内交错 3 轮）**
+>
+> 八格全部劣化，三轮同向、离散度多在 4% 以内：quorum-fsync −6.3%/−48.9%/−27.0%/−25.2%，
+> quorum-mem −4.9%/−1.8%/−5.0%/−5.7%（**mem 不得劣化的硬底线未通过**）。
+>
+> 根因由本文 §8 最能证伪的那条指标直接坐实——用 `/proc/diskstats` 第 19 字段
+> 直接数下盘 flush 次数，**fsync 摊薄比不升反降**：C1/256 由 4.11 条/次跌到
+> 1.60（×0.39），C3cross/16 由 1.49 跌到 1.01（×0.67）。且劣化幅度与「原本
+> batch 有多大」严格正相关：main 摊薄比最高的 C1/256 跌得最狠（−48.9%），
+> main 本就几乎没有 batch 的 C1/16 只跌 6.3%。
+>
+> **机理**：同步路径下「主循环阻塞在 fsync 里」本身就是一次隐式 group commit
+> ——阻塞期间新提案在 raft unstable log 里堆积，下一轮 Ready 因此携带一个大
+> 批次，一次 fsync 摊到很多条。打开 AsyncStorageWrites 后主循环不再阻塞、
+> 立刻回头取下一个 Ready，同样的提案流被切成更多更小的 `MsgStorageAppend`，
+> 而 `runAppend` 是**一条一 `Persist`、一条一 fsync**，没有任何合并——
+> 流水线是打开了，但它换掉的那个隐式 group commit 没有东西接替。
+>
+> **本文 §1 的前提因此需要修正**：+69% 的 raft 机制税不是「流水线深度不够」，
+> 至少主要不是；它更像是「单节点集群下 batch 规模本就小」。异步化只有在
+> **append 阶段自带 group commit** 时才可能为正——即 `runAppend` 批量抽干
+> `appendCh`、多条 `MsgStorageAppend` 各自 `Persist(sync=false)` 后合并成
+> **一次** `seglog.Log.Sync()`，再统一投递 Responses。该修正未实现、未验证。
+>
+> 语义面无问题：`test/e2e` 全量零修改通过（`ok 1159.589s`），
+> `go test ./... -race` 18 包全绿。劣化是纯性能问题，不是正确性问题。
+> 原始数据：会话 scratchpad `attribution/rawB/`（40 份 e2e 输出 + flush 计数）。
 前置：`2026-08-08-sq-v2-replication-design.md`（V2 复制设计，本文改的是它 §5 Ready 处理的**驱动方式**，不改任何 raft 语义与确认档语义）
 姊妹项：`2026-08-12-seglog-prealloc-fdatasync-design.md`（A，攻单次同步落盘成本；与本文完全解耦，可任意先后落地）
 
