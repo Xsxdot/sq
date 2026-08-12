@@ -5,6 +5,7 @@
 //   - 分发路由：MsgStorageAppend/MsgStorageApply 进本地通道，其余走 send
 //   - 响应投递：自指响应必须经 rn.Step 可靠投递，绝不经 gr.send（会丢）
 //   - MustSync 载体：fsync 档的同步判定随消息配对传递，语义与旧路径一致
+//   - mem 档内联快路径：append 消息在 dispatchReady 就地处理、不进 appendCh
 //
 // 边界：
 //   - 不覆盖多节点选举与消息语义（cluster_test.go 的范围）
@@ -116,6 +117,10 @@ func TestAppendBatchNoFsyncWhenNoneRequires(t *testing.T) {
 // MsgStorageAppend 就是 raft 永远等不到的那条 MsgStorageAppendResp。
 func TestDispatchReadyRoutesByTarget(t *testing.T) {
 	gr, _, _ := newApplyTestGroup(t, nil)
+	// 钉在 fsync 档：mem 档的 append 消息走内联快路径、不进 appendCh
+	// （那条契约由 TestMemModeAppendInlineFastPath 单独覆盖），本用例
+	// 守的是通道路由本身。
+	gr.mode = AckQuorumFsync
 	var sent []*raftpb.Message
 	gr.send = func(g uint32, msgs []*raftpb.Message) { sent = append(sent, msgs...) }
 
@@ -163,6 +168,8 @@ func TestDispatchReadyRoutesByTarget(t *testing.T) {
 // 轮也 fsync，退回 2026-08-08 优化之前的每提案两次盘。
 func TestDispatchReadyCarriesMustSync(t *testing.T) {
 	gr, _, _ := newApplyTestGroup(t, nil)
+	// MustSync 的配对传递只在 fsync 档有观测点（mem 档内联、不进通道）
+	gr.mode = AckQuorumFsync
 	gr.send = func(uint32, []*raftpb.Message) {}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -179,6 +186,68 @@ func TestDispatchReadyCarriesMustSync(t *testing.T) {
 			}
 		case <-time.After(time.Second):
 			t.Fatal("append 通道没收到消息")
+		}
+	}
+}
+
+// TestMemModeAppendInlineFastPath mem 档内联快路径的核心契约：
+// AckQuorumMem 下 append 消息在 dispatchReady 内就地处理完毕——appendCh
+// 恒空、条目已持久化进 MemoryStorage、响应已投递、一次 fsync 都不落。
+//
+// 为什么这条必须有用例：2026-08-12 三机实测证明 mem 档走 appendCh 是
+// 纯亏——mem 档不 fsync、append 合批永不触发，通道一来一回只付「主循环
+// → runAppend 协程 → 响应 Step」的调度分发税（−3.3%~−4.5%）。本用例
+// 守住「mem 档不进通道」；若有人把 mem 档改回入队（或搞出「普通条目
+// 内联、快照进通道」的混合形态导致部分消息入队），appendCh 非空的断言
+// 即刻变红。
+//
+// 响应投递用对端响应（To=2）观测：newApplyTestGroup 不装 raft 节点，
+// 自指响应会撞 nil rn；自指响应必须经 rn.Step 可靠投递的契约由
+// deliverResponses 的实现注释与多节点集成测试（cluster_test.go）覆盖，
+// 且内联路径与通道路径共用同一个 deliverResponses，无第二份实现。
+func TestMemModeAppendInlineFastPath(t *testing.T) {
+	gr, _, _ := newApplyTestGroup(t, nil) // newApplyTestGroup 默认即 AckQuorumMem
+	var sent []*raftpb.Message
+	gr.send = func(g uint32, msgs []*raftpb.Message) { sent = append(sent, msgs...) }
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 连投 3 轮，每轮一条带日志 + 一条对端响应的 MsgStorageAppend——
+	// 多轮才能暴露「第一轮内联、后续轮入队」之类的状态性回归
+	for i := uint64(1); i <= 3; i++ {
+		typ, to := raftpb.MsgStorageAppend, raft.LocalAppendThread
+		idx, tm := i, uint64(1)
+		etyp := raftpb.EntryNormal
+		respTyp, respTo := raftpb.MsgAppResp, uint64(2)
+		m := &raftpb.Message{Type: &typ, To: &to,
+			Entries:   []*raftpb.Entry{{Index: &idx, Term: &tm, Type: &etyp, Data: []byte("x")}},
+			Responses: []*raftpb.Message{{Type: &respTyp, To: &respTo}},
+		}
+		gr.dispatchReady(ctx, raft.Ready{MustSync: true, Messages: []*raftpb.Message{m}})
+		if n := len(gr.appendCh); n != 0 {
+			t.Fatalf("第 %d 轮后 appendCh 长度 = %d; mem 档 append 必须内联、恒不入队", i, n)
+		}
+	}
+
+	// 条目已持久化：内联路径必须走完 persistPhase（盘上 + MemoryStorage 双记账）
+	last, err := gr.mem.LastIndex()
+	if err != nil || last != 3 {
+		t.Fatalf("mem.LastIndex = %d, %v; want 3, nil——内联路径没有完成持久化", last, err)
+	}
+	if got := gr.appendCount.Load(); got != 3 {
+		t.Fatalf("appendCount = %d; want 3（内联路径必须计入可观测计数）", got)
+	}
+	// mem 档一次盘都不落：sync 判定（mode==Fsync && MustSync）在 mem 档恒假
+	if got := gr.syncCount.Load(); got != 0 {
+		t.Fatalf("mem 档落了 %d 次盘; want 0——内联不得改变 sync 判定", got)
+	}
+	// 响应已投递：每轮的对端响应都必须在持久化之后经 gr.send 发出
+	if len(sent) != 3 {
+		t.Fatalf("对端响应发出 %d 条; want 3——内联路径吞掉了响应（组会静默卡死）", len(sent))
+	}
+	for _, m := range sent {
+		if m.GetType() != raftpb.MsgAppResp || m.GetTo() != 2 {
+			t.Fatalf("发出的响应应为 MsgAppResp→2，得到 %s→%d", m.GetType().String(), m.GetTo())
 		}
 	}
 }
@@ -324,6 +393,9 @@ func TestSnapshotInstallExcludesApply(t *testing.T) {
 //     cancel 并等 done，不留悬挂协程。
 func TestOutboundNotBlockedByPersist(t *testing.T) {
 	gr, _, _ := newApplyTestGroup(t, nil)
+	// 钉在 fsync 档：判别力依赖「入队进满通道会阻塞」，mem 档内联根本
+	// 不入队，dispatchReady 不会阻塞，用例会退化成永真断言。
+	gr.mode = AckQuorumFsync
 	sent := make(chan struct{}, 1) // 有缓冲：send 发生时主协程还没在收
 	gr.send = func(uint32, []*raftpb.Message) { sent <- struct{}{} }
 
