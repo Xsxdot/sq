@@ -67,14 +67,28 @@ EOF」——预分配后 EOF 就是 `SegMaxBytes`，第一次 `Append` 会直接
 改为：`Log` 维护 `logicalSize`（当前有效字节数），写入走
 `WriteAt(buf, logicalSize)`，成功后 `logicalSize += n`。
 
-### 2.3 `activeSize` 的来源改为扫描逻辑末尾
+### 2.3 `activeSize` 的来源改为扫描逻辑末尾（并锁死预分配的顺序）
 
-`Open` 目前用 `activeSize: fi.Size()`（`seglog.go:295`）。预分配后
-`fi.Size()` 一开就是 `SegMaxBytes`，重启即触发轮转——**这是本方案唯一
-会静默破坏轮转的点，必须一并改**。
+`Open` 目前用 `activeSize: fi.Size()`（`seglog.go:295`）。
 
-改为取扫描过程已经算出的活动段逻辑末尾偏移（`off`）。轮转判定
-（`activeSize >= SegMaxBytes`）语义因此保持「已写入的有效字节数」不变。
+**先澄清一个容易误判的点**：这本身**不是潜伏 bug**。`f.Stat()` 发生在扫描
+**之后**（`seglog.go:281`），而扫描遇到零尾会走 torn tail 分支物理截断到
+好帧边界（`seglog.go:183`）——因此 `fi.Size()` 在那一刻已经等于逻辑末尾。
+现状能正常工作。
+
+真正的陷阱是**顺序**：`preallocActive` 必须发生在 `activeSize` 定下来
+**之后**。反过来（先预分配再 `Stat`）会让 `activeSize` 一开就是
+`SegMaxBytes`，重启即触发轮转。
+
+改动本身仍然要做，理由是**解除隐式依赖**：现状让「轮转判定的输入」依赖
+「扫描一定会物理截断零尾」这个不写在任何地方的副作用。改成显式取扫描过程
+已算出的逻辑末尾偏移（`off`），依赖关系从隐含变成明写，日后谁改动截断
+策略都不会静默踩塌轮转。轮转判定（`activeSize >= SegMaxBytes`）的语义
+保持「已写入的有效字节数」不变。
+
+**平台可观测性限制（必须写进 plan）**：这条顺序约束只在预分配真正生效时
+（Linux）才可观测。macOS 上 `prealloc == false`，写反了顺序测试也照样绿。
+因此对应用例必须以 `if l.prealloc` 为前提断言，且 Linux 侧验收不可跳过。
 
 ### 2.4 轮转关段前 `Truncate(logicalSize)`
 
@@ -83,11 +97,30 @@ EOF」——预分配后 EOF 就是 `SegMaxBytes`，第一次 `Append` 会直接
 `Truncate(logicalSize)`，让已关闭段的物理大小等于逻辑大小——这也让
 `TruncateTo` 删整段、`segMax` 记账、磁盘占用统计全部维持原样。
 
-### 2.5 `Sync()` → `Fdatasync()`
+### 2.5 `Sync()` → `Fdatasync()`（**有条件**）
 
 预分配 + 定长写入后文件大小不再变化，`fdatasync` 保证数据落盘即足够。
-三处同步点（`Append` 的 `sync=true`、`maybeRotate` 关段前、`Log.Sync`）
-统一改走 `fdatasync`。
+
+**但 `fdatasync` 只在预分配真正生效时才安全**——文件大小仍在增长时，
+`fdatasync` 不保证「文件长了」这件事落盘，掉电后已写入的尾部字节读不
+回来。因此 `Log` 必须记录活动段是否已预分配（`prealloc bool`），落盘走：
+
+```
+prealloc == true  ⇒ fdatasync
+prealloc == false ⇒ File.Sync()（非 Linux 平台、以及 fallocate 返回
+                    ENOTSUP 的文件系统）
+```
+
+三处同步点里只有两处适用：
+
+| 位置 | 用哪个 | 原因 |
+|---|---|---|
+| `Append` 的 `sync=true`（`seglog.go:394`） | 条件 datasync | 纯追加写，大小不变 |
+| `Log.Sync`（`seglog.go:507`） | 条件 datasync | 同上 |
+| `maybeRotate` 关段前（`seglog.go:426`） | **必须完整 `fsync`** | §2.4 的 `Truncate` 刚改过文件大小，元数据必须同步 |
+
+第三行是本节最容易写错的地方：轮转屏障的 `fsync` 紧跟在 `Truncate` 之后，
+那一刻文件大小刚变，`fdatasync` 不够。
 
 ## 3. 恢复语义：零尾与 torn tail 必须分开记
 
