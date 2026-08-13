@@ -55,19 +55,79 @@ const (
 	pushReceiveBatchSize int32 = 32
 )
 
-// backoffPolicy 服务端下发的重试退避策略，按部署形态分档：
+// publishBackoffPolicy 下发给**发布端**的重试策略。
+//
+// SDK 用它做 RPC 级的发送失败重试（producer_options.go 读
+// Settings.BackoffPolicy，producer 发送失败时按它退避重发）。按部署形态分档：
 //   - 单机档：100ms 起步、每次 ×2、封顶 1s，最多尝试 3 次
 //   - 集群档：同上倍率，封顶 3s、最多 5 次——选举窗口实测 1.5s 量级，
 //     单机档的 1s×3 次恰好可能全部落在窗口内（见常量注释）
 //
-// 发布端把它用于发送失败重试，订阅端把它用于消费失败后的重投间隔。
-func (s *Server) backoffPolicy() *pb.RetryPolicy {
+// 值与拆分前的 backoffPolicy 逐字段相同：发布端行为不得因本次拆分有任何变化。
+func (s *Server) publishBackoffPolicy() *pb.RetryPolicy {
 	max, attempts := backoffMax, backoffMaxAttempts
 	if s.cfg.ClusterEnabled() {
 		max, attempts = backoffMaxCluster, backoffMaxAttemptsCluster
 	}
 	return &pb.RetryPolicy{
 		MaxAttempts: int32(attempts),
+		Strategy: &pb.RetryPolicy_ExponentialBackoff{
+			ExponentialBackoff: &pb.ExponentialBackoff{
+				Initial:    durationpb.New(backoffInitial),
+				Max:        durationpb.New(max),
+				Multiplier: backoffMultiplier,
+			},
+		},
+	}
+}
+
+// subscribeBackoffPolicy 下发给**订阅端**的重试策略。
+//
+// 与发布端同名字段、完全不同的语义：SDK 用它做消息级处理——
+// push_consumer_options.go 读 Settings.BackoffPolicy 存进 pc.retryPolicy，
+// nackMessage 用它算重投的不可见时长、eraseFifoMessage 用它判死信。
+// 两个用途分属两类客户端，而 Settings 是逐客户端协商的，所以同一个字段本来
+// 就可以取不同值——这正是本函数存在的理由。
+//
+// 参数：
+//   - group: 该订阅端的消费组名（可能为空串：客户端未上报组）
+//
+// **本函数与 publishBackoffPolicy 只差 MaxAttempts 一个字段。**
+// 退避三要素（Initial/Max/Multiplier）刻意与发布端逐字段相同，**不是可以合并
+// 掉的重复代码**：
+//   - 曾有一版设计主张把它们改成 broker 的 retryBackoff（10s / 5min），理由是
+//     「客户端算出的不可见时长反正会被 broker 的退避下限覆盖」。**那个前提是
+//     错的**：SDK 消费失败走 ChangeInvisibleDuration，broker 侧
+//     deliver.ChangeInvisible 是 ExpireAtMs = now + invisible，原样透传、一处
+//     下限都没有；Receive 路径那条 max(客户端要求, 退避下限) 只用于投递时回填
+//     InvisibleDuration 字段，且判据带 MessageGroup == ""（顺序消息被排除）。
+//   - 真改了的后果：push 消费失败的重投从 100ms 变成 10s；顺序消息在反复失败时
+//     最坏把队列队头阻塞 5 分钟（顺序锁下每队列至多一条未终结 inflight）。
+//   - 详见 spec §2.2 与 §6-A4。settings_test.go 的 T2 把这条钉成红灯。
+//
+// 注意：本函数只读，不得建组。协商是协议握手，不该有持久化副作用；
+// 真正建组由 ReceiveMessage 路径的 EnsureGroup 负责。
+func (s *Server) subscribeBackoffPolicy(group string) *pb.RetryPolicy {
+	// 回退值取配置而不是 meta.DefaultMaxAttempts：后者是 meta 包的兜底常量
+	// （16），而组的实际默认值由 main 从 cfg.DefaultMaxAttempts 传进 meta.New。
+	// 用包常量会在用户改过配置时下发一个谁也没配过的 16。
+	attempts := s.cfg.DefaultMaxAttempts
+	if gc, ok := s.mt.GetGroup(group); ok {
+		attempts = gc.EffectiveMaxAttempts()
+	} else {
+		// 组还没注册（首次连接，还没走到 ReceiveMessage）时下发配置默认值。
+		// 这条是「为什么这个消费者拿到的是默认值而不是它组里配的值」唯一的
+		// 排查线索，故必打；用 Debug 是因为每个消费者首次连接都会命中一次，
+		// Info 会把它变成刷屏噪声。
+		s.logger.Debug("协商退避策略：消费组尚未注册，回退配置默认 maxAttempts",
+			"group", group, "max_attempts", attempts)
+	}
+	max := backoffMax
+	if s.cfg.ClusterEnabled() {
+		max = backoffMaxCluster
+	}
+	return &pb.RetryPolicy{
+		MaxAttempts: attempts,
 		Strategy: &pb.RetryPolicy_ExponentialBackoff{
 			ExponentialBackoff: &pb.ExponentialBackoff{
 				Initial:    durationpb.New(backoffInitial),
@@ -93,12 +153,17 @@ func (s *Server) negotiateSettings(client *pb.Settings) *pb.Settings {
 	out := &pb.Settings{
 		ClientType:     &ct,
 		AccessPoint:    s.endpoints(),
-		BackoffPolicy:  s.backoffPolicy(),
 		RequestTimeout: client.GetRequestTimeout(),
 		UserAgent:      client.GetUserAgent(),
 	}
+	// BackoffPolicy 不在公共段赋值：它的语义由客户端类型决定（发布端是 RPC
+	// 级发送重试次数，订阅端是消息级死信判据），放在公共段等于给两类客户端
+	// 下发同一份逐字节相同的值，其中 MaxAttempts 必有一份是错的。
+	// 客户端未上报可识别的 PubSub 时它也一并留空——与下面 PubSub 留空同理：
+	// 连客户端类型都判不出来，退避策略的语义就无从选择，服务端不凭空捏造。
 	switch ps := client.GetPubSub().(type) {
 	case *pb.Settings_Publishing:
+		out.BackoffPolicy = s.publishBackoffPolicy()
 		out.PubSub = &pb.Settings_Publishing{Publishing: &pb.Publishing{
 			// Topics 是客户端自报字段，原样带回：客户端不读它，但回包出现在
 			// 日志/抓包里时能一眼看出这次协商对应哪个发布端。
@@ -110,6 +175,7 @@ func (s *Server) negotiateSettings(client *pb.Settings) *pb.Settings {
 			ValidateMessageType: true,
 		}}
 	case *pb.Settings_Subscription:
+		out.BackoffPolicy = s.subscribeBackoffPolicy(ps.Subscription.GetGroup().GetName())
 		fifo := false
 		batch := pushReceiveBatchSize
 		out.PubSub = &pb.Settings_Subscription{Subscription: &pb.Subscription{
