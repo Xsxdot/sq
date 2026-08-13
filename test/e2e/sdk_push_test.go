@@ -538,6 +538,13 @@ func TestOfficialGoSDKPushRedeliverAfterInvisibleExpiry(t *testing.T) {
 	// 5s 不可见时长：不改的话走默认 1m，本用例要干等 60s+。
 	endpoint := startBroker(t, func(c *config.Config) {
 		c.DefaultInvisibleDuration = "5s"
+		// 必须显式关闭自动续租：PushConsumer 每次 ReceiveMessage 都下发
+		// auto_renew=true，续租开启时这条消息会在持有者存活期间被一路续下去，
+		// 永远走不到重投——本用例就再也观测不到它要测的东西了。
+		// 这不是给用例打补丁：用例 6 测的是「不可见期到期兜底」这条路径本身，
+		// 它必须在续租关闭的前提下才可见。续租开启时的正确行为由用例 7 覆盖，
+		// 两者是一对互补的断言。
+		c.AutoRenewEnabled = false
 	})
 	const (
 		topic = "e2e-push-redeliver"
@@ -597,4 +604,70 @@ func TestOfficialGoSDKPushRedeliverAfterInvisibleExpiry(t *testing.T) {
 		t.Fatalf("重投件句柄未变（%q）：说明是客户端本地重投，不是 broker 重投", got[1].receipt)
 	}
 	t.Logf("用例 6 通过：不可见期到期后重投，attempt=%d 且句柄已换", got[1].attempt)
+}
+
+// TestOfficialGoSDKPushAutoRenewPreventsRedelivery 用例 7：慢 handler 在持有
+// 消息期间被自动续租，因而不会被重复投递。
+//
+// 与用例 6 是一对互补断言：同样的构造（不可见期 5s、单消费线程、首投占住
+// 8s），用例 6 关掉续租测「到期兜底还活着」，本用例开着续租测「续租真的挡住
+// 了那次重投」。缺了本用例，把续租代码整段删掉用例 6 反而更绿——那样的测试
+// 套件对本特性是零覆盖。
+func TestOfficialGoSDKPushAutoRenewPreventsRedelivery(t *testing.T) {
+	endpoint := startBroker(t, func(c *config.Config) {
+		// 5s 不可见期：不续租的话 t=5s 必然重投（用例 6 已证明这一点），
+		// 所以「没有第二次投递」这个观测结果只能由续租解释。
+		c.DefaultInvisibleDuration = "5s"
+		// 显式写出默认值，让用例不依赖默认值将来是否变动
+		c.AutoRenewEnabled = true
+		c.AutoRenewMaxDuration = "10m"
+	})
+	const (
+		topic = "e2e-push-autorenew"
+		group = "e2e-push-autorenew-g"
+		body  = "renew-me"
+	)
+	sendPlain(t, endpoint, topic, body)
+
+	c := newCollector(t)
+	c.decide = func(mv *rmq.MessageView) rmq.ConsumerResult {
+		// 首投占住唯一消费线程 8s，跨过 5s 不可见期。与用例 6 的区别只有
+		// broker 侧开着续租——同样按投递次数分支，万一真的发生重投，
+		// 重投件立即返回，用例不会滚成无限重投而是直接在断言处红。
+		if mv.GetDeliveryAttempt() == 1 {
+			time.Sleep(8 * time.Second)
+		}
+		return rmq.SUCCESS
+	}
+	startPushConsumer(t, endpoint, group, topic, c,
+		rmq.WithPushConsumptionThreadCount(1))
+
+	// 时间线（确定的）：
+	//   t=0    首投进 listener，attempt=1，句柄 H1，唯一 worker 被占住；
+	//   t≈5s   broker 侧不可见期到期，长轮询触发扫描——四条判据全真
+	//          （本次取件带租约、预算 10m 未耗尽、归属已记、持有者
+	//          Telemetry 会话仍活）→ 续租到 t≈10s，不重投；
+	//   t=8s   handler 返回，用**仍然有效**的 H1 ack 成功（续租没动 attempts，
+	//          所以句柄没失效）；
+	//   t=8s~20s 静默段，确认不再有任何投递。
+	waitCount(t, c, 1, 20*time.Second)
+
+	// 7b【承重】：静默段必须长于一个完整的不可见期（12s > 5s）。窗口短于
+	// 不可见期时，「ack 成功」与「ack 失败、正在等下一次重投」两个世界观测
+	// 一致，7a 就成了假绿——这是 B13.2 终审抓出用例 1b 假绿的同款陷阱。
+	time.Sleep(12 * time.Second)
+
+	got := c.snapshot()
+	// 7a【承重】：全窗口只投递过一次。这里必须用 == 而不是 >=：本用例证明的
+	// 就是「不多投」，>= 会让断言恒真。
+	if len(got) != 1 {
+		t.Fatalf("期望恰好 1 次投递（续租应挡住重投），实际 %d 次: %+v", len(got), got)
+	}
+	// 7c：续租没有污染投递次数。它同时反证了句柄未失效——若续租改了
+	// attempts，ack 会被 broker 拒（陈旧句柄），这条消息必然在 t≈13s 重投，
+	// 7a 会先红。
+	if got[0].attempt != 1 {
+		t.Fatalf("attempt = %d，期望 1（续租不应改变投递次数）", got[0].attempt)
+	}
+	t.Logf("用例 7 通过：慢 handler 持有 8s 跨过 5s 不可见期，续租挡住了重投")
 }
