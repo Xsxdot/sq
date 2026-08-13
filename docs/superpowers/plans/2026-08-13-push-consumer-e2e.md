@@ -815,7 +815,22 @@ git commit -m "test(e2e): push 重试与死信归属用例——回执句柄判�
 
 ---
 
-### Task 5: 用例 2（长轮询唤醒）+ 用例 6（停机后 inflight 不丢）
+### Task 5: 用例 2（长轮询唤醒）+ 用例 6（不可见期到期重投）
+
+> ## ⚠️ 本 Task 的用例 6 部分（下方 Step 3 / Step 4）已作废
+>
+> 执行期实测发现计划的构造不成立：worker 收到 shutdown 后会 `for t := range tp.tasks { t() }`
+> 把排队任务**全部执行完**（SDK `simple_thread_pool.go:49-54`），而 `standardConsumeService.consume`
+> 是整批一次性 Submit（`consumer_service.go:129-143`），线程池容量 = `maxCacheMessageCount`
+> （默认 1024）填不满。**故停机时已投给客户端的消息全部会被消费并 ack，造不出「未 ack 缓存」，
+> 6a 必红。**
+>
+> 用例 6 已改测「未 ack 消息在不可见期到期后被重投」，**以订正后的 spec §6.4 为准**
+> （单消费者 / 1 条消息 / 首投占住唯一消费线程 8s 跨过 5s 不可见期 / 断言重投件换新回执句柄）。
+>
+> **做 spec 符合性裁决时不要拿下方 Step 3 的代码当需求原文**——它是已知错误的版本。
+>
+> 用例 2（Step 1 / Step 2）不受影响，照写。
 
 **Files:**
 - Modify: `test/e2e/sdk_push_test.go`
@@ -823,7 +838,7 @@ git commit -m "test(e2e): push 重试与死信归属用例——回执句柄判�
 **Interfaces:**
 - Consumes: Task 2 的 harness（含 `startPushConsumer` 返回的 `stop` 函数）；Task 1 的 `DefaultInvisibleDuration` 配置项。
 
-**用例 6 的一条硬约束（务必先读，否则会写出死锁的测试）：** `GracefulStop()` **会无上限等待在途 listener 完成**。调用链是 `GracefulStop` → `consumerService.Shutdown()` → `simpleThreadPool.Shutdown()` → `tp.waitGroup.Wait()`（SDK `simple_thread_pool.go:86`）。`waitingReceiveRequestFinished` 那层确实有超时，线程池这层没有。**所以「让 listener 永久阻塞以保证不 ack」这个构造不可用**——它会让测试永久死锁。改用下面的「缓存未消费」构造。
+**一条仍然有效的 SDK 硬约束：** `GracefulStop()` **会无上限等待在途 listener 完成**。调用链是 `GracefulStop` → `consumerService.Shutdown()` → `simpleThreadPool.Shutdown()` → `tp.waitGroup.Wait()`（SDK `simple_thread_pool.go:86`）。`waitingReceiveRequestFinished` 那层确实有超时，线程池这层没有。**所以任何「让 listener 永久阻塞」的构造都不可用**——它会让测试永久死锁。
 
 - [ ] **Step 1: 写用例 2**
 
