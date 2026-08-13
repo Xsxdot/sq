@@ -99,8 +99,13 @@ func TestAliveClientRefCount(t *testing.T) {
 func TestAliveClientIgnoresEmptyID(t *testing.T) {
 	ss := newSessions()
 	ss.add(&session{clientID: "", topics: map[string]bool{}})
-	// 空 id 不入索引，否则所有未带头的客户端会挤在同一个桶里互相"续命"
-	if ss.aliveClient("") {
-		t.Fatal("空 clientID 不应被判为存活")
+	// 必须直接断言 byClient 长度，不能只靠 aliveClient("") 为 false：
+	// aliveClient 对空 id 无条件早返回，删掉 add/remove 里的空 id 守卫
+	// 本用例照样绿——断言不到它宣称的「空 id 不入索引」。
+	ss.mu.Lock()
+	n := len(ss.byClient)
+	ss.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("空 clientID 不应入 byClient 索引，实际长度 %d", n)
 	}
 }

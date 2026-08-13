@@ -342,7 +342,17 @@ func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, 
 	// 阶段 1.5：续租。放在重投循环之前，让日志里「续租」与「重投」的时序与
 	// 扫描时的判定顺序一致，排障时不用反着推。两者写的是同一片 inflight 键
 	// 空间的不同键，先后不影响正确性。
+	//
+	// 续租优先于孤儿清理且不查消息本体：是否续租在扫描判定时就已决定
+	// （renewable 为真即入 renews），此分支也不像重投那样先 Get MsgKey 确认
+	// 消息仍在——retention 清掉消息后残留的 inflight，只要持有者会话仍活就
+	// 会被反复续租，孤儿清理（在下方 reds 循环里才做）最长被推迟到
+	// auto_renew_max_duration 耗尽。这是接受的设计代价：续租判定不引入额外
+	// 随机读，换取每轮扫描只走一遍 inflight 前缀；代价有界，不是缺陷。
 	for _, rn := range renews {
+		// invisible < 1ms 时 Milliseconds() 为 0，newExp == now，会每个兜底
+		// tick（100ms）续租一次。既有重投路径的 exp 计算同样是
+		// now + invisible.Milliseconds()，同款性质，不是本次引入的。
 		newExp := now + invisible.Milliseconds()
 		if newExp > rn.st.RenewUntilMs {
 			// 不越过硬上限：到点这一轮把 ExpireAtMs 正好压在上限上，

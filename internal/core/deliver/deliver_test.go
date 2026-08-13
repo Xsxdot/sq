@@ -1151,6 +1151,41 @@ func TestRenewDoesNotBreakOrderedLock(t *testing.T) {
 	}
 }
 
+// TestRenewThenAckWithOriginalAttemptSucceeds 续租后持有者的原句柄仍然有效：
+// 用续租前那次投递的 attempt 去 AckBatch 必须 OK==true。
+//
+// 这是「续租不动 attempts」这条承重不变式的**行为级**证据：既有测试只证明了
+// 盘上 Attempts 字段未被改写（间接证据），而收据句柄的校验发生在 AckBatch 里
+// （ist.Attempts != e.Attempt 即拒）。若有人改动续租路径偷偷递增 attempts，
+// 盘上断言不一定能立刻暴露，但本用例会直接红——续租后原句柄 ack 必被拒。
+func TestRenewThenAckWithOriginalAttemptSucceeds(t *testing.T) {
+	f := newFixture(t)
+	f.send(t, "t", "a")
+	// 首次取件：短不可见期 + 启用续租
+	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, 50*time.Millisecond, 0,
+		AllPass, WithLease(Lease{Owner: "c1", MaxRenew: time.Minute, Alive: aliveAlways()}))
+	if err != nil || len(msgs) != 1 {
+		t.Fatalf("首取: %d %v", len(msgs), err)
+	}
+	m := msgs[0]
+	time.Sleep(80 * time.Millisecond) // 让 50ms 不可见期到期
+	// 到期后再取件：被续租而非重投（取到 0 条）
+	again, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0,
+		AllPass, WithLease(Lease{Owner: "c1", MaxRenew: time.Minute, Alive: aliveAlways()}))
+	if err != nil || len(again) != 0 {
+		t.Fatalf("续租期取件: %d %v", len(again), err)
+	}
+	// 用续租前那次投递的 attempt 调 AckBatch：句柄必须仍有效
+	res, err := f.dl.AckBatch(context.Background(), "g", "t", 0,
+		[]AckEntry{{Offset: m.Offset, Attempt: m.DeliveryAttempt}})
+	if err != nil {
+		t.Fatalf("AckBatch: %v", err)
+	}
+	if len(res) != 1 || !res[0].OK {
+		t.Fatalf("续租后原句柄 ack 应成功（续租不得使持有者的句柄失效）: %+v", res)
+	}
+}
+
 // TestOldInflightRecordStillRedelivers 旧格式 inflight（无 Owner/RenewUntilMs）
 // 即便本次取件启用了续租也照常重投——零迁移的行为保证。
 func TestOldInflightRecordStillRedelivers(t *testing.T) {

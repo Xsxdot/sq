@@ -619,7 +619,11 @@ func TestOfficialGoSDKPushAutoRenewPreventsRedelivery(t *testing.T) {
 		c.DefaultInvisibleDuration = "5s"
 		// 显式写出默认值，让用例不依赖默认值将来是否变动
 		c.AutoRenewEnabled = true
-		c.AutoRenewMaxDuration = "10m"
+		// 预算刻意压到 15s：若续租真的污染了 attempts、t=8s 的 ack 被拒，
+		// 消息会被续租到预算耗尽（t≈15s）后必然重投——重投落进下面的观测
+		// 窗口，7a 才会红。预算取 10m 时重投要到 t≈600s，观测窗口根本
+		// 等不到，7c 就成了恒真断言。
+		c.AutoRenewMaxDuration = "15s"
 	})
 	const (
 		topic = "e2e-push-autorenew"
@@ -641,30 +645,37 @@ func TestOfficialGoSDKPushAutoRenewPreventsRedelivery(t *testing.T) {
 	startPushConsumer(t, endpoint, group, topic, c,
 		rmq.WithPushConsumptionThreadCount(1))
 
-	// 时间线（确定的）：
-	//   t=0    首投进 listener，attempt=1，句柄 H1，唯一 worker 被占住；
-	//   t≈5s   broker 侧不可见期到期，长轮询触发扫描——四条判据全真
-	//          （本次取件带租约、预算 10m 未耗尽、归属已记、持有者
+	// 时间线（确定的；waitCount 在 t≈0 即返回——采集点在 listener 入口、
+	// hold 之前，count>=1 立即满足，所以 sleep 从 t≈0 起算）：
+	//   t≈0   首投进 listener，attempt=1，句柄 H1，唯一 worker 被占住；
+	//   t≈5s  broker 侧不可见期到期，长轮询触发扫描——四条判据全真
+	//          （本次取件带租约、预算 15s 未耗尽、归属已记、持有者
 	//          Telemetry 会话仍活）→ 续租到 t≈10s，不重投；
+	//   t≈10s 不可见期再次到期 → 再续租，被硬上限钳到 t≈15s；
 	//   t=8s   handler 返回，用**仍然有效**的 H1 ack 成功（续租没动 attempts，
 	//          所以句柄没失效）；
-	//   t=8s~20s 静默段，确认不再有任何投递。
+	//   t≈15s 预算耗尽点：健康路径早已 ack、inflight 已删，此处无事发生。
 	waitCount(t, c, 1, 20*time.Second)
 
-	// 7b【承重】：静默段必须长于一个完整的不可见期（12s > 5s）。窗口短于
-	// 不可见期时，「ack 成功」与「ack 失败、正在等下一次重投」两个世界观测
+	// 7b【承重】：观测窗口必须越过 t≈15s 的预算耗尽点（25s > 15s）。
+	// 若续租改了 attempts，t=8s 的 ack 会被拒、消息续租到预算耗尽后必然
+	// 重投（attempt>=2），落进本窗口；健康路径则只有首投一条。窗口短于
+	// 预算耗尽点，「ack 成功」与「ack 被拒、消息正被无限续租」两个世界观测
 	// 一致，7a 就成了假绿——这是 B13.2 终审抓出用例 1b 假绿的同款陷阱。
-	time.Sleep(12 * time.Second)
+	time.Sleep(25 * time.Second)
 
 	got := c.snapshot()
 	// 7a【承重】：全窗口只投递过一次。这里必须用 == 而不是 >=：本用例证明的
-	// 就是「不多投」，>= 会让断言恒真。
+	// 就是「不多投」，>= 会让断言恒真。若续租污染了 attempts 导致 ack 被拒，
+	// 消息会在 t≈15s 预算耗尽后重投，本断言先红。
 	if len(got) != 1 {
 		t.Fatalf("期望恰好 1 次投递（续租应挡住重投），实际 %d 次: %+v", len(got), got)
 	}
-	// 7c：续租没有污染投递次数。它同时反证了句柄未失效——若续租改了
-	// attempts，ack 会被 broker 拒（陈旧句柄），这条消息必然在 t≈13s 重投，
-	// 7a 会先红。
+	// 7c：续租没有污染投递次数。判别器是「预算 15s 到期后必然重投」——若
+	// 续租改了 attempts，t=8s 的 ack 被拒，消息续租到 t≈15s 预算耗尽后必然
+	// 重投（attempt>=2）落进观测窗口，7a 会先红；此处断言健康路径下唯一的
+	// 那次投递仍是首投。它同时反证句柄未失效：若句柄失效，就不会只有一次
+	// attempt=1 的投递。
 	if got[0].attempt != 1 {
 		t.Fatalf("attempt = %d，期望 1（续租不应改变投递次数）", got[0].attempt)
 	}

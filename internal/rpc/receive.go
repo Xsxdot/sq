@@ -66,6 +66,13 @@ func filterKindOf(t pb.FilterType) (deliver.FilterKind, bool) {
 // 不启用，退化为固定不可见期）——**不返回错误、不拒绝请求**：手写客户端不带
 // x-mq-client-id 是合法的，它只是享受不到自动续租。
 func leaseFor(ctx context.Context, cfg *config.Config, ss *sessions, wantAutoRenew bool) deliver.Lease {
+	// ss==nil 的防御：ss.aliveClient 是 nil 接收者上的方法值，恒非 nil，
+	// Lease.Enabled() 的 Alive 检查拦不住 nil——真调用会在 aliveClient 的
+	// mu.Lock() 处 panic。生产路径恒非 nil（Server 自建 sessions），这里
+	// 只为守住「Enabled() 保证零值即不启用、不会半开」这条不变式不开口子。
+	if ss == nil {
+		return deliver.Lease{}
+	}
 	if !wantAutoRenew || !cfg.AutoRenewEnabled {
 		return deliver.Lease{}
 	}
