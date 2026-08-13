@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/xushixin/sq/internal/core"
+	"github.com/xushixin/sq/internal/core/deliver"
 )
 
 func TestGroupProgressAndResetCursor(t *testing.T) {
@@ -19,7 +20,7 @@ func TestGroupProgressAndResetCursor(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, err := dl.Receive(context.Background(), "g1", "t1", 0, 1, time.Minute, 0, nil); err != nil {
+	if _, err := dl.Receive(context.Background(), "g1", "t1", 0, 1, time.Minute, 0, deliver.AllPass); err != nil {
 		t.Fatal(err)
 	}
 	// 列表
@@ -60,7 +61,7 @@ func TestGroupProgressAndResetCursor(t *testing.T) {
 		map[string]any{"topic": "t1", "queue_id": 0, "offset": 0}); w.Code != http.StatusNoContent {
 		t.Fatalf("重置应 204，得到 %d body=%s", w.Code, w.Body)
 	}
-	got, err := dl.Receive(context.Background(), "g1", "t1", 0, 3, time.Minute, 0, nil)
+	got, err := dl.Receive(context.Background(), "g1", "t1", 0, 3, time.Minute, 0, deliver.AllPass)
 	if err != nil || len(got) != 3 {
 		t.Fatalf("重置后应从头收 3 条: %d %v", len(got), err)
 	}

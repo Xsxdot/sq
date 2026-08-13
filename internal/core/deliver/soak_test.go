@@ -105,7 +105,7 @@ func TestSoakE2E(t *testing.T) {
 				default:
 				}
 				// invisible 5 分钟：soak 全程不触发重投，acked 数即唯一确认数
-				msgs, err := dl.Receive(ctx, "g-soak", "t-soak-e2e", q, 32, 5*time.Minute, 200*time.Millisecond, nil)
+				msgs, err := dl.Receive(ctx, "g-soak", "t-soak-e2e", q, 32, 5*time.Minute, 200*time.Millisecond, AllPass)
 				if err != nil {
 					t.Errorf("Receive q=%d: %v", q, err)
 					return

@@ -50,7 +50,7 @@ func TestCollectDerivesStats(t *testing.T) {
 		}
 	}
 	// 消费 1 条不 ack：cursor=1、inflight=1、待拉取=2
-	if _, err := dl.Receive(context.Background(), "g1", "t1", 0, 1, time.Minute, 0, nil); err != nil {
+	if _, err := dl.Receive(context.Background(), "g1", "t1", 0, 1, time.Minute, 0, deliver.AllPass); err != nil {
 		t.Fatal(err)
 	}
 	s, err := Collect(st, mt)

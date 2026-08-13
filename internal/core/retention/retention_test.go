@@ -127,7 +127,7 @@ func TestConsumeAfterPurge(t *testing.T) {
 	}
 	pr := produce.New(rep, rt, st, mt, slog.Default())
 	dl := deliver.New(rep, rt, st, mt, pr, slog.Default())
-	msgs, err := dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	msgs, err := dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, deliver.AllPass)
 	if err != nil || len(msgs) != 1 || msgs[0].Offset != 1 {
 		t.Fatalf("清理后消费: %d %v", len(msgs), err)
 	}

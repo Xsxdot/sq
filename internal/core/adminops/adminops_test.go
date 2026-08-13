@@ -83,10 +83,10 @@ func TestPurgeGroupData(t *testing.T) {
 		t.Fatal(err)
 	}
 	// 真实消费一条：产生 cursor 与 inflight
-	if _, err := dl.Receive(context.Background(), "g-del", "t1", 0, 1, time.Minute, 0, nil); err != nil {
+	if _, err := dl.Receive(context.Background(), "g-del", "t1", 0, 1, time.Minute, 0, deliver.AllPass); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := dl.Receive(context.Background(), "g-keep", "t1", 0, 1, time.Minute, 0, nil); err != nil {
+	if _, err := dl.Receive(context.Background(), "g-keep", "t1", 0, 1, time.Minute, 0, deliver.AllPass); err != nil {
 		t.Fatal(err)
 	}
 	if err := PurgeGroupData(context.Background(), rep, rt, nil, st, "g-del", slog.Default()); err != nil {
@@ -122,7 +122,7 @@ func TestPurgeGroupDataBucketsByQueue(t *testing.T) {
 		if _, err := pr.Append(context.Background(), &core.Message{Topic: tc.topic, Body: []byte("x")}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := dl.Receive(context.Background(), "g", tc.topic, tc.q, 1, time.Minute, 0, nil); err != nil {
+		if _, err := dl.Receive(context.Background(), "g", tc.topic, tc.q, 1, time.Minute, 0, deliver.AllPass); err != nil {
 			t.Fatal(err)
 		}
 	}

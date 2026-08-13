@@ -42,6 +42,21 @@ const defaultLongPolling = 20 * time.Second
 // 否则响应会在 deadline 之后才发出，被客户端判定为超时。
 const longPollWaitMargin = time.Second
 
+// filterKindOf 把协议过滤类型映射为 deliver 的种类。
+// 第二个返回值为 false 表示本版本不支持该类型，调用方须回
+// ILLEGAL_FILTER_EXPRESSION——不能默默当成不过滤，那会让本应被筛掉的
+// 消息全量投给消费者。
+func filterKindOf(t pb.FilterType) (deliver.FilterKind, bool) {
+	switch t {
+	case pb.FilterType_TAG:
+		return deliver.FilterTag, true
+	case pb.FilterType_SQL:
+		return deliver.FilterSQL92, true
+	default:
+		return 0, false
+	}
+}
+
 // ReceiveMessage POP 取件（服务端流）。流格式：先逐条消息，最后一帧 status。
 //
 // 关于帧顺序（已用官方 SDK 实测，不是推测）：官方 Go SDK 并不依赖任何顺序——
@@ -71,18 +86,23 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 		}})
 	}
 
-	// TAG 表达式解析（M2）：支持 "*" / 单 tag / "a || b"。SQL92 → v1.1。
-	var filter *deliver.TagFilter
+	// 过滤表达式解析：协议枚举在此映射为 deliver 自己的种类
+	// （core 不 import pb 是既有架构约束）。未带 FilterExpression 时用
+	// AllPass，不传 nil——deliver 侧不接受 nil Filter。
+	filter := deliver.AllPass
 	if fe := req.GetFilterExpression(); fe != nil {
-		if fe.GetType() != pb.FilterType_TAG {
+		kind, ok := filterKindOf(fe.GetType())
+		if !ok {
 			s.logger.Warn("不支持的过滤类型", "group", group, "topic", topic, "type", fe.GetType())
 			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
-				Status: errStatus(pb.Code_ILLEGAL_FILTER_EXPRESSION, "仅支持 TAG 过滤（SQL92 计划 v1.1）"),
+				Status: errStatus(pb.Code_ILLEGAL_FILTER_EXPRESSION,
+					fmt.Sprintf("不支持的过滤类型 %v", fe.GetType())),
 			}})
 		}
-		f, err := deliver.ParseTagFilter(fe.GetExpression())
+		f, err := deliver.ParseFilter(kind, fe.GetExpression())
 		if err != nil {
-			s.logger.Warn("TAG 表达式非法", "group", group, "topic", topic, "expr", fe.GetExpression(), "err", err)
+			s.logger.Warn("过滤表达式非法", "group", group, "topic", topic,
+				"kind", fe.GetType(), "expr", fe.GetExpression(), "err", err)
 			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
 				Status: errStatus(pb.Code_ILLEGAL_FILTER_EXPRESSION, err.Error()),
 			}})

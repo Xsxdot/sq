@@ -25,7 +25,7 @@ func seedConsumption(t *testing.T, pr *produce.Producer, dl *deliver.Deliverer) 
 			t.Fatal(err)
 		}
 	}
-	if _, err := dl.Receive(context.Background(), "g1", "t1", 0, 1, time.Minute, 0, nil); err != nil {
+	if _, err := dl.Receive(context.Background(), "g1", "t1", 0, 1, time.Minute, 0, deliver.AllPass); err != nil {
 		t.Fatal(err)
 	}
 }

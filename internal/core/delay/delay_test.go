@@ -109,7 +109,7 @@ func TestPassMovesDueAndPreservesMessage(t *testing.T) {
 		t.Fatalf("delay 条目未删除: %d", n)
 	}
 	// 经正常投递链路可消费，DeliverAtMs/Tag/Keys 完整保留
-	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, nil)
+	msgs, err := f.dl.Receive(context.Background(), "g", "t", 0, 10, time.Minute, 0, deliver.AllPass)
 	if err != nil || len(msgs) != 1 {
 		t.Fatalf("到期消息应可投递: %d %v", len(msgs), err)
 	}

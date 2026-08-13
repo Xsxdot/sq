@@ -138,9 +138,10 @@ func (d *Deliverer) lockQueue(group, topic string, q uint32) *sync.Mutex {
 // 先重投本队列已过期的 inflight，再从 fetch 位点取新消息，合计不超过 maxMsgs。
 // 空结果时最长等待 wait（长轮询），期间新消息写入会立即唤醒重试；
 // wait<=0 时不等待，取一次就返回。
-// filter 非 nil 时只投 tag 命中的新消息：不匹配的跳过并推进本组位点，
-// 不投递、不占 inflight（对该组永久跳过）。阶段 1 的过期重投不重新过滤。
-func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible, wait time.Duration, filter *TagFilter) ([]*core.Message, error) {
+// 只投 filter.Match 返回 ResultTrue 的新消息；filter 不得为 nil，不过滤时传
+// AllPass。不匹配的跳过并推进本组位点，不投递、不占 inflight（对该组永久
+// 跳过）。阶段 1 的过期重投不重新过滤。
+func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible, wait time.Duration, filter Filter) ([]*core.Message, error) {
 	gc, err := d.mt.EnsureGroup(ctx, group)
 	if err != nil {
 		return nil, err
@@ -189,7 +190,7 @@ func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID ui
 // 它的 inflight 兜底记录必然已持久化，崩溃后该消息仍会被重投而不是丢失）。
 // 解锁后同队列的下一次取件/确认立即可进锁定序，与本批共享同一次 fsync——
 // 队列内 group commit 在消费路径生效的机制，与 produce 侧完全同款。
-func (d *Deliverer) receiveOnce(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter *TagFilter) ([]*core.Message, error) {
+func (d *Deliverer) receiveOnce(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter Filter) ([]*core.Message, error) {
 	qlock := d.lockQueue(group, topic, queueID)
 	qlock.Lock()
 	out, pending, applied, err := d.receiveOnceLocked(ctx, group, topic, queueID, maxMsgs, invisible, maxAttempts, filter)
@@ -204,12 +205,12 @@ func (d *Deliverer) receiveOnce(ctx context.Context, group, topic string, queueI
 }
 
 // receiveOnceLocked 单次取件的锁内部分：过期 inflight 重投 + 新消息扫描
-// （可带 Tag 过滤），合计不超过 maxMsgs；批次组装完成后 ApplyAsync 定序。
+// （可带过滤器），合计不超过 maxMsgs；批次组装完成后 ApplyAsync 定序。
 // 调用方必须持有该队列的 qlock；fsync 等待由调用方在锁外完成。
 //
 // 返回：(消息, pending, applied, error)。applied=false 表示本轮无暂存写入
 // （批次已 Close 回收），pending 为零值，调用方无需 Wait。
-func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter *TagFilter) ([]*core.Message, replication.Pending, bool, error) {
+func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter Filter) ([]*core.Message, replication.Pending, bool, error) {
 	now := time.Now().UnixMilli()
 	expireAt := now + invisible.Milliseconds()
 	var out []*core.Message
@@ -344,11 +345,9 @@ func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, 
 			if err != nil {
 				return false, err
 			}
-			// Tag 过滤在顺序锁之前：不匹配的消息（含顺序消息）对本消费组永久
-			// 跳过、推进位点（spec §5 流程 2 语义不变）。顺序消息被过滤跳过不
-			// 破坏顺序——它对本组从未投递，"已投递消息间"的相对顺序完好。
-			// 若把顺序锁放在前面，被锁拦住的不匹配消息会永远堵住位点。
-			if !filter.Match(m.Tag) {
+			// 过滤在顺序锁之前：不匹配的消息（含顺序消息）对本消费组永久跳过、
+			// 推进位点。放在顺序锁之后的话，被锁拦住的不匹配消息会永远堵住位点。
+			if r := filter.Match(m); r != ResultTrue {
 				newCursor = m.Offset + 1
 				skipped++
 				return true, nil
