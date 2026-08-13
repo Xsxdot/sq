@@ -87,23 +87,31 @@ func RetryBackoffParams() (initial, max time.Duration, multiplier float64)
 **用 `GetGroup` 而不是 `EnsureGroup`**：settings 协商是只读的协议协商，不应有
 建组副作用。真正建组由 ReceiveMessage 路径负责。
 
-## 4. 这不改变 `fifo` 的结论
+## 4. 这不改变 `fifo` 的结论，也**不改动那段注释**
 
-B13.2 把 `fifo=false` 定成**终态**，列了三条独立理由，其中第二条是「客户端按
-`MaxAttempts=3` 放弃并转 DLQ，而 broker 侧默认 16，两边判定不一致」
-（记在 `internal/rpc/settings.go` 注释里）。
+> **本节已订正。** 本 spec 初稿写着「B13.2 的三条理由里第二条是『客户端按
+> `MaxAttempts=3` 转 DLQ，与 broker 的 16 判定不一致』，本条目消除了它，实现时
+> 须把该条划掉」。**这是错的。** 核对链尾 `feat/auto-renew` 上
+> `internal/rpc/settings.go` 的实际注释（`git show feat/auto-renew:internal/rpc/settings.go`，
+> 全文件 grep `MaxAttempts|死信|DLQ` 只命中退避常量与归属权那条），根本没有
+> 「判定不一致」这条理由。按初稿施工会去划掉一条**正确且仍然成立**的理由。
 
-本改动**消除了第三条中的这一条**——下发真实 `MaxAttempts` 后两边判定一致了。
-另外两条仍然成立：
+B13.2 定 `fifo=false` 为终态，实际写在注释里的三条理由是：
 
-1. 翻 true 会让客户端改建 `FiFoConsumeService`，把**重试计数与 DLQ 判定从
-   broker 夺给客户端**，与 sq 的 broker 端 maxAttempts/DLQ 设计相反；
-2. B13.7 记录的 SDK 内部竞态（`Start()` 读 `isFifo` 与 telemetry 回调写并发）
-   使得翻 true 不保证被可靠观测到。
+1. **顺序安全不依赖此标志**——M4 起由队列级顺序锁保证每队列至多一条未终结的
+   顺序 inflight，e2e `TestOfficialGoSDKPushFIFOOrderLock` 实测 listener 并发峰值恒为 1；
+2. **翻 true 会夺走归属权**——客户端改建 `FiFoConsumeService`，消费失败转为
+   客户端本地循环重投 listener、不回 broker，重试计数与 DLQ 判定整个从 broker
+   挪到客户端，与 sq 的设计相反；
+3. **翻 true 本身不保证被可靠观测**——B13.7 记录的 SDK v5.1.4 内部竞态
+   （`Start()` 读 `isFifo` 与 telemetry 回调写同一字段，无同步）。
 
-**所以 `fifo` 保持 false，本条目不得被读成「现在可以翻了」。** 实现时必须同步
-更新 `settings.go` 里那段注释，把已消除的那条理由划掉并注明由本条目消除——
-否则后人看到三条理由里有一条已不成立，会怀疑整段结论。
+**本条目一条都不消除。** 下发真实 `MaxAttempts` 只意味着「万一客户端夺走了归属，
+它至少会数到正确的次数」——归属权迁移这件事本身（理由 2）纹丝不动，理由 1、3
+更是完全无关。
+
+**所以：`fifo` 保持 false，且实现时不要碰 `settings.go` 里那段 `fifo` 注释。**
+本条目也不得被读成「现在可以翻了」。
 
 ## 5. 测试计划
 
@@ -129,7 +137,8 @@ B13.2 把 `fifo=false` 定成**终态**，列了三条独立理由，其中第�
   「与 broker 实际施加的一致」，是修正而非退化；`MaxAttempts` 在 `fifo=false`
   下不被 SDK 使用，无当前影响。**但它确实改变了下发给所有存量消费者的协商值**，
   且是在用户外出期间定的，需复核。
-- **A3**：`fifo` 仍为 false（§4）。本条目消除了三条理由中的一条，另两条仍成立。
+- **A3**：`fifo` 仍为 false（§4）。三条理由**一条都没被本条目消除**，那段注释
+  不改动。此处与初稿相反，订正理由见 §4 的引注。
 
 ## 7. 日志与注释要求
 
@@ -139,7 +148,8 @@ B13.2 把 `fifo=false` 定成**终态**，列了三条独立理由，其中第�
   不要在此处另写常量」及其理由（§3.1）。
 - `deliver.RetryBackoffParams` 需导出注释，说明它与 `RetryBackoff` 共用同一组
   变量。
-- `settings.go` 中 `fifo` 那段注释按 §4 更新。
+- `settings.go` 中 `fifo` 那段注释**保持原样，一个字都不要改**（§4 订正后的结论；
+  本 spec 初稿要求更新它，那是基于对原文的误记）。
 - 协商时组查不到而回退默认值 → Debug 一条（含 group 与回退值）：这是「为什么
   这个消费者拿到的是 16 而不是它组里配的值」唯一的排查线索。
 - 本改动无错误分支（`GetGroup` 只读不报错），故无新增 Error 日志。
