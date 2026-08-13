@@ -70,6 +70,18 @@ go build -o sq ./cmd/sq
 `sq-origin-topic`/`sq-origin-queue`/`sq-origin-offset` 溯源属性，可用任意
 RocketMQ SDK 把 `%DLQ%{group}` 当普通 topic 订阅，做人工处理或重放。
 
+## 自动续租
+
+消费者可以在 `ReceiveMessage` 里声明 `auto_renew`，表示「我还在处理这条消息」。broker
+会在该客户端的 Telemetry 会话存活期间自动延长这条消息的不可见期，使处理时间超过
+`default_invisible_duration` 的 handler 不被重复投递。续租有 `auto_renew_max_duration`
+的硬上限，超过即按正常过期重投——这是「消费者进程活着但处理逻辑卡死」时死信队列仍能
+兜底的保证。客户端一旦断线，续租立即停止，消息在当前不可见期到期后正常重投，故障转移
+速度不受影响。
+
+顺序消息需额外注意：续租期间该队列的顺序锁一直被持有，后续消息全部等待，最长可达
+`auto_renew_max_duration`。
+
 ## 订阅过滤
 
 服务端按订阅表达式过滤，未命中（或无法判定）的消息跳过并永久越过位点：不投递、
@@ -120,6 +132,11 @@ auto_create_topic: true
 default_queue_nums: 16
 default_max_attempts: 16       # 新订阅组默认最大投递次数，超过转入 %DLQ%{group}
 default_invisible_duration: 1m # 客户端未指定时的消息不可见时长；push 消费全靠它
+auto_renew_enabled: true       # 默认 true。消费者声明 auto_renew 时在其存活期间自动续租
+                               # 不可见期（PushConsumer 总是声明它）；关闭后慢 handler 会被
+                               # 重复投递
+auto_renew_max_duration: 10m   # 单次投递允许续租的总时长上限（硬上限），超过即按正常过期
+                               # 重投（投递次数+1，可能进死信）
 retention_check_interval: 5m   # 过期清理扫描间隔（Go duration 格式）
 disk_watermark_percent: 85     # 磁盘使用率超过即拒写保读；0=关闭。状态可在控制台
                                # 总览页与 /metrics 的 sq_write_blocked 观察
