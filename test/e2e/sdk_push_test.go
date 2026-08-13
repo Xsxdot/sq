@@ -16,6 +16,7 @@ package e2e
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -251,4 +252,59 @@ func TestOfficialGoSDKPushBasicLoop(t *testing.T) {
 		t.Fatalf("Ack 未落地：新消费者在 15s 窗口内收到 %d 条: %+v", n, cB.snapshot())
 	}
 	t.Logf("用例 1 通过：5 条闭环 + Ack 位点已推进")
+}
+
+// TestOfficialGoSDKPushFIFOOrderLock 用例 5：同 MessageGroup 的 20 条消息在
+// 4 线程 push 消费下顺序不破。
+//
+// 这是 settings.go 下发 fifo=false 的承重断言：顺序安全不依赖协商标志，
+// 而由 broker 侧的队列级顺序锁保证（每队列至多一条未终结的顺序 inflight）。
+func TestOfficialGoSDKPushFIFOOrderLock(t *testing.T) {
+	endpoint := startBroker(t)
+	const (
+		topic = "e2e-push-fifo"
+		group = "e2e-push-fifo-g"
+		mg    = "order-key"
+		total = 20
+	)
+	sendFifoBatch(t, endpoint, topic, mg, "fifo", total)
+
+	c := newCollector(t)
+	// hold 必须远小于不可见时长（默认 1m，本用例不改）：若 hold 逼近不可见窗口，
+	// broker 会认为该条超时未终结而重投，重投件与仍在跑的那件重叠 →
+	// maxInFlight 变 2 → 假红。50ms 相对 1m 有三个数量级余量。
+	c.hold = 50 * time.Millisecond
+	startPushConsumer(t, endpoint, group, topic, c,
+		rmq.WithPushConsumptionThreadCount(4))
+	waitCount(t, c, total, 120*time.Second)
+
+	// 断言 A：body 序严格全等于发送序。
+	//
+	// 用严格全等而不是「递增」：重投会让 body 重复出现，全等能把它照出来。
+	// 真跑出间歇性红时正确的修法是调高不可见时长，不是把断言放宽成忽略重复
+	// ——那等于把要测的东西测没了。
+	snap := c.snapshot()
+	if len(snap) != total {
+		t.Fatalf("采集到 %d 条，期望恰好 %d 条（多出来的是重投件）: %+v", len(snap), total, snap)
+	}
+	for i, r := range snap {
+		want := fmt.Sprintf("fifo-%d", i)
+		if r.body != want {
+			t.Fatalf("第 %d 条乱序：期望 %s 收到 %s；全量: %+v", i, want, r.body, snap)
+		}
+		if r.group != mg {
+			t.Fatalf("第 %d 条 MessageGroup 回读不符: %q", i, r.group)
+		}
+	}
+
+	// 断言 B：并发峰值恒为 1 —— 顺序锁的直接证据，也是本用例真正的证明。
+	//
+	// 只写断言 A 是不够的：顺序锁正确时客户端手上永远只有一条，4 个线程没有
+	// 乱序机会，A 会恒真；锁坏掉时 A 只是【概率性】变红。B 是确定性的——
+	// 线程池有 4 个线程、listener 撑住 50ms，只要 broker 任何一次放出两条
+	// 同队列顺序消息，重叠必被观测到，maxInFlight 立刻变 2。
+	if peak := c.maxInFlight.Load(); peak != 1 {
+		t.Fatalf("顺序锁失效：listener 并发峰值 = %d，期望 1", peak)
+	}
+	t.Logf("用例 5 通过：20 条严格按序，并发峰值 1")
 }
