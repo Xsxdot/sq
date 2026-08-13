@@ -24,6 +24,7 @@ import (
 
 	rmq "github.com/apache/rocketmq-clients/golang/v5"
 	"github.com/apache/rocketmq-clients/golang/v5/credentials"
+	"github.com/xushixin/sq/internal/config"
 )
 
 // recv 是一次 listener 调用入口处的值快照。
@@ -307,4 +308,137 @@ func TestOfficialGoSDKPushFIFOOrderLock(t *testing.T) {
 		t.Fatalf("顺序锁失效：listener 并发峰值 = %d，期望 1", peak)
 	}
 	t.Logf("用例 5 通过：20 条严格按序，并发峰值 1")
+}
+
+// TestOfficialGoSDKPushRetryOwnedByBroker 用例 3：消费失败后由 broker 重投，
+// 不是客户端本地循环重投 listener。
+//
+// 这是 fifo=false 的另一半证据：翻成 true 会让客户端改建 FiFoConsumeService，
+// 消费失败转为客户端本地重投，重试计数就不再归 broker 了。
+func TestOfficialGoSDKPushRetryOwnedByBroker(t *testing.T) {
+	endpoint := startBroker(t)
+	const (
+		topic = "e2e-push-retry"
+		group = "e2e-push-retry-g"
+		body  = "retry-me"
+	)
+	sendPlain(t, endpoint, topic, body)
+
+	c := newCollector(t)
+	c.decide = func(*rmq.MessageView) rmq.ConsumerResult { return rmq.FAILURE }
+	startPushConsumer(t, endpoint, group, topic, c)
+	// 第 2 次投递的不可见窗口 = max(默认不可见 1m, 服务端退避下限 10s) = 1m，
+	// 窗口取 120s 留足余量。
+	waitCount(t, c, 2, 120*time.Second)
+
+	snap := c.snapshot()
+	first, second := snap[0], snap[1]
+	// 3a：同一条消息被投了两次
+	if first.id != second.id {
+		t.Fatalf("两次不是同一条消息: %s vs %s", first.id, second.id)
+	}
+	if first.body != body || second.body != body {
+		t.Fatalf("body 不符: %q / %q", first.body, second.body)
+	}
+	// 3b：投递次数递增
+	if first.attempt != 1 || second.attempt != 2 {
+		t.Fatalf("投递次数不符: %d → %d，期望 1 → 2", first.attempt, second.attempt)
+	}
+	// 3c：判别器 —— 回执句柄必须变。
+	//
+	// 3b 单独不足以判别：客户端本地重试同样会自增 deliveryAttempt
+	// （eraseFifoMessage 里就是 mv.deliveryAttempt += 1），两条路的 attempt 都会涨。
+	// 只有句柄能把它们分开——本地重试复用同一个 MessageView 反复喂 listener，
+	// 句柄不变；只有真的回了 broker、broker 重新发件，才会拿到编着新 attempt
+	// 的新句柄。
+	if first.receipt == second.receipt {
+		t.Fatalf("回执句柄未变（%q）：说明是客户端本地重投，不是 broker 重投", first.receipt)
+	}
+	t.Logf("用例 3 通过：attempt 1→2 且句柄已换，重试归 broker")
+}
+
+// TestOfficialGoSDKPushDLQOwnedByBroker 用例 4：投递超限后由 broker 转入
+// %DLQ%{group}，listener 不再被调用。
+//
+// 限界（如实记录，不包装）：DLQ 条目本身带不出「谁转的」签名——
+// ForwardMessageToDeadLetterQueue（RPC 路径，deliver.go:611）与 broker 自动超限
+// 路径最终汇进同一个 moveToDLQ（deliver.go:671），产出完全一致。所以「DLQ 判定
+// 归 broker」不是单条断言能证的，它由三件事合起来支撑：4a（listener 停止被调用）
+// + 4b（消息确实在 DLQ）+ SDK 侧静态事实（标准消费服务的 eraseMessage 只有
+// ack/nack 两条分支，根本没有 forward 调用）。第三条是读代码得来的，不是跑出来的。
+func TestOfficialGoSDKPushDLQOwnedByBroker(t *testing.T) {
+	endpoint := startBroker(t, func(c *config.Config) {
+		c.DefaultMaxAttempts = 2 // 2 次投递即超限，控制用例时长
+	})
+	const (
+		topic = "e2e-push-dlq"
+		group = "e2e-push-dlq-g"
+		body  = "push-poison"
+	)
+	sendPlain(t, endpoint, topic, body)
+
+	c := newCollector(t)
+	c.decide = func(*rmq.MessageView) rmq.ConsumerResult { return rmq.FAILURE }
+	startPushConsumer(t, endpoint, group, topic, c)
+	waitCount(t, c, 2, 120*time.Second)
+
+	// 4a：恰 2 次后不再被调用。
+	//
+	// 必须用【连续静默窗口】判定，不是「等一会儿看一眼」：看一眼恰好落在两次
+	// 投递之间就会误判为已停止。连续 15 轮 × 1s 计数不变才算数。
+	stable := 0
+	for i := 0; i < 15; i++ {
+		time.Sleep(time.Second)
+		if c.count() == 2 {
+			stable++
+			continue
+		}
+		t.Fatalf("超限后 listener 仍被调用：第 %d 秒计数变为 %d；全量: %+v", i+1, c.count(), c.snapshot())
+	}
+	if stable != 15 {
+		t.Fatalf("静默窗口未坐满: %d/15", stable)
+	}
+
+	// 4b：死信作为普通 topic 从 %DLQ%{group} 被读到。
+	//
+	// 转入是惰性的（原队列下一次 Receive 触发）——这里不需要像 SimpleConsumer 版
+	// 那样手动「戳原 topic」：push 消费者一直挂着长轮询，戳的动作天然在发生。
+	dlqTopic := "%DLQ%" + group
+	dlqConsumer, err := rmq.NewSimpleConsumer(&rmq.Config{
+		Endpoint:      endpoint,
+		ConsumerGroup: group + "-reader",
+		Credentials:   &credentials.SessionCredentials{},
+	},
+		rmq.WithSimpleAwaitDuration(3*time.Second),
+		rmq.WithSimpleSubscriptionExpressions(map[string]*rmq.FilterExpression{dlqTopic: rmq.SUB_ALL}),
+	)
+	if err != nil {
+		t.Fatalf("NewSimpleConsumer(DLQ): %v", err)
+	}
+	if err := dlqConsumer.Start(); err != nil {
+		t.Fatalf("dlqConsumer.Start: %v", err)
+	}
+	defer dlqConsumer.GracefulStop()
+
+	var gotBody string
+	deadline := time.Now().Add(120 * time.Second)
+	for gotBody == "" && time.Now().Before(deadline) {
+		mvs, err := dlqConsumer.Receive(context.Background(), 16, 30*time.Second)
+		if err != nil {
+			continue // 空轮询以 MESSAGE_NOT_FOUND 返回，属正常
+		}
+		for _, mv := range mvs {
+			gotBody = string(mv.GetBody())
+			if props := mv.GetProperties(); props["sq-origin-topic"] != topic {
+				t.Fatalf("死信缺少来源属性 sq-origin-topic: %v", props)
+			}
+			if err := dlqConsumer.Ack(context.Background(), mv); err != nil {
+				t.Fatalf("Ack 死信: %v", err)
+			}
+		}
+	}
+	if gotBody != body {
+		t.Fatalf("死信未到达或内容不符: %q", gotBody)
+	}
+	t.Logf("用例 4 通过：listener 恰 2 次后静默，消息在 %s 中", dlqTopic)
 }
