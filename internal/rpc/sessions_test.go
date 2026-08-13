@@ -70,3 +70,37 @@ func TestPickProducerRotates(t *testing.T) {
 		t.Fatalf("轮转应 wrap-around 回到第一个会话，得到 %p（first=%p）", third, first)
 	}
 }
+
+func TestAliveClientRefCount(t *testing.T) {
+	ss := newSessions()
+	if ss.aliveClient("c1") {
+		t.Fatal("未注册的客户端不应判为存活")
+	}
+	a := &session{clientID: "c1", topics: map[string]bool{}}
+	b := &session{clientID: "c1", topics: map[string]bool{}}
+	ss.add(a)
+	ss.add(b)
+	if !ss.aliveClient("c1") {
+		t.Fatal("已注册应判为存活")
+	}
+	// 重连窗口内新旧两条流短暂共存：注销其中一条后客户端仍然活着。
+	// 用指针 map 会让后注册的覆盖先注册的，先注册的注销即整条删除，
+	// 这里就会误判为已死——引用计数正是为了挡住这个。
+	ss.remove(a)
+	if !ss.aliveClient("c1") {
+		t.Fatal("同一 clientID 尚有一条流存活，不应判为已死")
+	}
+	ss.remove(b)
+	if ss.aliveClient("c1") {
+		t.Fatal("全部注销后应判为已死")
+	}
+}
+
+func TestAliveClientIgnoresEmptyID(t *testing.T) {
+	ss := newSessions()
+	ss.add(&session{clientID: "", topics: map[string]bool{}})
+	// 空 id 不入索引，否则所有未带头的客户端会挤在同一个桶里互相"续命"
+	if ss.aliveClient("") {
+		t.Fatal("空 clientID 不应被判为存活")
+	}
+}

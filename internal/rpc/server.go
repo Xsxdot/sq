@@ -353,7 +353,8 @@ func (s *Server) Telemetry(stream pb.MessagingService_TelemetryServer) error {
 	defer func() {
 		if sess != nil {
 			s.sessions.remove(sess)
-			s.logger.Debug("telemetry 会话注销", "connections", s.sessions.count())
+			s.logger.Debug("telemetry 会话注销", "client_id", sess.clientID,
+				"connections", s.sessions.count())
 		}
 	}()
 
@@ -375,10 +376,12 @@ func (s *Server) Telemetry(stream pb.MessagingService_TelemetryServer) error {
 				// 先注册会话再回包：回包经 sess.send 走同一把 sendMu，
 				// 从此本流上服务端的每一次写都被串行化（回查命令并发写安全）
 				if sess == nil {
-					sess = &session{stream: stream, clientType: c.Settings.GetClientType(), topics: map[string]bool{}}
+					sess = &session{stream: stream, clientType: c.Settings.GetClientType(),
+						topics: map[string]bool{}, clientID: clientIDFrom(stream.Context())}
 					s.sessions.add(sess)
 					s.logger.Debug("telemetry 会话注册",
-						"client_type", sess.clientType, "connections", s.sessions.count())
+						"client_type", sess.clientType, "client_id", sess.clientID,
+						"connections", s.sessions.count())
 				}
 				// SDK 周期性重发 Settings（topic 列表会增长），每次都全量刷新；
 				// 刷新经 updateTopics 持 sessions.mu 进行（topics 锁纪律见函数头注释）
