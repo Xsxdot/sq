@@ -44,13 +44,18 @@ type Store struct {
 
 // Open 打开（或创建）dir 下的 Pebble 库。syncWrites 决定 Apply 是否逐次 fsync。
 func Open(dir string, syncWrites bool, logger *slog.Logger) (*Store, error) {
-	db, err := pebble.Open(dir, &pebble.Options{})
+	// mod 一次性绑在 logger 上（与 meta/produce/deliver/rpc 各包的做法一致），
+	// 之后各调用点不再逐条重复这对键值。
+	//
+	// 必须在 pebble.Open 之前求值：Options.Logger 要拿它构造适配器。不设
+	// Options.Logger 时 Pebble 会退回 DefaultLogger 直写 stderr，绕过项目的
+	// 日志通道——那正是 B12 里 FAIL 行被噪声挤掉的成因。
+	l := logger.With("mod", "store")
+
+	db, err := pebble.Open(dir, &pebble.Options{Logger: newPebbleLogger(l)})
 	if err != nil {
 		return nil, fmt.Errorf("打开 Pebble(%s): %w", dir, err)
 	}
-	// mod 一次性绑在 logger 上（与 meta/produce/deliver/rpc 各包的做法一致），
-	// 之后各调用点不再逐条重复这对键值。
-	l := logger.With("mod", "store")
 	l.Info("store 已打开", "dir", dir, "sync", syncWrites)
 	return &Store{db: db, dir: dir, sync: syncWrites, logger: l}, nil
 }
