@@ -34,9 +34,11 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/xushixin/sq/internal/config"
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/deliver"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
@@ -968,4 +970,44 @@ func TestAckMessageMixedQueuesGrouped(t *testing.T) {
 			t.Fatalf("entry %d 顺序或状态错误: %v", i, e)
 		}
 	}
+}
+
+// TestLeaseForAutoRenew 锁定 leaseFor 的三开关判据：客户端请求了 auto_renew、
+// 服务端配置未关闭、能从 metadata 取到 x-mq-client-id——三个全真才启用租约，
+// 任一不满足都退化回零值（deliver 侧视为不启用，固定不可见期）。
+//
+// 边界语义（与 ReceiveMessage 接线共享）：缺 client-id 头是合法的（手写客户端
+// 不带该头），只该享受不到续租，绝不能报错/拒绝请求，所以这里断言「退化而不
+// 报错」而非返回错误。
+func TestLeaseForAutoRenew(t *testing.T) {
+	ss := newSessions()
+	base := &config.Config{AutoRenewEnabled: true, AutoRenewMaxDuration: "30s"}
+	withID := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs(clientIDHeaderKey, "cli-1"))
+
+	t.Run("正常启用", func(t *testing.T) {
+		l := leaseFor(withID, base, ss, true)
+		if !l.Enabled() {
+			t.Fatal("应当启用续租")
+		}
+		if l.Owner != "cli-1" || l.MaxRenew != 30*time.Second {
+			t.Fatalf("租约参数错误: %+v", l)
+		}
+	})
+	t.Run("客户端未请求续租", func(t *testing.T) {
+		if leaseFor(withID, base, ss, false).Enabled() {
+			t.Fatal("客户端未设 auto_renew 时不应启用")
+		}
+	})
+	t.Run("服务端配置关闭", func(t *testing.T) {
+		off := &config.Config{AutoRenewEnabled: false, AutoRenewMaxDuration: "30s"}
+		if leaseFor(withID, off, ss, true).Enabled() {
+			t.Fatal("配置关闭时不应启用")
+		}
+	})
+	t.Run("缺 client-id 头时退化而不报错", func(t *testing.T) {
+		if leaseFor(context.Background(), base, ss, true).Enabled() {
+			t.Fatal("无 client-id 头时不应启用")
+		}
+	})
 }

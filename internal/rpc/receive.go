@@ -28,6 +28,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/xushixin/sq/internal/config"
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
@@ -56,6 +57,23 @@ func filterKindOf(t pb.FilterType) (deliver.FilterKind, bool) {
 	default:
 		return 0, false
 	}
+}
+
+// leaseFor 组装本次取件的续租租约。
+//
+// 三个开关全开才启用：客户端在请求里声明了 auto_renew、服务端配置未关闭、
+// 且能从 metadata 取到客户端标识。任一不满足返回零值 Lease（deliver 侧视为
+// 不启用，退化为固定不可见期）——**不返回错误、不拒绝请求**：手写客户端不带
+// x-mq-client-id 是合法的，它只是享受不到自动续租。
+func leaseFor(ctx context.Context, cfg *config.Config, ss *sessions, wantAutoRenew bool) deliver.Lease {
+	if !wantAutoRenew || !cfg.AutoRenewEnabled {
+		return deliver.Lease{}
+	}
+	cid := clientIDFrom(ctx)
+	if cid == "" {
+		return deliver.Lease{}
+	}
+	return deliver.Lease{Owner: cid, MaxRenew: cfg.AutoRenewMax(), Alive: ss.aliveClient}
 }
 
 // ReceiveMessage POP 取件（服务端流）。流格式：先逐条消息，最后一帧 status。
@@ -145,7 +163,23 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 	}
 	wait := s.longPollWait(stream.Context())
 
-	msgs, err := s.dl.Receive(stream.Context(), group, topic, queueID, batch, invisible, wait, filter)
+	// 续租接线（本任务终点）：客户端声明 auto_renew 且三开关齐备时给本次取件
+	// 挂上租约，deliver 侧在持有者存活期间自动续不可见期；否则不传 opts 退化为
+	// 固定不可见期的既有行为。判定逻辑摘进 leaseFor 单独可单测。
+	var opts []deliver.ReceiveOption
+	if lease := leaseFor(stream.Context(), s.cfg, s.sessions, req.GetAutoRenew()); lease.Enabled() {
+		opts = append(opts, deliver.WithLease(lease))
+		s.logger.Debug("ReceiveMessage 启用自动续租", "group", group, "topic", topic,
+			"queue", queueID, "owner", lease.Owner, "max_renew", lease.MaxRenew)
+	} else if req.GetAutoRenew() {
+		// 客户端要了续租却没启用成——这是「为什么我的慢 handler 还是被重投了」
+		// 的第一个排查点。Debug 而非 Warn：手写客户端不带 client-id 头是合法的，
+		// 而 push 消费每次轮询都会走到这里，Warn 会刷屏。
+		s.logger.Debug("ReceiveMessage 请求了自动续租但未启用（配置关闭或缺 x-mq-client-id 头）",
+			"group", group, "topic", topic, "queue", queueID,
+			"cfg_enabled", s.cfg.AutoRenewEnabled, "has_client_id", clientIDFrom(stream.Context()) != "")
+	}
+	msgs, err := s.dl.Receive(stream.Context(), group, topic, queueID, batch, invisible, wait, filter, opts...)
 	if err != nil {
 		// deliver.Receive 的错误不是铁板一块，必须按性质分类（同 QueryAssignment
 		// 对 EnsureTopic 错误的分类原则）：
