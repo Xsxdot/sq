@@ -106,7 +106,11 @@ func TestRecallRejectsTopicMismatch(t *testing.T) {
 // 撤回本来就是在和调度器赛跑，输了不是 bug，谎报赢了才是。
 //
 // 它专门冲着「Scan 在 moveMu 之外」这条路径设计：due 全钉在 now+50ms，
-// 撤回与到期扫描必然重叠。少了 moveOne 的锁内重读，这条用例会红。
+// 撤回与到期扫描必然重叠。
+//
+// 关于判别力要诚实：单机档下「Scan 拷贝 → Recall 提交删除并返回 → moveOne 照陈旧 raw 入队」的窗口只有 µs 级，
+// 相对 1ms 扫描周期几乎不重叠，删掉重读本用例多半仍绿——它是压力测试而非确定性判别器。
+// 闸门二的结构必要性不靠本用例自证，见 moveOne 开头锁内重读注释的完整交错论证；本用例的价值是撞中即红，多跑可提高撞中概率。
 func TestRecallNeverFalselySucceeds(t *testing.T) {
 	f := newFixture(t)
 	const n = 64
