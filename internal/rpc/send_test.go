@@ -349,6 +349,51 @@ func TestSendDelayEpochTimestampNotDemotedToNormal(t *testing.T) {
 	}
 }
 
+// delayReq 本文件小 helper：一条延时消息的 SendMessageRequest。
+// 构造照既有内联写法（MessageType_DELAY + DeliveryTimestamp）。
+func delayReq(topic string, dueMs int64) *pb.SendMessageRequest {
+	return &pb.SendMessageRequest{Messages: []*pb.Message{{
+		Topic: &pb.Resource{Name: topic},
+		SystemProperties: &pb.SystemProperties{
+			MessageType:       pb.MessageType_DELAY,
+			DeliveryTimestamp: timestamppb.New(time.UnixMilli(dueMs)),
+		},
+		Body: []byte("x"),
+	}}}
+}
+
+// 延时消息的 SendResultEntry 必须带回可用的 recall 句柄；普通消息不带。
+func TestSendMessageIssuesRecallHandleForDelayOnly(t *testing.T) {
+	env := newTestEnv(t, true)
+	due := time.Now().Add(time.Hour).UnixMilli()
+
+	resp, err := env.client.SendMessage(context.Background(), delayReq("t-issue", due))
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	h := resp.GetEntries()[0].GetRecallHandle()
+	if h == "" {
+		t.Fatalf("延时消息未签发 recall 句柄")
+	}
+	// 句柄必须真的能解出这条消息的坐标
+	topic, gotDue, _, err := recallDecode(env.srv.handleSecret, h)
+	if err != nil {
+		t.Fatalf("签发的句柄自己解不开: %v", err)
+	}
+	if topic != "t-issue" || gotDue != due {
+		t.Fatalf("句柄内容不对：topic=%q due=%d（期望 t-issue / %d）", topic, gotDue, due)
+	}
+
+	// 普通消息：不签发
+	resp2, err := env.client.SendMessage(context.Background(), sendReq("t-issue"))
+	if err != nil {
+		t.Fatalf("SendMessage(普通): %v", err)
+	}
+	if got := resp2.GetEntries()[0].GetRecallHandle(); got != "" {
+		t.Fatalf("普通消息签发了 recall 句柄：%q", got)
+	}
+}
+
 func TestSendDelayMissingTimestampRejected(t *testing.T) {
 	c := newTestClient(t)
 	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
