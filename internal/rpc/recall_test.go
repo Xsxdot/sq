@@ -1,8 +1,12 @@
 package rpc
 
 import (
+	"context"
 	"strings"
 	"testing"
+	"time"
+
+	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 // U1 编解码往返。
@@ -71,5 +75,80 @@ func TestRecallDecodeRejectsTampered(t *testing.T) {
 	// 空串
 	if _, _, _, err := recallDecode(secret, ""); err == nil {
 		t.Fatalf("空句柄仍被接受")
+	}
+}
+
+// 端到端（走 gRPC stub）：签发 → 撤回 → 幂等拒绝 → 各类非法输入的状态码。
+func TestRecallMessageEndToEnd(t *testing.T) {
+	env := newTestEnv(t, true)
+	due := time.Now().Add(time.Hour).UnixMilli()
+	resp, err := env.client.SendMessage(context.Background(), delayReq("t-e2e", due))
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	h := resp.GetEntries()[0].GetRecallHandle()
+	msgID := resp.GetEntries()[0].GetMessageId()
+
+	// 成功
+	rr, err := env.client.RecallMessage(context.Background(), &pb.RecallMessageRequest{
+		Topic: &pb.Resource{Name: "t-e2e"}, RecallHandle: h,
+	})
+	if err != nil {
+		t.Fatalf("RecallMessage: %v", err)
+	}
+	if got := rr.GetStatus().GetCode(); got != pb.Code_OK {
+		t.Fatalf("Code=%v，期望 OK（message=%q）", got, rr.GetStatus().GetMessage())
+	}
+	if rr.GetMessageId() != msgID {
+		t.Fatalf("MessageId=%q，期望 %q", rr.GetMessageId(), msgID)
+	}
+
+	// 幂等：再撤一次 → MESSAGE_NOT_FOUND
+	rr2, err := env.client.RecallMessage(context.Background(), &pb.RecallMessageRequest{
+		Topic: &pb.Resource{Name: "t-e2e"}, RecallHandle: h,
+	})
+	if err != nil {
+		t.Fatalf("RecallMessage(重复): %v", err)
+	}
+	if got := rr2.GetStatus().GetCode(); got != pb.Code_MESSAGE_NOT_FOUND {
+		t.Fatalf("重复撤回 Code=%v，期望 MESSAGE_NOT_FOUND", got)
+	}
+
+	// 空句柄 → BAD_REQUEST
+	rr3, err := env.client.RecallMessage(context.Background(), &pb.RecallMessageRequest{
+		Topic: &pb.Resource{Name: "t-e2e"},
+	})
+	if err != nil {
+		t.Fatalf("RecallMessage(空句柄): %v", err)
+	}
+	if got := rr3.GetStatus().GetCode(); got != pb.Code_BAD_REQUEST {
+		t.Fatalf("空句柄 Code=%v，期望 BAD_REQUEST", got)
+	}
+
+	// 拿一个合法 receipt 句柄冒充 → BAD_REQUEST（域分隔在协议面的体现）
+	rr4, err := env.client.RecallMessage(context.Background(), &pb.RecallMessageRequest{
+		Topic:        &pb.Resource{Name: "t-e2e"},
+		RecallHandle: receiptEncode(env.srv.handleSecret, "g", "t-e2e", 0, 0, 1),
+	})
+	if err != nil {
+		t.Fatalf("RecallMessage(receipt 冒充): %v", err)
+	}
+	if got := rr4.GetStatus().GetCode(); got != pb.Code_BAD_REQUEST {
+		t.Fatalf("receipt 句柄冒充 Code=%v，期望 BAD_REQUEST", got)
+	}
+
+	// 请求 topic 与句柄 topic 不一致 → BAD_REQUEST
+	resp2, err := env.client.SendMessage(context.Background(), delayReq("t-e2e-2", due))
+	if err != nil {
+		t.Fatalf("SendMessage(第二个 topic): %v", err)
+	}
+	rr5, err := env.client.RecallMessage(context.Background(), &pb.RecallMessageRequest{
+		Topic: &pb.Resource{Name: "t-e2e"}, RecallHandle: resp2.GetEntries()[0].GetRecallHandle(),
+	})
+	if err != nil {
+		t.Fatalf("RecallMessage(topic 不一致): %v", err)
+	}
+	if got := rr5.GetStatus().GetCode(); got != pb.Code_BAD_REQUEST {
+		t.Fatalf("topic 不一致 Code=%v，期望 BAD_REQUEST", got)
 	}
 }

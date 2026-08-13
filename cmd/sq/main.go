@@ -380,7 +380,11 @@ func run() error {
 	// 无副作用，上移不改变任何行为。
 	// 路由视图：单机形态恒指向本节点（StaticRouteView）；集群形态指向
 	// 各队列所属组的当前 leader（clusterRouteView，见 clusterview.go）
-	srv := rpc.New(cfg, rv, mt, pr, dl, tx, writeBlocked, handleSecret, logger)
+	// delay 调度器需在 rpc.New 之前构造：RecallMessage 要经它撤回延时条目
+	// （撤回必须与调度器共用逐条互斥量）。delay.New 无副作用——真正启动的是
+	// 下面的 go ds.Run(dlyCtx)，上移构造不改变任何运行期行为与停机顺序。
+	ds := delay.New(rep, rt, st, pr, logger)
+	srv := rpc.New(cfg, rv, mt, pr, dl, ds, tx, writeBlocked, handleSecret, logger)
 
 	// metrics registry 必须先于任何后台 goroutine 装配：NewRegistry 会写包级
 	// 钩子 store.OnApplyObserve，其契约是「装配阶段设置一次、之后只读」——
@@ -418,7 +422,6 @@ func run() error {
 	// 不会在 store 关闭后提交搬运批次。
 	dlyCtx, dlyCancel := context.WithCancel(context.Background())
 	var dlyWG sync.WaitGroup
-	ds := delay.New(rep, rt, st, pr, logger)
 	dlyWG.Add(1)
 	go func() { defer dlyWG.Done(); ds.Run(dlyCtx) }()
 	defer func() { dlyCancel(); dlyWG.Wait() }()

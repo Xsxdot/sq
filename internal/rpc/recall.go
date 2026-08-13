@@ -16,12 +16,17 @@
 package rpc
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
+
+	"github.com/xushixin/sq/internal/core/delay"
+	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 // recallDomain 是 recall 句柄 HMAC 的域前缀。
@@ -89,4 +94,71 @@ func recallDecode(secret []byte, s string) (topic string, dueMs int64, seq uint6
 		return "", 0, 0, fmt.Errorf("recall handle 非法 JSON: %w", err)
 	}
 	return p.T, p.D, p.S, nil
+}
+
+// RecallMessage 撤回一条尚未到期的延时消息。
+//
+// 参数：req.Topic 与 req.RecallHandle 都必填。句柄由 SendMessage 在
+// SendResultEntry.RecallHandle 里签发（只有延时消息才有）。
+//
+// 返回：始终返回 nil error，失败信息放在 Status 里——与本包其余 handler
+// 的约定一致（gRPC error 留给传输层故障）。
+//
+// 状态码选择：
+//   - 句柄任一层非法、topic 不一致 → BAD_REQUEST。**不用
+//     INVALID_RECEIPT_HANDLE**：那是消费侧收据句柄的码，用在这里会把排查
+//     引向错误的方向
+//   - 条目不存在、已过投递时间 → 都是 MESSAGE_NOT_FOUND。对客户端而言
+//     「没赶上」与「已经不在了」行为完全相同，区分只会让它多写一条永远走
+//     同一分支的代码；服务端日志里两者措辞不同，排查不受影响
+//   - 非 meta leader → HA_NOT_AVAILABLE（复用 topicErrStatus，语义
+//     「这节点没坏，你该问 leader」）
+func (s *Server) RecallMessage(ctx context.Context, req *pb.RecallMessageRequest) (*pb.RecallMessageResponse, error) {
+	topic := req.GetTopic().GetName()
+	h := req.GetRecallHandle()
+	if h == "" {
+		s.logger.Warn("RecallMessage 缺少 recall handle", "topic", topic)
+		return &pb.RecallMessageResponse{
+			Status: errStatus(pb.Code_BAD_REQUEST, "recall handle 为空"),
+		}, nil
+	}
+	hTopic, dueMs, seq, err := recallDecode(s.handleSecret, h)
+	if err != nil {
+		s.logger.Warn("RecallMessage 句柄非法", "topic", topic, "err", err)
+		return &pb.RecallMessageResponse{
+			Status: errStatus(pb.Code_BAD_REQUEST, err.Error()),
+		}, nil
+	}
+	// 句柄里的 topic 与请求体的 topic 必须一致。二者都由客户端提供，不一致
+	// 说明它拿错了句柄——先在协议层挡一道，delay.Recall 里还会拿**条目里
+	// 真实的** topic 再校一次（纵深防御，见该函数判据 4）。
+	if hTopic != topic {
+		s.logger.Warn("RecallMessage 句柄 topic 与请求 topic 不一致",
+			"req_topic", topic, "handle_topic", hTopic)
+		return &pb.RecallMessageResponse{
+			Status: errStatus(pb.Code_BAD_REQUEST, "recall handle 与请求 topic 不一致"),
+		}, nil
+	}
+
+	msgID, err := s.ds.Recall(ctx, topic, dueMs, seq)
+	switch {
+	case err == nil:
+		s.logger.Info("RecallMessage 撤回成功", "topic", topic, "msg_id", msgID,
+			"due_ms", dueMs, "seq", seq)
+		return &pb.RecallMessageResponse{Status: okStatus(), MessageId: msgID}, nil
+	case errors.Is(err, delay.ErrRecallNotFound), errors.Is(err, delay.ErrRecallTooLate):
+		// 两者同码。delay 侧已按不同措辞各打了一条 Debug，此处不重复记录
+		return &pb.RecallMessageResponse{
+			Status: errStatus(pb.Code_MESSAGE_NOT_FOUND, err.Error()),
+		}, nil
+	case errors.Is(err, delay.ErrRecallTopicMismatch):
+		return &pb.RecallMessageResponse{
+			Status: errStatus(pb.Code_BAD_REQUEST, err.Error()),
+		}, nil
+	default:
+		// 非 leader 与内部故障都交给 topicErrStatus 统一分类与记录
+		return &pb.RecallMessageResponse{
+			Status: s.topicErrStatus("RecallMessage", topic, err, "due_ms", dueMs, "seq", seq),
+		}, nil
+	}
 }

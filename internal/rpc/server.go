@@ -21,6 +21,7 @@ import (
 	"google.golang.org/grpc"
 
 	"github.com/xushixin/sq/internal/config"
+	"github.com/xushixin/sq/internal/core/delay"
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
@@ -39,11 +40,15 @@ var errNoLeader = errors.New("队列所属组尚无 leader（选举窗口）")
 // 同时满足 gRPC "must embed Unimplemented...Server" 的前向兼容惯例。
 type Server struct {
 	pb.UnimplementedMessagingServiceServer
-	cfg          *config.Config
-	rv           RouteView
-	mt           *meta.Meta
-	pr           *produce.Producer
-	dl           *deliver.Deliverer
+	cfg *config.Config
+	rv  RouteView
+	mt  *meta.Meta
+	pr  *produce.Producer
+	dl  *deliver.Deliverer
+	// ds 延时调度器。RecallMessage 需要它——撤回必须与调度器共用那把逐条
+	// 互斥量（见 delay.Scheduler.moveMu），所以撤回逻辑属于 delay 包，
+	// rpc 这边只做协议翻译。
+	ds           *delay.Scheduler
 	tx           *txn.Manager
 	writeBlocked *atomic.Bool
 	// handleSecret 是 receipt handle 的 HMAC-SHA256 签名密钥（见 handle_secret.go），
@@ -62,13 +67,14 @@ type Server struct {
 	doneOnce sync.Once
 }
 
-// New 构造协议适配层。六个依赖各自服务于一组 RPC：cfg 提供对外通告地址与
+// New 构造协议适配层。七个依赖各自服务于一组 RPC：cfg 提供对外通告地址与
 // 协商参数，rv 是队列归属视图——QueryRoute/QueryAssignment 把每条队列指向
 // 其所属组 leader、SendMessage/ReceiveMessage 在 follower 上快速失败
 // （单机装配传 StaticRouteView(cfg)，集群装配见 cmd/sq），mt 管
 // topic/group 注册表（QueryRoute/Heartbeat/QueryAssignment），pr 是写路径
 // （SendMessage），dl 是 POP 消费路径
-// （ReceiveMessage/AckMessage/ChangeInvisibleDuration），tx 是事务管理器
+// （ReceiveMessage/AckMessage/ChangeInvisibleDuration），ds 是延时调度器
+// （RecallMessage：撤回必须与调度器共用 delay.Scheduler.moveMu），tx 是事务管理器
 // （M6）：SendMessage 把 TRANSACTION 半消息交给它暂存，EndTransaction 由它
 // 决断；writeBlocked 是磁盘水位拒写开关（spec §7，由 retention 循环每趟更新），
 // 为 nil 时不拒写；handleSecret 是 receipt handle 的 HMAC-SHA256 签名密钥
@@ -76,9 +82,9 @@ type Server struct {
 // 可被轻易伪造，即失去防伪造保护（而非验签必失败），正常装配不允许传入 nil。
 // sessions 是 Telemetry 会话注册表
 // （M6 事务回查通道与连接数口径，本 task 自建，不依赖外部注入）。
-func New(cfg *config.Config, rv RouteView, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, tx *txn.Manager, writeBlocked *atomic.Bool, handleSecret []byte, logger *slog.Logger) *Server {
+func New(cfg *config.Config, rv RouteView, mt *meta.Meta, pr *produce.Producer, dl *deliver.Deliverer, ds *delay.Scheduler, tx *txn.Manager, writeBlocked *atomic.Bool, handleSecret []byte, logger *slog.Logger) *Server {
 	return &Server{
-		cfg: cfg, rv: rv, mt: mt, pr: pr, dl: dl, tx: tx, writeBlocked: writeBlocked, handleSecret: handleSecret, logger: logger.With("mod", "rpc"),
+		cfg: cfg, rv: rv, mt: mt, pr: pr, dl: dl, ds: ds, tx: tx, writeBlocked: writeBlocked, handleSecret: handleSecret, logger: logger.With("mod", "rpc"),
 		done:     make(chan struct{}),
 		sessions: newSessions(),
 	}
