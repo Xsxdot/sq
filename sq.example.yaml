@@ -13,6 +13,12 @@ advertise_port: 8081
 data_dir: "./data"
 # 写盘策略：sync | async
 fsync: sync
+# 消息编码：json | binary
+#   json   = 历史格式（整条 JSON，Body 走 base64，体积 +33%）
+#   binary = v1 混合格式（Body 原始字节直落，省掉 base64 膨胀与编解码 CPU）
+# ⚠️ 开启 binary 必须在全集群升级完成之后（两步纪律见 README「升级注意」）：
+#    解码永远双格式，但旧版本进程不认识 binary 产物。
+message_encoding: json
 
 # 未知 topic 时自动创建
 auto_create_topic: true

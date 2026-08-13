@@ -493,6 +493,50 @@ func loadYAML(t *testing.T, body string) (*Config, error) {
 	return Load(p)
 }
 
+// TestMessageEncodingDefault 缺省必须是 json：binary 只能显式开启。
+//
+// 为什么默认值本身值得钉一条用例：这个默认值是「升级不改配置就零风险」
+// 的全部依据。若某次重构把默认翻成 binary，升级后混版集群里旧节点立刻
+// 解不开新节点转发的消息，而单元测试全绿——只有直接断言默认值拦得住。
+func TestMessageEncodingDefault(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MessageEncoding != "json" {
+		t.Fatalf("message_encoding 默认值 = %q, 应为 json", cfg.MessageEncoding)
+	}
+}
+
+// TestMessageEncodingOverrideAndValidation 覆盖生效 + 非法值启动即拒。
+//
+// 非法值必须挡在启动期：静默回落默认档会让运维以为 binary 已生效，
+// 而盘上格式与预期不符是事后极难察觉的偏差（数据没坏，只是没省下）。
+func TestMessageEncodingOverrideAndValidation(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "sq.yaml")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		return p
+	}
+
+	cfg, err := Load(write(t, "message_encoding: binary\n"))
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.MessageEncoding != "binary" {
+		t.Fatalf("覆盖未生效: %q", cfg.MessageEncoding)
+	}
+
+	if _, err := Load(write(t, "message_encoding: protobuf\n")); err == nil {
+		t.Fatal("非法 message_encoding 应拒绝启动")
+	} else if !strings.Contains(err.Error(), "message_encoding") {
+		t.Fatalf("错误信息未指明配置项: %v", err)
+	}
+}
+
 // TestClusterTruncationConfigDefaults 截断循环与快照分块三项配置的默认
 // 值与上界校验：缺省即 10000/30s/4MiB；分块必须 < 16MiB 传输层帧上限，
 // 否则整份快照永远发不出去。

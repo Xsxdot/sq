@@ -2,12 +2,12 @@
 //
 // 职责：
 //   - Message：协议无关的消息内部表示（adapter 负责与 proto 互转）
-//   - 存储编解码（当前 JSON，Body 走 base64）
+//   - InflightState 等辅助结构及其编解码
 //
 // 边界：
 //   - 不 import 任何 proto/pb 包（spec 的协议适配层约束）
-//   - JSON 编码是 M1 的性能取舍：可读易调试，量级足够；
-//     若未来需要可替换为二进制编码，Encode/Decode 是唯一出入口
+//   - 不含消息的存储编解码——已独立到 encoding.go（两套格式 + 档位开关），
+//     本文件只留 Message 模型本身与 InflightState 的编解码
 package core
 
 import (
@@ -91,24 +91,6 @@ type Message struct {
 	// 前缀表达，提交移入 msg/ 后它就是普通消息。
 	Transactional   bool  `json:"-"`
 	DeliveryAttempt int32 `json:"-"`
-}
-
-// EncodeMessage 序列化消息用于落盘。
-func EncodeMessage(m *Message) ([]byte, error) {
-	b, err := json.Marshal(m)
-	if err != nil {
-		return nil, fmt.Errorf("编码消息 %s: %w", m.ID, err)
-	}
-	return b, nil
-}
-
-// DecodeMessage 反序列化落盘消息。
-func DecodeMessage(b []byte) (*Message, error) {
-	m := &Message{}
-	if err := json.Unmarshal(b, m); err != nil {
-		return nil, fmt.Errorf("解码消息: %w", err)
-	}
-	return m, nil
 }
 
 // NewMessageID 生成 32 位大写十六进制消息 ID（16 随机字节）。

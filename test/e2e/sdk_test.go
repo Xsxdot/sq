@@ -224,11 +224,15 @@ func writeBrokerConfig(t *testing.T, mutate ...func(*config.Config)) (cfgPath, e
 	// QueryRoute 返回的 endpoints 就是 SDK 后续做 telemetry/send/receive 的目标，
 	// 对不上时表现为握手超时而不是「路由错」，很难定位。
 	cfg := &config.Config{
-		GRPCListen:         fmt.Sprintf("127.0.0.1:%d", port),
-		AdvertiseHost:      "127.0.0.1",
-		AdvertisePort:      port,
-		DataDir:            filepath.Join(dir, "data"),
-		Fsync:              "sync",
+		GRPCListen:    fmt.Sprintf("127.0.0.1:%d", port),
+		AdvertiseHost: "127.0.0.1",
+		AdvertisePort: port,
+		DataDir:       filepath.Join(dir, "data"),
+		Fsync:         "sync",
+		// 与 DefaultMaxAttempts/RetentionCheckInterval 同款陷阱：本结构体
+		// 不走 config.Load 的默认值，零值会序列化成 message_encoding: ""
+		// 并被 Load 的白名单拒绝，broker 直接起不来。取值同 Load 的缺省。
+		MessageEncoding:    "json",
 		AutoCreateTopic:    true,
 		DefaultQueueNums:   4,
 		DefaultMaxAttempts: 16,
@@ -262,6 +266,34 @@ func writeBrokerConfig(t *testing.T, mutate ...func(*config.Config)) (cfgPath, e
 		t.Fatalf("写 broker 配置失败: %v", err)
 	}
 	return cfgPath, fmt.Sprintf("%s:%d", cfg.AdvertiseHost, cfg.AdvertisePort)
+}
+
+// rewriteBrokerConfig 就地改写已有的 broker 配置文件（保留 data_dir、端口等
+// 全部既有取值），供「同一份数据目录、跨代换配置重启」的用例使用。
+//
+// 为什么不能再调一次 writeBrokerConfig：它内部 t.TempDir() + pickPort()
+// 会给出全新的数据目录与端口，第二代进程就读不到第一代写下的数据了——
+// 而跨档位互读要验证的恰恰是"同一份盘上数据被另一档位的进程读出来"。
+func rewriteBrokerConfig(t *testing.T, cfgPath string, mutate ...func(*config.Config)) {
+	t.Helper()
+	raw, err := os.ReadFile(cfgPath)
+	if err != nil {
+		t.Fatalf("读 broker 配置失败: %v", err)
+	}
+	cfg := &config.Config{}
+	if err := yaml.Unmarshal(raw, cfg); err != nil {
+		t.Fatalf("解析 broker 配置失败: %v", err)
+	}
+	for _, f := range mutate {
+		f(cfg)
+	}
+	out, err := yaml.Marshal(cfg)
+	if err != nil {
+		t.Fatalf("序列化 broker 配置失败: %v", err)
+	}
+	if err := os.WriteFile(cfgPath, out, 0o600); err != nil {
+		t.Fatalf("写 broker 配置失败: %v", err)
+	}
 }
 
 // launchBroker 按给定配置启动一个 broker 进程并等待其开始接受连接。

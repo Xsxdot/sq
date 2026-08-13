@@ -101,6 +101,16 @@ func run() error {
 	config.SetupSlog(cfg.LogLevel)
 	logger := slog.Default()
 
+	// 编码档位必须在任何编解码发生之前装配：它是进程级一次性开关。
+	// 非法值 fail-stop——config.Load 已挡过一道，这里是 core 侧边界的
+	// 二次确认，两处都便宜且都在启动期。
+	if err := core.SetEncoding(cfg.MessageEncoding); err != nil {
+		return err
+	}
+	// 档位是"盘上为什么出现二进制数据"的唯一线索，无条件打一条：
+	// 「已启动」日志在 recover 子命令与启动期失败时不会出现。
+	logger.Info("消息编码档位已装配", "message_encoding", cfg.MessageEncoding)
+
 	st, err := store.Open(cfg.DataDir, cfg.Fsync == "sync", logger)
 	if err != nil {
 		return err
@@ -493,11 +503,13 @@ func run() error {
 	if cfg.ClusterEnabled() {
 		logger.Info("sq 已启动（集群模式）", "grpc_listen", cfg.GRPCListen,
 			"advertise", cfg.AdvertiseHost, "data_dir", cfg.DataDir, "fsync", cfg.Fsync,
+			"message_encoding", cfg.MessageEncoding,
 			"node_id", cfg.Cluster.NodeID, "data_groups", cfg.Cluster.DataGroups,
 			"ack", cfg.Cluster.Ack, "peers", len(cfg.Cluster.Peers))
 	} else {
 		logger.Info("sq 已启动（单机模式）", "grpc_listen", cfg.GRPCListen,
 			"advertise", cfg.AdvertiseHost, "data_dir", cfg.DataDir, "fsync", cfg.Fsync,
+			"message_encoding", cfg.MessageEncoding,
 			"txn_check_interval", cfg.TxnCheckInterval, "txn_max_checks", cfg.TxnMaxChecks)
 	}
 

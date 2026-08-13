@@ -76,6 +76,9 @@ advertise_host: "127.0.0.1"   # 路由响应中的对外地址，容器/远程�
 advertise_port: 8081
 data_dir: "./data"
 fsync: sync                   # sync|async
+message_encoding: json         # json|binary。binary 让 Body 以原始字节落盘，
+                               # 省掉 base64 的 +33% 体积与编解码 CPU；
+                               # 开启前请先读「升级注意」的两步纪律
 auto_create_topic: true
 default_queue_nums: 16
 default_max_attempts: 16       # 新订阅组默认最大投递次数，超过转入 %DLQ%{group}
@@ -148,6 +151,23 @@ fsync=sync 时，并发写入由 Pebble commit pipeline 合并 fsync（group com
   快照路径才能带上单机档的 FSM 存量数据；种子日志未压缩（写入量不足约
   2×`log_retain_entries`，默认 10000）时新节点走日志重放，存量数据静默缺失。
   扩容前请先让种子节点写入越过该量，运维指引见 B8.3。
+- **开启 `message_encoding: binary` 必须分两步（顺序不可颠倒）**：本版本起
+  broker **读**方向同时认识两种消息格式（历史 JSON 与 v1 二进制），**写**方向
+  由 `message_encoding` 决定，缺省仍是 `json`。
+
+  1. **先把全集群升到本版本，`message_encoding` 保持缺省 `json`。** 此阶段
+     所有节点写的都是历史格式，任何新旧混版组合都安全。
+  2. **确认全部节点都已升级后**，再逐节点把 `message_encoding` 改为 `binary`
+     并重启。翻档期间部分节点写二进制、部分写 JSON——所有节点都能解双格式，
+     安全。
+
+  **为什么顺序不能颠倒**：跨组写入经 `OpForwardAppend` 把编码字节直接转发给
+  目标组 leader。混版集群里提前开启 binary，二进制字节会转发给尚未升级的
+  旧版 leader，它解不开，写入直接失败。
+
+  **回滚边界**：第 1 步可自由回滚。第 2 步之后盘上已有二进制数据，
+  **降级到不认识该格式的旧版本不受支持**；把 `message_encoding` 改回 `json`
+  只停止新增二进制数据，不消除存量。
 
 ## Admin API
 
