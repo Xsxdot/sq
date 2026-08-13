@@ -142,7 +142,7 @@ type recv struct {
 
 | 签名 | 职责 |
 |---|---|
-| `startPushConsumer(t, endpoint, group, topic string, c *pushCollector, opts ...rmq.PushConsumerOption) rmq.PushConsumer` | 建 + `Start()` + `t.Cleanup(GracefulStop)` |
+| `startPushConsumer(t, endpoint, group, topic string, c *pushCollector, opts ...rmq.PushConsumerOption) func()` | 建 + `Start()` + `t.Cleanup(stop)`。返回 `stop` 而非消费者本身：用例 1 的 1b 必须在测试中途显式停 A，而消费者句柄本身没有用例需要；`stop` 用 `sync.Once` 包住，与 cleanup 的重复调用无害 |
 | `waitCount(t, c *pushCollector, n int, within time.Duration)` | 轮询等到累计条数达 n，超时 `t.Fatalf` |
 | `snapshot(c *pushCollector) []recv` | 加锁拷贝 |
 
@@ -241,7 +241,9 @@ B 才是真正的证明。**不要只写 A**：顺序锁正确时客户端手上
 | 6c | `got[1].attempt >= 2` |
 | 6d | `got[1].receipt != got[0].receipt` |
 
-**6d 是承重的**。它与用例 3 构成对照：用例 3 的 `FAILURE` 走客户端本地重试，**复用**同一个 `MessageView` 与同一个回执句柄；本用例的不可见期到期走 broker 重投，**铸出新句柄**。只有真的经过 broker 重投才会换句柄，所以它才是「broker 重投」与「客户端本地重投」的判别器——只断言 attempt 递增不够，两条路都会让 attempt 涨。
+**6d 是承重的**，理由与用例 3 的 3c 同源：客户端本地重试会复用同一个 `MessageView` 反复喂 listener，句柄不变，而 `deliveryAttempt` 照样自增（`eraseFifoMessage` 里就是 `mv.deliveryAttempt += 1`）——所以**只断言 attempt 递增判别不出重投来自哪一侧**，只有换了句柄才证明真的回了 broker、由 broker 重新发件。
+
+与用例 3 的区别不在归属（两者都归 broker、都换句柄），而在**触发方式**：用例 3 是消费返回 `FAILURE` 触发显式 nack（`process_queue.go` 的 `nackMessage`）后重投；本用例是**完全不 ack**，靠不可见期自然到期重投。两条路都要有覆盖——前者验的是失败路径的归属，后者验的是超时兜底本身还活着。
 
 一律用 `>=` 而非 `==`：消费线程被占住期间 sq 有可能多重投一代（取决于它把消息重新置为可见的扫描粒度），多出来的采集条目是良性的，不该让用例变红。
 
@@ -249,7 +251,7 @@ B 才是真正的证明。**不要只写 A**：顺序锁正确时客户端手上
 
 ### 6.5 用例 1：基础闭环
 
-**构造**：发 5 条普通消息，`handle` 恒返 `rmq.SUCCESS`。
+**构造**：broker 以 `default_invisible_duration = 10s` 启动（理由见下），发 5 条普通消息，`handle` 恒返 `rmq.SUCCESS`。
 
 **断言**：
 
@@ -259,6 +261,8 @@ B 才是真正的证明。**不要只写 A**：顺序锁正确时客户端手上
 | 1b | 消费者 `GracefulStop()` 后，同组新起一个消费者 B，在 **15s 窗口内 B 的 listener 零调用** |
 
 1b 证明 Ack 真落地——位点推进了，而不是「收到了但位点没推」。
+
+**静默窗口必须长于不可见期，否则 1b 是假绿**：sq 只有过期重投一条重新投递路径，`internal/core/deliver` 里没有「客户端断连即释放 inflight」的逻辑。所以若 ack 真的丢了，那 5 条仍是 inflight、要等不可见期到期才会重投——窗口短于不可见期时，「已 ack」与「ack 全丢」两个世界给出的观测完全一样（都是零调用），断言恒真。默认不可见期是 1 分钟，远长于 15s 窗口，因此本用例**必须**显式把它压到 10s。改动这个 mutate 前先想清楚这一条。
 
 **这里不需要 SQL92 那种「N 轮连续空轮询」的手法**：那条纪律的成因是 SimpleConsumer 每次 `Receive` 只轮询一个队列，单次为空不代表所有队列都空。PushConsumer 对每个已分配队列各维持一条长轮询，一个持续窗口内的零调用即覆盖全部队列。窗口取 15s（> `defaultLongPolling` 20s 的一半，且远大于 assignment 建立所需时间）。
 
