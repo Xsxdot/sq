@@ -205,3 +205,21 @@ func TestNegotiateSettingsNoPubSubLeavesBackoffEmpty(t *testing.T) {
 		t.Fatalf("BackoffPolicy 应为空，实际 %+v", out.GetBackoffPolicy())
 	}
 }
+
+// T7【承重】组已注册后配置默认值发生漂移时，必须下发组落盘的值。
+//
+// 这条是本条目唯一能区分『查了组』与『只回退配置默认』的用例：T3/T5 的夹具
+// 里两者恒等（EnsureGroup 写的就是 meta.New 收到的 defaultMaxAttempts，而
+// 夹具让它与 cfg.DefaultMaxAttempts 同源），所以把实现退化成不查组也能全绿。
+// 这里让组先在 9 下注册，再把配置默认改成 5，制造出二者的差异。
+func TestNegotiateSettingsSubscribePrefersGroupOverConfigDrift(t *testing.T) {
+	s := newSettingsServer(t, 9, false)
+	if _, err := s.mt.EnsureGroup(context.Background(), "g-drift"); err != nil {
+		t.Fatalf("EnsureGroup: %v", err)
+	}
+	// 组已按 9 落盘；此后运维把配置默认值改成 5（重启后 cfg 变、组不变）。
+	s.cfg.DefaultMaxAttempts = 5
+	if got := s.negotiateSettings(subscribeSettings("g-drift")).GetBackoffPolicy().GetMaxAttempts(); got != 9 {
+		t.Fatalf("MaxAttempts=%d，期望组落盘值 9；拿到 5 说明实现没查组、直接回退了 cfg.DefaultMaxAttempts", got)
+	}
+}
