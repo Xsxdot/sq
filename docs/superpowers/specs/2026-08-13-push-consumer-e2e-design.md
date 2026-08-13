@@ -217,17 +217,28 @@ B 才是真正的证明。**不要只写 A**：顺序锁正确时客户端手上
 
 ### 6.4 用例 6：`GracefulStop` 后 inflight 不丢
 
-**构造**（三步，顺序固定）：
+**先说一条硬约束**：`GracefulStop()` **会无上限等待在途 listener 完成**。调用链是 `GracefulStop` → `consumerService.Shutdown()` → `simpleThreadPool.Shutdown()` → `tp.waitGroup.Wait()`（`simple_thread_pool.go:86`）。`waitingReceiveRequestFinished` 那层确实有超时（`RequestTimeout + longPollingTimeout`），但线程池这层没有。
 
-1. broker 以 `default_invisible_duration = 5s` 启动（§7.2）。发 1 条消息，消费者 A 的 `handle` 收到后**永久阻塞**（`select {}` 不返回），因此这条永远不会被 ack。
-2. `waitCount(t, cA, 1, 30*time.Second)` 确认 A 确实收到了这一条，再对 A 调 `GracefulStop()`。
-3. 起消费者 B（同组、同 topic，`handle` 返 `rmq.SUCCESS`），`waitCount(t, cB, 1, 20*time.Second)`。
+**因此「让 listener 永久阻塞以保证不 ack」这个构造不可用——它会让测试永久死锁。**
 
-**断言**：B 收到该条，body 对上，且 `GetDeliveryAttempt() >= 2`（证明它是重投件，不是新消息）。
+**改用「缓存未消费」构造**，它测的也是更真实的停机丢失风险点：消息已被 broker 投给客户端、缓存在 process queue 里，但还没轮到进 listener 就停机了。
 
-**为什么必须永久阻塞而不是「返回前消费者已停」**：后者的时序不可控——`GracefulStop` 与 listener 返回谁先谁后取决于调度，若 listener 抢先返回并 ack 成功，B 就永远等不到，用例间歇性红。永久阻塞把「这条一定没 ack」变成确定事实。`GracefulStop` 不会等这个阻塞的 listener（SDK 侧有超时），进程退出时 goroutine 随之消失，不泄漏。
+1. broker 以 `default_invisible_duration = 5s` 启动（§7.2）。发 **10 条**普通消息。
+2. 消费者 A 配 `WithPushConsumptionThreadCount(1)`，采集器 `hold = 2s`，`handle` 返 `rmq.SUCCESS`。单线程 + 每条停留 2s，使 A 在短时间内只能消费掉少数几条，其余留在客户端缓存里。
+3. `waitCount(t, cA, 1, 30*time.Second)` 确认 A 已开工，随即 `stopA()`。`GracefulStop` 会等当前那条 listener 跑完（≤2s，有界）并 ack 它，然后关闭线程池——**缓存里剩下的那些从未进入 listener，也从未被 ack**。
+4. 起消费者 B（同组、同 topic，`handle` 返 `rmq.SUCCESS`，`hold = 0`）。
 
-**成本与依赖**：本用例是 §7.2 配置化改动的唯一动因。若不做该改动，初次投递的不可见时长走 §3.5 的硬编码 1 分钟，本用例要干等 60s+。
+**断言**：
+
+| 编号 | 内容 |
+|---|---|
+| 6a | A 的采集条数 `< 10`（它确实没消费完就停了；否则本用例什么都没测到，必须显式挡住） |
+| 6b | B 在 30s 内收到 A 未见过的全部剩余 body |
+| 6c | B 收到的每条 `GetDeliveryAttempt() >= 2`（是重投件，不是新消息） |
+
+**6c 同时覆盖两条重投路径**：SDK 在关闭时可能主动 nack 缓存中未消费的消息，也可能什么都不做、由 broker 在不可见期（5s）后重投。两条路都会让 attempt 递增，断言对二者都成立——本用例不区分它们，也不应区分。
+
+**成本与依赖**：本用例是 §7.2 配置化改动的唯一动因。若不做该改动，不可见时长走 §3.5 的硬编码 1 分钟，本用例要干等 60s+。
 
 ### 6.5 用例 1：基础闭环
 
