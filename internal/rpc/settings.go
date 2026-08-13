@@ -115,9 +115,20 @@ func (s *Server) negotiateSettings(client *pb.Settings) *pb.Settings {
 		out.PubSub = &pb.Settings_Subscription{Subscription: &pb.Subscription{
 			Group:         ps.Subscription.GetGroup(),
 			Subscriptions: ps.Subscription.GetSubscriptions(),
-			// M4 起顺序由 broker 端强制（队列级顺序锁），消费端无需协商关闭；
-			// fifo 协商标志待 push 消费流程验证后（M5+）再翻转，
-			// 当前保持显式下发 false（不能留空让客户端去猜）。
+			// 显式下发 false，且这是终态，不是待翻转的临时值（B13.2 已验）。
+			//
+			// 两条理由，缺一不可：
+			//  1. 顺序安全不依赖此标志：M4 起队列级顺序锁保证每队列至多一条
+			//     未终结的顺序 inflight（deliver.go 顺序锁）。e2e
+			//     TestOfficialGoSDKPushFIFOOrderLock 用 4 线程 push 消费 20 条
+			//     同组消息，实测 listener 并发峰值恒为 1。
+			//  2. 翻成 true 会夺走归属权：客户端会改建 FiFoConsumeService，消费
+			//     失败转为【客户端本地循环重投 listener】，不回 broker——重试
+			//     计数与死信判定都会从 broker 挪到客户端，与 sq 的设计相反。
+			//     e2e TestOfficialGoSDKPushRetryOwnedByBroker /
+			//     TestOfficialGoSDKPushDLQOwnedByBroker 证的就是当前归属在 broker。
+			//
+			// 仍必须显式下发而不是留空：留空让客户端去猜，协商结果不确定。
 			Fifo:             &fifo,
 			ReceiveBatchSize: &batch,
 			// 下发服务端真实的长轮询上限，而不是回显客户端自报的值：
