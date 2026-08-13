@@ -1,18 +1,21 @@
-// sql92_parse.go：SQL92 过滤表达式的语法解析（token 流 → AST）。
+// sql92_parse.go：SQL92 过滤表达式的语法解析（token 流 → AST）与构建期语义校验。
 //
 // 职责：
 //   - 按 spec §3.1 文法递归下降：OR < AND < NOT < primary
 //   - 产出带语义信息的最小 AST（比较、BETWEEN、IN、IS NULL、NOT、AND、OR）
+//   - buildSQLFilter 在 AST 上做构建期语义校验（类型混用、NULL 比较、深度/长度/元素数上限）
 //
 // 边界：
-//   - 只管语法结构：类型混用等语义校验在 Task 4 的 buildSQLFilter
+//   - 语法错误带 1-based 列号，原样进入 ILLEGAL_FILTER_EXPRESSION 回给客户端；
+//     构建期语义错误是表达式层面的，无列号，仅带子串可辨的原因
 //   - 常量在左的比较在此归一化为 ident 在左并翻转运算符，求值层只处理一种朝向
-//   - 语法错误一律带 1-based 列号，原样进入 ILLEGAL_FILTER_EXPRESSION 回给客户端
 package deliver
 
 import (
 	"fmt"
 	"strconv"
+
+	"github.com/xushixin/sq/internal/core"
 )
 
 // node 语法树节点的公共接口，所有具体节点类型实现空的 isNode()。
@@ -112,8 +115,9 @@ type constant struct {
 
 // parser 递归下降解析器：持有 token 流与当前位置。
 type parser struct {
-	toks []token
-	pos  int
+	toks  []token
+	pos   int
+	depth int // 括号嵌套深度，防止病态深括号打爆递归
 }
 
 // parseSQL92 把过滤表达式解析为 AST 根节点。
@@ -131,6 +135,101 @@ func parseSQL92(expr string) (node, error) {
 		return nil, p.errorf(p.peek(), "期望表达式结束，实际读到 %s", tokDesc(p.peek()))
 	}
 	return n, nil
+}
+
+const (
+	// maxExprBytes 表达式长度上限。远高于任何正常表达式，卡的是病态输入。
+	// 不做配置项：spec §2.3 决定用上限替代配置开关，阈值一旦可配就等于
+	// 把开关又加了回来。
+	maxExprBytes = 1024
+	// maxASTDepth AST 嵌套深度上限，防深层递归求值。
+	maxASTDepth = 16
+	// maxInElems 单个 IN 列表的元素数上限。
+	maxInElems = 64
+)
+
+// SQLFilter SQL92 过滤表达式：已通过构建期校验的 AST + 求值入口。
+//
+// 实现 Filter 接口（见 filter.go）；构造必须走 buildSQLFilter，直接拼
+// SQLFilter{} 会绕过语义校验。
+type SQLFilter struct {
+	root node
+}
+
+// Match 求值入口。Task 5 实现真正的三值求值；此刻返回 ResultUnknown 是
+// 保守的占位——UNKNOWN 不投递，接错线也不会把不该投的消息投出去。
+func (f *SQLFilter) Match(m *core.Message) Result { return ResultUnknown }
+
+// buildSQLFilter 构建一个 SQL92 过滤器：先做长度上限检查，再语法解析，
+// 最后在 AST 上做构建期语义校验。任一步失败都返回带原因的 error。
+func buildSQLFilter(expr string) (*SQLFilter, error) {
+	if len(expr) > maxExprBytes {
+		return nil, fmt.Errorf("过滤表达式长度 %d 超过上限 %d 字节", len(expr), maxExprBytes)
+	}
+	root, err := parseSQL92(expr)
+	if err != nil {
+		return nil, err
+	}
+	if err := validate(root, 1); err != nil {
+		return nil, err
+	}
+	return &SQLFilter{root: root}, nil
+}
+
+// validate 构建期语义校验，按节点类型检查：
+//   - 任意节点：嵌套深度超过 maxASTDepth
+//   - cmpNode：字符串常量不得用于 > >= < <=；NULL 只允许出现在 IS NULL
+//   - inNode：元素数不超过 maxInElems，且元素类型一致
+//   - betweenNode：上下界类型一致
+//
+// 错误不带列号：语法层面已带列号，语义层面是整棵子树的属性，定位到列
+// 反而误导。
+func validate(n node, depth int) error {
+	if depth > maxASTDepth {
+		return fmt.Errorf("表达式嵌套深度超过上限 %d 层", maxASTDepth)
+	}
+	switch v := n.(type) {
+	case *orNode:
+		if err := validate(v.left, depth+1); err != nil {
+			return err
+		}
+		return validate(v.right, depth+1)
+	case *andNode:
+		if err := validate(v.left, depth+1); err != nil {
+			return err
+		}
+		return validate(v.right, depth+1)
+	case *notNode:
+		return validate(v.inner, depth+1)
+	case *cmpNode:
+		if v.val.kind == constString {
+			switch v.op {
+			case ">", ">=", "<", "<=":
+				// 字符串只支持相等性判断（= <> IN），大小比较无字典序
+				// 依据，spec §4.2 明确排除。
+				return fmt.Errorf("字符串常量不支持大小比较（仅 = <> IN）")
+			}
+		}
+		if v.val.kind == constNull {
+			// = NULL 恒 UNKNOWN（NULL 不参与相等比较），SQL 标准里合法但
+			// 对过滤毫无意义，直接拒绝并给出可照做的替代写法。
+			return fmt.Errorf("%s = NULL 恒不成立，请改用 %s IS NULL", v.ident, v.ident)
+		}
+	case *inNode:
+		if len(v.vals) > maxInElems {
+			return fmt.Errorf("IN 列表元素数 %d 超过上限 %d", len(v.vals), maxInElems)
+		}
+		for i := 1; i < len(v.vals); i++ {
+			if v.vals[i].kind != v.vals[0].kind {
+				return fmt.Errorf("IN 列表的常量类型必须一致")
+			}
+		}
+	case *betweenNode:
+		if v.lo.kind != v.hi.kind {
+			return fmt.Errorf("BETWEEN 上下界的常量类型必须一致")
+		}
+	}
+	return nil
 }
 
 // parseOr 文法：andExpr { OR andExpr }。优先级最低。
@@ -187,8 +286,17 @@ func (p *parser) parsePrimary() (node, error) {
 	t := p.peek()
 	switch t.kind {
 	case tokLParen:
+		// 为什么在解析层卡括号深度：括号在 AST 里是透明的（parsePrimary
+		// 直接返回 inner），validate 只看得见节点嵌套，看不见括号层数；
+		// 若不在此拦截，`((((...a = 1...))))` 会绕过 validate 的深度检查，
+		// 递归解析器本身也会随括号数线性下探。
+		if p.depth >= maxASTDepth {
+			return nil, p.errorf(t, "表达式嵌套深度超过上限 %d 层", maxASTDepth)
+		}
+		p.depth++
 		p.next()
 		inner, err := p.parseOr()
+		p.depth--
 		if err != nil {
 			return nil, err
 		}

@@ -8,6 +8,7 @@
 package deliver
 
 import (
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -166,6 +167,78 @@ func TestParseSQL92SyntaxErrors(t *testing.T) {
 		}
 		if !strings.Contains(err.Error(), "第") {
 			t.Fatalf("parseSQL92(%q) 错误 %q 缺列号", c.expr, err.Error())
+		}
+	}
+}
+
+func TestBuildSQLFilterSemanticRejects(t *testing.T) {
+	cases := []struct{ expr, wantIn string }{
+		{"k > 'abc'", "字符串"},           // 字符串不支持大小比较
+		{"k >= 'abc'", "字符串"},
+		{"k = NULL", "IS NULL"},           // 必须提示改用 IS NULL
+		{"1 = 1", "属性名"},                // 常量对常量
+		{"a = b", "属性名"},                // 属性对属性
+		{"k IN (1, 'a')", "类型"},          // IN 列表类型混用
+		{"k BETWEEN 1 AND 'z'", "类型"},    // BETWEEN 上下界类型混用
+	}
+	for _, c := range cases {
+		_, err := buildSQLFilter(c.expr)
+		if err == nil {
+			t.Fatalf("buildSQLFilter(%q) 期望报错，实际 nil", c.expr)
+		}
+		if !strings.Contains(err.Error(), c.wantIn) {
+			t.Fatalf("buildSQLFilter(%q) 错误 %q 未包含 %q", c.expr, err.Error(), c.wantIn)
+		}
+	}
+}
+
+func TestBuildSQLFilterEqNullMessageIsActionable(t *testing.T) {
+	// = NULL 的错误信息必须直接给出可照做的替代写法，不能只说"不支持"。
+	// 这是相对 SQL 标准的有意偏离（标准里它合法且恒 UNKNOWN），
+	// 偏离的价值全在这句提示上。
+	_, err := buildSQLFilter("k = NULL")
+	if err == nil {
+		t.Fatal("期望报错")
+	}
+	if !strings.Contains(err.Error(), "k IS NULL") {
+		t.Fatalf("错误 %q 未给出 `k IS NULL` 的替代写法", err.Error())
+	}
+}
+
+func TestBuildSQLFilterLimits(t *testing.T) {
+	// 长度上限
+	long := "k = '" + strings.Repeat("x", maxExprBytes) + "'"
+	if _, err := buildSQLFilter(long); err == nil || !strings.Contains(err.Error(), "长度") {
+		t.Fatalf("超长表达式未被拒或错误不含'长度': %v", err)
+	}
+	// 深度上限：嵌套括号
+	deep := strings.Repeat("(", maxASTDepth+2) + "a = 1" + strings.Repeat(")", maxASTDepth+2)
+	if _, err := buildSQLFilter(deep); err == nil || !strings.Contains(err.Error(), "深度") {
+		t.Fatalf("超深表达式未被拒或错误不含'深度': %v", err)
+	}
+	// IN 元素数上限
+	elems := make([]string, maxInElems+1)
+	for i := range elems {
+		elems[i] = strconv.Itoa(i)
+	}
+	big := "k IN (" + strings.Join(elems, ",") + ")"
+	if _, err := buildSQLFilter(big); err == nil || !strings.Contains(err.Error(), "IN") {
+		t.Fatalf("超大 IN 列表未被拒或错误不含'IN': %v", err)
+	}
+}
+
+func TestBuildSQLFilterAcceptsValid(t *testing.T) {
+	// 正常表达式必须通过——上限用例容易写成"什么都拒"，需要反向对照
+	for _, expr := range []string{
+		"a = 1",
+		"a > 1 AND b = 'x'",
+		"a BETWEEN 1 AND 10 OR NOT c IS NULL",
+		"k IN ('x', 'y', 'z')",
+		"flag = TRUE",
+		"10 < age",
+	} {
+		if _, err := buildSQLFilter(expr); err != nil {
+			t.Fatalf("buildSQLFilter(%q) 意外报错: %v", expr, err)
 		}
 	}
 }
