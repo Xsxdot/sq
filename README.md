@@ -46,6 +46,9 @@ go build -o sq ./cmd/sq
 - 消息 retention：按 topic 保留时长后台清理（默认 3 天），消息与 key 索引一并删除
 - 磁盘水位保护：磁盘使用率超过阈值（默认 85%）时拒写保读，低于阈值自动恢复
 - 延时消息：任意秒级延时（deliveryTimestamp），重启不丢，精度 ~100ms 调度间隔
+- 消息撤回：延时消息在到期前可撤回（RecallMessage），句柄由 SendMessage 的
+  SendResultEntry 随发送结果返回。已到期（已进入投递队列）或已被撤回的消息返回
+  失败，不做补偿——撤回本来就是在和调度器赛跑，谎报成功比撤回失败更糟
 - 顺序消息：同 MessageGroup 严格按序（FIFO），失败卡队头重投、超限入 DLQ 后推进；建议顺序消息使用专用 topic（顺序锁按队列生效，与普通消息混发会队头阻塞）
 - 事务消息：SendMessage 带 TRANSACTION 类型时先以半消息暂存，由
   `EndTransaction` 提交/回滚后才可见；未决半消息服务端按 `txn_check_interval`
