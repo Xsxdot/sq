@@ -239,32 +239,42 @@ func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, 
 	return m, nil
 }
 
-// AppendDelay 将延时消息写入 delay/ 暂存区（spec §5 流程 3 前半）。
+// AppendDelay 写入一条延时消息。
 //
-// 参数：m.DeliverAtMs 必须 >0（协议层已保证 DELAY 消息带 delivery_timestamp，
-// <=0 属编程错误直接报错）。到期时间已过（<=now）时直通 Append 立即投递：
-// 语义上"到期的延时消息"就是普通消息，绕道暂存区再被调度器搬回来只是
-// 多一次读写放大，结果完全相同。
+// 参数：m.DeliverAtMs 必须 > 0。
 //
-// 返回：写入后的消息。注意暂存态消息没有队列与 offset（m.QueueID/Offset
-// 保持零值）——它们在到期移入 msg/ 时才由正常写入路径分配。
+// 返回：
+//   - stored: 回填了 ID/时间戳的消息
+//   - seq: 该条目在延时暂存区的分配序号，与 DeliverAtMs 一起构成
+//     store.DelayKey——撤回（RecallMessage）靠这两个值定位条目
+//   - staged: 是否真的进了延时暂存区。**已到期的消息会直通 Append**，
+//     此时 staged=false、seq 无意义。调用方必须据此判断能否签发 recall
+//     句柄：给一条已经进了队列的消息签句柄，撤回时只会查无此条。
+//   - err: 失败原因
 //
-// 原子性：delay 条目与 seq 计数器同一 Batch 提交，理由与 Append 的
-// offset 计数器完全相同（崩溃后计数器与已写条目严格一致，seq 绝不复用）。
-func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (*core.Message, error) {
+// 为什么用布尔而不是 seq==0 当"未暂存"的哨兵：延时 seq 从 0 开始分配
+// （见 nextDelaySeqLocked：计数器不存在时返回 0），0 是合法 seq。
+//
+// 为什么把 seq 放进返回值而不是挂到 core.Message 上：core.Message 会被
+// EncodeMessage 持久化，加字段等于动存储格式（消息 v1 二进制编码刚落地）；
+// 而改签名是编译期可见的——所有调用点会立刻报错，不会留下静默失配。
+func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (*core.Message, uint64, bool, error) {
 	if m.DeliverAtMs <= 0 {
-		return nil, fmt.Errorf("AppendDelay 要求 DeliverAtMs>0，得到 %d", m.DeliverAtMs)
+		return nil, 0, false, fmt.Errorf("AppendDelay 要求 DeliverAtMs>0，得到 %d", m.DeliverAtMs)
 	}
 	if len(m.Body) == 0 || len(m.Body) > MaxBodySize {
-		return nil, fmt.Errorf("消息体大小非法: %d（上限 %d）", len(m.Body), MaxBodySize)
+		return nil, 0, false, fmt.Errorf("消息体大小非法: %d（上限 %d）", len(m.Body), MaxBodySize)
 	}
 	// 写入时就确认 topic 存在（autoCreate 时创建）：错误要在发送端立刻暴露，
 	// 不能等到几小时后到期移入时才发现 topic 不存在、消息无处可去。
 	if _, err := p.mt.EnsureTopic(ctx, m.Topic); err != nil {
-		return nil, err
+		return nil, 0, false, err
 	}
 	if m.DeliverAtMs <= time.Now().UnixMilli() {
-		return p.Append(ctx, m)
+		// 已到期直通正常追加：消息此刻就进队列，不经暂存区，因此没有 seq、
+		// 也不可撤回（staged=false）
+		stored, err := p.Append(ctx, m)
+		return stored, 0, false, err
 	}
 	if m.ID == "" {
 		m.ID = core.NewMessageID()
@@ -275,13 +285,13 @@ func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (*core.Mess
 	m.StoreAtMs = time.Now().UnixMilli()
 	raw, err := core.EncodeMessage(m)
 	if err != nil {
-		return nil, err
+		return nil, 0, false, err
 	}
 	p.delayMu.Lock()
 	seq, err := p.nextDelaySeqLocked()
 	if err != nil {
 		p.delayMu.Unlock()
-		return nil, err
+		return nil, 0, false, err
 	}
 	b := p.st.NewBatch()
 	b.Set(store.DelayKey(m.DeliverAtMs, seq), raw)
@@ -291,7 +301,7 @@ func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (*core.Mess
 	pending, err := p.rep.ApplyAsync(ctx, g, b)
 	if err != nil {
 		p.delayMu.Unlock()
-		return nil, fmt.Errorf("写入延时消息 %s (topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
+		return nil, 0, false, fmt.Errorf("写入延时消息 %s (topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
 	}
 	// 定序成功即推进 seq 缓存并解锁：并发的延时写入随即进锁定序，与本条共享
 	// 同一次 fsync（拆分提交，与 Append 的 qs.next 同款）。提前推进的安全性
@@ -303,11 +313,11 @@ func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (*core.Mess
 
 	// 锁外等待持久化：fsync 完成之前绝不确认（语义红线 1）
 	if err := pending.Wait(); err != nil {
-		return nil, fmt.Errorf("等待延时消息 %s 持久化 (topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
+		return nil, 0, false, fmt.Errorf("等待延时消息 %s 持久化 (topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
 	}
 	p.logger.Debug("延时消息已暂存", "topic", m.Topic, "msg_id", m.ID,
 		"due_ms", m.DeliverAtMs, "seq", seq)
-	return m, nil
+	return m, seq, true, nil
 }
 
 // nextDelaySeqLocked 取下一延时 seq。缓存未命中时读盘上 delayalloc 计数器，

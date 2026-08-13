@@ -140,7 +140,7 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 		case m.DeliverAtMs > 0:
 			// 延时消息进暂存区（未分配 offset，entry 里 Offset 回 0——SDK 的
 			// SendReceipt 只消费 MessageId，offset 字段对延时场景无意义）
-			stored, err = s.pr.AppendDelay(ctx, m)
+			stored, _, _, err = s.pr.AppendDelay(ctx, m)
 		default:
 			stored, err = s.pr.Append(ctx, m)
 		}

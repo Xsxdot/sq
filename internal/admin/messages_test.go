@@ -102,7 +102,7 @@ func TestDelayViewAndOverview(t *testing.T) {
 	s, _, _, pr, _, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	due := time.Now().Add(time.Hour).UnixMilli()
-	if _, err := pr.AppendDelay(context.Background(), &core.Message{Topic: "t1", Body: []byte("later"), DeliverAtMs: due}); err != nil {
+	if _, _, _, err := pr.AppendDelay(context.Background(), &core.Message{Topic: "t1", Body: []byte("later"), DeliverAtMs: due}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("now")}); err != nil {
