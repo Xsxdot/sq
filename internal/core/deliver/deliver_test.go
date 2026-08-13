@@ -28,6 +28,7 @@ package deliver
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -985,5 +986,222 @@ func TestConcurrentReceiveAckNoRace(t *testing.T) {
 	}
 	if n != 0 {
 		t.Fatalf("全部确认后残留 %d 条 inflight", n)
+	}
+}
+
+// aliveAlways / aliveNever 构造测试用的存活判定闭包。
+func aliveAlways() func(string) bool { return func(string) bool { return true } }
+func aliveNever() func(string) bool  { return func(string) bool { return false } }
+
+// TestReceiveRenewsInsteadOfRedelivering 持有者活着且预算充足时，到期的
+// inflight 被续租而不是重投：不产出消息、Attempts 不变、ExpireAtMs 被推后。
+func TestReceiveRenewsInsteadOfRedelivering(t *testing.T) {
+	// 续租分支不走退避逻辑，但为稳定注入小退避基数（var 供测试注入，
+	// 见实现注释）：万一续租判据误判走重投，本用例能立即暴露而不是等 10s。
+	oldBase := retryBackoffBase
+	retryBackoffBase = 10 * time.Millisecond
+	defer func() { retryBackoffBase = oldBase }()
+
+	f := newFixture(t)
+	f.send(t, "rt", "a")
+	lease := Lease{Owner: "c1", MaxRenew: time.Minute, Alive: aliveAlways()}
+	first, err := f.dl.Receive(context.Background(), "g", "rt", 0, 10, 50*time.Millisecond, 0, AllPass, WithLease(lease))
+	if err != nil || len(first) != 1 || first[0].DeliveryAttempt != 1 {
+		t.Fatalf("首投: %d %v", len(first), err)
+	}
+	time.Sleep(80 * time.Millisecond) // 超过不可见期，让 inflight 到期
+	beforeRenew := time.Now().UnixMilli()
+	again, err := f.dl.Receive(context.Background(), "g", "rt", 0, 10, 50*time.Millisecond, 0, AllPass, WithLease(lease))
+	if err != nil || len(again) != 0 {
+		t.Fatalf("持有者存活时应续租而非重投: %d %v", len(again), err)
+	}
+	// 直接读盘断言续租效果：Attempts 不变、归属保留、预算存在、过期被推后
+	v, ok, err := f.st.Get(store.InflightKey("g", "rt", 0, first[0].Offset))
+	if err != nil || !ok {
+		t.Fatalf("inflight 缺失: %v", err)
+	}
+	st, err := core.DecodeInflight(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Attempts != 1 {
+		t.Fatalf("续租不应改变投递次数: %d", st.Attempts)
+	}
+	if st.Owner != "c1" {
+		t.Fatalf("续租后归属应变: %q", st.Owner)
+	}
+	if st.RenewUntilMs <= 0 {
+		t.Fatalf("续租预算缺失: %d", st.RenewUntilMs)
+	}
+	if st.ExpireAtMs <= beforeRenew {
+		t.Fatalf("续租应把 ExpireAtMs 推到未来: %d vs now %d", st.ExpireAtMs, beforeRenew)
+	}
+}
+
+// TestReceiveRedeliversWhenOwnerGone 持有者断线时立刻走重投（故障转移不退化）。
+func TestReceiveRedeliversWhenOwnerGone(t *testing.T) {
+	oldBase := retryBackoffBase
+	retryBackoffBase = 10 * time.Millisecond
+	defer func() { retryBackoffBase = oldBase }()
+
+	f := newFixture(t)
+	f.send(t, "rt", "a")
+	first, err := f.dl.Receive(context.Background(), "g", "rt", 0, 10, 50*time.Millisecond, 0, AllPass,
+		WithLease(Lease{Owner: "c1", MaxRenew: time.Minute, Alive: aliveAlways()}))
+	if err != nil || len(first) != 1 {
+		t.Fatalf("首投: %d %v", len(first), err)
+	}
+	time.Sleep(80 * time.Millisecond)
+	// 持有者断线：故障转移立即生效，不必等续租预算耗尽
+	red, err := f.dl.Receive(context.Background(), "g", "rt", 0, 10, time.Minute, 0, AllPass,
+		WithLease(Lease{Owner: "c1", MaxRenew: time.Minute, Alive: aliveNever()}))
+	if err != nil || len(red) != 1 || red[0].DeliveryAttempt != 2 {
+		t.Fatalf("持有者断线应立即重投 attempt=2: %d %v", len(red), err)
+	}
+}
+
+// TestRenewDoesNotExceedBudget 续租不越过硬上限，越过后正常重投且 Attempts++。
+func TestRenewDoesNotExceedBudget(t *testing.T) {
+	// 预算（100ms）与不可见期（30ms）都必须小于退避下限（默认 10s）：预算
+	// 耗尽后的重投若套上 10s 退避，ExpireAtMs 被推到 now+10s，本用例在合理
+	// 时间内等不到它。注入小退避基数（var 供测试注入，见实现注释）。
+	oldBase := retryBackoffBase
+	retryBackoffBase = 10 * time.Millisecond
+	defer func() { retryBackoffBase = oldBase }()
+
+	f := newFixture(t)
+	f.send(t, "rt", "a")
+	lease := Lease{Owner: "c1", MaxRenew: 100 * time.Millisecond, Alive: aliveAlways()}
+
+	first, err := f.dl.Receive(context.Background(), "g", "rt", 0, 10, 30*time.Millisecond, 0, AllPass, WithLease(lease))
+	if err != nil || len(first) != 1 || first[0].DeliveryAttempt != 1 {
+		t.Fatalf("首投: %d %v", len(first), err)
+	}
+	var red *core.Message
+	renewed := 0
+	for i := 0; i < 20; i++ {
+		time.Sleep(40 * time.Millisecond)
+		out, err := f.dl.Receive(context.Background(), "g", "rt", 0, 10, 30*time.Millisecond, 0, AllPass, WithLease(lease))
+		if err != nil {
+			t.Fatalf("取件: %v", err)
+		}
+		if len(out) > 0 {
+			red = out[0]
+			break
+		}
+		renewed++
+		// 续租期间 ExpireAtMs 绝不能越过 RenewUntilMs 硬上限
+		v, ok, err := f.st.Get(store.InflightKey("g", "rt", 0, first[0].Offset))
+		if err != nil || !ok {
+			t.Fatalf("inflight 缺失: %v", err)
+		}
+		st, err := core.DecodeInflight(v)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.ExpireAtMs > st.RenewUntilMs {
+			t.Fatalf("续租越过硬上限: expire=%d renew_until=%d", st.ExpireAtMs, st.RenewUntilMs)
+		}
+	}
+	if red == nil {
+		t.Fatal("预算耗尽后应重投出消息")
+	}
+	if renewed == 0 {
+		t.Fatal("预算充足时首轮就应续租而非重投")
+	}
+	if red.DeliveryAttempt != 2 {
+		t.Fatalf("预算耗尽后的重投 attempt 应为 2: %d", red.DeliveryAttempt)
+	}
+}
+
+// TestRenewDoesNotBreakOrderedLock 顺序消息续租后仍占着队列顺序锁：
+// 既没重投第 1 条，也没因为锁被误释放而投出第 2 条。
+func TestRenewDoesNotBreakOrderedLock(t *testing.T) {
+	oldBase := retryBackoffBase
+	retryBackoffBase = 10 * time.Millisecond
+	defer func() { retryBackoffBase = oldBase }()
+
+	f := newFixture(t)
+	f.sendGrouped(t, "rt", "a", "mg")
+	f.sendGrouped(t, "rt", "b", "mg")
+	lease := Lease{Owner: "c1", MaxRenew: time.Minute, Alive: aliveAlways()}
+	first, err := f.dl.Receive(context.Background(), "g", "rt", 0, 10, 30*time.Millisecond, 0, AllPass, WithLease(lease))
+	if err != nil || len(first) != 1 || string(first[0].Body) != "a" {
+		t.Fatalf("首投应得第 1 条顺序消息: %d %v", len(first), err)
+	}
+	time.Sleep(50 * time.Millisecond)
+	again, err := f.dl.Receive(context.Background(), "g", "rt", 0, 10, time.Minute, 0, AllPass, WithLease(lease))
+	if err != nil || len(again) != 0 {
+		t.Fatalf("续租后既不应重投第 1 条也不应投出第 2 条: %d %v", len(again), err)
+	}
+	// 顺序锁仍在：记录里 Ordered 未丢、Attempts 未变
+	v, ok, err := f.st.Get(store.InflightKey("g", "rt", 0, first[0].Offset))
+	if err != nil || !ok {
+		t.Fatalf("inflight 缺失: %v", err)
+	}
+	st, err := core.DecodeInflight(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !st.Ordered {
+		t.Fatal("续租后顺序标记丢失，顺序锁被误释放")
+	}
+	if st.Attempts != 1 {
+		t.Fatalf("续租不应改变投递次数: %d", st.Attempts)
+	}
+}
+
+// TestOldInflightRecordStillRedelivers 旧格式 inflight（无 Owner/RenewUntilMs）
+// 即便本次取件启用了续租也照常重投——零迁移的行为保证。
+func TestOldInflightRecordStillRedelivers(t *testing.T) {
+	f := newFixture(t)
+	f.send(t, "rt", "a")
+	first, err := f.dl.Receive(context.Background(), "g", "rt", 0, 10, 30*time.Millisecond, 0, AllPass)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("首投: %d %v", len(first), err)
+	}
+	// 手工改写为旧格式 inflight（无 owner/renew_until_ms）且已到期——模拟
+	// M1–M4 时代落盘的记录，改造后必须零迁移直接读（批次写法与
+	// TestOrphanInflightCleanupPersistsAndDoesNotReportDelivery 一致）
+	b := f.st.NewBatch()
+	old := fmt.Sprintf(`{"expire_at_ms":%d,"attempts":1}`, time.Now().UnixMilli()-1000)
+	b.Set(store.InflightKey("g", "rt", 0, first[0].Offset), []byte(old))
+	if err := f.st.Apply(b); err != nil {
+		t.Fatalf("改写旧格式 inflight: %v", err)
+	}
+	time.Sleep(30 * time.Millisecond)
+	// 即便本次取件启用续租，旧格式记录（预算为零）也照常重投
+	red, err := f.dl.Receive(context.Background(), "g", "rt", 0, 10, time.Minute, 0, AllPass,
+		WithLease(Lease{Owner: "c1", MaxRenew: time.Minute, Alive: aliveAlways()}))
+	if err != nil || len(red) != 1 || red[0].DeliveryAttempt != 2 {
+		t.Fatalf("旧格式记录应照常重投 attempt=2: %d %v", len(red), err)
+	}
+}
+
+// TestReceiveWithoutLeaseUnchanged 不传 WithLease 时行为与改造前逐字节相同。
+func TestReceiveWithoutLeaseUnchanged(t *testing.T) {
+	f := newFixture(t)
+	f.send(t, "rt", "a")
+	first, err := f.dl.Receive(context.Background(), "g", "rt", 0, 10, 30*time.Millisecond, 0, AllPass)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("首投: %d %v", len(first), err)
+	}
+	// 不带 option 时记录必须与改造前一致：无归属、无续租预算
+	v, ok, err := f.st.Get(store.InflightKey("g", "rt", 0, first[0].Offset))
+	if err != nil || !ok {
+		t.Fatalf("inflight 缺失: %v", err)
+	}
+	st, err := core.DecodeInflight(v)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Owner != "" || st.RenewUntilMs != 0 {
+		t.Fatalf("不带 lease 不应写归属/预算: owner=%q renew_until=%d", st.Owner, st.RenewUntilMs)
+	}
+	time.Sleep(50 * time.Millisecond)
+	// 到期后照常重投
+	red, err := f.dl.Receive(context.Background(), "g", "rt", 0, 10, time.Minute, 0, AllPass)
+	if err != nil || len(red) != 1 || red[0].DeliveryAttempt != 2 {
+		t.Fatalf("不带 lease 应照常重投 attempt=2: %d %v", len(red), err)
 	}
 }

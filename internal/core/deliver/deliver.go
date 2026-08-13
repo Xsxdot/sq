@@ -186,7 +186,11 @@ func (d *Deliverer) lockQueue(group, topic string, q uint32) *sync.Mutex {
 // 只投 filter.Match 返回 ResultTrue 的新消息；filter 不得为 nil，不过滤时传
 // AllPass。不匹配的跳过并推进本组位点，不投递、不占 inflight（对该组永久
 // 跳过）。阶段 1 的过期重投不重新过滤。
-func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible, wait time.Duration, filter Filter) ([]*core.Message, error) {
+func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible, wait time.Duration, filter Filter, opts ...ReceiveOption) ([]*core.Message, error) {
+	var ro receiveOpts
+	for _, opt := range opts {
+		opt(&ro)
+	}
 	gc, err := d.mt.EnsureGroup(ctx, group)
 	if err != nil {
 		return nil, err
@@ -206,7 +210,7 @@ func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID ui
 		// 这个窗口期内的写入会错过 close 广播，导致长轮询白等到超时——
 		// 订阅在前，即便取件与写入之间发生竞态，wakeCh 也一定能收到这次唤醒。
 		wakeCh := d.pr.Subscribe(topic)
-		msgs, err := d.receiveOnce(ctx, group, topic, queueID, maxMsgs, invisible, gc.EffectiveMaxAttempts(), filter)
+		msgs, err := d.receiveOnce(ctx, group, topic, queueID, maxMsgs, invisible, gc.EffectiveMaxAttempts(), filter, ro.lease)
 		if err != nil || len(msgs) > 0 {
 			return msgs, err
 		}
@@ -235,10 +239,10 @@ func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID ui
 // 它的 inflight 兜底记录必然已持久化，崩溃后该消息仍会被重投而不是丢失）。
 // 解锁后同队列的下一次取件/确认立即可进锁定序，与本批共享同一次 fsync——
 // 队列内 group commit 在消费路径生效的机制，与 produce 侧完全同款。
-func (d *Deliverer) receiveOnce(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter Filter) ([]*core.Message, error) {
+func (d *Deliverer) receiveOnce(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter Filter, lease Lease) ([]*core.Message, error) {
 	qlock := d.lockQueue(group, topic, queueID)
 	qlock.Lock()
-	out, pending, applied, err := d.receiveOnceLocked(ctx, group, topic, queueID, maxMsgs, invisible, maxAttempts, filter)
+	out, pending, applied, err := d.receiveOnceLocked(ctx, group, topic, queueID, maxMsgs, invisible, maxAttempts, filter, lease)
 	qlock.Unlock()
 	if err != nil || !applied {
 		return out, err
@@ -255,7 +259,7 @@ func (d *Deliverer) receiveOnce(ctx context.Context, group, topic string, queueI
 //
 // 返回：(消息, pending, applied, error)。applied=false 表示本轮无暂存写入
 // （批次已 Close 回收），pending 为零值，调用方无需 Wait。
-func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter Filter) ([]*core.Message, replication.Pending, bool, error) {
+func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, queueID uint32, maxMsgs int, invisible time.Duration, maxAttempts int32, filter Filter, lease Lease) ([]*core.Message, replication.Pending, bool, error) {
 	now := time.Now().UnixMilli()
 	expireAt := now + invisible.Milliseconds()
 	var out []*core.Message
@@ -272,6 +276,14 @@ func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, 
 		ordered  bool
 	}
 	var reds []redeliver
+	// renewal 一条判定为「应续租而非重投」的 inflight。带值拷贝而非指针：
+	// Scan 回调的 k/v 出了回调即失效，虽然 DecodeInflight 解出的是独立对象，
+	// 这里仍按回调契约取值拷贝，免得日后有人把解码改成零拷贝时踩坑。
+	type renewal struct {
+		offset uint64
+		st     core.InflightState
+	}
+	var renews []renewal
 	// orderedBusy：本队列是否存在未终结的顺序 inflight（顺序锁的内存判据，
 	// spec §5 流程 4）。不变式「每队列至多 1 条 Ordered inflight」由阶段 2 的
 	// 投递门维护，因此单个 bool 足够，无需计数。
@@ -289,8 +301,32 @@ func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, 
 		if ist.Ordered {
 			orderedBusy = true
 		}
-		if ist.ExpireAtMs <= now && len(reds) < maxMsgs {
-			reds = append(reds, redeliver{offset: off, attempts: ist.Attempts, ordered: ist.Ordered})
+		if ist.ExpireAtMs <= now {
+			if renewable(lease, ist, now) {
+				// 续租不占 maxMsgs 预算：它不产出可投递的消息，只是把这条
+				// inflight 的不可见期往后推。占了预算会让「一批慢消息正在
+				// 续租」白白挤掉本轮本可以投出的新消息。
+				renews = append(renews, renewal{offset: off, st: *ist})
+			} else if len(reds) < maxMsgs {
+				// 只在「本可以续租却没续成」时记一笔，区分两种原因——这是慢消费者
+				// 排障的入口：看到「预算耗尽」说明 handler 卡死该查业务，
+				// 看到「持有者已断线」说明是故障转移在正常工作。
+				// 判据 1（本次取件没启用续租）不打日志：SimpleConsumer 的每一次
+				// 正常重投都会命中它，打了就是刷屏。
+				if lease.Enabled() && ist.Owner != "" {
+					if ist.RenewUntilMs <= now {
+						d.logger.Info("续租预算已耗尽，转正常重投", "group", group,
+							"topic", topic, "queue", queueID, "offset", off,
+							"owner", ist.Owner, "attempts", ist.Attempts,
+							"renew_until_ms", ist.RenewUntilMs)
+					} else {
+						d.logger.Info("持有者会话已断，立即重投", "group", group,
+							"topic", topic, "queue", queueID, "offset", off,
+							"owner", ist.Owner, "attempts", ist.Attempts)
+					}
+				}
+				reds = append(reds, redeliver{offset: off, attempts: ist.Attempts, ordered: ist.Ordered})
+			}
 		}
 		// M1-M3 在收满 maxMsgs 个重投候选后提前停扫；M4 起必须看完整个队列的
 		// inflight——顺序锁判据 orderedBusy 需要完整视野，提前停会漏看排在
@@ -301,6 +337,32 @@ func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, 
 	if err != nil {
 		b.Close() // 未提交，按批次生命周期契约自行回收
 		return nil, nil, false, fmt.Errorf("扫描 inflight (group=%s topic=%s q=%d): %w", group, topic, queueID, err)
+	}
+
+	// 阶段 1.5：续租。放在重投循环之前，让日志里「续租」与「重投」的时序与
+	// 扫描时的判定顺序一致，排障时不用反着推。两者写的是同一片 inflight 键
+	// 空间的不同键，先后不影响正确性。
+	for _, rn := range renews {
+		newExp := now + invisible.Milliseconds()
+		if newExp > rn.st.RenewUntilMs {
+			// 不越过硬上限：到点这一轮把 ExpireAtMs 正好压在上限上，
+			// 下一轮扫描时判据 2 即为假，自然转入重投
+			newExp = rn.st.RenewUntilMs
+		}
+		rn.st.ExpireAtMs = newExp
+		// Attempts 与 Ordered 原样保留，这两条都是承重的：
+		//   - 收据句柄由 (group,topic,queue,offset,attempts) 编码，Ack 与
+		//     ChangeInvisible 都拿 attempts 校验陈旧句柄。续租若动了它，
+		//     等于把持有者手里那个还在用的句柄当场作废——它处理完回来 ack
+		//     会被拒，消息必然重投，续租的目的完全落空。
+		//   - Ordered 丢了，顺序锁判据 orderedBusy 会漏看这条记录，
+		//     下一条顺序消息会与它并发投递，顺序即破。
+		b.Set(store.InflightKey(group, topic, queueID, rn.offset), core.EncodeInflight(&rn.st))
+		staged = true
+		d.logger.Debug("inflight 自动续租", "group", group, "topic", topic,
+			"queue", queueID, "offset", rn.offset, "owner", rn.st.Owner,
+			"attempts", rn.st.Attempts, "new_expire_at_ms", newExp,
+			"budget_remain_ms", rn.st.RenewUntilMs-now)
 	}
 	for _, r := range reds {
 		raw, ok, err := d.st.Get(store.MsgKey(topic, queueID, r.offset))
@@ -359,8 +421,15 @@ func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, 
 		}
 		// 重投必须原样保留 Ordered 标记：丢了它，重投后的记录不再被视为
 		// 顺序锁占用，下一条顺序消息会与卡在队头的这条并发投递，顺序即破。
-		b.Set(store.InflightKey(group, topic, queueID, r.offset),
-			core.EncodeInflight(&core.InflightState{ExpireAtMs: exp, Attempts: m.DeliveryAttempt, Ordered: r.ordered}))
+		nst := &core.InflightState{ExpireAtMs: exp, Attempts: m.DeliveryAttempt, Ordered: r.ordered}
+		if lease.Enabled() {
+			// 重投等于一次全新的投递：归属换成本次轮询方，续租预算重新计时。
+			// 不继承旧记录的 RenewUntilMs——那是上一任持有者的预算，
+			// 继承会让接手者的可用续租时间莫名其妙地短一截。
+			nst.Owner = lease.Owner
+			nst.RenewUntilMs = now + lease.MaxRenew.Milliseconds()
+		}
+		b.Set(store.InflightKey(group, topic, queueID, r.offset), core.EncodeInflight(nst))
 		out = append(out, m)
 		staged = true
 	}
@@ -419,8 +488,14 @@ func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, 
 				// 由此维持「每队列至多 1 条 Ordered inflight」不变式
 				orderedBusy = true
 			}
-			b.Set(store.InflightKey(group, topic, queueID, m.Offset),
-				core.EncodeInflight(&core.InflightState{ExpireAtMs: expireAt, Attempts: 1, Ordered: ordered}))
+			nst := &core.InflightState{ExpireAtMs: expireAt, Attempts: 1, Ordered: ordered}
+			if lease.Enabled() {
+				// 只有启用续租的取件才在记录上留归属与预算：SimpleConsumer 的
+				// 投递不写这两个字段，其 inflight 与改造前逐字节相同
+				nst.Owner = lease.Owner
+				nst.RenewUntilMs = now + lease.MaxRenew.Milliseconds()
+			}
+			b.Set(store.InflightKey(group, topic, queueID, m.Offset), core.EncodeInflight(nst))
 			out = append(out, m)
 			return len(out) < maxMsgs, nil
 		})
