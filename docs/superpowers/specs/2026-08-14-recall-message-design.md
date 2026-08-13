@@ -109,8 +109,15 @@ follower 上会转发给 leader），所以「能不能写」不是约束，「�
 签名改为：
 
 ```go
-func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (*core.Message, uint64, error)
+func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (stored *core.Message, seq uint64, staged bool, err error)
 ```
+
+> **本节已订正。** 初稿写的是三返回值 `(*core.Message, uint64, error)`，**不可用**。
+> `AppendDelay` 开头有一条直通分支：`m.DeliverAtMs <= now` 时消息**不进暂存区**，
+> 直接走 `p.Append`——此时没有 seq、也无条目可撤。三返回值形态下调用方只能拿
+> `seq == 0` 当「没暂存」的哨兵，而 `nextDelaySeqLocked` 在计数器不存在时返回 **0**，
+> 所以空库里第一条延时消息的 seq 就是 0，是个**合法值**。用 0 当哨兵会让它永远
+> 签不出句柄。故必须多一个 `staged bool`。
 
 生产调用点仅两处（`internal/rpc/send.go:143`、`internal/admin/messages.go:146`），
 加测试共约 8 处。
