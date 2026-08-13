@@ -4,7 +4,7 @@
 //   - 锁定 parseSQL92 的优先级、节点形状、常量归一化与错误形态
 //
 // 边界：
-//   - 只测语法层，不测求值（那是 sql92_eval 的事）
+//   - 测语法解析与构建期语义校验；不测求值（那是 sql92_eval 的事）
 package deliver
 
 import (
@@ -180,6 +180,9 @@ func TestBuildSQLFilterSemanticRejects(t *testing.T) {
 		{"a = b", "属性名"},                // 属性对属性
 		{"k IN (1, 'a')", "类型"},          // IN 列表类型混用
 		{"k BETWEEN 1 AND 'z'", "类型"},    // BETWEEN 上下界类型混用
+		{"f > TRUE", "布尔"},                // 布尔常量不支持大小比较
+		{"a BETWEEN 'x' AND 'y'", "数值"},   // BETWEEN 仅支持数值常量
+		{"k IN (NULL)", "NULL"},             // IN 列表不允许 NULL
 	}
 	for _, c := range cases {
 		_, err := buildSQLFilter(c.expr)
@@ -211,7 +214,15 @@ func TestBuildSQLFilterLimits(t *testing.T) {
 	if _, err := buildSQLFilter(long); err == nil || !strings.Contains(err.Error(), "长度") {
 		t.Fatalf("超长表达式未被拒或错误不含'长度': %v", err)
 	}
-	// 深度上限：嵌套括号
+	// 深度上限：16 层应过（恰好等于上限），17 层拒
+	ok16 := strings.Repeat("(", maxASTDepth) + "a = 1" + strings.Repeat(")", maxASTDepth)
+	if _, err := buildSQLFilter(ok16); err != nil {
+		t.Fatalf("%d 层括号应可通过: %v", maxASTDepth, err)
+	}
+	deep17 := strings.Repeat("(", maxASTDepth+1) + "a = 1" + strings.Repeat(")", maxASTDepth+1)
+	if _, err := buildSQLFilter(deep17); err == nil || !strings.Contains(err.Error(), "深度") {
+		t.Fatalf("%d 层括号应被拒或错误不含'深度': %v", maxASTDepth+1, err)
+	}
 	deep := strings.Repeat("(", maxASTDepth+2) + "a = 1" + strings.Repeat(")", maxASTDepth+2)
 	if _, err := buildSQLFilter(deep); err == nil || !strings.Contains(err.Error(), "深度") {
 		t.Fatalf("超深表达式未被拒或错误不含'深度': %v", err)

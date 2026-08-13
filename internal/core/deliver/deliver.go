@@ -473,7 +473,7 @@ func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, 
 	}
 	if len(out) == 0 {
 		// 本轮做了"无投递但有写入"的工作：清理孤儿 inflight（上面那条 Warn
-		// 已说明是哪几条），或全部新消息被 Tag 过滤跳过、只推进了本组位点
+		// 已说明是哪几条），或全部新消息被过滤跳过、只推进了本组位点
 		// （上方 Debug 日志说明跳过了几条）。单独一句话，不与投递共用消息：
 		// 这恰恰是运维最需要读懂的一轮——打成"投递消息 count=0"会让人以为
 		// 队列空转，从而忽略掉刚刚发生的数据修复或过滤推进。

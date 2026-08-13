@@ -144,8 +144,8 @@ func evalCmp(n *cmpNode, m *core.Message) Result {
 			// 属性值既不是 true 也不是 false，无法按布尔档解释。
 			return ResultUnknown
 		}
-		// 大小比较（> >= < <=）对布尔常量未在构建期拦截，这里按
-		// `=`/`<>` 两种朝向判定；其余运算符保守判 UNKNOWN。
+		// 布尔大小比较（> >= < <=）已在构建期 validate 拒绝，这里只会是
+		// `=`/`<>`；其余运算符走 default 只是防御性兜底。
 		switch n.op {
 		case "=":
 			if b == n.val.b {
@@ -256,7 +256,9 @@ func cmpFloat(op string, lhs, rhs float64) Result {
 func evalBetween(n *betweenNode, m *core.Message) Result {
 	// 为什么这里不走 evalCmp：展开式 `a >= lo` 对字符串常量本就被构建期
 	// validate 拒绝（字符串不支持大小比较），逐字等价无从谈起；数值档的
-	// BETWEEN 才是有意义的用法，其他类型保守判 UNKNOWN。
+	// BETWEEN 才是唯一合法用法。
+	// 构建期 validate 已拒绝非数值上下界（含 NULL），此处仅是防御性兜底，
+	// 不是主路径。
 	if n.lo.kind != constNumber {
 		return ResultUnknown
 	}

@@ -160,8 +160,10 @@ func TestOfficialGoSDKSQL92StringIn(t *testing.T) {
 
 // TestOfficialGoSDKSQL92Combined 组合逻辑，顺带验证 AND 优先级高于 OR：
 // 表达式等价于 (age > 18 AND region = 'cn') OR vip = TRUE。
-// 若服务端把优先级搞反成 age > 18 AND (region = 'cn' OR vip = TRUE)，
-// young-vip 会落选、old-us 会命中，两个方向都被下面的期望集合抓住。
+// 判别信号是 young-vip 落选——若服务端把优先级搞反成
+// age > 18 AND (region = 'cn' OR vip = TRUE)，young-vip 会命中，立即被抓。
+// old-us 则是「属性缺失不得放行」的负探针：它缺 vip 属性，三值语义下
+// (region = 'cn' OR vip = TRUE) 求值为 UNKNOWN，绝不投递。
 func TestOfficialGoSDKSQL92Combined(t *testing.T) {
 	runSQL92Case(t, "e2e-sql-comb", "e2e-sql-comb-g",
 		"age > 18 AND region = 'cn' OR vip = TRUE",

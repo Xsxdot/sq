@@ -281,6 +281,7 @@ func TestCollectorExposesFilterSkipped(t *testing.T) {
 	fs := fakeFilterStats{m: map[deliver.FilterSkipKey]uint64{
 		{Topic: "t", Group: "g", Reason: "sql_false"}:   3,
 		{Topic: "t", Group: "g", Reason: "sql_unknown"}: 7,
+		{Topic: "t", Group: "g", Reason: "tag_miss"}:    5,
 	}}
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(NewCollector(st, mt, nil, nil, nil, fs, slog.Default()))
@@ -304,7 +305,7 @@ func TestCollectorExposesFilterSkipped(t *testing.T) {
 			got[reason] = m.GetCounter().GetValue()
 		}
 	}
-	if got["sql_false"] != 3 || got["sql_unknown"] != 7 {
-		t.Fatalf("sq_filter_skipped_total 分桶 = %v，期望 sql_false=3 sql_unknown=7", got)
+	if got["sql_false"] != 3 || got["sql_unknown"] != 7 || got["tag_miss"] != 5 {
+		t.Fatalf("sq_filter_skipped_total 分桶 = %v，期望 sql_false=3 sql_unknown=7 tag_miss=5", got)
 	}
 }

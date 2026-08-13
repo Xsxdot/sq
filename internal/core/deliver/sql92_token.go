@@ -3,7 +3,7 @@
 // 职责：
 //   - 把表达式字符串切成 token 流，每个 token 带 1-based 字节列号
 //   - 关键字识别与大写规范化；属性名原样保留（大小写敏感）
-//   - 字符串常量的 ” 转义
+//   - 字符串常量的 '' 转义
 //
 // 边界：
 //   - 不做任何语法结构判断（那是 sql92_parse.go 的事）：本文件只回答
@@ -169,8 +169,9 @@ func lex(expr string) ([]token, error) {
 				i++
 			}
 			text := expr[start:i]
-			if keywords[strings.ToUpper(text)] {
-				toks = append(toks, token{kind: tokKeyword, text: strings.ToUpper(text), col: start + 1})
+			upper := strings.ToUpper(text)
+			if keywords[upper] {
+				toks = append(toks, token{kind: tokKeyword, text: upper, col: start + 1})
 			} else {
 				toks = append(toks, token{kind: tokIdent, text: text, col: start + 1})
 			}

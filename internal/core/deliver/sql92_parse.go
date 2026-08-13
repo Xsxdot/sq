@@ -35,13 +35,10 @@ type notNode struct{ inner node }
 func (*notNode) isNode() {}
 
 // cmpNode 比较表达式：ident op val。
-// identOnLeft 为 true 表示原文就是属性名在左；为 false 表示常量在左、
-// 解析器已翻转运算符归一化，仅供错误信息按原文还原用。
 type cmpNode struct {
-	ident       string
-	op          string
-	val         constant
-	identOnLeft bool
+	ident string
+	op    string
+	val   constant
 }
 
 func (*cmpNode) isNode() {}
@@ -154,10 +151,6 @@ type SQLFilter struct {
 	root node
 }
 
-// Match 求值入口。三值求值实现在 sql92_eval.go：evalNode 按 AST 递归求值，
-// 属性缺失或类型无法解释一律 ResultUnknown（不投递）。本文件只管解析与
-// 构建期校验，不参与求值。
-
 // buildSQLFilter 构建一个 SQL92 过滤器：先做长度上限检查，再语法解析，
 // 最后在 AST 上做构建期语义校验。任一步失败都返回带原因的 error。
 func buildSQLFilter(expr string) (*SQLFilter, error) {
@@ -176,9 +169,10 @@ func buildSQLFilter(expr string) (*SQLFilter, error) {
 
 // validate 构建期语义校验，按节点类型检查：
 //   - 任意节点：嵌套深度超过 maxASTDepth
-//   - cmpNode：字符串常量不得用于 > >= < <=；NULL 只允许出现在 IS NULL
-//   - inNode：元素数不超过 maxInElems，且元素类型一致
-//   - betweenNode：上下界类型一致
+//   - cmpNode：字符串常量不得用于 > >= < <=；布尔常量不得用于大小比较；
+//     NULL 只允许出现在 IS NULL
+//   - inNode：元素数不超过 maxInElems，元素类型一致，且不允许 NULL 常量
+//   - betweenNode：上下界类型一致，且必须是数值
 //
 // 错误不带列号：语法层面已带列号，语义层面是整棵子树的属性，定位到列
 // 反而误导。
@@ -213,6 +207,10 @@ func validate(n node, depth int) error {
 			// 对过滤毫无意义，直接拒绝并给出可照做的替代写法。
 			return fmt.Errorf("%s = NULL 恒不成立，请改用 %s IS NULL", v.ident, v.ident)
 		}
+		if v.val.kind == constBool && (v.op == ">" || v.op == ">=" || v.op == "<" || v.op == "<=") {
+			// 布尔只有真/假两态，大小排序无意义，spec §4.2 仅允许 = <>。
+			return fmt.Errorf("布尔常量不支持大小比较（仅 = <>）")
+		}
 	case *inNode:
 		if len(v.vals) > maxInElems {
 			return fmt.Errorf("IN 列表元素数 %d 超过上限 %d", len(v.vals), maxInElems)
@@ -222,9 +220,17 @@ func validate(n node, depth int) error {
 				return fmt.Errorf("IN 列表的常量类型必须一致")
 			}
 		}
+		for _, item := range v.vals {
+			if item.kind == constNull {
+				return fmt.Errorf("IN 列表不允许 NULL 常量（请用 IS NULL）")
+			}
+		}
 	case *betweenNode:
 		if v.lo.kind != v.hi.kind {
 			return fmt.Errorf("BETWEEN 上下界的常量类型必须一致")
+		}
+		if v.lo.kind != constNumber {
+			return fmt.Errorf("BETWEEN 仅支持数值常量")
 		}
 	}
 	return nil
@@ -326,13 +332,13 @@ func (p *parser) parseIdentForm() (node, error) {
 		// 属性对属性（`a = b`）在文法层被拒：AST 的 cmpNode 只支持
 		// ident 对常量，右侧必须是常量。
 		if p.peek().kind == tokIdent {
-			return nil, p.errorf(p.peek(), "比较两侧至少要有一个属性名")
+			return nil, p.errorf(p.peek(), "比较两侧不能都是属性名")
 		}
 		val, err := p.parseConstant()
 		if err != nil {
 			return nil, err
 		}
-		return &cmpNode{ident: ident, op: op.text, val: val, identOnLeft: true}, nil
+		return &cmpNode{ident: ident, op: op.text, val: val}, nil
 	case tokKeyword:
 		switch nxt.text {
 		case "IS":
@@ -447,9 +453,8 @@ func (p *parser) parseConstLeft() (node, error) {
 		}
 		ident := p.next()
 		// 为什么：常量在左必须归一化为属性名在左并翻转运算符。
-		// 求值层只需处理 ident 在左一种朝向，比较逻辑不用按朝向分叉；
-		// identOnLeft=false 仅用于错误信息按原文还原。
-		return &cmpNode{ident: ident.text, op: flipOp(op.text), val: val, identOnLeft: false}, nil
+		// 求值层只需处理 ident 在左一种朝向，比较逻辑不用按朝向分叉。
+		return &cmpNode{ident: ident.text, op: flipOp(op.text), val: val}, nil
 	}
 	if nxt.kind == tokKeyword && (nxt.text == "IS" || nxt.text == "BETWEEN" || nxt.text == "IN") {
 		return nil, p.errorf(nxt, "IS NULL/BETWEEN/IN 左侧必须是属性名")
