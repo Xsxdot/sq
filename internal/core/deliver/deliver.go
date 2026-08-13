@@ -552,7 +552,7 @@ func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, 
 		// （上方 Debug 日志说明跳过了几条）。单独一句话，不与投递共用消息：
 		// 这恰恰是运维最需要读懂的一轮——打成"投递消息 count=0"会让人以为
 		// 队列空转，从而忽略掉刚刚发生的数据修复或过滤推进。
-		d.logger.Debug("本轮无可投递消息，仅清理了孤儿 inflight 或推进了过滤位点",
+		d.logger.Debug("本轮无可投递消息，仅续租了 inflight、清理了孤儿或推进了过滤位点",
 			"group", group, "topic", topic, "queue", queueID, "cursor", newCursor)
 	} else {
 		d.logger.Debug("投递消息已定序", "group", group, "topic", topic, "queue", queueID,

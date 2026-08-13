@@ -3,14 +3,13 @@
 // 官方 Go SDK PushConsumer e2e：B13.2 的验证载体。
 //
 // 职责：
-//   - 覆盖 push 消费路径（callback 驱动）的六条真实链路：基础闭环、长轮询唤醒、
-//     消费失败重投、超限转 DLQ、FIFO 顺序不破、不可见期到期重投
+//   - 覆盖 push 消费路径（callback 驱动）的七条真实链路：基础闭环、长轮询唤醒、
+//     消费失败重投、超限转 DLQ、FIFO 顺序不破、不可见期到期重投、AutoRenew 续租
 //   - 实证 settings.go 下发的 fifo=false 是正确终态：重试计数与死信判定都归 broker
 //
 // 边界：
 //   - 不覆盖 LitePushConsumer（依赖未实现的 SyncLiteSubscription）
 //   - 不覆盖集群档（本文件全部单机 broker）
-//   - 不验证 AutoRenew 续租（sq 侧未实现，已另立 backlog B13.5）
 //   - 不做批量 ReceiveBatchSize 的断言（客户端侧观察不到有意义的差别）
 //   - 本套件不是 -race 干净的：竞态成因在 SDK v5.1.4 内部——Start() 读
 //     pcSettings.isFifo（push_consumer.go:379）与 telemetry 回调
