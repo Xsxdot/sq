@@ -14,8 +14,6 @@ package deliver
 import (
 	"fmt"
 	"strconv"
-
-	"github.com/xushixin/sq/internal/core"
 )
 
 // node 语法树节点的公共接口，所有具体节点类型实现空的 isNode()。
@@ -156,9 +154,9 @@ type SQLFilter struct {
 	root node
 }
 
-// Match 求值入口。Task 5 实现真正的三值求值；此刻返回 ResultUnknown 是
-// 保守的占位——UNKNOWN 不投递，接错线也不会把不该投的消息投出去。
-func (f *SQLFilter) Match(m *core.Message) Result { return ResultUnknown }
+// Match 求值入口。三值求值实现在 sql92_eval.go：evalNode 按 AST 递归求值，
+// 属性缺失或类型无法解释一律 ResultUnknown（不投递）。本文件只管解析与
+// 构建期校验，不参与求值。
 
 // buildSQLFilter 构建一个 SQL92 过滤器：先做长度上限检查，再语法解析，
 // 最后在 AST 上做构建期语义校验。任一步失败都返回带原因的 error。
