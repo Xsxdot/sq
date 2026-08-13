@@ -388,9 +388,15 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// DefaultInvisible 解析后的默认不可见时长（Load 已校验合法，此处不会失败）。
+// DefaultInvisible 解析后的默认不可见时长。解析失败兜底返回 1m（与改造前的
+// 硬编码一致）：返回 0 会让消息投出去立刻可再投、无限重复消费——正是这个配置项
+// 要挡的故障。Load 校验只覆盖走 Load 的路径，用 &config.Config{...} 字面量
+// 构造 Server 时拿到空串就会踩到，这里不能再指望校验兜底。
 func (c *Config) DefaultInvisible() time.Duration {
-	d, _ := time.ParseDuration(c.DefaultInvisibleDuration)
+	d, err := time.ParseDuration(c.DefaultInvisibleDuration)
+	if err != nil || d <= 0 {
+		return time.Minute
+	}
 	return d
 }
 

@@ -117,7 +117,7 @@ func (s *Server) negotiateSettings(client *pb.Settings) *pb.Settings {
 			Subscriptions: ps.Subscription.GetSubscriptions(),
 			// 显式下发 false，且这是终态，不是待翻转的临时值（B13.2 已验）。
 			//
-			// 两条理由，缺一不可：
+			// 三条理由，缺一不可：
 			//  1. 顺序安全不依赖此标志：M4 起队列级顺序锁保证每队列至多一条
 			//     未终结的顺序 inflight（deliver.go 顺序锁）。e2e
 			//     TestOfficialGoSDKPushFIFOOrderLock 用 4 线程 push 消费 20 条
@@ -127,6 +127,11 @@ func (s *Server) negotiateSettings(client *pb.Settings) *pb.Settings {
 			//     计数与死信判定都会从 broker 挪到客户端，与 sq 的设计相反。
 			//     e2e TestOfficialGoSDKPushRetryOwnedByBroker /
 			//     TestOfficialGoSDKPushDLQOwnedByBroker 证的就是当前归属在 broker。
+			//  3. 翻成 true 本身就不保证被可靠观测：SDK 的 Start() 读
+			//     pcSettings.isFifo（push_consumer.go:379）与 telemetry 回调
+			//     applySettingsCommand 写同一字段（push_consumer_options.go:226）
+			//     是 v5.1.4 内部的真实竞态，两者并发、无同步。即使下发 true，
+			//     消费服务选型（Standard vs FiFo）也会因时序变得不确定。
 			//
 			// 仍必须显式下发而不是留空：留空让客户端去猜，协商结果不确定。
 			Fifo:             &fifo,

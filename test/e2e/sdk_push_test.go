@@ -12,6 +12,11 @@
 //   - 不覆盖集群档（本文件全部单机 broker）
 //   - 不验证 AutoRenew 续租（sq 侧未实现，已另立 backlog B13.5）
 //   - 不做批量 ReceiveBatchSize 的断言（客户端侧观察不到有意义的差别）
+//   - 本套件不是 -race 干净的：竞态成因在 SDK v5.1.4 内部——Start() 读
+//     pcSettings.isFifo（push_consumer.go:379）与 telemetry 回调
+//     applySettingsCommand 写同一字段（push_consumer_options.go:226）并发，
+//     双方都是 SDK goroutine，与本套件代码无关；采集器自身的并发保护已由
+//     mutex/atomic 覆盖。跑 -race 会有概率性失败，验证用不带 -race 的命令。
 package e2e
 
 import (
@@ -108,7 +113,7 @@ func (c *pushCollector) listener() *rmq.FuncMessageListener {
 			if c.decide != nil {
 				res = c.decide(mv)
 			}
-			c.t.Logf("listener 出口: body=%s 结果=%+v", r.body, res.Type)
+			c.t.Logf("listener 出口: body=%s 结果=%s", r.body, consumerResultName(res.Type))
 			return res
 		},
 	}
@@ -130,12 +135,13 @@ func (c *pushCollector) count() int {
 	return len(c.got)
 }
 
-// startPushConsumer 建 PushConsumer、Start、注册 cleanup，返回消费者与一个
-// 幂等的 stop 函数。
+// startPushConsumer 建 PushConsumer、Start、注册 cleanup，返回一个幂等的
+// stop 函数。
 //
 // 返回 stop 而不是只返回消费者：用例 6 必须在测试中途显式停 A，而 cleanup 里
-// 还会再停一次；sync.Once 包住后重复调用是 no-op。
-func startPushConsumer(t *testing.T, endpoint, group, topic string, c *pushCollector, opts ...rmq.PushConsumerOption) (rmq.PushConsumer, func()) {
+// 还会再停一次；sync.Once 包住后重复调用是 no-op。消费者返回值在全部调用点都
+// 被丢弃，t.Cleanup(stop) 在函数体内执行，与返回值无关。
+func startPushConsumer(t *testing.T, endpoint, group, topic string, c *pushCollector, opts ...rmq.PushConsumerOption) func() {
 	t.Helper()
 	base := []rmq.PushConsumerOption{
 		rmq.WithPushSubscriptionExpressions(map[string]*rmq.FilterExpression{topic: rmq.SUB_ALL}),
@@ -163,7 +169,7 @@ func startPushConsumer(t *testing.T, endpoint, group, topic string, c *pushColle
 		})
 	}
 	t.Cleanup(stop)
-	return pc, stop
+	return stop
 }
 
 // waitCount 轮询等到累计采集条数达 n，超时即 Fatalf。
@@ -213,10 +219,30 @@ func bodySet(rs []recv) map[string]int {
 	return m
 }
 
+// consumerResultName 把 SDK 的 ConsumerResultType 折成可读文本，供 listener
+// 出口日志使用（SDK 未提供 String()，直接 %d 只能看到 0/1）。
+func consumerResultName(rt rmq.ConsumerResultType) string {
+	switch rt {
+	case rmq.ConsumerResultTypeSuccess:
+		return "SUCCESS"
+	case rmq.ConsumerResultTypeFailure:
+		return "FAILURE"
+	case rmq.ConsumerResultTypeSuspend:
+		return "SUSPEND"
+	default:
+		return fmt.Sprintf("UNKNOWN(%d)", int8(rt))
+	}
+}
+
 // TestOfficialGoSDKPushBasicLoop 用例 1：QueryAssignment → 长轮询 Receive →
 // listener → Ack 整条链路通，且 Ack 真落地（位点推进）。
 func TestOfficialGoSDKPushBasicLoop(t *testing.T) {
-	endpoint := startBroker(t)
+	endpoint := startBroker(t, func(c *config.Config) {
+		// 1b 的静默窗口必须覆盖一个完整的不可见期，否则断言假绿：
+		// 若 ack 丢失，消息要等不可见期到期才会重投，窗口短于它就观测不到差别，
+		// 「已 ack」与「ack 全丢」两个世界给出同样的零调用。
+		c.DefaultInvisibleDuration = "10s"
+	})
 	const (
 		topic = "e2e-push-basic"
 		group = "e2e-push-basic-g"
@@ -225,7 +251,7 @@ func TestOfficialGoSDKPushBasicLoop(t *testing.T) {
 	sendPlain(t, endpoint, topic, bodies...)
 
 	c := newCollector(t)
-	_, stopA := startPushConsumer(t, endpoint, group, topic, c)
+	stopA := startPushConsumer(t, endpoint, group, topic, c)
 	// 1a：5 条全部到达，body 集合与发送集合相等
 	waitCount(t, c, len(bodies), 30*time.Second)
 	got := bodySet(c.snapshot())
@@ -327,8 +353,9 @@ func TestOfficialGoSDKPushRetryOwnedByBroker(t *testing.T) {
 	c := newCollector(t)
 	c.decide = func(*rmq.MessageView) rmq.ConsumerResult { return rmq.FAILURE }
 	startPushConsumer(t, endpoint, group, topic, c)
-	// 第 2 次投递的不可见窗口 = max(默认不可见 1m, 服务端退避下限 10s) = 1m，
-	// 窗口取 120s 留足余量。
+	// waitCount 等的是第 2 次投递【到来】的时间：FAILURE 经 nackMessage →
+	// changeInvisibleDuration 下发退避（协商策略 initial 100ms / max 1s），
+	// 是亚秒级，这条路径不经过 default_invisible_duration。120s 预算留足余量。
 	waitCount(t, c, 2, 120*time.Second)
 
 	snap := c.snapshot()
@@ -386,17 +413,13 @@ func TestOfficialGoSDKPushDLQOwnedByBroker(t *testing.T) {
 	//
 	// 必须用【连续静默窗口】判定，不是「等一会儿看一眼」：看一眼恰好落在两次
 	// 投递之间就会误判为已停止。连续 15 轮 × 1s 计数不变才算数。
-	stable := 0
+	// 循环本身已是完整判据：任何一轮 count() != 2 都直接 Fatalf，不存在
+	// 「等完 15 轮再回头看」的情况。
 	for i := 0; i < 15; i++ {
 		time.Sleep(time.Second)
-		if c.count() == 2 {
-			stable++
-			continue
+		if c.count() != 2 {
+			t.Fatalf("超限后 listener 仍被调用：第 %d 秒计数变为 %d；全量: %+v", i+1, c.count(), c.snapshot())
 		}
-		t.Fatalf("超限后 listener 仍被调用：第 %d 秒计数变为 %d；全量: %+v", i+1, c.count(), c.snapshot())
-	}
-	if stable != 15 {
-		t.Fatalf("静默窗口未坐满: %d/15", stable)
 	}
 
 	// 4b：死信作为普通 topic 从 %DLQ%{group} 被读到。
@@ -454,22 +477,40 @@ func TestOfficialGoSDKPushLongPollingWakeup(t *testing.T) {
 	c := newCollector(t)
 	startPushConsumer(t, endpoint, group, topic, c)
 
+	// producer 提前建好并复用：NewProducer + Start 走路由查询 + telemetry 协商，
+	// 耗时不确定，若把它算进唤醒计时，慢一次就假红。
+	producer, err := rmq.NewProducer(&rmq.Config{
+		Endpoint:    endpoint,
+		Credentials: &credentials.SessionCredentials{},
+	}, rmq.WithTopics(topic))
+	if err != nil {
+		t.Fatalf("NewProducer: %v", err)
+	}
+	if err := producer.Start(); err != nil {
+		t.Fatalf("producer.Start: %v", err)
+	}
+	defer producer.GracefulStop()
+	sendBody := func(b string) {
+		if _, err := producer.Send(context.Background(), &rmq.Message{Topic: topic, Body: []byte(b)}); err != nil {
+			t.Fatalf("Send %q: %v", b, err)
+		}
+	}
+
 	// 探针先行：消费者 Start() 之后要走 Telemetry 协商 + QueryAssignment 才会挂上
 	// 长轮询，这段耗时不确定。不用探针而直接「起消费者 → 睡 2s → 发消息 → 计时」，
 	// 测的是「协商耗时 + 唤醒耗时」的和，协商慢一点就假红。探针到达后，
 	// t0 之后长轮询确定已在挂着，量到的才是纯唤醒延迟。
-	sendPlain(t, endpoint, topic, "probe")
+	sendBody("probe")
 	waitCount(t, c, 1, 30*time.Second)
 
+	// 复用同一 producer，只把第二次 Send 圈进计时；Send 本身是几十毫秒级。
 	t0 := time.Now()
-	sendPlain(t, endpoint, topic, "wakeup")
+	sendBody("wakeup")
 	waitCount(t, c, 2, 30*time.Second)
 	elapsed := time.Since(t0)
 
 	// 阈值 3s：若客户端退化成慢周期轮询，周期上限是 defaultLongPolling = 20s，
 	// 唤醒延迟会落在秒级到 20s；3s 能把两者分开，同时对本机 e2e 抖动留足余量。
-	//
-	// 注意 elapsed 含一次 producer 建连 + Send 的往返，本机量级在几十毫秒。
 	if elapsed >= 3*time.Second {
 		t.Fatalf("唤醒延迟 %v ≥ 3s：疑似退化成周期轮询而非长轮询", elapsed)
 	}
@@ -544,10 +585,14 @@ func TestOfficialGoSDKPushRedeliverAfterInvisibleExpiry(t *testing.T) {
 	}
 	// 6d【承重】：重投件换新回执句柄。
 	//
-	// 与用例 3 构成对照：用例 3 的 FAILURE 走客户端本地重试，复用同一个
-	// MessageView、同一个句柄；这里的不可见期到期走 broker 重投，换新句柄。
-	// 只有真的经过 broker 重投才会铸出新句柄——这是「broker 重投」与「客户端
-	// 本地重投」的判别器；只断言 attempt 递增不够，两条路都会让 attempt 涨。
+	// 6d 与用例 3 的 3c 是同源判别器，不是对照：客户端本地重投会复用同一个
+	// MessageView 反复喂 listener，句柄不变而 deliveryAttempt 照样自增
+	// （eraseFifoMessage 路径，fifo=true 才会建的服务，本分支不走）——所以只断言
+	// attempt 递增判别不出重投来自哪一侧，只有换了句柄才证明真的回了 broker。
+	//
+	// 与用例 3 的区别在触发方式而非归属：用例 3 是 FAILURE 触发显式 nack 后重投，
+	// 本用例是完全不 ack、靠不可见期自然到期重投。前者验失败路径的归属，
+	// 后者验超时兜底本身还活着。
 	if got[1].receipt == got[0].receipt {
 		t.Fatalf("重投件句柄未变（%q）：说明是客户端本地重投，不是 broker 重投", got[1].receipt)
 	}
