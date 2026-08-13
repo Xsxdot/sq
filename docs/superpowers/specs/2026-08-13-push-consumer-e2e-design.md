@@ -92,7 +92,7 @@ sq 侧 `receive.go:110-112`：`invisible <= 0` 时回落 `time.Minute`。行为�
 | 3 | 消费失败 → broker 重投 | 重试计数归 broker | 见 §6.2 |
 | 4 | 超限 → DLQ | DLQ 判定归 broker | 见 §6.3 |
 | 5 | FIFO + 并发消费顺序不破 | `settings.go` 的承重断言 | 见 §6.1 |
-| 6 | `GracefulStop` 后 inflight 不丢 | 停机语义 | 见 §6.4 |
+| 6 | 未 ack 消息在不可见期到期后被重投 | 不可见期语义 | 见 §6.4 |
 
 **明确排除的两条**（曾考虑，砍掉）：
 
@@ -215,28 +215,35 @@ B 才是真正的证明。**不要只写 A**：顺序锁正确时客户端手上
 
 **限界（spec 必须如实写，不得包装）**：DLQ 条目本身**带不出「谁转的」签名**——`ForwardToDLQ`（RPC 路径，`deliver.go:611`）与 broker 自动超限路径最终汇进同一个 `moveToDLQ`（`deliver.go:671`），产出完全一致。所以「DLQ 判定归 broker」不是单条 e2e 断言能证的，它由三件事合起来支撑：4a（listener 停止被调用）+ 4b（消息确实在 DLQ）+ **SDK 侧静态事实**（标准消费服务的 `eraseMessage` 只有 ack/nack 两条分支，根本没有 forward 调用）。第三条是读代码得来的，不是测试跑出来的。
 
-### 6.4 用例 6：`GracefulStop` 后 inflight 不丢
+### 6.4 用例 6：未 ack 消息在不可见期到期后被重投
 
-**先说一条硬约束**：`GracefulStop()` **会无上限等待在途 listener 完成**。调用链是 `GracefulStop` → `consumerService.Shutdown()` → `simpleThreadPool.Shutdown()` → `tp.waitGroup.Wait()`（`simple_thread_pool.go:86`）。`waitingReceiveRequestFinished` 那层确实有超时（`RequestTimeout + longPollingTimeout`），但线程池这层没有。
+**先说两条 SDK 硬约束**，它们排掉了两个看起来更直观的构造：
 
-**因此「让 listener 永久阻塞以保证不 ack」这个构造不可用——它会让测试永久死锁。**
+1. `GracefulStop()` **会无上限等待在途 listener 完成**。调用链是 `GracefulStop` → `consumerService.Shutdown()` → `simpleThreadPool.Shutdown()` → `tp.waitGroup.Wait()`（`simple_thread_pool.go:86`）。`waitingReceiveRequestFinished` 那层确实有超时（`RequestTimeout + longPollingTimeout`），但线程池这层没有。**所以「让 listener 永久阻塞以保证不 ack」会让测试永久死锁。**
+2. worker 收到 shutdown 信号后会 **把排队任务全部执行完**才退出（`simple_thread_pool.go:49-54` 的 `for t := range tp.tasks { t() }`，`Shutdown` 是先 `close(tasks)` 再 `waitGroup.Wait()`）。而 `standardConsumeService.consume` 是把整批收到的消息**一次性全部 Submit**（`consumer_service.go:129-143`），线程池容量又等于 `maxCacheMessageCount`（默认 1024，`push_consumer.go:378`）——十条消息填不满，不会触发 `Submit` 的丢弃兜底。**所以停机时已投给客户端的消息全部会被消费并 ack，「缓存未消费」这个构造在 v5.1.4 下根本构造不出「未 ack 缓存」。**
 
-**改用「缓存未消费」构造**，它测的也是更真实的停机丢失风险点：消息已被 broker 投给客户端、缓存在 process queue 里，但还没轮到进 listener 就停机了。
+结论：`GracefulStop` 本身就是防丢机制，inflight 不丢是 SDK 的性质，不是 sq 需要保证的语义，测它价值很低；要留下真正未 ack 的消息只能进程级强杀消费者，超出本条目 harness 的范围。
 
-1. broker 以 `default_invisible_duration = 5s` 启动（§7.2）。发 **10 条**普通消息。
-2. 消费者 A 配 `WithPushConsumptionThreadCount(1)`，采集器 `hold = 2s`，`handle` 返 `rmq.SUCCESS`。单线程 + 每条停留 2s，使 A 在短时间内只能消费掉少数几条，其余留在客户端缓存里。
-3. `waitCount(t, cA, 1, 30*time.Second)` 确认 A 已开工，随即 `stopA()`。`GracefulStop` 会等当前那条 listener 跑完（≤2s，有界）并 ack 它，然后关闭线程池——**缓存里剩下的那些从未进入 listener，也从未被 ack**。
-4. 起消费者 B（同组、同 topic，`handle` 返 `rmq.SUCCESS`，`hold = 0`）。
+**真正属于 sq 的语义是这条**：已投递但未 ack 的消息，在不可见期到期后重新可见并被重投，且投递次数递增。用**单消费者**测——引入第二个消费者会让两者同组同时长轮询，重投件落到谁手里是赌概率。
 
-**断言**：
+1. broker 以 `default_invisible_duration = 5s` 启动（§7.2）。发 **1 条**普通消息。
+2. 单个消费者配 `WithPushConsumptionThreadCount(1)`，采集器 `hold = 0`。
+3. **等待放进 `handle` 里按投递次数分支**（不改 §5.1 的 `hold` 字段——它是无条件 sleep，放那儿会让重投件也再等一轮）：`GetDeliveryAttempt() == 1` 时 `time.Sleep(8 * time.Second)` 再返 `rmq.SUCCESS`，否则立即返 `rmq.SUCCESS`。
+
+时间线是确定的：t=0 首投进 listener（attempt=1，句柄 H1）并占住唯一的消费线程；t=5s 不可见期到期，消息重新可见，消费者自己的长轮询把它收回来（attempt=2，句柄 H2）排进线程池；t=8s 线程空出，先跑完首投回调、用已失效的 H1 ack（sq 会拒，SDK 日志里会有一条 ack 失败，**属预期**），随即消费重投件并用 H2 ack 成功，终止。
+
+**断言**（`waitCount(t, c, 2, 40*time.Second)` 之后）：
 
 | 编号 | 内容 |
 |---|---|
-| 6a | A 的采集条数 `< 10`（它确实没消费完就停了；否则本用例什么都没测到，必须显式挡住） |
-| 6b | B 在 30s 内收到 A 未见过的全部剩余 body |
-| 6c | B 收到的每条 `GetDeliveryAttempt() >= 2`（是重投件，不是新消息） |
+| 6a | `len(got) >= 2`（确实发生了重投） |
+| 6b | `got[1].id == got[0].id`（是同一条消息的重投，不是新消息） |
+| 6c | `got[1].attempt >= 2` |
+| 6d | `got[1].receipt != got[0].receipt` |
 
-**6c 同时覆盖两条重投路径**：SDK 在关闭时可能主动 nack 缓存中未消费的消息，也可能什么都不做、由 broker 在不可见期（5s）后重投。两条路都会让 attempt 递增，断言对二者都成立——本用例不区分它们，也不应区分。
+**6d 是承重的**。它与用例 3 构成对照：用例 3 的 `FAILURE` 走客户端本地重试，**复用**同一个 `MessageView` 与同一个回执句柄；本用例的不可见期到期走 broker 重投，**铸出新句柄**。只有真的经过 broker 重投才会换句柄，所以它才是「broker 重投」与「客户端本地重投」的判别器——只断言 attempt 递增不够，两条路都会让 attempt 涨。
+
+一律用 `>=` 而非 `==`：消费线程被占住期间 sq 有可能多重投一代（取决于它把消息重新置为可见的扫描粒度），多出来的采集条目是良性的，不该让用例变红。
 
 **成本与依赖**：本用例是 §7.2 配置化改动的唯一动因。若不做该改动，不可见时长走 §3.5 的硬编码 1 分钟，本用例要干等 60s+。
 
