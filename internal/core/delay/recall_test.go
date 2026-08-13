@@ -111,6 +111,9 @@ func TestRecallRejectsTopicMismatch(t *testing.T) {
 // 关于判别力要诚实：单机档下「Scan 拷贝 → Recall 提交删除并返回 → moveOne 照陈旧 raw 入队」的窗口只有 µs 级，
 // 相对 1ms 扫描周期几乎不重叠，删掉重读本用例多半仍绿——它是压力测试而非确定性判别器。
 // 闸门二的结构必要性不靠本用例自证，见 moveOne 开头锁内重读注释的完整交错论证；本用例的价值是撞中即红，多跑可提高撞中概率。
+// 闸门二的**确定性**判据在 TestMoveOneRejectsRecalledEntry（U8）：它不赛跑，直接重放
+// 「陈旧 raw + 已被撤回的 key」那一刻并断言 moveOne 拒绝入队——删掉锁内重读那条必红。
+// 本用例（U7）只是提高撞中概率的压力测试，不是闸门二自身的判别器。
 func TestRecallNeverFalselySucceeds(t *testing.T) {
 	f := newFixture(t)
 	const n = 64
@@ -209,4 +212,42 @@ func TestRecallNeverFalselySucceeds(t *testing.T) {
 	}
 	t.Logf("并发不变式通过：撤回成功 %d 条、投递 %d 条，无交集无丢失",
 		countTrue(recalled), len(delivered))
+}
+
+// U8【承重】闸门二的确定性判别器：陈旧 raw 撞上已被撤回的条目，moveOne 必须拒绝入队。
+//
+// 与 U7 分工明确：U7 是并发压力测试（撞中即红，但单机档 µs 级窗口多半撞不中），
+// U8 不赛跑——它直接重放 Pass 在锁外 Scan 拷完 key/raw、moveOne 还没拿到锁的那个
+// 瞬间，此时 Recall 已提交删除并向客户端返回了成功。删掉 moveOne 开头的锁内重读，
+// 这条必红。**这是闸门二唯一的自动化判据，删它等于把撤回假成功的入口重新打开。**
+func TestMoveOneRejectsRecalledEntry(t *testing.T) {
+	f := newFixture(t)
+	const seq = 1
+	dueMs := time.Now().Add(time.Hour).UnixMilli() // 远未到期，Recall 的闸门三放行
+	m := &core.Message{Topic: "t-gate2", ID: core.NewMessageID(), Body: []byte("x")}
+	f.putDelay(t, seq, dueMs, m)
+	key := store.DelayKey(dueMs, seq)
+
+	// 模拟 Pass：Scan 已把 key/raw 拷贝出来（这就是调度器手里那份快照）
+	raw, ok, err := f.st.Get(key)
+	if err != nil || !ok {
+		t.Fatalf("取 raw 快照失败: err=%v ok=%v", err, ok)
+	}
+
+	// 此刻 Recall 抢先一步：删除提交成功，客户端已收到「撤回成功」
+	if _, err := f.sc.Recall(context.Background(), m.Topic, dueMs, seq); err != nil {
+		t.Fatalf("Recall: %v", err)
+	}
+
+	before := f.msgCount(t)
+	moved, err := f.sc.moveOne(context.Background(), key, raw)
+	if err != nil {
+		t.Fatalf("moveOne 返回错误: %v", err)
+	}
+	if moved {
+		t.Fatalf("moveOne 照陈旧 raw 入队了——闸门二失效，撤回变成假成功")
+	}
+	if after := f.msgCount(t); after != before {
+		t.Fatalf("消息区多了 %d 条：撤回已返回成功，消息却仍被投递", after-before)
+	}
 }
