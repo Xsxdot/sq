@@ -67,9 +67,23 @@ type Config struct {
 	// WrapReceiveMessageRequest 只设 LongPollingTimeout/BatchSize/AutoRenew），
 	// 所以整条 push 消费路径的不可见时长全部由它决定。默认 1m。
 	DefaultInvisibleDuration string `yaml:"default_invisible_duration"`
-	RetentionCheckInterval   string `yaml:"retention_check_interval"` // 过期清理扫描间隔（Go duration 格式）
-	DiskWatermarkPercent     int    `yaml:"disk_watermark_percent"`   // 超过即拒写，0=关闭
-	LogLevel                 string `yaml:"log_level"`                // debug|info|warn|error
+	// AutoRenewEnabled 消费者在 ReceiveMessage 里声明 auto_renew 时，是否在其
+	// 存活期间自动续租不可见期。默认 true——这是协议正确的行为，官方 SDK 的
+	// PushConsumer 每次请求都下发 auto_renew=true 且从不下发 invisible_duration，
+	// 关掉它意味着 listener 慢过不可见期就会被重复投递。
+	//
+	// 注意与 AutoRenewMaxDuration 的不对称：本项用 &Config{...} 字面量构造时
+	// 得 false（续租关闭，退化为固定不可见期），失败方向是安全的，所以不需要
+	// 像 AutoRenewMax() 那样的兜底。
+	AutoRenewEnabled bool `yaml:"auto_renew_enabled"`
+	// AutoRenewMaxDuration 单次投递允许续租的总时长上限（Go duration 格式）。
+	// 超过即按正常过期重投（Attempts++、可能进 DLQ）。它是防「消费者活着但
+	// 卡死」的唯一兜底：没有上限，一个死锁的 handler 能把消息永久扣住，
+	// 死信队列永远等不到它。
+	AutoRenewMaxDuration   string `yaml:"auto_renew_max_duration"`
+	RetentionCheckInterval string `yaml:"retention_check_interval"` // 过期清理扫描间隔（Go duration 格式）
+	DiskWatermarkPercent   int    `yaml:"disk_watermark_percent"`   // 超过即拒写，0=关闭
+	LogLevel               string `yaml:"log_level"`                // debug|info|warn|error
 	// —— M5 认证与管理面 ——
 	AdminListen   string `yaml:"admin_listen"`   // Admin HTTP 监听地址，"" = 关闭；默认 :8082
 	AdminUsername string `yaml:"admin_username"` // Admin API 登录用户名（与密码成对，均空 = 免登录）
@@ -162,6 +176,8 @@ func Load(path string) (*Config, error) {
 
 		DefaultMaxAttempts: 16, LogLevel: "info",
 		DefaultInvisibleDuration: "1m",
+		AutoRenewEnabled:         true,
+		AutoRenewMaxDuration:     "10m",
 		RetentionCheckInterval:   "5m",
 		DiskWatermarkPercent:     85,
 		AdminListen:              ":8082",
@@ -396,6 +412,20 @@ func (c *Config) DefaultInvisible() time.Duration {
 	d, err := time.ParseDuration(c.DefaultInvisibleDuration)
 	if err != nil || d <= 0 {
 		return time.Minute
+	}
+	return d
+}
+
+// AutoRenewMax 解析后的单次投递续租总时长上限。解析失败或非正数兜底返回 10m。
+//
+// 不返回 0 的理由与 DefaultInvisible 同源：0 会让续租判据恒假，把一个配置
+// 笔误变成静默的功能关闭——运维配了 auto_renew_max_duration 却发现续租没生效，
+// 而日志里没有任何线索。Load 的校验只覆盖走 Load 的路径，用
+// &config.Config{...} 字面量构造时拿到空串就会踩到。
+func (c *Config) AutoRenewMax() time.Duration {
+	d, err := time.ParseDuration(c.AutoRenewMaxDuration)
+	if err != nil || d <= 0 {
+		return 10 * time.Minute
 	}
 	return d
 }

@@ -29,6 +29,15 @@ default_max_attempts: 16
 # 客户端未指定 invisible_duration 时的不可见时长（Go duration，如 1m、30s）。
 # 官方 Go SDK 的 PushConsumer 不下发该字段，push 消费全靠这个默认值。
 default_invisible_duration: 1m
+# 消费者在 ReceiveMessage 里声明 auto_renew 时，是否在其存活期间自动续租
+# 不可见期。官方 SDK 的 PushConsumer 每次请求都声明它，用来表达「我还在处理」。
+# 关闭后 push 消费退回固定不可见期：listener 慢过 default_invisible_duration
+# 就会被重复投递。
+auto_renew_enabled: true
+# 单次投递允许续租的总时长上限，超过即按正常过期重投（投递次数 +1，可能进死信）。
+# 它兜的是「消费者进程活着但 handler 卡死」——没有上限这条消息会被永久扣住。
+# 顺序消息尤其要注意：续租期间该队列的顺序锁一直被占，后续消息全部等待。
+auto_renew_max_duration: 10m
 
 # 过期清理扫描间隔（Go duration，如 5m、1h）
 retention_check_interval: 5m

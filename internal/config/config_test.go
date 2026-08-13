@@ -360,6 +360,43 @@ func TestLoadStrictRejectsTypoField(t *testing.T) {
 	}
 }
 
+func TestAutoRenewMax(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want time.Duration
+	}{
+		{"合法值按原样解析", "30s", 30 * time.Second},
+		{"空串回落默认", "", 10 * time.Minute},
+		{"非法值回落默认", "十分钟", 10 * time.Minute},
+		{"零值回落默认", "0s", 10 * time.Minute},
+		{"负值回落默认", "-1m", 10 * time.Minute},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{AutoRenewMaxDuration: tc.raw}
+			if got := c.AutoRenewMax(); got != tc.want {
+				t.Fatalf("AutoRenewMax(%q) = %v，期望 %v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAutoRenewDefaults(t *testing.T) {
+	// path=="" 走纯默认值分支，不读文件
+	c, err := Load("")
+	if err != nil {
+		t.Fatalf("Load(\"\"): %v", err)
+	}
+	// 默认开启：这是协议正确的行为，SDK 的 PushConsumer 每次请求都在要它
+	if !c.AutoRenewEnabled {
+		t.Fatal("AutoRenewEnabled 默认应为 true")
+	}
+	if got := c.AutoRenewMax(); got != 10*time.Minute {
+		t.Fatalf("AutoRenewMax 默认 = %v，期望 10m", got)
+	}
+}
+
 // TestLoadStrictAcceptsExampleConfig 仓库自带的 sq.example.yaml 必须与严格 schema
 // 一致（它是用户照抄的模板，任何漂移都等于把错误教给用户）。
 func TestLoadStrictAcceptsExampleConfig(t *testing.T) {
