@@ -214,9 +214,11 @@ go test -race -count=1 ./internal/config ./internal/rpc
 Expected: 两包全 PASS
 
 ```bash
-cd test/e2e && go test -tags e2e -count=1 -run TestOfficialGoSDKBasic
+cd test/e2e && go test -tags e2e -count=1 -run TestOfficialGoSDKSendAndReceive
 ```
 Expected: PASS（证明 Step 10 的单机字面量生效，broker 起得来）
+
+> 初稿这里写的是 `-run TestOfficialGoSDKBasic`，**那个测试不存在**——执行期由 executor 撞出并替换。选任何一条起单机 broker 的现存用例都可以，`TestOfficialGoSDKSendAndReceive` 是最短的那条。
 
 再挑**最短的一条集群用例**跑一遍，证明 `clusterNodeConfig` 那处也生效（全量集群套件留给 Task 6 Step 4，这里只要一条起得来即可）。
 
