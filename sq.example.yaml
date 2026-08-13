@@ -26,6 +26,9 @@ auto_create_topic: true
 default_queue_nums: 16
 # 新订阅组默认最大投递次数，超过转入 %DLQ%{group}
 default_max_attempts: 16
+# 客户端未指定 invisible_duration 时的不可见时长（Go duration，如 1m、30s）。
+# 官方 Go SDK 的 PushConsumer 不下发该字段，push 消费全靠这个默认值。
+default_invisible_duration: 1m
 
 # 过期清理扫描间隔（Go duration，如 5m、1h）
 retention_check_interval: 5m

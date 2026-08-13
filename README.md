@@ -119,6 +119,7 @@ message_encoding: json         # json|binary。binary 让 Body 以原始字节�
 auto_create_topic: true
 default_queue_nums: 16
 default_max_attempts: 16       # 新订阅组默认最大投递次数，超过转入 %DLQ%{group}
+default_invisible_duration: 1m # 客户端未指定时的消息不可见时长；push 消费全靠它
 retention_check_interval: 5m   # 过期清理扫描间隔（Go duration 格式）
 disk_watermark_percent: 85     # 磁盘使用率超过即拒写保读；0=关闭。状态可在控制台
                                # 总览页与 /metrics 的 sq_write_blocked 观察

@@ -240,6 +240,10 @@ func writeBrokerConfig(t *testing.T, mutate ...func(*config.Config)) (cfgPath, e
 		// 会拒绝空 retention_check_interval，序列化出去反而起不来（与
 		// DefaultMaxAttempts 同款陷阱）。
 		RetentionCheckInterval: "5m",
+		// 与 RetentionCheckInterval / TxnCheckInterval 同款陷阱：本结构体不走
+		// config.Load 的默认值，零值会序列化成 default_invisible_duration: ""
+		// 并被 Load 的校验拒绝，broker 直接起不来。取值同 Load 的缺省。
+		DefaultInvisibleDuration: "1m",
 		// 事务配置同理：零值序列化出去（txn_check_interval: "" 与
 		// txn_max_checks: 0）会被 Load 的校验拒绝，broker 起不来。取值与
 		// config.Load 的默认值一致；需要短间隔的用例经 mutate 覆盖。

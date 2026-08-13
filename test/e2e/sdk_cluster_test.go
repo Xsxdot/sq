@@ -115,20 +115,21 @@ func pickPorts(t *testing.T, n int) []int {
 func clusterNodeConfig(t *testing.T, dir string, nodeID uint64, grpcPort, raftPort int, dataGroups uint32) *config.Config {
 	t.Helper()
 	cfg := &config.Config{
-		GRPCListen:             fmt.Sprintf("127.0.0.1:%d", grpcPort),
-		AdvertiseHost:          "127.0.0.1",
-		AdvertisePort:          grpcPort,
-		DataDir:                filepath.Join(dir, "data"),
-		Fsync:                  "sync",
-		MessageEncoding:        "json", // 同 writeBrokerConfig：字面量不走 Load 默认值，空串会被拒
-		AutoCreateTopic:        true,
-		DefaultQueueNums:       6, // plan：保证三组都有队列
-		DefaultMaxAttempts:     16,
-		RetentionCheckInterval: "5m",
-		TxnCheckInterval:       "30s",
-		TxnMaxChecks:           15,
-		DiskWatermarkPercent:   0, // 同 writeBrokerConfig：e2e 机器磁盘不可控，关闭水位
-		LogLevel:               "debug",
+		GRPCListen:               fmt.Sprintf("127.0.0.1:%d", grpcPort),
+		AdvertiseHost:            "127.0.0.1",
+		AdvertisePort:            grpcPort,
+		DataDir:                  filepath.Join(dir, "data"),
+		Fsync:                    "sync",
+		MessageEncoding:          "json", // 同 writeBrokerConfig：字面量不走 Load 默认值，空串会被拒
+		AutoCreateTopic:          true,
+		DefaultQueueNums:         6, // plan：保证三组都有队列
+		DefaultMaxAttempts:       16,
+		RetentionCheckInterval:   "5m",
+		DefaultInvisibleDuration: "1m", // 同 writeBrokerConfig：字面量不走 Load 默认值，空串会被拒
+		TxnCheckInterval:         "30s",
+		TxnMaxChecks:             15,
+		DiskWatermarkPercent:     0, // 同 writeBrokerConfig：e2e 机器磁盘不可控，关闭水位
+		LogLevel:                 "debug",
 		Credentials: []config.Credential{
 			{Name: "e2e-cluster", AccessKey: clusterAK, SecretKey: clusterSK},
 		},

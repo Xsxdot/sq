@@ -122,6 +122,28 @@ func TestDefaultMaxAttempts(t *testing.T) {
 	}
 }
 
+// TestDefaultInvisibleDuration 默认不可见时长为 1m（与改造前 receive.go 的硬编码
+// 一致），且非正 duration 必须在 Load 阶段被拒——配成 0 会让消息投出去立刻可再投，
+// 表现为无限重复消费，等到运行时才发现的代价远高于启动即挡。
+func TestDefaultInvisibleDuration(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load(\"\"): %v", err)
+	}
+	if got := cfg.DefaultInvisible(); got != time.Minute {
+		t.Fatalf("默认不可见时长 = %v，期望 1m", got)
+	}
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	os.WriteFile(p, []byte("default_invisible_duration: 0s\n"), 0o644)
+	if _, err := Load(p); err == nil {
+		t.Fatal("应拒绝 default_invisible_duration=0s")
+	}
+	os.WriteFile(p, []byte("default_invisible_duration: \"\"\n"), 0o644)
+	if _, err := Load(p); err == nil {
+		t.Fatal("应拒绝空 default_invisible_duration")
+	}
+}
+
 func TestDiskWatermark(t *testing.T) {
 	cfg, err := Load("")
 	if err != nil || cfg.DiskWatermarkPercent != 85 {

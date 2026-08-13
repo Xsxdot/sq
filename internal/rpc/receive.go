@@ -132,7 +132,12 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 	}
 	invisible := req.GetInvisibleDuration().AsDuration()
 	if invisible <= 0 {
-		invisible = time.Minute
+		// 客户端没给不可见时长，落到服务端默认值。这条分支是 push 消费的常态而
+		// 非兜底：官方 Go SDK 的 PushConsumer 从不下发 invisible_duration，
+		// 整条 push 路径的不可见窗口都由 default_invisible_duration 决定。
+		invisible = s.cfg.DefaultInvisible()
+		s.logger.Debug("ReceiveMessage 采用服务端默认不可见时长",
+			"group", group, "topic", topic, "queue", queueID, "invisible", invisible)
 	}
 	batch := int(req.GetBatchSize())
 	if batch <= 0 {

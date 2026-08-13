@@ -56,13 +56,20 @@ type Config struct {
 	// ⚠️ 开启 binary 必须在**全集群升级完成之后**：解码永远双格式，但旧版本
 	// 进程不认识 v1，混版期提前开启会让旧节点解不开转发来的消息。两步纪律
 	// 见 README「升级注意」。
-	MessageEncoding        string `yaml:"message_encoding"`
-	AutoCreateTopic        bool   `yaml:"auto_create_topic"`        // QueryRoute/Send 未知 topic 时自动建
-	DefaultQueueNums       uint32 `yaml:"default_queue_nums"`       // 自动建 topic 的队列数
-	DefaultMaxAttempts     int32  `yaml:"default_max_attempts"`     // 新订阅组默认最大投递次数
-	RetentionCheckInterval string `yaml:"retention_check_interval"` // 过期清理扫描间隔（Go duration 格式）
-	DiskWatermarkPercent   int    `yaml:"disk_watermark_percent"`   // 超过即拒写，0=关闭
-	LogLevel               string `yaml:"log_level"`                // debug|info|warn|error
+	MessageEncoding    string `yaml:"message_encoding"`
+	AutoCreateTopic    bool   `yaml:"auto_create_topic"`    // QueryRoute/Send 未知 topic 时自动建
+	DefaultQueueNums   uint32 `yaml:"default_queue_nums"`   // 自动建 topic 的队列数
+	DefaultMaxAttempts int32  `yaml:"default_max_attempts"` // 新订阅组默认最大投递次数
+	// DefaultInvisibleDuration 客户端未在 ReceiveMessage 里指定 invisible_duration
+	// 时采用的不可见时长（Go duration 格式）。
+	//
+	// 这不是边角配置：官方 Go SDK 的 PushConsumer 从不下发该字段（其
+	// WrapReceiveMessageRequest 只设 LongPollingTimeout/BatchSize/AutoRenew），
+	// 所以整条 push 消费路径的不可见时长全部由它决定。默认 1m。
+	DefaultInvisibleDuration string `yaml:"default_invisible_duration"`
+	RetentionCheckInterval   string `yaml:"retention_check_interval"` // 过期清理扫描间隔（Go duration 格式）
+	DiskWatermarkPercent     int    `yaml:"disk_watermark_percent"`   // 超过即拒写，0=关闭
+	LogLevel                 string `yaml:"log_level"`                // debug|info|warn|error
 	// —— M5 认证与管理面 ——
 	AdminListen   string `yaml:"admin_listen"`   // Admin HTTP 监听地址，"" = 关闭；默认 :8082
 	AdminUsername string `yaml:"admin_username"` // Admin API 登录用户名（与密码成对，均空 = 免登录）
@@ -154,12 +161,13 @@ func Load(path string) (*Config, error) {
 		AutoCreateTopic: true, DefaultQueueNums: 16, // 16：队列数决定消费并行度（每队列一路消费）；写吞吐自队列内 group commit 后与队列数基本无关
 
 		DefaultMaxAttempts: 16, LogLevel: "info",
-		RetentionCheckInterval: "5m",
-		DiskWatermarkPercent:   85,
-		AdminListen:            ":8082",
-		MetricsRetentionHours:  168,
-		TxnCheckInterval:       "30s",
-		TxnMaxChecks:           15,
+		DefaultInvisibleDuration: "1m",
+		RetentionCheckInterval:   "5m",
+		DiskWatermarkPercent:     85,
+		AdminListen:              ":8082",
+		MetricsRetentionHours:    168,
+		TxnCheckInterval:         "30s",
+		TxnMaxChecks:             15,
 	}
 	if path == "" {
 		return cfg, nil
@@ -217,6 +225,11 @@ func Load(path string) (*Config, error) {
 	// meta.New 的防御性回退重叠，配置层面的笔误不该静默吞掉，启动即报错。
 	if cfg.DefaultMaxAttempts <= 0 {
 		return nil, fmt.Errorf("配置 default_max_attempts 必须 >0，得到 %d", cfg.DefaultMaxAttempts)
+	}
+	// 同理：default_invisible_duration 非正（含空串）必须启动即拒——它决定 push
+	// 消费的不可见窗口，配成 0 会让消息投出去立刻可再投，表现为无限重复消费。
+	if d, err := time.ParseDuration(cfg.DefaultInvisibleDuration); err != nil || d <= 0 {
+		return nil, fmt.Errorf("配置 default_invisible_duration 须为正 duration（如 1m），得到 %q", cfg.DefaultInvisibleDuration)
 	}
 	// retention_check_interval 必须是正 duration：空串（yaml 漏填）或拼写错误
 	// 都不能让 retention 任务以 0 间隔空转或整趟跳过，启动时挡住。
@@ -373,6 +386,12 @@ func Load(path string) (*Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// DefaultInvisible 解析后的默认不可见时长（Load 已校验合法，此处不会失败）。
+func (c *Config) DefaultInvisible() time.Duration {
+	d, _ := time.ParseDuration(c.DefaultInvisibleDuration)
+	return d
 }
 
 // RetentionInterval 解析后的清理扫描间隔（Load 已校验合法，此处不会失败）。
