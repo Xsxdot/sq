@@ -28,7 +28,7 @@
 |---|---|---|
 | `internal/config/config.go` | 修改 | 新增 `DefaultInvisibleDuration` 字段 + 默认值 + 校验 + `DefaultInvisible()` 访问器 |
 | `internal/config/config_test.go` | 修改 | 新增 `TestDefaultInvisibleDuration` |
-| `internal/rpc/receive.go` | 修改 | 硬编码 `time.Minute` 换成 `s.cfg.DefaultInvisible()` |
+| `internal/rpc/receive.go` | 修改 | 硬编码 `time.Minute` 换成 `s.cfg.DefaultInvisible()`（按文本定位，不按行号） |
 | `sq.example.yaml` | 修改 | 新增配置项示例 |
 | `README.md` | 修改 | 配置块新增一行 |
 | `test/e2e/sdk_test.go` | 修改 | `writeBrokerConfig` 补 `DefaultInvisibleDuration` 字段（不补 broker 起不来） |
@@ -42,7 +42,7 @@
 **Files:**
 - Modify: `internal/config/config.go`（结构体字段、`Load` 默认值、`Load` 校验、访问器）
 - Modify: `internal/config/config_test.go`
-- Modify: `internal/rpc/receive.go:110-113`
+- Modify: `internal/rpc/receive.go`（`invisible := req.GetInvisibleDuration()...` 那个 `if` 块；**按文本定位不要按行号**——本分支基线含 B13.1 的过滤改动，该块的行号约在 133 而非 110）
 - Modify: `sq.example.yaml`
 - Modify: `README.md`
 - Modify: `test/e2e/sdk_test.go`（`writeBrokerConfig` 的 `config.Config` 字面量）
