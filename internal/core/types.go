@@ -109,6 +109,18 @@ type InflightState struct {
 	// (group,topic,queue) 至多 1 条 Ordered inflight。omitempty：M3 及以前
 	// 落盘的旧记录无此键，解码得 false（非顺序），无需迁移。
 	Ordered bool `json:"ordered,omitempty"`
+	// Owner 本次投递的持有者客户端标识（gRPC metadata 的 x-mq-client-id）。
+	// 仅在该次投递启用了自动续租时写入；空串表示不参与续租判定。
+	// omitempty：M1–M4 落盘的旧记录无此键，解码得空串，行为与改造前相同，
+	// 无需迁移——与 Ordered 当初的处理方式一致。
+	Owner string `json:"owner,omitempty"`
+	// RenewUntilMs 本次投递允许续租到的绝对时刻（毫秒）。0 表示不续租。
+	//
+	// 它是**硬上限**而不是目标：续租每次把 ExpireAtMs 推到
+	// min(now+不可见期, RenewUntilMs)，越过它就必须走重投。没有这条线，
+	// 一个「进程活着但 handler 卡死」的消费者能永久扣住消息，投递次数永不
+	// 增长，死信队列永远等不到它——而这类故障恰恰最需要 DLQ 兜底。
+	RenewUntilMs int64 `json:"renew_until_ms,omitempty"`
 }
 
 // EncodeInflight 序列化 inflight 状态。

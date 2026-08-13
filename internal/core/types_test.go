@@ -131,3 +131,39 @@ func TestInflightOrderedRoundTripAndCompat(t *testing.T) {
 		t.Fatal("零值 Ordered 不应出现在 JSON 中")
 	}
 }
+
+func TestInflightStateOldRecordDecodesAsNonRenewable(t *testing.T) {
+	// M1–M4 落盘的旧记录：没有 owner / renew_until_ms 两个键
+	old := []byte(`{"expire_at_ms":1700000000000,"attempts":3}`)
+	st, err := DecodeInflight(old)
+	if err != nil {
+		t.Fatalf("解码旧记录: %v", err)
+	}
+	if st.ExpireAtMs != 1700000000000 || st.Attempts != 3 {
+		t.Fatalf("旧字段解码错误: %+v", st)
+	}
+	// 零值即「不参与续租」，这是零迁移的全部依据
+	if st.Owner != "" || st.RenewUntilMs != 0 {
+		t.Fatalf("旧记录不应带续租信息: owner=%q renew_until=%d", st.Owner, st.RenewUntilMs)
+	}
+}
+
+func TestInflightStateOmitsRenewFieldsWhenUnset(t *testing.T) {
+	// 不启用续租时编码结果必须与改造前逐字节相同，否则存量部署重启后
+	// 每条 inflight 都会因为多出两个键而变长，且旧版本 sq 读不回去
+	b := EncodeInflight(&InflightState{ExpireAtMs: 1, Attempts: 1})
+	if got := string(b); got != `{"expire_at_ms":1,"attempts":1}` {
+		t.Fatalf("未启用续租时的编码结果 = %s，期望不含 owner/renew_until_ms", got)
+	}
+}
+
+func TestInflightStateRenewFieldsRoundTrip(t *testing.T) {
+	want := &InflightState{ExpireAtMs: 10, Attempts: 2, Ordered: true, Owner: "cli-1", RenewUntilMs: 99}
+	got, err := DecodeInflight(EncodeInflight(want))
+	if err != nil {
+		t.Fatalf("往返解码: %v", err)
+	}
+	if *got != *want {
+		t.Fatalf("往返后 = %+v，期望 %+v", got, want)
+	}
+}
