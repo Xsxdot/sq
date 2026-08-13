@@ -32,6 +32,7 @@
 | `sq.example.yaml` | 修改 | 新增配置项示例 |
 | `README.md` | 修改 | 配置块新增一行 |
 | `test/e2e/sdk_test.go` | 修改 | `writeBrokerConfig` 补 `DefaultInvisibleDuration` 字段（不补 broker 起不来） |
+| `test/e2e/sdk_cluster_test.go` | 修改 | `clusterNodeConfig` 同款陷阱，同样补 `DefaultInvisibleDuration` |
 | `test/e2e/sdk_push_test.go` | **新建** | 采集器 + 3 helper + 6 个 push 用例 |
 | `internal/rpc/settings.go` | 修改 | `fifo` 注释订正为 §7.1 的终态文本 |
 
@@ -179,7 +180,15 @@ Run: `go build ./internal/rpc`
 		DefaultInvisibleDuration: "1m",
 ```
 
-**这一步漏掉会让 40 条现存 e2e 全部红**（broker 起不来），而不是只影响新用例。
+**同款陷阱还有第二处**：`test/e2e/sdk_cluster_test.go` 的 `clusterNodeConfig`（约 117 行）同样会被 `yaml.Marshal` 后交给 `launchBroker` → `config.Load`，也必须补 `DefaultInvisibleDuration: "1m"`，注释风格与该字面量里既有的 `MessageEncoding` / `DiskWatermarkPercent` 两条对齐。
+
+判据统一为一句话：**这个 `config.Config` 字面量最终会不会被序列化成 yaml 交给 `config.Load`**。会，就必须显式给值。
+
+**`test/e2e/sdk_test.go` 的 `rewriteBrokerConfig`（约 283 行）不要动**：它是先 `yaml.Unmarshal` 既有配置文件到空字面量、mutate 后再 `Marshal` 回写，字段会被原样带过，不存在空串问题。在那里塞硬编码值反而会覆盖调用方经 `writeBrokerConfig` mutate 设进去的值——那正是跨档位互读用例要避免的。
+
+**这一步漏掉会让全部现存 e2e 红**（broker 起不来），而不是只影响新用例。
+
+> 本步的第二处（`clusterNodeConfig`）是**执行期由 executor 发工单撞出来的 plan 补漏**，写计划时只核了 `sdk_test.go` 一个字面量。已按上述判据统一收口。
 
 - [ ] **Step 11: 更新文档**
 
@@ -207,7 +216,9 @@ Expected: 两包全 PASS
 ```bash
 cd test/e2e && go test -tags e2e -count=1 -run TestOfficialGoSDKBasic
 ```
-Expected: PASS（证明 Step 10 生效，broker 起得来）
+Expected: PASS（证明 Step 10 的单机字面量生效，broker 起得来）
+
+再挑**最短的一条集群用例**跑一遍，证明 `clusterNodeConfig` 那处也生效（全量集群套件留给 Task 6 Step 4，这里只要一条起得来即可）。
 
 ```bash
 git add internal/config/config.go internal/config/config_test.go internal/rpc/receive.go sq.example.yaml README.md test/e2e/sdk_test.go
