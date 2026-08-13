@@ -4,7 +4,7 @@
 //
 // 职责：
 //   - 覆盖 push 消费路径（callback 驱动）的六条真实链路：基础闭环、长轮询唤醒、
-//     消费失败重投、超限转 DLQ、FIFO 顺序不破、停机后 inflight 不丢
+//     消费失败重投、超限转 DLQ、FIFO 顺序不破、不可见期到期重投
 //   - 实证 settings.go 下发的 fifo=false 是正确终态：重试计数与死信判定都归 broker
 //
 // 边界：
@@ -441,4 +441,115 @@ func TestOfficialGoSDKPushDLQOwnedByBroker(t *testing.T) {
 		t.Fatalf("死信未到达或内容不符: %q", gotBody)
 	}
 	t.Logf("用例 4 通过：listener 恰 2 次后静默，消息在 %s 中", dlqTopic)
+}
+
+// TestOfficialGoSDKPushLongPollingWakeup 用例 2：消息到达即唤醒长轮询，
+// 而不是慢周期轮询。
+func TestOfficialGoSDKPushLongPollingWakeup(t *testing.T) {
+	endpoint := startBroker(t)
+	const (
+		topic = "e2e-push-wakeup"
+		group = "e2e-push-wakeup-g"
+	)
+	c := newCollector(t)
+	startPushConsumer(t, endpoint, group, topic, c)
+
+	// 探针先行：消费者 Start() 之后要走 Telemetry 协商 + QueryAssignment 才会挂上
+	// 长轮询，这段耗时不确定。不用探针而直接「起消费者 → 睡 2s → 发消息 → 计时」，
+	// 测的是「协商耗时 + 唤醒耗时」的和，协商慢一点就假红。探针到达后，
+	// t0 之后长轮询确定已在挂着，量到的才是纯唤醒延迟。
+	sendPlain(t, endpoint, topic, "probe")
+	waitCount(t, c, 1, 30*time.Second)
+
+	t0 := time.Now()
+	sendPlain(t, endpoint, topic, "wakeup")
+	waitCount(t, c, 2, 30*time.Second)
+	elapsed := time.Since(t0)
+
+	// 阈值 3s：若客户端退化成慢周期轮询，周期上限是 defaultLongPolling = 20s，
+	// 唤醒延迟会落在秒级到 20s；3s 能把两者分开，同时对本机 e2e 抖动留足余量。
+	//
+	// 注意 elapsed 含一次 producer 建连 + Send 的往返，本机量级在几十毫秒。
+	if elapsed >= 3*time.Second {
+		t.Fatalf("唤醒延迟 %v ≥ 3s：疑似退化成周期轮询而非长轮询", elapsed)
+	}
+	if snap := c.snapshot(); snap[1].body != "wakeup" {
+		t.Fatalf("第 2 条 body = %q，期望 wakeup", snap[1].body)
+	}
+	t.Logf("用例 2 通过：唤醒延迟 %v", elapsed)
+}
+
+// TestOfficialGoSDKPushRedeliverAfterInvisibleExpiry 用例 6：已投递给客户端但
+// 尚未 ack 的消息，在 broker 侧不可见期到期后被重新投递。
+//
+// 为什么不测「GracefulStop 后 inflight 不丢」：SDK 的 simpleThreadPool 收到
+// shutdown 信号后会排干任务队列（simple_thread_pool.go:49-54，worker 收到
+// shutdown 后 for t := range tp.tasks { t() } 把剩余任务全部执行完），且
+// Shutdown() 先 close(tp.tasks) 再 waitGroup.Wait()（simple_thread_pool.go:83-86）
+// ——GracefulStop 期间已入队的消息全部会被消费并 ack，构造不出「从未进 listener、
+// 也从未被 ack」的缓存。记下这个事实，免得以后有人照着旧标题「GracefulStop 后
+// inflight 不丢」再推一遍错的假设。
+//
+// 真正属于 sq 的语义是这条：消息已投给客户端、尚未 ack，在不可见期到期后被
+// 重新投递。单消费者即可测——A、B 同组同时长轮询时重投件落到谁手里是赌概率，
+// 不能那么写。
+func TestOfficialGoSDKPushRedeliverAfterInvisibleExpiry(t *testing.T) {
+	// 5s 不可见时长：不改的话走默认 1m，本用例要干等 60s+。
+	endpoint := startBroker(t, func(c *config.Config) {
+		c.DefaultInvisibleDuration = "5s"
+	})
+	const (
+		topic = "e2e-push-redeliver"
+		group = "e2e-push-redeliver-g"
+		body  = "redeliver-me"
+	)
+	sendPlain(t, endpoint, topic, body)
+
+	c := newCollector(t)
+	// 等待按投递次数分支，放进 decide 而不是 hold 字段：hold 是无条件 sleep，
+	// 放那儿会让第二次投递也睡 8s，用例会滚成无限重投。
+	c.decide = func(mv *rmq.MessageView) rmq.ConsumerResult {
+		// 首投占住唯一的消费线程 8s，跨过 broker 侧 5s 的不可见期，让这条消息
+		// 在「已投递给客户端但尚未 ack」的状态下被重新置为可见。重投件立即
+		// 返回，否则每一代都要再等 8s。
+		if mv.GetDeliveryAttempt() == 1 {
+			time.Sleep(8 * time.Second)
+		}
+		return rmq.SUCCESS
+	}
+	startPushConsumer(t, endpoint, group, topic, c,
+		rmq.WithPushConsumptionThreadCount(1))
+	// 时间线（确定的）：
+	//   t=0 首投进 listener，attempt=1，句柄 H1，唯一 worker 被占住；
+	//   t=5s broker 侧不可见期到期，消息重新可见，长轮询把它收回来
+	//        （attempt=2，句柄 H2），排进线程池等 worker；
+	//   t=8s worker 空出：先跑完首投回调 → 用 H1 ack（H1 已失效，sq 会拒，
+	//        SDK 日志会有一条 ack 失败，这是预期的，不是用例失败）；随即消费
+	//        重投件 → 立即 SUCCESS → 用 H2 ack 成功 → 终止，不再重投。
+	waitCount(t, c, 2, 40*time.Second)
+
+	got := c.snapshot()
+	// 6a：确实发生了重投。用 >= 而非 ==：worker 被占住期间 sq 可能多重投一代
+	// （取决于重新置为可见的扫描粒度），多出来的采集条目是良性的。
+	if len(got) < 2 {
+		t.Fatalf("未发生重投：只采集到 %d 条: %+v", len(got), got)
+	}
+	// 6b：是同一条消息的重投，不是新消息。
+	if got[1].id != got[0].id {
+		t.Fatalf("第 2 条不是第 1 条的重投: %s vs %s", got[1].id, got[0].id)
+	}
+	// 6c：重投件投递次数递增。用 >=：多重投一代时 attempt 会更高。
+	if got[1].attempt < 2 {
+		t.Fatalf("重投件 attempt = %d，期望 ≥2", got[1].attempt)
+	}
+	// 6d【承重】：重投件换新回执句柄。
+	//
+	// 与用例 3 构成对照：用例 3 的 FAILURE 走客户端本地重试，复用同一个
+	// MessageView、同一个句柄；这里的不可见期到期走 broker 重投，换新句柄。
+	// 只有真的经过 broker 重投才会铸出新句柄——这是「broker 重投」与「客户端
+	// 本地重投」的判别器；只断言 attempt 递增不够，两条路都会让 attempt 涨。
+	if got[1].receipt == got[0].receipt {
+		t.Fatalf("重投件句柄未变（%q）：说明是客户端本地重投，不是 broker 重投", got[1].receipt)
+	}
+	t.Logf("用例 6 通过：不可见期到期后重投，attempt=%d 且句柄已换", got[1].attempt)
 }
