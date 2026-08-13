@@ -91,6 +91,82 @@ func (f *fixture) sendGrouped(t *testing.T, topic, body, group string) {
 	}
 }
 
+// sendProps 发送一条带自定义属性的消息（SQL92 过滤用例专用辅助）。
+func (f *fixture) sendProps(t *testing.T, topic, body string, props map[string]string) {
+	t.Helper()
+	if _, err := f.pr.Append(context.Background(), &core.Message{
+		Topic: topic, Body: []byte(body), Properties: props,
+	}); err != nil {
+		t.Fatalf("Append: %v", err)
+	}
+}
+
+func TestReceiveSQL92FilterSkipsAndAdvancesCursor(t *testing.T) {
+	f := newFixture(t)
+	topic, group := "t-sql", "g-sql"
+	// 写 3 条：命中 / 不命中 / 属性缺失
+	f.sendProps(t, topic, "hit", map[string]string{"age": "20"})
+	f.sendProps(t, topic, "miss", map[string]string{"age": "5"})
+	f.sendProps(t, topic, "absent", map[string]string{})
+
+	flt, err := ParseFilter(FilterSQL92, "age > 10")
+	if err != nil {
+		t.Fatalf("ParseFilter: %v", err)
+	}
+	msgs, err := f.dl.Receive(context.Background(), group, topic, 0, 10, time.Minute, 0, flt)
+	if err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+	if len(msgs) != 1 || string(msgs[0].Body) != "hit" {
+		t.Fatalf("收到 %d 条 %v，期望仅 age=20 那条", len(msgs), msgs)
+	}
+	// 位点必须越过全部 3 条：被过滤的消息永久跳过，不占 inflight、
+	// 也不会在下一次取件时冒出来
+	msgs2, err := f.dl.Receive(context.Background(), group, topic, 0, 10, time.Minute, 0, flt)
+	if err != nil {
+		t.Fatalf("Receive 二次: %v", err)
+	}
+	if len(msgs2) != 0 {
+		t.Fatalf("二次取件收到 %d 条，期望 0——被过滤消息应已永久越过位点", len(msgs2))
+	}
+}
+
+func TestReceiveFilterSkipReasonBuckets(t *testing.T) {
+	// §7.1 的诊断能力：FALSE 与 UNKNOWN 必须分开计数。
+	// 不测等于没有这个能力——两者都不投递，从投递结果上看不出区别。
+	f := newFixture(t)
+	topic, group := "t-bucket", "g-bucket"
+	f.sendProps(t, topic, "false", map[string]string{"age": "5"})     // FALSE
+	f.sendProps(t, topic, "absent", map[string]string{})              // UNKNOWN：属性缺失
+	f.sendProps(t, topic, "badtype", map[string]string{"age": "abc"}) // UNKNOWN：类型解释失败
+
+	flt, _ := ParseFilter(FilterSQL92, "age > 10")
+	if _, err := f.dl.Receive(context.Background(), group, topic, 0, 10, time.Minute, 0, flt); err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+	got := f.dl.FilterSkipped()
+	if n := got[FilterSkipKey{Topic: topic, Group: group, Reason: "sql_false"}]; n != 1 {
+		t.Fatalf("sql_false = %d，期望 1", n)
+	}
+	if n := got[FilterSkipKey{Topic: topic, Group: group, Reason: "sql_unknown"}]; n != 2 {
+		t.Fatalf("sql_unknown = %d，期望 2", n)
+	}
+}
+
+func TestReceiveTagSkipReasonBucket(t *testing.T) {
+	f := newFixture(t)
+	topic, group := "t-tagb", "g-tagb"
+	f.sendTagged(t, topic, "a", "a")
+	f.sendTagged(t, topic, "z", "z")
+	flt, _ := ParseFilter(FilterTag, "a")
+	if _, err := f.dl.Receive(context.Background(), group, topic, 0, 10, time.Minute, 0, flt); err != nil {
+		t.Fatalf("Receive: %v", err)
+	}
+	if n := f.dl.FilterSkipped()[FilterSkipKey{Topic: topic, Group: group, Reason: "tag_miss"}]; n != 1 {
+		t.Fatalf("tag_miss = %d，期望 1", n)
+	}
+}
+
 func TestReceiveAckFlow(t *testing.T) {
 	f := newFixture(t)
 	f.send(t, "t", "a")

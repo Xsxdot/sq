@@ -646,13 +646,14 @@ func TestReceiveTagFilter(t *testing.T) {
 	}
 }
 
-// TestReceiveRejectsUnsupportedFilter SQL92 与非法 TAG 表达式返回 ILLEGAL_FILTER_EXPRESSION。
+// TestReceiveRejectsUnsupportedFilter 非法过滤表达式返回 ILLEGAL_FILTER_EXPRESSION。
+// （SQL92 已接线，合法表达式不再走拒绝分支，其协议行为见 TestReceiveSQL92Filter。）
 func TestReceiveRejectsUnsupportedFilter(t *testing.T) {
 	c := newTestClient(t)
 	sendOne(t, c, "tf-bad", "x")
 	cases := []*pb.FilterExpression{
-		{Type: pb.FilterType_SQL, Expression: "a > 1"},
 		{Type: pb.FilterType_TAG, Expression: "a ||"},
+		{Type: pb.FilterType_SQL, Expression: "k = NULL"}, // 构建期语义拒绝（请用 k IS NULL）
 	}
 	for _, fe := range cases {
 		stream, err := c.ReceiveMessage(context.Background(), &pb.ReceiveMessageRequest{
@@ -668,6 +669,64 @@ func TestReceiveRejectsUnsupportedFilter(t *testing.T) {
 		msgs, st := recvAll(t, stream)
 		if len(msgs) != 0 || st.GetCode() != pb.Code_ILLEGAL_FILTER_EXPRESSION {
 			t.Fatalf("期望 ILLEGAL_FILTER_EXPRESSION，得到 %v (msgs=%d)", st, len(msgs))
+		}
+	}
+}
+
+// sendProps 发送带用户属性的消息（SQL92 属性过滤用例专用辅助）。
+func sendProps(t *testing.T, c pb.MessagingServiceClient, topic, body string, props map[string]string) {
+	t.Helper()
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic:            &pb.Resource{Name: topic},
+			SystemProperties: &pb.SystemProperties{MessageType: pb.MessageType_NORMAL},
+			UserProperties:   props,
+			Body:             []byte(body),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("send: %v %v", resp.GetStatus(), err)
+	}
+}
+
+// receiveQueueSQL 与 receiveQueue 同款，但用 SQL92 过滤表达式取件。
+func receiveQueueSQL(t *testing.T, c pb.MessagingServiceClient, group, topic string, q int32, expr string) []*pb.Message {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := c.ReceiveMessage(ctx, &pb.ReceiveMessageRequest{
+		Group:             &pb.Resource{Name: group},
+		MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: topic}, Id: q},
+		FilterExpression:  &pb.FilterExpression{Type: pb.FilterType_SQL, Expression: expr},
+		BatchSize:         16,
+		InvisibleDuration: durationpb.New(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ReceiveMessage: %v", err)
+	}
+	msgs, _ := recvAll(t, stream)
+	return msgs
+}
+
+// TestReceiveSQL92Filter 协议层走通 SQL92 属性过滤：只投属性命中表达式的
+// 消息；不命中的被永久跳过（换全量也收不到）。
+func TestReceiveSQL92Filter(t *testing.T) {
+	c := newTestClient(t)
+	sendProps(t, c, "tsql", "hit", map[string]string{"age": "20"})
+	sendProps(t, c, "tsql", "miss", map[string]string{"age": "5"})
+	var got []string
+	for q := int32(0); q < 4; q++ {
+		for _, m := range receiveQueueSQL(t, c, "g-tsql", "tsql", q, "age > 10") {
+			got = append(got, string(m.GetBody()))
+		}
+	}
+	if len(got) != 1 || got[0] != "hit" {
+		t.Fatalf("SQL92 过滤应只收到 age>10 的消息: %v", got)
+	}
+	// 被过滤的 miss 已被位点跳过，事后用 "*" 也收不到
+	for q := int32(0); q < 4; q++ {
+		if rest := receiveQueue(t, c, "g-tsql", "tsql", q, "*"); len(rest) != 0 {
+			t.Fatalf("被过滤消息不应可再收: %d", len(rest))
 		}
 	}
 }

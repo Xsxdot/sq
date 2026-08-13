@@ -10,7 +10,8 @@
 //     经 RouteView 把队列指向各 leader，行为与 QueryRoute 一致）
 //
 // 边界：
-//   - Tag 过滤支持 "*" / 单 tag / "a || b"，SQL92 属性过滤计划 v1.1
+//   - Tag 过滤支持 "*" / 单 tag / "a || b"，SQL92 属性过滤已支持
+//     （语法子集与限制见 README「订阅过滤」小节）
 //   - 不直接操作 store/meta 以外的状态，翻译逻辑之外的业务规则全部在
 //     deliver 包（本包不重复实现 attempt 校验、inflight 生命周期等）
 package rpc
@@ -108,6 +109,8 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 			}})
 		}
 		filter = f
+		s.logger.Debug("订阅过滤已解析", "group", group, "topic", topic,
+			"kind", fe.GetType(), "expr", fe.GetExpression())
 	}
 	// topic 存在性与队列边界必须在进入 deliver 前挡住（spec 鉴权收尾 §5）。
 	// 用只读 GetTopic 而非 EnsureTopic：消费动作不应创建 topic。

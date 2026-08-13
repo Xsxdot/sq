@@ -23,6 +23,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
+	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/store"
 	"github.com/xushixin/sq/internal/sysinfo"
@@ -45,6 +46,13 @@ type ConnCounter interface {
 	ConnectionCount() int
 }
 
+// FilterStats 订阅过滤跳过计数的只读视图（*deliver.Deliverer 天然实现）。
+//
+// 边界：只暴露累计计数；为 nil 时 Collector 跳过该指标。
+type FilterStats interface {
+	FilterSkipped() map[deliver.FilterSkipKey]uint64
+}
+
 var (
 	descTopics = prometheus.NewDesc("sq_topics", "已注册 topic 数", nil, nil)
 	descGroups = prometheus.NewDesc("sq_groups", "已注册消费组数", nil, nil)
@@ -62,6 +70,9 @@ var (
 		"事务回查超限累计丢弃条数", nil, nil)
 	descConns = prometheus.NewDesc("sq_connections",
 		"已完成 Settings 协商的客户端连接数", nil, nil)
+	descFilterSkipped = prometheus.NewDesc("sq_filter_skipped_total",
+		"订阅过滤累计跳过消息数，按跳过原因分桶（tag_miss/sql_false/sql_unknown）",
+		[]string{"topic", "group", "reason"}, nil)
 	descDiskUsed = prometheus.NewDesc("sq_disk_used_percent",
 		"数据目录所在文件系统已用百分比（与 df 同口径）", nil, nil)
 	descDiskFree = prometheus.NewDesc("sq_disk_free_bytes",
@@ -79,13 +90,14 @@ type Collector struct {
 	sys    *sysinfo.Reporter
 	tx     TxnStats
 	conns  ConnCounter
+	fs     FilterStats
 	logger *slog.Logger
 }
 
-// NewCollector 构造状态 Collector。sys/tx/conns 为 nil 时跳过各自负责的
+// NewCollector 构造状态 Collector。sys/tx/conns/fs 为 nil 时跳过各自负责的
 // 指标组（测试可只关心业务指标；main 装配时恒非 nil）。
-func NewCollector(st *store.Store, mt *meta.Meta, sys *sysinfo.Reporter, tx TxnStats, conns ConnCounter, logger *slog.Logger) *Collector {
-	return &Collector{st: st, mt: mt, sys: sys, tx: tx, conns: conns, logger: logger.With("mod", "metrics")}
+func NewCollector(st *store.Store, mt *meta.Meta, sys *sysinfo.Reporter, tx TxnStats, conns ConnCounter, fs FilterStats, logger *slog.Logger) *Collector {
+	return &Collector{st: st, mt: mt, sys: sys, tx: tx, conns: conns, fs: fs, logger: logger.With("mod", "metrics")}
 }
 
 // Describe 实现 prometheus.Collector。
@@ -100,6 +112,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descTxnChecks
 	ch <- descTxnDropped
 	ch <- descConns
+	ch <- descFilterSkipped
 	ch <- descDiskUsed
 	ch <- descDiskFree
 	ch <- descDataDir
@@ -142,6 +155,11 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	if c.conns != nil {
 		ch <- prometheus.MustNewConstMetric(descConns, prometheus.GaugeValue, float64(c.conns.ConnectionCount()))
 	}
+	if c.fs != nil {
+		for k, n := range c.fs.FilterSkipped() {
+			ch <- prometheus.MustNewConstMetric(descFilterSkipped, prometheus.CounterValue, float64(n), k.Topic, k.Group, k.Reason)
+		}
+	}
 }
 
 // collectSystem 产出系统类指标。
@@ -173,12 +191,12 @@ func (c *Collector) collectSystem(ch chan<- prometheus.Metric) {
 
 // NewRegistry 组装进程级指标注册表并挂接 store.Apply 耗时直方图。
 // 只能在装配阶段调用一次（会写 store.OnApplyObserve 包级钩子）。
-// tx/conns 允许为 nil（测试与降级场景跳过事务/连接指标）。
-func NewRegistry(st *store.Store, mt *meta.Meta, sys *sysinfo.Reporter, tx TxnStats, conns ConnCounter, logger *slog.Logger) *prometheus.Registry {
+// tx/conns/fs 允许为 nil（测试与降级场景跳过事务/连接/过滤跳过指标）。
+func NewRegistry(st *store.Store, mt *meta.Meta, sys *sysinfo.Reporter, tx TxnStats, conns ConnCounter, fs FilterStats, logger *slog.Logger) *prometheus.Registry {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector())
 	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	reg.MustRegister(NewCollector(st, mt, sys, tx, conns, logger))
+	reg.MustRegister(NewCollector(st, mt, sys, tx, conns, fs, logger))
 	h := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: "sq_store_apply_duration_seconds",
 		Help: "store 批次提交耗时（含 fsync）",

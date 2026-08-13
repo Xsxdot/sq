@@ -61,11 +61,19 @@ func TestParseFilterTagRejectsEmptyTokens(t *testing.T) {
 	}
 }
 
-func TestParseFilterSQL92NotYetWired(t *testing.T) {
-	// Task 1 只搭骨架，SQL92 分支必须显式报错而不是静默当成 AllPass——
-	// 静默放行会让所有 SQL92 订阅收到全量消息，比报错危险得多。
-	if _, err := ParseFilter(FilterSQL92, "a = 1"); err == nil {
-		t.Fatal("ParseFilter(FilterSQL92) 期望报错，实际 nil")
+func TestParseFilterSQL92Wired(t *testing.T) {
+	// SQL92 分支已接线：合法表达式必须产出可用的 SQLFilter，而不是报错
+	// 或静默当成 AllPass（静默放行会让所有 SQL92 订阅收到全量消息）。
+	// 非法表达式仍须报错，把错误回给客户端（ILLEGAL_FILTER_EXPRESSION）。
+	flt, err := ParseFilter(FilterSQL92, "age > 10 AND TAGS = 'a'")
+	if err != nil {
+		t.Fatalf("ParseFilter(FilterSQL92, 合法表达式) 报错: %v", err)
+	}
+	if _, ok := flt.(*SQLFilter); !ok {
+		t.Fatalf("ParseFilter(FilterSQL92) = %#v，期望 *SQLFilter", flt)
+	}
+	if _, err := ParseFilter(FilterSQL92, "k = NULL"); err == nil {
+		t.Fatal("ParseFilter(FilterSQL92, 非法表达式) 应报错，实际 nil")
 	}
 }
 

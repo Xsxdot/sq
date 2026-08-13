@@ -107,7 +107,7 @@ func ParseFilter(kind FilterKind, expr string) (Filter, error) {
 		}
 		return parseTagFilter(expr)
 	case FilterSQL92:
-		return nil, fmt.Errorf("SQL92 过滤尚未接线")
+		return buildSQLFilter(expr)
 	default:
 		return nil, fmt.Errorf("未知过滤种类 %d", uint8(kind))
 	}

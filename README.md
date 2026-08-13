@@ -37,6 +37,8 @@ go build -o sq ./cmd/sq
 - 普通消息收发：官方 SDK 直连，gRPC + Pebble 存储，消息体上限 4MB
 - Tag 过滤：服务端按订阅表达式过滤（`"*"`/单 tag/`a || b`），被过滤消息跳过并
   永久越过位点，不占消费 inflight
+- SQL92 属性过滤：按消息属性求值订阅表达式（`age > 10`、`region IN ('cn','us')`），
+  未命中与无法判定的消息跳过并永久越过位点；支持子集与限制见「订阅过滤」
 - 重试与死信：投递失败按指数退避重投（10s 起、每次 ×2、封顶 5min），超过订阅组
   `default_max_attempts` 后原子转入 `%DLQ%{group}` 死信队列并带 `sq-origin-*`
   溯源属性（见「消费失败链路」）
@@ -54,7 +56,8 @@ go build -o sq ./cmd/sq
 - Admin API（M5a）：topic/消费组管理、消息 Keys 查询与队列浏览、发送测试消息、
   DLQ 重发、延时与事务视图、总览（见「Admin API」）
 - Prometheus /metrics（M5a）：topic 写入计数、消费组堆积/inflight、延时深度、
-  半消息深度与回查/丢弃计数、连接数、store 提交耗时直方图（见「Admin API」）
+  半消息深度与回查/丢弃计数、订阅过滤跳过计数（按原因分桶）、连接数、
+  store 提交耗时直方图（见「Admin API」）
 - Web 控制台（M5b）：`go:embed` 进单二进制的静态站，11 个页面覆盖总览/时序/总账、
   topic 与消费组管理、消息查询与发送、死信重发、延时与事务视图（见「Web 控制台」）
 
@@ -66,6 +69,40 @@ go build -o sq ./cmd/sq
 `%DLQ%{group}`（group 为原消费组名）并从原队列移除，不再重投。转入时写入
 `sq-origin-topic`/`sq-origin-queue`/`sq-origin-offset` 溯源属性，可用任意
 RocketMQ SDK 把 `%DLQ%{group}` 当普通 topic 订阅，做人工处理或重放。
+
+## 订阅过滤
+
+服务端按订阅表达式过滤，未命中（或无法判定）的消息跳过并永久越过位点：不投递、
+不占消费 inflight，换更宽的过滤器也收不回。跳过计数按原因分桶暴露在 `/metrics`
+的 `sq_filter_skipped_total{topic,group,reason}`（`tag_miss`/`sql_false`/`sql_unknown`）。
+
+支持两种过滤器：TAG（`"*"`/单 tag/`a || b`）与 SQL92 属性过滤。SQL92 支持以下
+语法子集（RocketMQ 文档化子集）：
+
+- 比较：`=`、`<>`、`>`、`>=`、`<`、`<=`，属性与常量比较，如 `age > 10`
+- 逻辑组合：`AND` / `OR` / `NOT`，可用括号改变优先级，如 `(a = 1 OR b = 2) AND c = 3`
+- `BETWEEN lo AND hi`：`age BETWEEN 18 AND 65`
+- `IN (...)`：`region IN ('cn', 'us')`
+- `IS [NOT] NULL`：`nickname IS NOT NULL`
+- 布尔常量：`TRUE` / `FALSE`
+
+注意与 RocketMQ 对齐的几条约定：
+
+- **`TAGS` 是保留属性名**：映射到消息的 tag（RocketMQ 把 tag 作为可过滤属性暴露）。
+  若消息同时带有同名用户属性 `TAGS`，系统映射遮蔽该用户属性——同名用户属性不会生效。
+- **`k = NULL` 不被接受**，请用 `k IS NULL`。这是相对 SQL 标准的有意偏离：
+  `NULL` 不参与相等比较，`k = NULL` 恒为 UNKNOWN，对过滤毫无意义，构建期直接拒绝
+  并给出可照做的替代写法。
+
+不支持（明确拒绝）：`LIKE`、算术运算、函数调用、子查询、字符串大小比较
+（`>`/`>=`/`<`/`<=` 只支持数值）、属性间比较（两侧必须是属性与常量）、`!=`
+（请用 `<>`）。
+
+表达式上限：长度 1024 字节、嵌套 16 层、IN 列表 64 个元素，超限拒绝。
+
+**排查提示**：若 `sql_unknown` 持续增长而 `sql_false` 恒为 0，通常不是表达式
+本身不匹配，而是属性名拼错或属性值的类型与表达式常量对不上（如数字属性写成了
+字符串）——`unknown` 桶就是为这类「表达式没写错但数据对不上」的情形准备的。
 
 ## 配置
 

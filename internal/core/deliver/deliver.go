@@ -13,7 +13,8 @@
 //     没有消费者在收时也就没有人需要重投，语义等价而实现最简
 //   - 投递次数超上限的消息在重投检查时惰性转入死信 %DLQ%{group}（1 队列）；
 //     重投指数退避靠不可见时长下限实现，详见 retryBackoff 注释
-//   - Tag 过滤已落地（"*"/"tagA"/"tagA || tagB"），SQL92 属性过滤属 v1.1
+//   - Tag 过滤与 SQL92 属性过滤均已落地；跳过计数按原因分桶
+//     （tag_miss/sql_false/sql_unknown）供 /metrics 抓取，见 FilterSkipped
 //   - 顺序消息（M4）：队列级顺序锁，MessageGroup 非空即顺序；重投无退避、超限入 DLQ 解锁
 //
 // 位点语义说明（对应 spec §5.2"推进到最小未 ack"的实现形态）：
@@ -98,6 +99,13 @@ type Deliverer struct {
 	mu  sync.Mutex
 	qmu map[string]*sync.Mutex // "group/topic/qid" -> 队列级锁
 
+	// skipMu 保护 skipped。计数在扫描回调里累加（持队列锁），
+	// 而 FilterSkipped 由 metrics 抓取协程调用——两者天然并发。
+	// 为避免 metrics 抓取的锁竞争进入投递热路径，回调本身不加锁：
+	// 计数先累进本趟扫描的局部 map，扫描结束后才持 skipMu 一次性合并。
+	skipMu  sync.Mutex
+	skipped map[FilterSkipKey]uint64
+
 	// afterAppendHook 测试专用注入钩子（生产恒为 nil）：在 moveToDLQ 第一段
 	// （死信消息写入）成功后、第二段（删源 inflight）前调用，用于模拟两段
 	// 之间进程崩溃。生产代码绝不允许设置。
@@ -113,7 +121,44 @@ func New(rep replication.Replicator, rt replication.Router, st *store.Store,
 	mt *meta.Meta, pr *produce.Producer, logger *slog.Logger) *Deliverer {
 	fwd, _ := rt.(replication.Forwarder)
 	return &Deliverer{rep: rep, rt: rt, fwd: fwd, st: st, mt: mt, pr: pr,
-		logger: logger.With("mod", "deliver"), qmu: map[string]*sync.Mutex{}}
+		logger: logger.With("mod", "deliver"), qmu: map[string]*sync.Mutex{},
+		skipped: map[FilterSkipKey]uint64{}}
+}
+
+// FilterSkipKey 跳过计数的维度：topic + 消费组 + 跳过原因。
+type FilterSkipKey struct {
+	Topic  string
+	Group  string
+	Reason string
+}
+
+// FilterSkipped 返回跳过计数的快照。
+//
+// 供 /metrics 抓取期调用（metrics.FilterStats）。返回的是拷贝，
+// 调用方可以随意持有；计数只增不减，进程重启归零（counter 语义）。
+func (d *Deliverer) FilterSkipped() map[FilterSkipKey]uint64 {
+	d.skipMu.Lock()
+	defer d.skipMu.Unlock()
+	out := make(map[FilterSkipKey]uint64, len(d.skipped))
+	for k, v := range d.skipped {
+		out[k] = v
+	}
+	return out
+}
+
+// skipReasonOf 把（过滤器类型, 三值结果）映射为计数维度。
+//
+// 为什么用类型断言而不给 Filter 加 Kind() 方法：Kind 是构造期就确定的
+// 元信息，加进接口会让每个实现都要维护一个与自身类型重复的字段；
+// 而这里只有两个实现，断言一次即可，接口保持只有 Match 一个方法。
+func skipReasonOf(f Filter, r Result) string {
+	if _, ok := f.(*TagFilter); ok {
+		return "tag_miss"
+	}
+	if r == ResultUnknown {
+		return "sql_unknown"
+	}
+	return "sql_false"
 }
 
 // lockQueue 返回 (group,topic,queueID) 对应的队列级锁，不存在则创建。
@@ -339,7 +384,11 @@ func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, 
 	if len(out) < maxMsgs {
 		lower := store.MsgKey(topic, queueID, cursor)
 		upper := store.PrefixUpperBound(store.MsgQueuePrefix(topic, queueID))
-		skipped := 0
+		// skipReasons 是本趟扫描的局部跳过计数，按原因分桶。不在回调里逐条
+		// 持 skipMu 累加：回调持队列锁，逐条加锁会把队列锁的持有时间拉长
+		// （metrics 抓取协程的锁竞争直接进入投递热路径）。扫描结束后才一次性
+		// 合并进 d.skipped（见收尾处）。
+		skipReasons := map[string]int{}
 		err = d.st.Scan(lower, upper, scanBudget, func(k, v []byte) (bool, error) {
 			m, err := core.DecodeMessage(v)
 			if err != nil {
@@ -349,7 +398,7 @@ func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, 
 			// 推进位点。放在顺序锁之后的话，被锁拦住的不匹配消息会永远堵住位点。
 			if r := filter.Match(m); r != ResultTrue {
 				newCursor = m.Offset + 1
-				skipped++
+				skipReasons[skipReasonOf(filter, r)]++
 				return true, nil
 			}
 			// 顺序锁（spec §5 流程 4）：队列存在未终结的顺序 inflight 时，
@@ -382,8 +431,16 @@ func (d *Deliverer) receiveOnceLocked(ctx context.Context, group, topic string, 
 		if newCursor > cursor {
 			staged = true
 		}
-		if skipped > 0 {
-			d.logger.Debug("Tag 过滤跳过消息", "group", group, "topic", topic, "queue", queueID, "skipped", skipped)
+		if len(skipReasons) > 0 {
+			d.skipMu.Lock()
+			for reason, n := range skipReasons {
+				d.skipped[FilterSkipKey{Topic: topic, Group: group, Reason: reason}] += uint64(n)
+			}
+			d.skipMu.Unlock()
+			d.logger.Debug("订阅过滤跳过消息", "group", group, "topic", topic, "queue", queueID,
+				"tag_miss", skipReasons["tag_miss"],
+				"sql_false", skipReasons["sql_false"],
+				"sql_unknown", skipReasons["sql_unknown"])
 		}
 	}
 
