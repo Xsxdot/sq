@@ -6,9 +6,12 @@
 package cluster
 
 import (
+	"context"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 
 	"go.etcd.io/raft/v3/raftpb"
@@ -617,5 +620,107 @@ func TestTruncateLogReclaimsSegmentsPhysically(t *testing.T) {
 	_, gotEnts, _, err := rs2.Load(1)
 	if err != nil || len(gotEnts) == 0 || gotEnts[len(gotEnts)-1].GetIndex() != 10 {
 		t.Fatalf("物理回收后日志尾丢失: %d 条, %v", len(gotEnts), err)
+	}
+}
+
+// captureHandler 收集日志记录的级别与消息，供级别断言使用。
+// 只留断言需要的两个字段——不做通用日志断言框架。
+type captureHandler struct {
+	mu   *sync.Mutex
+	recs *[]slog.Record
+}
+
+func (h captureHandler) Enabled(context.Context, slog.Level) bool { return true }
+func (h captureHandler) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	*h.recs = append(*h.recs, r.Clone())
+	return nil
+}
+func (h captureHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h captureHandler) WithGroup(string) slog.Handler      { return h }
+
+// newCaptureLogger 返回 logger 与取记录的闭包。
+func newCaptureLogger() (*slog.Logger, func() []slog.Record) {
+	var mu sync.Mutex
+	recs := new([]slog.Record)
+	lg := slog.New(captureHandler{mu: &mu, recs: recs})
+	return lg, func() []slog.Record {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]slog.Record(nil), *recs...)
+	}
+}
+
+// levelOf 找出第一条包含 substr 的记录的级别；找不到返回 (0,false)。
+func levelOf(recs []slog.Record, substr string) (slog.Level, bool) {
+	for _, r := range recs {
+		if strings.Contains(r.Message, substr) {
+			return r.Level, true
+		}
+	}
+	return 0, false
+}
+
+// seedHardStates 造出「组 0..dataGroups 各有一个带 term/vote 的 HardState」的现场。
+func seedHardStates(t *testing.T, rs *raftStore, dataGroups uint32) {
+	t.Helper()
+	for g := uint32(0); g <= dataGroups; g++ {
+		term, vote, commit := uint64(7), uint64(2), uint64(11)
+		hs := &raftpb.HardState{Term: &term, Vote: &vote, Commit: &commit}
+		if err := rs.Persist(g, hs, nil, true); err != nil {
+			t.Fatalf("组 %d 造 HardState: %v", g, err)
+		}
+	}
+}
+
+// TestLocalResumeBumpLogsWarn【承重】mem 档常规重启的抬任期必须是 WARN。
+//
+// 这条路径是 manager.go 注释写明的预期动作（mem 档投票走 NoSync 可能未落盘），
+// 后果只是多一轮选举。打成 ERROR 会训练运维忽略 ERROR——2026-08-14 跨机集群
+// 验证时每次 kill -9 重启都刷 4 条 ERROR，正是这个问题（backlog B15）。
+func TestLocalResumeBumpLogsWarn(t *testing.T) {
+	lg, dump := newCaptureLogger()
+	st := mustOpenStore(t, t.TempDir())
+	rs := newRaftStore(st, lg)
+	const groups = uint32(3)
+	seedHardStates(t, rs, groups)
+
+	if err := rs.BumpTermsForLocalResume(groups); err != nil {
+		t.Fatalf("BumpTermsForLocalResume: %v", err)
+	}
+	lvl, ok := levelOf(dump(), "任期已抬、投票已清")
+	if !ok {
+		t.Fatal("没找到抬任期日志——这条路径必须留痕，静默抬任期无从排查")
+	}
+	if lvl != slog.LevelWarn {
+		t.Fatalf("级别是 %v，期望 WARN；常规重启打 ERROR 会淹没真正需要关注的告警", lvl)
+	}
+}
+
+// TestForcedRecoverBumpLogsError【承重】签字放行的抬任期必须保持 ERROR。
+//
+// 与上一条相反的方向：--grant 意味着运维已接受「可能丢已确认消息」，
+// 与它同属许可路径的另外两条日志也都是 Error。一刀切降 WARN 会把真正
+// 该喊的这条一起压掉，所以本用例和上一条必须成对存在。
+func TestForcedRecoverBumpLogsError(t *testing.T) {
+	lg, dump := newCaptureLogger()
+	st := mustOpenStore(t, t.TempDir())
+	rs := newRaftStore(st, lg)
+	const groups = uint32(3)
+	seedHardStates(t, rs, groups)
+	if err := rs.SaveRecoverPermit(recoverPermit{GrantedAt: "t", Gen: "gen-b"}); err != nil {
+		t.Fatalf("SaveRecoverPermit: %v", err)
+	}
+
+	if err := rs.ForceLocalRecover(groups); err != nil {
+		t.Fatalf("ForceLocalRecover: %v", err)
+	}
+	lvl, ok := levelOf(dump(), "任期已抬、投票已清")
+	if !ok {
+		t.Fatal("没找到抬任期日志")
+	}
+	if lvl != slog.LevelError {
+		t.Fatalf("级别是 %v，期望 ERROR；签字放行可能丢已确认消息，不能降级", lvl)
 	}
 }
