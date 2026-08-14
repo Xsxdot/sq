@@ -34,12 +34,15 @@ import (
 	"testing"
 	"time"
 
+	"google.golang.org/grpc/metadata"
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/xushixin/sq/internal/config"
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/deliver"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
+	"github.com/xushixin/sq/internal/store"
 )
 
 // recvAll 读整个 ReceiveMessage 流，分离消息与末尾 status。
@@ -646,13 +649,14 @@ func TestReceiveTagFilter(t *testing.T) {
 	}
 }
 
-// TestReceiveRejectsUnsupportedFilter SQL92 与非法 TAG 表达式返回 ILLEGAL_FILTER_EXPRESSION。
+// TestReceiveRejectsUnsupportedFilter 非法过滤表达式返回 ILLEGAL_FILTER_EXPRESSION。
+// （SQL92 已接线，合法表达式不再走拒绝分支，其协议行为见 TestReceiveSQL92Filter。）
 func TestReceiveRejectsUnsupportedFilter(t *testing.T) {
 	c := newTestClient(t)
 	sendOne(t, c, "tf-bad", "x")
 	cases := []*pb.FilterExpression{
-		{Type: pb.FilterType_SQL, Expression: "a > 1"},
 		{Type: pb.FilterType_TAG, Expression: "a ||"},
+		{Type: pb.FilterType_SQL, Expression: "k = NULL"}, // 构建期语义拒绝（请用 k IS NULL）
 	}
 	for _, fe := range cases {
 		stream, err := c.ReceiveMessage(context.Background(), &pb.ReceiveMessageRequest{
@@ -668,6 +672,64 @@ func TestReceiveRejectsUnsupportedFilter(t *testing.T) {
 		msgs, st := recvAll(t, stream)
 		if len(msgs) != 0 || st.GetCode() != pb.Code_ILLEGAL_FILTER_EXPRESSION {
 			t.Fatalf("期望 ILLEGAL_FILTER_EXPRESSION，得到 %v (msgs=%d)", st, len(msgs))
+		}
+	}
+}
+
+// sendProps 发送带用户属性的消息（SQL92 属性过滤用例专用辅助）。
+func sendProps(t *testing.T, c pb.MessagingServiceClient, topic, body string, props map[string]string) {
+	t.Helper()
+	resp, err := c.SendMessage(context.Background(), &pb.SendMessageRequest{
+		Messages: []*pb.Message{{
+			Topic:            &pb.Resource{Name: topic},
+			SystemProperties: &pb.SystemProperties{MessageType: pb.MessageType_NORMAL},
+			UserProperties:   props,
+			Body:             []byte(body),
+		}},
+	})
+	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
+		t.Fatalf("send: %v %v", resp.GetStatus(), err)
+	}
+}
+
+// receiveQueueSQL 与 receiveQueue 同款，但用 SQL92 过滤表达式取件。
+func receiveQueueSQL(t *testing.T, c pb.MessagingServiceClient, group, topic string, q int32, expr string) []*pb.Message {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	stream, err := c.ReceiveMessage(ctx, &pb.ReceiveMessageRequest{
+		Group:             &pb.Resource{Name: group},
+		MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: topic}, Id: q},
+		FilterExpression:  &pb.FilterExpression{Type: pb.FilterType_SQL, Expression: expr},
+		BatchSize:         16,
+		InvisibleDuration: durationpb.New(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ReceiveMessage: %v", err)
+	}
+	msgs, _ := recvAll(t, stream)
+	return msgs
+}
+
+// TestReceiveSQL92Filter 协议层走通 SQL92 属性过滤：只投属性命中表达式的
+// 消息；不命中的被永久跳过（换全量也收不到）。
+func TestReceiveSQL92Filter(t *testing.T) {
+	c := newTestClient(t)
+	sendProps(t, c, "tsql", "hit", map[string]string{"age": "20"})
+	sendProps(t, c, "tsql", "miss", map[string]string{"age": "5"})
+	var got []string
+	for q := int32(0); q < 4; q++ {
+		for _, m := range receiveQueueSQL(t, c, "g-tsql", "tsql", q, "age > 10") {
+			got = append(got, string(m.GetBody()))
+		}
+	}
+	if len(got) != 1 || got[0] != "hit" {
+		t.Fatalf("SQL92 过滤应只收到 age>10 的消息: %v", got)
+	}
+	// 被过滤的 miss 已被位点跳过，事后用 "*" 也收不到
+	for q := int32(0); q < 4; q++ {
+		if rest := receiveQueue(t, c, "g-tsql", "tsql", q, "*"); len(rest) != 0 {
+			t.Fatalf("被过滤消息不应可再收: %d", len(rest))
 		}
 	}
 }
@@ -908,5 +970,112 @@ func TestAckMessageMixedQueuesGrouped(t *testing.T) {
 			e.GetMessageId() != msgs[i].GetSystemProperties().GetMessageId() {
 			t.Fatalf("entry %d 顺序或状态错误: %v", i, e)
 		}
+	}
+}
+
+// TestLeaseForAutoRenew 锁定 leaseFor 的三开关判据：客户端请求了 auto_renew、
+// 服务端配置未关闭、能从 metadata 取到 x-mq-client-id——三个全真才启用租约，
+// 任一不满足都退化回零值（deliver 侧视为不启用，固定不可见期）。
+//
+// 边界语义（与 ReceiveMessage 接线共享）：缺 client-id 头是合法的（手写客户端
+// 不带该头），只该享受不到续租，绝不能报错/拒绝请求，所以这里断言「退化而不
+// 报错」而非返回错误。
+func TestLeaseForAutoRenew(t *testing.T) {
+	ss := newSessions()
+	base := &config.Config{AutoRenewEnabled: true, AutoRenewMaxDuration: "30s"}
+	withID := metadata.NewIncomingContext(context.Background(),
+		metadata.Pairs(clientIDHeaderKey, "cli-1"))
+
+	t.Run("正常启用", func(t *testing.T) {
+		l := leaseFor(withID, base, ss, true)
+		if !l.Enabled() {
+			t.Fatal("应当启用续租")
+		}
+		if l.Owner != "cli-1" || l.MaxRenew != 30*time.Second {
+			t.Fatalf("租约参数错误: %+v", l)
+		}
+	})
+	t.Run("客户端未请求续租", func(t *testing.T) {
+		if leaseFor(withID, base, ss, false).Enabled() {
+			t.Fatal("客户端未设 auto_renew 时不应启用")
+		}
+	})
+	t.Run("服务端配置关闭", func(t *testing.T) {
+		off := &config.Config{AutoRenewEnabled: false, AutoRenewMaxDuration: "30s"}
+		if leaseFor(withID, off, ss, true).Enabled() {
+			t.Fatal("配置关闭时不应启用")
+		}
+	})
+	t.Run("缺 client-id 头时退化而不报错", func(t *testing.T) {
+		if leaseFor(context.Background(), base, ss, true).Enabled() {
+			t.Fatal("无 client-id 头时不应启用")
+		}
+	})
+}
+
+// TestReceiveMessageWiresLeaseIntoInflight 钉住 receive.go 把 opts... 传给
+// deliver.Receive 这一步接线：带 x-mq-client-id 头 + AutoRenew=true 的取件，
+// 盘上的 inflight 记录必须写入 Owner/RenewUntilMs。
+//
+// 为什么查盘而不是看响应：响应里的消息没有 Owner 字段，只有持久化的 inflight
+// 记录能证明租约真的传到了 deliver.Receive——若有人删掉 opts... 接线，测试
+// 侧消息照常收到、响应照常 OK，但 Owner 不会被写，本测试即红。这是 e2e 之外
+// 对这条接线的唯一单测覆盖。
+func TestReceiveMessageWiresLeaseIntoInflight(t *testing.T) {
+	env := newTestEnv(t, true)
+	const topic = "lease-wire"
+	const group = "g-wire"
+	sendOne(t, env.client, topic, "hello")
+
+	// 消息落在哪个队列不定（topic 多队列、sendOne 轮转），仿照
+	// TestReceiveAckRoundTrip 逐队列取直到收到一条；每队列用 2s 有限 deadline，
+	// 空队列不会长轮询 20s（同 receiveOne 的理由）。
+	var got *pb.Message
+	var queueID uint32
+	for q := int32(0); q < 4 && got == nil; q++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs(clientIDHeaderKey, "cli-wire"))
+		stream, err := env.client.ReceiveMessage(ctx, &pb.ReceiveMessageRequest{
+			Group:             &pb.Resource{Name: group},
+			MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: topic}, Id: q},
+			FilterExpression:  &pb.FilterExpression{Type: pb.FilterType_TAG, Expression: "*"},
+			BatchSize:         10,
+			InvisibleDuration: durationpb.New(time.Minute),
+			AutoRenew:         true,
+		})
+		if err != nil {
+			cancel()
+			t.Fatalf("ReceiveMessage: %v", err)
+		}
+		// 必须等流读完整再 cancel：服务端流处理依赖 ctx 存活，提前 cancel 会让
+		// deliver.Receive 在长轮询中途被打断、返回 context.Canceled。
+		msgs, _ := recvAll(t, stream)
+		cancel()
+		if len(msgs) == 0 {
+			continue
+		}
+		got, queueID = msgs[0], uint32(q)
+	}
+	if got == nil {
+		t.Fatal("未收到消息")
+	}
+	// QueueOffset 底层是 *int64（proto 生成代码），Getter 返回解引用后的
+	// int64 值，直接用。
+	off := got.GetSystemProperties().GetQueueOffset()
+	// 直接查盘上的 inflight 记录：响应里没有 Owner 字段，只有这条持久化记录
+	// 能证明租约真的经 opts... 传到了 deliver.Receive——删掉接线则 Owner 为空。
+	raw, ok, err := env.st.Get(store.InflightKey(group, topic, queueID, uint64(off)))
+	if err != nil || !ok {
+		t.Fatalf("查盘 inflight 失败: ok=%v err=%v", ok, err)
+	}
+	inf, err := core.DecodeInflight(raw)
+	if err != nil {
+		t.Fatalf("解码 inflight: %v", err)
+	}
+	if inf.Owner != "cli-wire" {
+		t.Fatalf("inflight Owner 应为 cli-wire，实际 %q（opts... 接线被删则此处为空）", inf.Owner)
+	}
+	if inf.RenewUntilMs <= 0 {
+		t.Fatalf("inflight RenewUntilMs 应 > 0（租约生效的标记），实际 %d", inf.RenewUntilMs)
 	}
 }

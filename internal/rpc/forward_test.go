@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/xushixin/sq/internal/core/deliver"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
@@ -66,7 +67,7 @@ func TestForwardMessageMalformedHandle(t *testing.T) {
 func receiveOneAnyQueue(t *testing.T, env testEnv, group, topic string, invisible time.Duration) *pb.Message {
 	t.Helper()
 	for q := uint32(0); q < 4; q++ {
-		msgs, err := env.dl.Receive(context.Background(), group, topic, q, 1, invisible, 0, nil)
+		msgs, err := env.dl.Receive(context.Background(), group, topic, q, 1, invisible, 0, deliver.AllPass)
 		if err != nil {
 			t.Fatalf("Receive q%d: %v", q, err)
 		}

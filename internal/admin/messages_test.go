@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/xushixin/sq/internal/core"
+	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/txn"
 	"github.com/xushixin/sq/internal/store"
@@ -83,7 +84,7 @@ func TestDLQResend(t *testing.T) {
 		t.Fatalf("重发应 201，得到 %d body=%s", w.Code, w.Body)
 	}
 	// 原 topic 里能消费到重发的消息
-	got, err := dl.Receive(context.Background(), "g-verify", "t-orig", 0, 1, time.Minute, 0, nil)
+	got, err := dl.Receive(context.Background(), "g-verify", "t-orig", 0, 1, time.Minute, 0, deliver.AllPass)
 	if err != nil || len(got) != 1 || string(got[0].Body) != "dead" || got[0].ID != "dead-1" {
 		t.Fatalf("原 topic 应收到重发消息: %+v %v", got, err)
 	}
@@ -101,7 +102,7 @@ func TestDelayViewAndOverview(t *testing.T) {
 	s, _, _, pr, _, _ := newTestServer(t, "", "")
 	h := s.Handler()
 	due := time.Now().Add(time.Hour).UnixMilli()
-	if _, err := pr.AppendDelay(context.Background(), &core.Message{Topic: "t1", Body: []byte("later"), DeliverAtMs: due}); err != nil {
+	if _, _, _, err := pr.AppendDelay(context.Background(), &core.Message{Topic: "t1", Body: []byte("later"), DeliverAtMs: due}); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("now")}); err != nil {

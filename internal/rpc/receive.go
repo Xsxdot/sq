@@ -10,7 +10,8 @@
 //     经 RouteView 把队列指向各 leader，行为与 QueryRoute 一致）
 //
 // 边界：
-//   - Tag 过滤支持 "*" / 单 tag / "a || b"，SQL92 属性过滤计划 v1.1
+//   - Tag 过滤支持 "*" / 单 tag / "a || b"，SQL92 属性过滤已支持
+//     （语法子集与限制见 README「订阅过滤」小节）
 //   - 不直接操作 store/meta 以外的状态，翻译逻辑之外的业务规则全部在
 //     deliver 包（本包不重复实现 attempt 校验、inflight 生命周期等）
 package rpc
@@ -27,6 +28,7 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/xushixin/sq/internal/config"
 	"github.com/xushixin/sq/internal/core"
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
@@ -41,6 +43,45 @@ const defaultLongPolling = 20 * time.Second
 // 服务端需要留出时间构造响应、写回流，不能把整个 deadline 都花在等待上，
 // 否则响应会在 deadline 之后才发出，被客户端判定为超时。
 const longPollWaitMargin = time.Second
+
+// filterKindOf 把协议过滤类型映射为 deliver 的种类。
+// 第二个返回值为 false 表示本版本不支持该类型，调用方须回
+// ILLEGAL_FILTER_EXPRESSION——不能默默当成不过滤，那会让本应被筛掉的
+// 消息全量投给消费者。
+func filterKindOf(t pb.FilterType) (deliver.FilterKind, bool) {
+	switch t {
+	case pb.FilterType_TAG:
+		return deliver.FilterTag, true
+	case pb.FilterType_SQL:
+		return deliver.FilterSQL92, true
+	default:
+		return 0, false
+	}
+}
+
+// leaseFor 组装本次取件的续租租约。
+//
+// 三个开关全开才启用：客户端在请求里声明了 auto_renew、服务端配置未关闭、
+// 且能从 metadata 取到客户端标识。任一不满足返回零值 Lease（deliver 侧视为
+// 不启用，退化为固定不可见期）——**不返回错误、不拒绝请求**：手写客户端不带
+// x-mq-client-id 是合法的，它只是享受不到自动续租。
+func leaseFor(ctx context.Context, cfg *config.Config, ss *sessions, wantAutoRenew bool) deliver.Lease {
+	// ss==nil 的防御：ss.aliveClient 是 nil 接收者上的方法值，恒非 nil，
+	// Lease.Enabled() 的 Alive 检查拦不住 nil——真调用会在 aliveClient 的
+	// mu.Lock() 处 panic。生产路径恒非 nil（Server 自建 sessions），这里
+	// 只为守住「Enabled() 保证零值即不启用、不会半开」这条不变式不开口子。
+	if ss == nil {
+		return deliver.Lease{}
+	}
+	if !wantAutoRenew || !cfg.AutoRenewEnabled {
+		return deliver.Lease{}
+	}
+	cid := clientIDFrom(ctx)
+	if cid == "" {
+		return deliver.Lease{}
+	}
+	return deliver.Lease{Owner: cid, MaxRenew: cfg.AutoRenewMax(), Alive: ss.aliveClient}
+}
 
 // ReceiveMessage POP 取件（服务端流）。流格式：先逐条消息，最后一帧 status。
 //
@@ -71,23 +112,30 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 		}})
 	}
 
-	// TAG 表达式解析（M2）：支持 "*" / 单 tag / "a || b"。SQL92 → v1.1。
-	var filter *deliver.TagFilter
+	// 过滤表达式解析：协议枚举在此映射为 deliver 自己的种类
+	// （core 不 import pb 是既有架构约束）。未带 FilterExpression 时用
+	// AllPass，不传 nil——deliver 侧不接受 nil Filter。
+	filter := deliver.AllPass
 	if fe := req.GetFilterExpression(); fe != nil {
-		if fe.GetType() != pb.FilterType_TAG {
+		kind, ok := filterKindOf(fe.GetType())
+		if !ok {
 			s.logger.Warn("不支持的过滤类型", "group", group, "topic", topic, "type", fe.GetType())
 			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
-				Status: errStatus(pb.Code_ILLEGAL_FILTER_EXPRESSION, "仅支持 TAG 过滤（SQL92 计划 v1.1）"),
+				Status: errStatus(pb.Code_ILLEGAL_FILTER_EXPRESSION,
+					fmt.Sprintf("不支持的过滤类型 %v", fe.GetType())),
 			}})
 		}
-		f, err := deliver.ParseTagFilter(fe.GetExpression())
+		f, err := deliver.ParseFilter(kind, fe.GetExpression())
 		if err != nil {
-			s.logger.Warn("TAG 表达式非法", "group", group, "topic", topic, "expr", fe.GetExpression(), "err", err)
+			s.logger.Warn("过滤表达式非法", "group", group, "topic", topic,
+				"kind", fe.GetType(), "expr", fe.GetExpression(), "err", err)
 			return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
 				Status: errStatus(pb.Code_ILLEGAL_FILTER_EXPRESSION, err.Error()),
 			}})
 		}
 		filter = f
+		s.logger.Debug("订阅过滤已解析", "group", group, "topic", topic,
+			"kind", fe.GetType(), "expr", fe.GetExpression())
 	}
 	// topic 存在性与队列边界必须在进入 deliver 前挡住（spec 鉴权收尾 §5）。
 	// 用只读 GetTopic 而非 EnsureTopic：消费动作不应创建 topic。
@@ -109,7 +157,12 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 	}
 	invisible := req.GetInvisibleDuration().AsDuration()
 	if invisible <= 0 {
-		invisible = time.Minute
+		// 客户端没给不可见时长，落到服务端默认值。这条分支是 push 消费的常态而
+		// 非兜底：官方 Go SDK 的 PushConsumer 从不下发 invisible_duration，
+		// 整条 push 路径的不可见窗口都由 default_invisible_duration 决定。
+		invisible = s.cfg.DefaultInvisible()
+		s.logger.Debug("ReceiveMessage 采用服务端默认不可见时长",
+			"group", group, "topic", topic, "queue", queueID, "invisible", invisible)
 	}
 	batch := int(req.GetBatchSize())
 	if batch <= 0 {
@@ -117,7 +170,23 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 	}
 	wait := s.longPollWait(stream.Context())
 
-	msgs, err := s.dl.Receive(stream.Context(), group, topic, queueID, batch, invisible, wait, filter)
+	// 续租接线（本任务终点）：客户端声明 auto_renew 且三开关齐备时给本次取件
+	// 挂上租约，deliver 侧在持有者存活期间自动续不可见期；否则不传 opts 退化为
+	// 固定不可见期的既有行为。判定逻辑摘进 leaseFor 单独可单测。
+	var opts []deliver.ReceiveOption
+	if lease := leaseFor(stream.Context(), s.cfg, s.sessions, req.GetAutoRenew()); lease.Enabled() {
+		opts = append(opts, deliver.WithLease(lease))
+		s.logger.Debug("ReceiveMessage 启用自动续租", "group", group, "topic", topic,
+			"queue", queueID, "owner", lease.Owner, "max_renew", lease.MaxRenew)
+	} else if req.GetAutoRenew() {
+		// 客户端要了续租却没启用成——这是「为什么我的慢 handler 还是被重投了」
+		// 的第一个排查点。Debug 而非 Warn：手写客户端不带 client-id 头是合法的，
+		// 而 push 消费每次轮询都会走到这里，Warn 会刷屏。
+		s.logger.Debug("ReceiveMessage 请求了自动续租但未启用（配置关闭或缺 x-mq-client-id 头）",
+			"group", group, "topic", topic, "queue", queueID,
+			"cfg_enabled", s.cfg.AutoRenewEnabled, "has_client_id", clientIDFrom(stream.Context()) != "")
+	}
+	msgs, err := s.dl.Receive(stream.Context(), group, topic, queueID, batch, invisible, wait, filter, opts...)
 	if err != nil {
 		// deliver.Receive 的错误不是铁板一块，必须按性质分类（同 QueryAssignment
 		// 对 EnsureTopic 错误的分类原则）：

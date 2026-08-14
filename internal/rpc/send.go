@@ -130,6 +130,9 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 	for _, m := range msgs {
 		var stored *core.Message
 		var txID string
+		// recallHandle 每轮循环重新声明：它是**本条消息**的句柄，
+		// 声明在循环外会让上一条的句柄泄漏到下一条 entry 上
+		var recallHandle string
 		var err error
 		switch {
 		case m.Transactional:
@@ -140,7 +143,15 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 		case m.DeliverAtMs > 0:
 			// 延时消息进暂存区（未分配 offset，entry 里 Offset 回 0——SDK 的
 			// SendReceipt 只消费 MessageId，offset 字段对延时场景无意义）
-			stored, err = s.pr.AppendDelay(ctx, m)
+			var seq uint64
+			var staged bool
+			stored, seq, staged, err = s.pr.AppendDelay(ctx, m)
+			if err == nil && staged {
+				// 只有真进了暂存区才签发句柄。已到期的延时消息被
+				// AppendDelay 直通 Append，此刻已在队列里、无条目可撤，
+				// 给它签句柄只会让客户端拿到一个必然查无此条的凭据。
+				recallHandle = recallEncode(s.handleSecret, m.Topic, m.DeliverAtMs, seq)
+			}
 		default:
 			stored, err = s.pr.Append(ctx, m)
 		}
@@ -160,7 +171,8 @@ func (s *Server) SendMessage(ctx context.Context, req *pb.SendMessageRequest) (*
 			Status:        okStatus(),
 			MessageId:     stored.ID,
 			Offset:        int64(stored.Offset),
-			TransactionId: txID, // 非事务消息为空串，proto3 省略
+			TransactionId: txID,         // 非事务消息为空串，proto3 省略
+			RecallHandle:  recallHandle, // 非延时消息为空串，proto3 省略
 		})
 	}
 	return &pb.SendMessageResponse{Status: okStatus(), Entries: entries}, nil

@@ -28,6 +28,7 @@ import (
 	"google.golang.org/grpc/test/bufconn"
 
 	"github.com/xushixin/sq/internal/config"
+	"github.com/xushixin/sq/internal/core/delay"
 	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/meta"
 	"github.com/xushixin/sq/internal/core/produce"
@@ -88,6 +89,7 @@ func newTestEnvWith(t *testing.T, autoCreate bool, rv RouteView, rep replication
 	}
 	pr := produce.New(rep, rt, st, mt, slog.Default())
 	dl := deliver.New(rep, rt, st, mt, pr, slog.Default())
+	ds := delay.New(rep, rt, st, pr, slog.Default())
 	cfg, err := config.Load("")
 	if err != nil {
 		t.Fatalf("config.Load: %v", err)
@@ -99,7 +101,7 @@ func newTestEnvWith(t *testing.T, autoCreate bool, rv RouteView, rep replication
 	blocked := &atomic.Bool{}
 	// txn 管理器与生产装配同参数（30s 首查间隔、15 次上限，见 config 默认值）
 	tx := txn.New(rep, rt, st, pr, mt, 30*time.Second, 15, slog.Default())
-	srv := New(cfg, rv, mt, pr, dl, tx, blocked, []byte("test-handle-secret"), slog.Default())
+	srv := New(cfg, rv, mt, pr, dl, ds, tx, blocked, []byte("test-handle-secret"), slog.Default())
 
 	lis := bufconn.Listen(1 << 20)
 	gs := grpc.NewServer(opts...)

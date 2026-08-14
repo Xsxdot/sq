@@ -29,7 +29,11 @@ type session struct {
 	// SendMsg，漏了这把锁就是数据竞争加流损坏
 	sendMu     sync.Mutex
 	clientType pb.ClientType
-	topics     map[string]bool // producer 声明发布的 topics（来自 Settings.Publishing.Topics）
+	// clientID 客户端实例标识（x-mq-client-id）。自动续租靠它判定
+	// 「持有这条 inflight 的客户端是否还活着」。可能为空（手写客户端未带头），
+	// 空值不入 byClient 索引。
+	clientID string
+	topics   map[string]bool // producer 声明发布的 topics（来自 Settings.Publishing.Topics）
 }
 
 // send 向该会话写一条命令（并发安全）。
@@ -45,9 +49,19 @@ type sessions struct {
 	all    map[*session]struct{}
 	next   int // pickProducer 轮转游标
 	nextID int // 下一注册序（add 时递增，见 session.id）
+
+	// byClient 客户端标识 → 该标识当前活跃的会话数。
+	//
+	// 用计数而不是 map[string]*session：同一个 client id 理论上可以并存多条
+	// Telemetry 流（客户端重连时新旧流在一小段窗口内共存）。用指针会让后注册
+	// 的覆盖先注册的，随后先注册的那条注销时把整个条目删掉——客户端明明活着
+	// 却被判为已死，它手上正在处理的消息会被立刻重投。
+	byClient map[string]int
 }
 
-func newSessions() *sessions { return &sessions{all: map[*session]struct{}{}} }
+func newSessions() *sessions {
+	return &sessions{all: map[*session]struct{}{}, byClient: map[string]int{}}
+}
 
 func (ss *sessions) add(se *session) {
 	ss.mu.Lock()
@@ -55,18 +69,46 @@ func (ss *sessions) add(se *session) {
 	se.id = ss.nextID
 	ss.nextID++
 	ss.all[se] = struct{}{}
+	if se.clientID != "" {
+		// 空 id 不入索引：所有未带头的客户端会挤在同一个桶里，
+		// 任一条流活着就让全体被判为存活，等于让续租判据失效
+		ss.byClient[se.clientID]++
+	}
 }
 
 func (ss *sessions) remove(se *session) {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	delete(ss.all, se)
+	if se.clientID != "" {
+		if n := ss.byClient[se.clientID] - 1; n > 0 {
+			ss.byClient[se.clientID] = n
+		} else {
+			delete(ss.byClient, se.clientID)
+		}
+	}
 }
 
 func (ss *sessions) count() int {
 	ss.mu.Lock()
 	defer ss.mu.Unlock()
 	return len(ss.all)
+}
+
+// aliveClient 判定某客户端标识当前是否仍有活跃的 Telemetry 会话。
+//
+// 供自动续租的判据 4 使用（见 auto-renew spec §6）。空 id 恒为 false。
+//
+// 固有窗口：Telemetry 流断开到重连之间会判为 false，于是消息被重投——
+// 这恰好是改造前的无条件行为，不是回归，只是那一刻少续了一次租。反向误判
+// （进程已死但 gRPC 尚未感知流断）由 InflightState.RenewUntilMs 硬上限兜底。
+func (ss *sessions) aliveClient(id string) bool {
+	if id == "" {
+		return false
+	}
+	ss.mu.Lock()
+	defer ss.mu.Unlock()
+	return ss.byClient[id] > 0
 }
 
 // updateTopics 全量替换某 producer 会话的 topics 声明（SDK 周期性重发

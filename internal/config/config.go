@@ -56,10 +56,31 @@ type Config struct {
 	// ⚠️ 开启 binary 必须在**全集群升级完成之后**：解码永远双格式，但旧版本
 	// 进程不认识 v1，混版期提前开启会让旧节点解不开转发来的消息。两步纪律
 	// 见 README「升级注意」。
-	MessageEncoding        string `yaml:"message_encoding"`
-	AutoCreateTopic        bool   `yaml:"auto_create_topic"`        // QueryRoute/Send 未知 topic 时自动建
-	DefaultQueueNums       uint32 `yaml:"default_queue_nums"`       // 自动建 topic 的队列数
-	DefaultMaxAttempts     int32  `yaml:"default_max_attempts"`     // 新订阅组默认最大投递次数
+	MessageEncoding    string `yaml:"message_encoding"`
+	AutoCreateTopic    bool   `yaml:"auto_create_topic"`    // QueryRoute/Send 未知 topic 时自动建
+	DefaultQueueNums   uint32 `yaml:"default_queue_nums"`   // 自动建 topic 的队列数
+	DefaultMaxAttempts int32  `yaml:"default_max_attempts"` // 新订阅组默认最大投递次数
+	// DefaultInvisibleDuration 客户端未在 ReceiveMessage 里指定 invisible_duration
+	// 时采用的不可见时长（Go duration 格式）。
+	//
+	// 这不是边角配置：官方 Go SDK 的 PushConsumer 从不下发该字段（其
+	// WrapReceiveMessageRequest 只设 LongPollingTimeout/BatchSize/AutoRenew），
+	// 所以整条 push 消费路径的不可见时长全部由它决定。默认 1m。
+	DefaultInvisibleDuration string `yaml:"default_invisible_duration"`
+	// AutoRenewEnabled 消费者在 ReceiveMessage 里声明 auto_renew 时，是否在其
+	// 存活期间自动续租不可见期。默认 true——这是协议正确的行为，官方 SDK 的
+	// PushConsumer 每次请求都下发 auto_renew=true 且从不下发 invisible_duration，
+	// 关掉它意味着 listener 慢过不可见期就会被重复投递。
+	//
+	// 注意与 AutoRenewMaxDuration 的不对称：本项用 &Config{...} 字面量构造时
+	// 得 false（续租关闭，退化为固定不可见期），失败方向是安全的，所以不需要
+	// 像 AutoRenewMax() 那样的兜底。
+	AutoRenewEnabled bool `yaml:"auto_renew_enabled"`
+	// AutoRenewMaxDuration 单次投递允许续租的总时长上限（Go duration 格式）。
+	// 超过即按正常过期重投（Attempts++、可能进 DLQ）。它是防「消费者活着但
+	// 卡死」的唯一兜底：没有上限，一个死锁的 handler 能把消息永久扣住，
+	// 死信队列永远等不到它。
+	AutoRenewMaxDuration   string `yaml:"auto_renew_max_duration"`
 	RetentionCheckInterval string `yaml:"retention_check_interval"` // 过期清理扫描间隔（Go duration 格式）
 	DiskWatermarkPercent   int    `yaml:"disk_watermark_percent"`   // 超过即拒写，0=关闭
 	LogLevel               string `yaml:"log_level"`                // debug|info|warn|error
@@ -154,12 +175,15 @@ func Load(path string) (*Config, error) {
 		AutoCreateTopic: true, DefaultQueueNums: 16, // 16：队列数决定消费并行度（每队列一路消费）；写吞吐自队列内 group commit 后与队列数基本无关
 
 		DefaultMaxAttempts: 16, LogLevel: "info",
-		RetentionCheckInterval: "5m",
-		DiskWatermarkPercent:   85,
-		AdminListen:            ":8082",
-		MetricsRetentionHours:  168,
-		TxnCheckInterval:       "30s",
-		TxnMaxChecks:           15,
+		DefaultInvisibleDuration: "1m",
+		AutoRenewEnabled:         true,
+		AutoRenewMaxDuration:     "10m",
+		RetentionCheckInterval:   "5m",
+		DiskWatermarkPercent:     85,
+		AdminListen:              ":8082",
+		MetricsRetentionHours:    168,
+		TxnCheckInterval:         "30s",
+		TxnMaxChecks:             15,
 	}
 	if path == "" {
 		return cfg, nil
@@ -217,6 +241,11 @@ func Load(path string) (*Config, error) {
 	// meta.New 的防御性回退重叠，配置层面的笔误不该静默吞掉，启动即报错。
 	if cfg.DefaultMaxAttempts <= 0 {
 		return nil, fmt.Errorf("配置 default_max_attempts 必须 >0，得到 %d", cfg.DefaultMaxAttempts)
+	}
+	// 同理：default_invisible_duration 非正（含空串）必须启动即拒——它决定 push
+	// 消费的不可见窗口，配成 0 会让消息投出去立刻可再投，表现为无限重复消费。
+	if d, err := time.ParseDuration(cfg.DefaultInvisibleDuration); err != nil || d <= 0 {
+		return nil, fmt.Errorf("配置 default_invisible_duration 须为正 duration（如 1m），得到 %q", cfg.DefaultInvisibleDuration)
 	}
 	// retention_check_interval 必须是正 duration：空串（yaml 漏填）或拼写错误
 	// 都不能让 retention 任务以 0 间隔空转或整趟跳过，启动时挡住。
@@ -373,6 +402,32 @@ func Load(path string) (*Config, error) {
 		}
 	}
 	return cfg, nil
+}
+
+// DefaultInvisible 解析后的默认不可见时长。解析失败兜底返回 1m（与改造前的
+// 硬编码一致）：返回 0 会让消息投出去立刻可再投、无限重复消费——正是这个配置项
+// 要挡的故障。Load 校验只覆盖走 Load 的路径，用 &config.Config{...} 字面量
+// 构造 Server 时拿到空串就会踩到，这里不能再指望校验兜底。
+func (c *Config) DefaultInvisible() time.Duration {
+	d, err := time.ParseDuration(c.DefaultInvisibleDuration)
+	if err != nil || d <= 0 {
+		return time.Minute
+	}
+	return d
+}
+
+// AutoRenewMax 解析后的单次投递续租总时长上限。解析失败或非正数兜底返回 10m。
+//
+// 不返回 0 的理由与 DefaultInvisible 同源：0 会让续租判据恒假，把一个配置
+// 笔误变成静默的功能关闭——运维配了 auto_renew_max_duration 却发现续租没生效，
+// 而日志里没有任何线索。Load 的校验只覆盖走 Load 的路径，用
+// &config.Config{...} 字面量构造时拿到空串就会踩到。
+func (c *Config) AutoRenewMax() time.Duration {
+	d, err := time.ParseDuration(c.AutoRenewMaxDuration)
+	if err != nil || d <= 0 {
+		return 10 * time.Minute
+	}
+	return d
 }
 
 // RetentionInterval 解析后的清理扫描间隔（Load 已校验合法，此处不会失败）。

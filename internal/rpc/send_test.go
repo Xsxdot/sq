@@ -27,6 +27,7 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	"github.com/xushixin/sq/internal/core/deliver"
 	"github.com/xushixin/sq/internal/core/produce"
 	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
 	"github.com/xushixin/sq/internal/store"
@@ -139,7 +140,7 @@ func TestSendMessageRejectsBatchAtomically(t *testing.T) {
 	}
 
 	// 直接从消费引擎取该 topic，证明"first-valid"没有被真正写入。
-	msgs, err := dl.Receive(context.Background(), "g-batch-check", topic, 0, 10, time.Second, 0, nil)
+	msgs, err := dl.Receive(context.Background(), "g-batch-check", topic, 0, 10, time.Second, 0, deliver.AllPass)
 	if err != nil {
 		t.Fatalf("Receive: %v", err)
 	}
@@ -212,7 +213,7 @@ func TestSendMessageRejectsBatchWithOversizedBodyAtomically(t *testing.T) {
 		t.Fatalf("整批失败时不应返回任何 entry: %v", resp.GetEntries())
 	}
 
-	msgs, err := dl.Receive(context.Background(), "g-batch-oversized-check", topic, 0, 10, time.Second, 0, nil)
+	msgs, err := dl.Receive(context.Background(), "g-batch-oversized-check", topic, 0, 10, time.Second, 0, deliver.AllPass)
 	if err != nil {
 		t.Fatalf("Receive: %v", err)
 	}
@@ -303,7 +304,7 @@ func TestSendDelayMessageGoesToDelayAreaNotDeliverable(t *testing.T) {
 		t.Fatalf("延时发送应成功: %v %v", resp.GetStatus(), err)
 	}
 	// 未到期：正常消费链路取不到
-	msgs, err := env.dl.Receive(context.Background(), "g", "dly", 0, 10, time.Minute, 0, nil)
+	msgs, err := env.dl.Receive(context.Background(), "g", "dly", 0, 10, time.Minute, 0, deliver.AllPass)
 	if err != nil || len(msgs) != 0 {
 		t.Fatalf("未到期不应可消费: %d %v", len(msgs), err)
 	}
@@ -339,12 +340,57 @@ func TestSendDelayEpochTimestampNotDemotedToNormal(t *testing.T) {
 	if err != nil || resp.GetStatus().GetCode() != pb.Code_OK {
 		t.Fatalf("DELAY+epoch 时间戳应被接受（直通立即投递）: %v %v", resp.GetStatus(), err)
 	}
-	msgs, err := dl.Receive(context.Background(), "g", "dly-epoch", 0, 10, time.Second, 5*time.Second, nil)
+	msgs, err := dl.Receive(context.Background(), "g", "dly-epoch", 0, 10, time.Second, 5*time.Second, deliver.AllPass)
 	if err != nil || len(msgs) != 1 {
 		t.Fatalf("直通投递应可取到 1 条: %d %v", len(msgs), err)
 	}
 	if msgs[0].DeliverAtMs <= 0 {
 		t.Fatalf("DeliverAtMs 应为正（DELAY 语义被保留），实际 %d——消息被降级成了 NORMAL", msgs[0].DeliverAtMs)
+	}
+}
+
+// delayReq 本文件小 helper：一条延时消息的 SendMessageRequest。
+// 构造照既有内联写法（MessageType_DELAY + DeliveryTimestamp）。
+func delayReq(topic string, dueMs int64) *pb.SendMessageRequest {
+	return &pb.SendMessageRequest{Messages: []*pb.Message{{
+		Topic: &pb.Resource{Name: topic},
+		SystemProperties: &pb.SystemProperties{
+			MessageType:       pb.MessageType_DELAY,
+			DeliveryTimestamp: timestamppb.New(time.UnixMilli(dueMs)),
+		},
+		Body: []byte("x"),
+	}}}
+}
+
+// 延时消息的 SendResultEntry 必须带回可用的 recall 句柄；普通消息不带。
+func TestSendMessageIssuesRecallHandleForDelayOnly(t *testing.T) {
+	env := newTestEnv(t, true)
+	due := time.Now().Add(time.Hour).UnixMilli()
+
+	resp, err := env.client.SendMessage(context.Background(), delayReq("t-issue", due))
+	if err != nil {
+		t.Fatalf("SendMessage: %v", err)
+	}
+	h := resp.GetEntries()[0].GetRecallHandle()
+	if h == "" {
+		t.Fatalf("延时消息未签发 recall 句柄")
+	}
+	// 句柄必须真的能解出这条消息的坐标
+	topic, gotDue, _, err := recallDecode(env.srv.handleSecret, h)
+	if err != nil {
+		t.Fatalf("签发的句柄自己解不开: %v", err)
+	}
+	if topic != "t-issue" || gotDue != due {
+		t.Fatalf("句柄内容不对：topic=%q due=%d（期望 t-issue / %d）", topic, gotDue, due)
+	}
+
+	// 普通消息：不签发
+	resp2, err := env.client.SendMessage(context.Background(), sendReq("t-issue"))
+	if err != nil {
+		t.Fatalf("SendMessage(普通): %v", err)
+	}
+	if got := resp2.GetEntries()[0].GetRecallHandle(); got != "" {
+		t.Fatalf("普通消息签发了 recall 句柄：%q", got)
 	}
 }
 
@@ -421,7 +467,7 @@ func TestSendFifoMessageOrderedThroughStack(t *testing.T) {
 	// 同组消息落同一队列；顺序锁下首轮只投 f1。队列号由 hash 决定，逐队列探测。
 	got := 0
 	for q := uint32(0); q < 4; q++ {
-		msgs, err := env.dl.Receive(context.Background(), "g", "fifo", q, 10, time.Minute, 0, nil)
+		msgs, err := env.dl.Receive(context.Background(), "g", "fifo", q, 10, time.Minute, 0, deliver.AllPass)
 		if err != nil {
 			t.Fatalf("Receive q%d: %v", q, err)
 		}
@@ -554,7 +600,7 @@ func TestSendTransactionStagesHalfMessage(t *testing.T) {
 		t.Fatal("SendResultEntry 未回填 transaction_id——SDK 的 Commit/Rollback 全靠它")
 	}
 	// 未提交前不可消费（半消息不可见：deliver 只扫 msg/，half/ 数据取不到）
-	msgs, err := dl.Receive(context.Background(), "g", "t-txn", 0, 10, time.Minute, 0, nil)
+	msgs, err := dl.Receive(context.Background(), "g", "t-txn", 0, 10, time.Minute, 0, deliver.AllPass)
 	if err != nil || len(msgs) != 0 {
 		t.Fatalf("未提交的半消息不应可消费: %d %v", len(msgs), err)
 	}

@@ -143,7 +143,7 @@ func (s *Server) handleMessageSend(w http.ResponseWriter, r *http.Request) {
 	forwarded := false
 	if req.DelayMs > 0 {
 		m.DeliverAtMs = now + req.DelayMs
-		m, err = s.pr.AppendDelay(r.Context(), m)
+		m, _, _, err = s.pr.AppendDelay(r.Context(), m)
 	} else {
 		// 集群档写转发（batch⑤）：本节点不是目标组 leader 时经
 		// fwd.ForwardAppend 交给组 leader 的 produce 栈追加——控制台的地址

@@ -111,7 +111,7 @@ func TestCommitMovesToMsgAndCleansHalf(t *testing.T) {
 		t.Fatal("commit 后 halfidx 残留")
 	}
 	// 提交后可正常消费到
-	got, err := f.dl.Receive(context.Background(), "g", "t-txn", 0, 1, time.Minute, 0, nil)
+	got, err := f.dl.Receive(context.Background(), "g", "t-txn", 0, 1, time.Minute, 0, deliver.AllPass)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("提交后的消息不可消费: %v %d", err, len(got))
 	}
@@ -127,7 +127,7 @@ func TestRollbackDeletesEverything(t *testing.T) {
 	if f.halfCount(t) != 0 {
 		t.Fatal("rollback 后 half 条目残留")
 	}
-	got, _ := f.dl.Receive(context.Background(), "g", "t-txn", 0, 1, time.Minute, 0, nil)
+	got, _ := f.dl.Receive(context.Background(), "g", "t-txn", 0, 1, time.Minute, 0, deliver.AllPass)
 	if len(got) != 0 {
 		t.Fatal("rollback 的消息被消费到了")
 	}
@@ -177,7 +177,7 @@ func TestEndTwiceSecondIsNoop(t *testing.T) {
 		t.Fatalf("重复 commit 应为幂等 no-op: found=%v err=%v", found, err)
 	}
 	// 消息只有一条，没有被重复投入
-	got, _ := f.dl.Receive(context.Background(), "g", "t-txn", 0, 10, time.Minute, 0, nil)
+	got, _ := f.dl.Receive(context.Background(), "g", "t-txn", 0, 10, time.Minute, 0, deliver.AllPass)
 	if len(got) != 1 {
 		t.Fatalf("重复 End 导致消息条数 = %d", len(got))
 	}

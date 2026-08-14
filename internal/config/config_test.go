@@ -122,6 +122,28 @@ func TestDefaultMaxAttempts(t *testing.T) {
 	}
 }
 
+// TestDefaultInvisibleDuration 默认不可见时长为 1m（与改造前 receive.go 的硬编码
+// 一致），且非正 duration 必须在 Load 阶段被拒——配成 0 会让消息投出去立刻可再投，
+// 表现为无限重复消费，等到运行时才发现的代价远高于启动即挡。
+func TestDefaultInvisibleDuration(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatalf("Load(\"\"): %v", err)
+	}
+	if got := cfg.DefaultInvisible(); got != time.Minute {
+		t.Fatalf("默认不可见时长 = %v，期望 1m", got)
+	}
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	os.WriteFile(p, []byte("default_invisible_duration: 0s\n"), 0o644)
+	if _, err := Load(p); err == nil {
+		t.Fatal("应拒绝 default_invisible_duration=0s")
+	}
+	os.WriteFile(p, []byte("default_invisible_duration: \"\"\n"), 0o644)
+	if _, err := Load(p); err == nil {
+		t.Fatal("应拒绝空 default_invisible_duration")
+	}
+}
+
 func TestDiskWatermark(t *testing.T) {
 	cfg, err := Load("")
 	if err != nil || cfg.DiskWatermarkPercent != 85 {
@@ -335,6 +357,43 @@ func TestLoadStrictRejectsTypoField(t *testing.T) {
 	}
 	if _, err := Load(p); err == nil {
 		t.Fatal("键名笔误应被严格解析拒绝")
+	}
+}
+
+func TestAutoRenewMax(t *testing.T) {
+	cases := []struct {
+		name string
+		raw  string
+		want time.Duration
+	}{
+		{"合法值按原样解析", "30s", 30 * time.Second},
+		{"空串回落默认", "", 10 * time.Minute},
+		{"非法值回落默认", "十分钟", 10 * time.Minute},
+		{"零值回落默认", "0s", 10 * time.Minute},
+		{"负值回落默认", "-1m", 10 * time.Minute},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{AutoRenewMaxDuration: tc.raw}
+			if got := c.AutoRenewMax(); got != tc.want {
+				t.Fatalf("AutoRenewMax(%q) = %v，期望 %v", tc.raw, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestAutoRenewDefaults(t *testing.T) {
+	// path=="" 走纯默认值分支，不读文件
+	c, err := Load("")
+	if err != nil {
+		t.Fatalf("Load(\"\"): %v", err)
+	}
+	// 默认开启：这是协议正确的行为，SDK 的 PushConsumer 每次请求都在要它
+	if !c.AutoRenewEnabled {
+		t.Fatal("AutoRenewEnabled 默认应为 true")
+	}
+	if got := c.AutoRenewMax(); got != 10*time.Minute {
+		t.Fatalf("AutoRenewMax 默认 = %v，期望 10m", got)
 	}
 }
 

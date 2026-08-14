@@ -210,7 +210,7 @@ func TestAppendConcurrentNoDupNoHole(t *testing.T) {
 // sendDelay 构造一条延时消息并 AppendDelay（测试辅助）
 func sendDelay(t *testing.T, p *Producer, topic string, body string, dueMs int64) *core.Message {
 	t.Helper()
-	m, err := p.AppendDelay(context.Background(), &core.Message{Topic: topic, Body: []byte(body), DeliverAtMs: dueMs})
+	m, _, _, err := p.AppendDelay(context.Background(), &core.Message{Topic: topic, Body: []byte(body), DeliverAtMs: dueMs})
 	if err != nil {
 		t.Fatalf("AppendDelay: %v", err)
 	}
@@ -266,10 +266,10 @@ func TestAppendDelayPastDueFallsThroughToImmediate(t *testing.T) {
 func TestAppendDelayRejectsInvalid(t *testing.T) {
 	p, st := newTestProducer(t, t.TempDir())
 	defer st.Close()
-	if _, err := p.AppendDelay(context.Background(), &core.Message{Topic: "t", Body: nil, DeliverAtMs: time.Now().Add(time.Hour).UnixMilli()}); err == nil {
+	if _, _, _, err := p.AppendDelay(context.Background(), &core.Message{Topic: "t", Body: nil, DeliverAtMs: time.Now().Add(time.Hour).UnixMilli()}); err == nil {
 		t.Fatal("空 body 应拒绝")
 	}
-	if _, err := p.AppendDelay(context.Background(), &core.Message{Topic: "t", Body: []byte("x"), DeliverAtMs: 0}); err == nil {
+	if _, _, _, err := p.AppendDelay(context.Background(), &core.Message{Topic: "t", Body: []byte("x"), DeliverAtMs: 0}); err == nil {
 		t.Fatal("DeliverAtMs<=0 是编程错误，应拒绝")
 	}
 }
@@ -403,7 +403,7 @@ func TestAppendDelayConcurrentSeqUnique(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for i := 0; i < perG; i++ {
-				if _, err := p.AppendDelay(context.Background(), &core.Message{Topic: "dly-cc", Body: []byte("x"), DeliverAtMs: due}); err != nil {
+				if _, _, _, err := p.AppendDelay(context.Background(), &core.Message{Topic: "dly-cc", Body: []byte("x"), DeliverAtMs: due}); err != nil {
 					t.Errorf("AppendDelay: %v", err)
 					return
 				}
@@ -446,5 +446,46 @@ func TestAppendBatchAtomicOnInvalidBody(t *testing.T) {
 		if _, ok, _ := st.Get(store.AllocKey("tb3", q)); ok {
 			t.Fatalf("队列 %d 的 alloc 计数器不应存在（整批应零落盘）", q)
 		}
+	}
+}
+
+// TestAppendDelayReportsSeqAndStaged 钉住新签名的两条语义：
+// 真进暂存区时 staged=true 且 seq 是该条目的分配值（据此能拼出 DelayKey）；
+// 已到期直通 Append 时 staged=false。
+//
+// 为什么必须有 staged 这个布尔而不能用 seq==0 当哨兵：延时 seq 从 0 开始
+// 分配（nextDelaySeqLocked 在计数器不存在时返回 0），所以 0 是一个**合法**
+// 的 seq——空库里第一条延时消息的 seq 就是 0。用 0 当"未暂存"的哨兵会让
+// 这条消息永远签不出句柄。
+func TestAppendDelayReportsSeqAndStaged(t *testing.T) {
+	p, st := newTestProducer(t, t.TempDir())
+	defer st.Close()
+	due := time.Now().Add(time.Hour).UnixMilli()
+
+	m, seq, staged, err := p.AppendDelay(context.Background(),
+		&core.Message{Topic: "dly-seq", Body: []byte("x"), DeliverAtMs: due})
+	if err != nil {
+		t.Fatalf("AppendDelay: %v", err)
+	}
+	if !staged {
+		t.Fatalf("due 在一小时后，应进暂存区（staged=true）")
+	}
+	// 空库第一条：seq 必须是 0，且 DelayKey(due, seq) 必须真的存在
+	if _, ok, err := st.Get(store.DelayKey(due, seq)); err != nil || !ok {
+		t.Fatalf("DelayKey(due=%d, seq=%d) 不存在（ok=%v err=%v）——seq 报错了", due, seq, ok, err)
+	}
+	if m.ID == "" {
+		t.Fatalf("返回消息缺 ID")
+	}
+
+	// 已到期：直通 Append，不进暂存区
+	past := time.Now().Add(-time.Second).UnixMilli()
+	_, _, staged2, err := p.AppendDelay(context.Background(),
+		&core.Message{Topic: "dly-seq", Body: []byte("y"), DeliverAtMs: past})
+	if err != nil {
+		t.Fatalf("AppendDelay(已到期): %v", err)
+	}
+	if staged2 {
+		t.Fatalf("due 已过，应直通 Append（staged=false）")
 	}
 }

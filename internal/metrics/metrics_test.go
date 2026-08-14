@@ -50,7 +50,7 @@ func TestCollectDerivesStats(t *testing.T) {
 		}
 	}
 	// 消费 1 条不 ack：cursor=1、inflight=1、待拉取=2
-	if _, err := dl.Receive(context.Background(), "g1", "t1", 0, 1, time.Minute, 0, nil); err != nil {
+	if _, err := dl.Receive(context.Background(), "g1", "t1", 0, 1, time.Minute, 0, deliver.AllPass); err != nil {
 		t.Fatal(err)
 	}
 	s, err := Collect(st, mt)
@@ -80,7 +80,7 @@ func TestRegistryExposesMetrics(t *testing.T) {
 	if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
 		t.Fatal(err)
 	}
-	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()), nil, nil, slog.Default())
+	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()), nil, nil, nil, slog.Default())
 	// Append 走过 store.Apply，直方图应已有样本；写入 counter 应为 1
 	got, err := testutil.GatherAndCount(reg, "sq_topic_messages_written_total", "sq_store_apply_duration_seconds")
 	if err != nil || got == 0 {
@@ -101,7 +101,7 @@ func TestRegistryExposesDiskAndWriteBlocked(t *testing.T) {
 	st, mt, _, _ := fixture(t)
 	blocked := &atomic.Bool{}
 	sys := sysinfo.New(t.TempDir(), 85, blocked, slog.Default())
-	reg := NewRegistry(st, mt, sys, nil, nil, slog.Default())
+	reg := NewRegistry(st, mt, sys, nil, nil, nil, slog.Default())
 
 	names := gatherNames(t, reg)
 	for _, want := range []string{"sq_write_blocked", "sq_data_dir_bytes", "sq_disk_used_percent", "sq_disk_free_bytes"} {
@@ -171,7 +171,7 @@ func TestSystemMetricsSurviveStoreFailure(t *testing.T) {
 	blocked := &atomic.Bool{}
 	blocked.Store(true)
 	sys := sysinfo.New(t.TempDir(), 85, blocked, slog.Default())
-	reg := NewRegistry(st, mt, sys, nil, nil, slog.Default())
+	reg := NewRegistry(st, mt, sys, nil, nil, nil, slog.Default())
 
 	// 关掉 store，让业务采集必然失败（Collect 里的 st.Get/Scan 会报 ErrClosed）
 	if err := st.Close(); err != nil {
@@ -231,7 +231,7 @@ func TestRegistryExportsTxnAndConnMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()),
-		&fakeTxnStats{checks: 7, dropped: 1}, &fakeConns{n: 3}, slog.Default())
+		&fakeTxnStats{checks: 7, dropped: 1}, &fakeConns{n: 3}, nil, slog.Default())
 	if err := testutil.GatherAndCompare(reg, strings.NewReader(`
 # HELP sq_half_messages 半消息暂存区待回查条数
 # TYPE sq_half_messages gauge
@@ -255,7 +255,7 @@ sq_connections 3
 func TestRegistryTolerantToNilTxnAndConns(t *testing.T) {
 	st, mt, _, _ := fixture(t)
 	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()),
-		nil, nil, slog.Default())
+		nil, nil, nil, slog.Default())
 	names := gatherNames(t, reg)
 	for _, absent := range []string{"sq_txn_checks_total", "sq_txn_dropped_total", "sq_connections"} {
 		if names[absent] {
@@ -265,5 +265,47 @@ func TestRegistryTolerantToNilTxnAndConns(t *testing.T) {
 	// 业务指标不受影响仍正常产出——顺带确认 nil 分支没有打乱既有采集
 	if !names["sq_topics"] {
 		t.Fatalf("tx/conns 为 nil 不影响业务指标，实际有 %v", names)
+	}
+}
+
+// fakeFilterStats 测试替身：注入固定的订阅过滤跳过计数。
+type fakeFilterStats struct{ m map[deliver.FilterSkipKey]uint64 }
+
+func (f fakeFilterStats) FilterSkipped() map[deliver.FilterSkipKey]uint64 { return f.m }
+
+func TestCollectorExposesFilterSkipped(t *testing.T) {
+	// 用 fixture 构造真实 st/mt（Collect 对 st/mt 为 nil 不耐受，
+	// doc 只承诺 sys/tx/conns 可为 nil——不要为测试放宽该假设），
+	// 只把 fs 换成 fake。
+	st, mt, _, _ := fixture(t)
+	fs := fakeFilterStats{m: map[deliver.FilterSkipKey]uint64{
+		{Topic: "t", Group: "g", Reason: "sql_false"}:   3,
+		{Topic: "t", Group: "g", Reason: "sql_unknown"}: 7,
+		{Topic: "t", Group: "g", Reason: "tag_miss"}:    5,
+	}}
+	reg := prometheus.NewRegistry()
+	reg.MustRegister(NewCollector(st, mt, nil, nil, nil, fs, slog.Default()))
+
+	mfs, err := reg.Gather()
+	if err != nil {
+		t.Fatalf("Gather: %v", err)
+	}
+	got := map[string]float64{} // reason -> value
+	for _, mf := range mfs {
+		if mf.GetName() != "sq_filter_skipped_total" {
+			continue
+		}
+		for _, m := range mf.GetMetric() {
+			var reason string
+			for _, l := range m.GetLabel() {
+				if l.GetName() == "reason" {
+					reason = l.GetValue()
+				}
+			}
+			got[reason] = m.GetCounter().GetValue()
+		}
+	}
+	if got["sql_false"] != 3 || got["sql_unknown"] != 7 || got["tag_miss"] != 5 {
+		t.Fatalf("sq_filter_skipped_total 分桶 = %v，期望 sql_false=3 sql_unknown=7 tag_miss=5", got)
 	}
 }
