@@ -1,4 +1,8 @@
-.PHONY: build build-go web test test-web proto e2e soak soak-e2e
+.PHONY: build build-go web test test-cluster test-web proto e2e soak soak-e2e
+
+# set -o pipefail 是 bash 特性，Makefile 默认的 /bin/sh 在部分平台上不支持。
+# 测试目标依赖它保住 go test 的退出码，所以整个 Makefile 统一用 bash。
+SHELL := /bin/bash
 
 # 默认构建包含控制台：单二进制「启动即见一切」是产品承诺的一半
 build: web build-go
@@ -14,8 +18,22 @@ web:
 	cd web && npm ci && npm run build
 	touch web/dist/.gitkeep
 
+# 测试输出纪律（B12 教训，别改回去）：
+#   ① 完整输出落文件，永不过 tail/head——2026-08-11 一次 `go test ./... | tail -60`
+#      让 Pebble 噪声把唯一那行 `--- FAIL: TestXxx` 挤出了窗口，失败用例至今不可考。
+#      要截，也先落完整文件再从文件里截。
+#   ② set -o pipefail 保住 go test 的退出码——同一条管道当时把退出码换成了
+#      tail 的 0，那次失败差点被整个漏掉。
+#   ③ -timeout 显式写出（与 Go 默认值相同），让它是个可见的旋钮而非隐式默认。
 test:
-	go test ./...
+	set -o pipefail; go test -timeout 10m ./... 2>&1 | tee test-output.log
+
+# internal/cluster 专用入口：该包有一次未复现的偶发失败（B12）。
+#   -count=1  防测试缓存给出假绿——追偶发时缓存命中等于没跑。
+#   -timeout 5m 该包全量约 72–85s，5m 是约 3.5 倍余量；真挂死时比默认的 10m
+#              早 5 分钟触发栈转储。
+test-cluster:
+	set -o pipefail; go test -timeout 5m -count=1 ./internal/cluster/... 2>&1 | tee test-cluster.log
 
 test-web:
 	cd web && npm run test
