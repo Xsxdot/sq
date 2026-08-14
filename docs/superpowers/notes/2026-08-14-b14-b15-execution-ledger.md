@@ -128,3 +128,26 @@ Previous write at 0x000105573bc8 by goroutine 11:
 **Minor（记账，终审 triage）**：task3-mutation.txt 只记 FAIL 文案未记变异具体改动行（FAIL 消息「级别是 ERROR，期望 WARN」已自证，可接受）；captureHandler 的 WithAttrs/WithGroup 丢弃 attrs/group，注释已声明「不做通用断言框架」，非问题。
 
 **Commit**：`816e46c fix(cluster): 本地恢复抬任期日志按调用方分级——常规重启 WARN、签字放行 ERROR`
+
+## Task 4: 全量回归与改动面核验
+
+**Step 1 全量 race**：`go test -race -timeout 20m ./...` → exit=0，18/18 包 PASS（含 internal/cluster 82.8s、internal/rpc 27.7s），输出零 `WARNING: DATA RACE`。完整输出存 `/var/folders/xc/hpx9c9w153j7tvphw53lc8qr0000gn/T/opencode/task4-fullrace.txt`。
+
+**Step 2 改动面**：`git diff eaf537d...HEAD --name-only`（实现基线起）只含白名单 8 文件 + ledger：
+`cmd/sq/main.go`、`internal/cluster/group_test.go`、`internal/cluster/raftstore.go`、`internal/cluster/raftstore_test.go`、`internal/metrics/collector.go`、`internal/metrics/metrics_test.go`、`internal/store/store.go`、`internal/store/store_observer_test.go`（新增）+ `docs/superpowers/notes/2026-08-14-b14-b15-execution-ledger.md`。
+ledger 为白名单外文件，理由见本文件头部：协调可见的取证载体，本次改动面核验以此为记。
+（`git diff main...HEAD` 里的其余 docs 文件来自分支基线前已提交的 spec/plan/backlog 历史，非本实现改动。）
+
+**Step 3 残留**：`grep -rn "OnApplyObserve" internal/ cmd/` 仅 4 处，全为注释中的语义性历史称呼（store.go:241/271/348、store_observer_test.go:21），代码引用零命中。
+
+**Step 4 构建**：`go build ./... && go vet ./...` 均无输出。
+
+**Step 5 变异验证取证汇总**（本计划最重要的交付物）：
+1. **Task 1 判别器（B14）**：掐掉 atomic.Pointer 退回裸全局 `onApplyObserveRaw` → `TestApplyObserverConcurrentSetAndRead` 在 -race 下变红，报 `WARNING: DATA RACE`（读在 observeApply、写在 SetApplyObserver）→ 备份还原，工作区干净。取证见上文 Task 1 段（含裁决偏离前/后两次，改后那次为承重）。
+2. **Task 3 判别器（B15）**：把分级改回一律 Error → `TestLocalResumeBumpLogsWarn` 变红，报「级别是 ERROR，期望 WARN」→ 备份还原，备份与现文件 diff IDENTICAL，工作区干净。取证见上文 Task 3 段。
+
+两条判别器都完成了「掐掉实现 → 用例变红 → 还原且干净」的完整闭环，测试的判别力有实证背书，不是「全绿只证明测试跑过」。
+
+## 终审（整分支 diff 复核）
+
+（终审记录在下方追加）
