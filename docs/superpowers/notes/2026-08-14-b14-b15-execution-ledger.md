@@ -105,3 +105,26 @@ Previous write at 0x000105573bc8 by goroutine 11:
 **Minor（记账，终审 triage）**：collector.go:13-14 括号「进程内只应调用一次（见 store 侧 SetApplyObserver 注释）」指向失准——store.go 的 SetApplyObserver 注释主张「可在进程任意时刻调用」，不为「只调一次」背书；该约束真正来源是 NewRegistry 自身语义。建议改为指向本函数语义或去掉括号。
 
 **Commit**：`f89c51a refactor(metrics,cluster,cmd): 迁移到 SetApplyObserver，订正作废的顺序契约注释`
+
+## Task 3: 本地恢复抬任期日志按调用方分级
+
+**Step 2 判别器先失败确认**：新增两条用例后、实现前 `go test -run 'TestLocalResumeBumpLogsWarn|TestForcedRecoverBumpLogsError' ./internal/cluster/ -v` → `TestLocalResumeBumpLogsWarn` FAIL（级别是 ERROR，期望 WARN）；`TestForcedRecoverBumpLogsError` PASS（现状本就是 ERROR）。与预期一致。
+
+**Step 3 实现**：raftstore.go 新增 `termBumpReason` 类型与 `bumpLocalResume`/`bumpForcedRecover` 两常量；`bumpTermsInto` 加 reason 形参；循环内日志按 `reason == bumpForcedRecover` 分流——Error「签字放行的本地恢复」/ Warn「mem 档本地恢复…抬任期是预期动作，代价是多一轮选举」，两条都保留 `g`/`term`/`legacy` 字段。`ForceLocalRecover` 传 `bumpForcedRecover`，`BumpTermsForLocalResume` 传 `bumpLocalResume`。抬任期行为（legacy hsKey 分流、逐组 Persist 落盘、commit 位点不动、许可消费顺序）零变化。
+
+**Step 4 通过确认**：两条新用例 PASS。
+
+**变异验证取证（承重）**：
+- 掐掉什么：把分级分支临时改回一律 Error（删 if/else，只留 `r.lg.Error("不干净关机后本地恢复：任期已抬、投票已清", ...)`），保留 `_ = reason` 防编译失败。
+- 哪条用例变红：`TestLocalResumeBumpLogsWarn` FAIL，报 `raftstore_test.go:697: 级别是 ERROR，期望 WARN；常规重启打 ERROR 会淹没真正需要关注的告警`。
+- 已还原：变异前备份到 temp（`raftstore.go.task3.bak`），用 `cp` 还原（不用 git checkout，因分级实现尚未提交），备份与还原后文件 diff IDENTICAL，`git status --porcelain` 干净。
+- 失败输出存 `/var/folders/xc/hpx9c9w153j7tvphw53lc8qr0000gn/T/opencode/task3-mutation.txt`。
+- **若变异后仍 PASS 则 BLOCKED——未发生**。
+
+**Step 8 本包全量**：`go test -race ./internal/cluster/` PASS（80.195s）。既有行为测试 `TestForceLocalRecoverBumpsTermAndConsumesPermit`、`TestForceLocalRecoverBumpsLegacyHardStateOnUnmigratedDisk` 原样通过。
+
+**审查**：spec 符合性不通过（缺口：ledger 缺 Task 3 段，即本段）+ 代码质量通过。补写本段后复查。
+
+**Minor（记账，终审 triage）**：task3-mutation.txt 只记 FAIL 文案未记变异具体改动行（FAIL 消息「级别是 ERROR，期望 WARN」已自证，可接受）；captureHandler 的 WithAttrs/WithGroup 丢弃 attrs/group，注释已声明「不做通用断言框架」，非问题。
+
+**Commit**：`816e46c fix(cluster): 本地恢复抬任期日志按调用方分级——常规重启 WARN、签字放行 ERROR`
