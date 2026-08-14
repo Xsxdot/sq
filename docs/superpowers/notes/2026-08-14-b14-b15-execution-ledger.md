@@ -93,3 +93,15 @@ Previous write at 0x000105573bc8 by goroutine 11:
 **Commit**：`8e44325 fix(store): Apply 观测钩子改 atomic.Pointer，消除集群档启动期数据竞态`
 
 **提交后预期编译失败确认**：`go vet ./internal/cluster/` 报 `internal/cluster/group_test.go:781:15: undefined: store.OnApplyObserve`，正是 plan 预言的编译器替我们找遗漏调用方。未保留任何兼容别名。Task 2 Step 1 将再确认。
+
+## Task 2: 迁移调用方与两处过时注释
+
+**Step 1 编译失败确认**：`go build ./...` 报 `internal/metrics/collector.go:190:8: undefined: store.OnApplyObserve`；`go vet ./...` 额外报 `internal/cluster/group_test.go:781:15: undefined: store.OnApplyObserve`（仅 vet 暴露）。与预期一致。
+
+**实现与验证**：collector.go 装配点改 `store.SetApplyObserver`；group_test.go `countApplyCommits` 改 `SwapApplyObserver` 存还原；main.go 作废契约注释替换；metrics_test.go 文件头理由改写。`grep -rn "OnApplyObserve" internal/ cmd/` 仅剩语义性历史称呼（store.go:241/271/348、store_observer_test.go:21）；三包 `-race` 全 PASS。装配日志 `logger.Info("metrics registry 已装配")` 保留。另收尾清零 collector.go:13 文件头一处失实的「写 OnApplyObserve」描述（白名单内，符合 Step 6 零残留目标）。
+
+**审查**：spec 符合性通过 + 代码质量通过（双裁决）。
+
+**Minor（记账，终审 triage）**：collector.go:13-14 括号「进程内只应调用一次（见 store 侧 SetApplyObserver 注释）」指向失准——store.go 的 SetApplyObserver 注释主张「可在进程任意时刻调用」，不为「只调一次」背书；该约束真正来源是 NewRegistry 自身语义。建议改为指向本函数语义或去掉括号。
+
+**Commit**：`f89c51a refactor(metrics,cluster,cmd): 迁移到 SetApplyObserver，订正作废的顺序契约注释`
