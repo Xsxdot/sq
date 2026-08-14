@@ -25,10 +25,48 @@ import (
 	"github.com/cockroachdb/pebble/v2/batchrepr"
 )
 
-// OnApplyObserve 若非 nil，每次 Apply 成功提交后以提交耗时（含 fsync）回调，
-// 供 metrics 装配 fsync 延迟直方图（spec §8）。契约：进程装配阶段设置一次，
-// 服务启动后只读——据此不加锁；运行期改写属数据竞态，禁止。
-var OnApplyObserve func(d time.Duration)
+// onApplyObserve 是 Apply 耗时观测钩子。用 atomic.Pointer 而非裸函数变量：
+// 这个钩子由装配阶段的 main goroutine 写、由 raft apply 等后台 goroutine 读，
+// 二者的先后没有任何跨文件手段能可靠保证——集群档下 cluster.Manager.Start
+// 拉起的 apply goroutine 就跑在 metrics 装配之前（2026-08-14 由带 -race 的
+// broker 实测抓到，backlog B14）。原先靠「装配阶段设置一次、之后只读」这条
+// 注释约定维系，而它已被一次看起来无害的重排打破。不变量交给类型，不交给
+// cmd/sq/main.go 里的语句顺序。
+var onApplyObserve atomic.Pointer[func(time.Duration)]
+
+// SetApplyObserver 设置 Apply 耗时观测钩子；传 nil 清除。
+//
+// 并发安全：可在进程任意时刻调用，读侧看到的要么是旧钩子要么是新钩子。
+// 不保证「设置后立刻对所有在途 Apply 生效」——观测是尽力而为的，
+// 漏掉切换瞬间的少数样本不影响直方图语义。
+func SetApplyObserver(f func(d time.Duration)) {
+	if f == nil {
+		onApplyObserve.Store(nil)
+		return
+	}
+	onApplyObserve.Store(&f)
+}
+
+// SwapApplyObserver 设置新钩子并返回旧钩子，供测试保存/还原现场。
+// 传 nil 表示清除并取回旧值；无旧值时返回 nil。
+func SwapApplyObserver(f func(d time.Duration)) func(d time.Duration) {
+	var next *func(time.Duration)
+	if f != nil {
+		next = &f
+	}
+	if old := onApplyObserve.Swap(next); old != nil {
+		return *old
+	}
+	return nil
+}
+
+// observeApply 读路径：非 nil 才回调。
+// 这里刻意不打日志——它跑在每次成功提交之后，是热路径。
+func observeApply(d time.Duration) {
+	if p := onApplyObserve.Load(); p != nil {
+		(*p)(d)
+	}
+}
 
 // Store 封装单个 Pebble 实例。并发安全（Pebble 自身保证）。
 //
@@ -202,9 +240,7 @@ func (s *Store) ApplyWith(b *Batch, sync bool) error {
 	}
 	// OnApplyObserve 只观测成功提交：失败路径由调用方打日志，
 	// 混进观测会污染 fsync 延迟直方图分布。
-	if OnApplyObserve != nil {
-		OnApplyObserve(time.Since(start))
-	}
+	observeApply(time.Since(start))
 	// 成功后必须 Close 回收批次：Pebble 把关闭的批次还回内部
 	// sync.Pool 复用，热路径不能持续分配新的 batch 结构。
 	return b.b.Close()
@@ -296,9 +332,7 @@ func (s *Store) ApplyAsync(b *Batch) (Pending, error) {
 		if err := b.b.Commit(pebble.NoSync); err != nil {
 			return Pending{}, fmt.Errorf("store ApplyAsync: %w", err)
 		}
-		if OnApplyObserve != nil {
-			OnApplyObserve(time.Since(start))
-		}
+		observeApply(time.Since(start))
 		return Pending{b: b.b}, nil
 	}
 	// ApplyNoSyncWait 要求 opts.Sync=true（Pebble 契约）：批次进入 commit
@@ -320,9 +354,7 @@ func (p Pending) Wait() error {
 		if err := p.b.SyncWait(); err != nil {
 			return fmt.Errorf("store WaitSync: %w", err)
 		}
-		if OnApplyObserve != nil {
-			OnApplyObserve(time.Since(p.start))
-		}
+		observeApply(time.Since(p.start))
 	}
 	return p.b.Close()
 }
