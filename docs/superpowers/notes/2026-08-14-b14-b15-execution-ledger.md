@@ -150,4 +150,18 @@ ledger 为白名单外文件，理由见本文件头部：协调可见的取证�
 
 ## 终审（整分支 diff 复核）
 
-（终审记录在下方追加）
+**终审结论**：通过。整分支 diff（eaf537d...HEAD，9 文件）整体复核无问题；跨 task 一致性（三符号定义/消费、commit hash 对上、改动面 8+ledger）核对一致；构建/测试干净。
+
+**Minor triage**：
+- A（collector.go:13-14 括号指向失准）→ **修**。
+- B（判别器注释 11/11 vs ledger 6/6 数字不一致）→ **修**。
+- C（task3-mutation 取证简化）→ 不修，ledger 已完整记载变异手法。
+- D（captureHandler 丢弃 attrs/group）→ 不修，注释已声明「不做通用断言框架」。
+
+**新观察（记账，不阻断）**：`levelOf` 取第一条匹配记录——局部回归（首组 Warn 后组 Error）不会被抓；变异验证已证明对「一律 Error」这一单点回归变红，且为 plan 指定结构，不修。
+
+**终审修复 commit**：`fa9bd24 docs: 终审 Minor 修复——订正 NewRegistry 只调一次的理由指向、统一判别器注释的实测数字`（仅 collector.go + store_observer_test.go 两处注释），范围复审通过。
+
+**终态回归**：修复后 `go test -race -timeout 20m ./...` exit=0，18/18 包 PASS，零 `WARNING: DATA RACE`。
+
+**交付摘要**：B14（Apply 观测钩子改 atomic.Pointer，含裁决偏离修改与两次变异验证取证）+ B15（本地恢复抬任期日志按调用方分级，含变异验证取证）全部完成；两条承重判别器均完成「掐掉实现 → 用例变红 → 还原干净」闭环；改动面 = 白名单 8 文件 + 本 ledger。
