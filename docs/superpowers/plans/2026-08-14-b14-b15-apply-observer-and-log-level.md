@@ -99,7 +99,7 @@ func TestApplyObserverConcurrentSetAndRead(t *testing.T) {
 	defer s.Close()
 	t.Cleanup(func() { SetApplyObserver(nil) })
 
-	const writers, rounds = 4, 200
+	const writers = 4
 	var observed atomic.Int64
 	stop := make(chan struct{})
 	var wg sync.WaitGroup
@@ -128,19 +128,33 @@ func TestApplyObserverConcurrentSetAndRead(t *testing.T) {
 		}(w)
 	}
 
-	// 写侧：反复在「装钩子」与「清钩子」之间切换，模拟装配阶段与后台
-	// goroutine 重叠的那个窗口。
-	for i := 0; i < rounds; i++ {
+	// 写侧：每轮换一个**新的非 nil** 闭包，指针每轮都变，全程不切 nil；
+	// 清 nil 只在循环结束后做一次（那也是生产里唯一的 nil 转换方向）。
+	//
+	// 为什么不「非 nil ↔ nil 来回切」：并发暴露面并不会因此变大——race
+	// detector 看的是「无同步地读写同一变量」，与值是不是 nil 无关——但
+	// 那种写法的非 nil 窗口只有相邻两条语句的纳秒级间隙，而读侧要等一次
+	// Pebble 提交（微秒级）才读一次钩子。机器一忙，读侧整轮都撞不上非 nil，
+	// observed 恒为 0、用例假红。实测：整包跑 11/11 红、单跑 20/20 绿。
+	// 下一个人若觉得「来回切更全面」而改回去，缺陷会复发。
+	deadline := time.Now().Add(10 * time.Second)
+	for rounds := 0; ; rounds++ {
 		SetApplyObserver(func(time.Duration) { observed.Add(1) })
-		SetApplyObserver(nil)
+		if rounds >= 200 && observed.Load() > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			break
+		}
 	}
+	SetApplyObserver(nil)
 	close(stop)
 	wg.Wait()
 
 	// 不断言具体条数：切换瞬间漏样本是允许的。但一条都没观测到，说明
 	// 钩子从未真正被调用过，用例失去判别力。
 	if observed.Load() == 0 {
-		t.Fatal("观测计数为 0——钩子一次都没被调用，本用例无法证明任何并发性质")
+		t.Fatal("10 秒内观测计数仍为 0——钩子一次都没被调用，本用例无法证明任何并发性质")
 	}
 }
 ```
