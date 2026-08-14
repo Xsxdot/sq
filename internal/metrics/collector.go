@@ -11,7 +11,7 @@
 //
 // 边界：
 //   - NewRegistry 通过 store.SetApplyObserver 挂接进程级钩子，进程内只应
-//     调用一次（见 store 侧 SetApplyObserver 注释）
+//     调用一次（重复调用会静默覆盖前一次的直方图，见下方 NewRegistry）
 //   - 不出内存指标：GoCollector 已提供 go_memstats_*，重复暴露会让告警
 //     规则出现两个口径不同的来源
 package metrics

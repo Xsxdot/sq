@@ -23,7 +23,8 @@ import (
 //
 // 为什么写侧不「装/清交替」、而是每轮换一个新非 nil 闭包、循环结束后统一清一次：
 // 第一版写侧是每轮 SetApplyObserver(fn) 紧接 SetApplyObserver(nil)，本机实测不稳定——
-// 整包 `go test -race ./internal/store/` 11/11 红、隔离单跑 20/20 绿。根因是非 nil
+// 整包 `go test -race ./internal/store/` 曾全红（6/6、11/11 两批次，负载相关，见执行
+// ledger）、隔离单跑 20/20 绿。根因是非 nil
 // 窗口只存在于相邻两条语句之间，是纳秒级间隙，而读侧每个 goroutine 每次 Pebble
 // 提交（微秒级）完成后才读一次钩子；本机负载高时，主 goroutine 打完整轮 toggle
 // 循环期间读侧赶不上任何一次提交后读取，观测计数落 0——正确实现也会红。改成
