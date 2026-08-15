@@ -3,7 +3,9 @@
 //
 // 职责：
 //   - ReceiveMessage：服务端流式取件，core.Message → proto Message，
-//     并在此注入自包含的 receipt handle（见 receipt.go）
+//     并在此注入自包含的 receipt handle（见 receipt.go）；有消息可投时还发
+//     一帧信封层 delivery_timestamp（协议要求 broker 发，官方 Python SDK 的
+//     push 路径硬依赖它）
 //   - AckMessage/ChangeInvisibleDuration：解出 handle 后转发给
 //     deliver.Deliverer，把 (bool,error) 结果映射为协议 Status
 //   - QueryAssignment：路由查询，复用 QueryRoute 的 messageQueues（集群档
@@ -83,7 +85,8 @@ func leaseFor(ctx context.Context, cfg *config.Config, ss *sessions, wantAutoRen
 	return deliver.Lease{Owner: cid, MaxRenew: cfg.AutoRenewMax(), Alive: ss.aliveClient}
 }
 
-// ReceiveMessage POP 取件（服务端流）。流格式：先逐条消息，最后一帧 status。
+// ReceiveMessage POP 取件（服务端流）。流格式：一帧信封层 delivery_timestamp
+// （仅本批确有消息时发）、逐条消息、最后一帧 status。
 //
 // 关于帧顺序（已用官方 SDK 实测，不是推测）：官方 Go SDK 并不依赖任何顺序——
 // 它把整条流读到 io.EOF 收集成一个切片后才统一处理，Status 帧无论出现在头部
@@ -91,6 +94,11 @@ func leaseFor(ctx context.Context, cfg *config.Config, ss *sessions, wantAutoRen
 // 收尾：它同时也是"服务端已经把本批全部发完"的天然信号，而且消息推送中途失败
 // 时不会留下一个"已经宣称 OK 却没发全"的流。两种顺序都在 test/e2e 里用真实
 // SDK 实跑验证过，此处的选择不影响 SDK 兼容性。
+//
+// 信封层 delivery_timestamp 因此只能放在 status 之前（上游放在最后一帧）：
+// status 既然被 sq 用作终止信号，其后再挂 metadata 帧就自相矛盾。它只在本批
+// 确有消息时发——两处偏离参考实现的判据见
+// specs/2026-08-16-receive-delivery-timestamp-design.md 的 D1/D2。
 //
 // 空结果不走这条格式：长轮询到期无消息时只发一帧 MESSAGE_NOT_FOUND status，
 // 理由见下方该分支的注释。
@@ -246,6 +254,34 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 			Status: errStatus(pb.Code_MESSAGE_NOT_FOUND, "本次长轮询无可投递消息"),
 		}})
 	}
+	// 信封层 delivery_timestamp（proto 注释："The timestamp that brokers start
+	// to deliver status line or message"）——该由 broker 发，sq 此前从不发。
+	//
+	// 为什么必须发：官方 Python SDK 的 push 路径对它做无保护减法
+	// （client_metrics.py:151 `latency = current - transport_delivery_timestamp`），
+	// 缺失即抛 TypeError；异常被 push_consumer.py 的 except 吞掉，同一 try 块里
+	// 排在其后的 cache_messages / execute_consume 都不执行，listener 永不触发，
+	// 消息卡在 in-flight 无限重试。Go / Java / C# 只是把它存进变量、容忍 nil，
+	// 所以这条缺口在全用 Go SDK 的 e2e 里全绿了很久（B13.8）。
+	//
+	// 为什么放批首而不像上游那样放批尾：sq 的 status 在末尾，是"本批已全部
+	// 发完"的终止信号（见本函数上方"关于帧顺序"），metadata 帧挂在终止信号
+	// 之后自相矛盾；批首也是 proto 注释 "start to deliver" 的字面语义。帧序
+	// 对客户端无影响——Python 与 Go 都是收完整条流再按 oneof 分类。
+	//
+	// 为什么空批与错误分支不发（与上游 onComplete 的无条件发刻意不同）：
+	// 空长轮询是常态热路径，而没有任何已知 SDK 在空响应下读它。判据与推翻
+	// 它所需的证据见 specs/2026-08-16-receive-delivery-timestamp-design.md D1。
+	deliveryTS := time.Now()
+	if err := stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_DeliveryTimestamp{
+		DeliveryTimestamp: timestamppb.New(deliveryTS),
+	}}); err != nil {
+		// 首帧就发不出去意味着流已经断了，后面的消息发了也没有意义。不能静默
+		// 吞掉：吞掉就变成"客户端什么都没收到、服务端日志一片安静"。
+		s.logger.Warn("ReceiveMessage 发送 delivery_timestamp 帧失败，流可能已被客户端关闭",
+			"group", group, "topic", topic, "queue", queueID, "count", len(msgs), "err", err)
+		return err
+	}
 	for i, m := range msgs {
 		if err := stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Message{
 			Message: s.toPBMessage(m, group, invisible),
@@ -259,7 +295,10 @@ func (s *Server) ReceiveMessage(req *pb.ReceiveMessageRequest, stream pb.Messagi
 			return err
 		}
 	}
-	s.logger.Debug("ReceiveMessage 完成", "group", group, "topic", topic, "queue", queueID, "count", len(msgs))
+	// delivery_ts 一并打出：客户端侧的消费延迟指标就是拿它做减数算出来的，
+	// "客户端说延迟不对"时有它才能在服务端侧直接对账，而不必去猜。
+	s.logger.Debug("ReceiveMessage 完成", "group", group, "topic", topic, "queue", queueID,
+		"count", len(msgs), "delivery_ts", deliveryTS.UnixMilli())
 	return stream.Send(&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_Status{
 		Status: okStatus(),
 	}})

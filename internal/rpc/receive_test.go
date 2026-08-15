@@ -1079,3 +1079,118 @@ func TestReceiveMessageWiresLeaseIntoInflight(t *testing.T) {
 		t.Fatalf("inflight RenewUntilMs 应 > 0（租约生效的标记），实际 %d", inf.RenewUntilMs)
 	}
 }
+
+// recvAllFrames 读整个 ReceiveMessage 流，原样保留帧序。
+//
+// 与 recvAll 的区别：它不做分类归约。归约之后就看不出帧的**位置**了，而
+// 信封层 delivery_timestamp 的判据恰恰是位置（必须是首帧，见
+// specs/2026-08-16-receive-delivery-timestamp-design.md 的 D2）。
+func recvAllFrames(t *testing.T, stream pb.MessagingService_ReceiveMessageClient) []*pb.ReceiveMessageResponse {
+	t.Helper()
+	var frames []*pb.ReceiveMessageResponse
+	for {
+		resp, err := stream.Recv()
+		if err == io.EOF {
+			return frames
+		}
+		if err != nil {
+			t.Fatalf("recv: %v", err)
+		}
+		frames = append(frames, resp)
+	}
+}
+
+// TestReceiveSendsEnvelopeDeliveryTimestampAsFirstFrame 锁定 B13.8 的修复：
+// 有消息可投时，响应流的首帧必须是信封层 delivery_timestamp。
+//
+// 为什么这条值得单独锁：缺这一帧时 Go / Java / C# 三门 SDK 全都若无其事
+// （它们只是把值存进变量、容忍 nil），只有官方 Python SDK 在 push 路径上对它
+// 无条件做减法，抛 TypeError → 异常被吞 → listener 永不触发。也就是说这条
+// 缺失在 Go e2e 里**照不出来**（e2e 用的就是 Go SDK），只能靠这里的位置断言
+// 守住——这也是它必须是单测而不是 e2e 用例的原因。
+func TestReceiveSendsEnvelopeDeliveryTimestampAsFirstFrame(t *testing.T) {
+	c := newTestClient(t)
+	const topic = "envts"
+	sendOne(t, c, topic, "hello")
+
+	before := time.Now()
+	// 只有落到消息所在队列的那次 receive 才会有消息；四个队列都试。
+	// 空队列只返回一帧 MESSAGE_NOT_FOUND，用帧数即可判别。
+	var frames []*pb.ReceiveMessageResponse
+	for q := int32(0); q < 4 && frames == nil; q++ {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		stream, err := c.ReceiveMessage(ctx, &pb.ReceiveMessageRequest{
+			Group:             &pb.Resource{Name: "g-envts"},
+			MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: topic}, Id: q},
+			BatchSize:         8,
+			InvisibleDuration: durationpb.New(time.Minute),
+		})
+		if err != nil {
+			cancel()
+			t.Fatalf("ReceiveMessage: %v", err)
+		}
+		got := recvAllFrames(t, stream)
+		cancel()
+		if len(got) > 1 {
+			frames = got
+		}
+	}
+	after := time.Now()
+	if len(frames) != 3 {
+		t.Fatalf("期望 3 帧（delivery_timestamp + message + status），实际 %d", len(frames))
+	}
+
+	ts, ok := frames[0].GetContent().(*pb.ReceiveMessageResponse_DeliveryTimestamp)
+	if !ok {
+		t.Fatalf("首帧必须是信封层 delivery_timestamp，实际 %T", frames[0].GetContent())
+	}
+	got := ts.DeliveryTimestamp.AsTime()
+	// 取值判据不能只判「非零」：非零可以由一个写死的常量满足。要求它落在本次
+	// 调用的真实时间窗内，才能证明取的是「开始投递的那一刻」而不是某个定值。
+	if got.Before(before) || got.After(after) {
+		t.Fatalf("delivery_timestamp %v 不在本次调用区间 [%v, %v] 内", got, before, after)
+	}
+	if _, ok := frames[1].GetContent().(*pb.ReceiveMessageResponse_Message); !ok {
+		t.Fatalf("第 2 帧应为 message，实际 %T", frames[1].GetContent())
+	}
+	// 末帧仍是 status：sq 刻意的 status-last 帧序（"本批已全部发完"的终止信号）
+	// 不能被这次改动破坏
+	if _, ok := frames[2].GetContent().(*pb.ReceiveMessageResponse_Status); !ok {
+		t.Fatalf("末帧必须是 status，实际 %T", frames[2].GetContent())
+	}
+}
+
+// TestReceiveEmptyPollSendsNoDeliveryTimestamp 锁定 spec D1：空长轮询是 sq 的
+// 常态热路径（每消费者每队列每 20s 一次），不能因为这次改动被恒定加一帧。
+//
+// 这与参考实现刻意不同——上游在 finally 里的 onComplete() 无条件发。依据是
+// 没有任何已知 SDK 在空响应下读它（Python 的赋值条件带 len(messages) > 0、
+// Go 只把它当 fromProtobuf_MessageView2 的入参）。判据与推翻它所需的证据都
+// 写在 specs/2026-08-16-receive-delivery-timestamp-design.md 的 D1。
+func TestReceiveEmptyPollSendsNoDeliveryTimestamp(t *testing.T) {
+	c := newTestClient(t)
+	const topic = "envts-empty"
+	// 经 QueryRoute 建一个从未发过消息的 topic：任何队列都必然为空，
+	// 不依赖发送轮询的落点（那会让用例随队列数变化而脆弱）
+	if _, err := c.QueryRoute(context.Background(), &pb.QueryRouteRequest{Topic: &pb.Resource{Name: topic}}); err != nil {
+		t.Fatalf("QueryRoute: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	stream, err := c.ReceiveMessage(ctx, &pb.ReceiveMessageRequest{
+		Group:             &pb.Resource{Name: "g-envts-empty"},
+		MessageQueue:      &pb.MessageQueue{Topic: &pb.Resource{Name: topic}, Id: 0},
+		BatchSize:         8,
+		InvisibleDuration: durationpb.New(time.Minute),
+	})
+	if err != nil {
+		t.Fatalf("ReceiveMessage: %v", err)
+	}
+	frames := recvAllFrames(t, stream)
+	if len(frames) != 1 {
+		t.Fatalf("空长轮询应只有一帧 status，实际 %d 帧", len(frames))
+	}
+	if _, ok := frames[0].GetContent().(*pb.ReceiveMessageResponse_Status); !ok {
+		t.Fatalf("空长轮询的唯一一帧应为 status，实际 %T", frames[0].GetContent())
+	}
+}
