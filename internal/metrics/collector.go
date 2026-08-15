@@ -10,8 +10,8 @@
 //     store.Apply 耗时直方图（挂接包级钩子）
 //
 // 边界：
-//   - NewRegistry 写 store.OnApplyObserve 包级钩子，进程内只可调用一次
-//     （装配期契约，见 store 侧注释）
+//   - NewRegistry 通过 store.SetApplyObserver 挂接进程级钩子，进程内只应
+//     调用一次（重复调用会静默覆盖前一次的直方图，见下方 NewRegistry）
 //   - 不出内存指标：GoCollector 已提供 go_memstats_*，重复暴露会让告警
 //     规则出现两个口径不同的来源
 package metrics
@@ -190,7 +190,10 @@ func (c *Collector) collectSystem(ch chan<- prometheus.Metric) {
 }
 
 // NewRegistry 组装进程级指标注册表并挂接 store.Apply 耗时直方图。
-// 只能在装配阶段调用一次（会写 store.OnApplyObserve 包级钩子）。
+// 进程内只应调用一次：它会通过 store.SetApplyObserver 抢占进程级的 Apply
+// 观测钩子，调用两次后一次会静默覆盖前一次的直方图。钩子本身并发安全
+// （见 store.SetApplyObserver），因此本函数相对后台 goroutine 的启动顺序
+// 不影响正确性——只影响装配完成前那一小段时间的样本会不会被记录。
 // tx/conns/fs 允许为 nil（测试与降级场景跳过事务/连接/过滤跳过指标）。
 func NewRegistry(st *store.Store, mt *meta.Meta, sys *sysinfo.Reporter, tx TxnStats, conns ConnCounter, fs FilterStats, logger *slog.Logger) *prometheus.Registry {
 	reg := prometheus.NewRegistry()
@@ -205,7 +208,7 @@ func NewRegistry(st *store.Store, mt *meta.Meta, sys *sysinfo.Reporter, tx TxnSt
 		Buckets: prometheus.ExponentialBuckets(0.0001, 2, 14),
 	})
 	reg.MustRegister(h)
-	store.OnApplyObserve = func(d time.Duration) { h.Observe(d.Seconds()) }
+	store.SetApplyObserver(func(d time.Duration) { h.Observe(d.Seconds()) })
 	logger.Info("metrics registry 已装配", "mod", "metrics")
 	return reg
 }

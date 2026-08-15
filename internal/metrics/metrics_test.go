@@ -1,8 +1,9 @@
 // metrics 测试：走真实 produce/deliver 制造状态，断言 Collect 推导值与
 // Prometheus 文本输出。
 //
-// 不用 t.Parallel()：NewRegistry 会设置包级钩子 store.OnApplyObserve，并行测试
-// 会互相覆盖该钩子（且本包测试本就 cheap，无并行收益）。
+// 不用 t.Parallel()：NewRegistry 会通过 store.SetApplyObserver 抢占进程级的
+// Apply 观测钩子（钩子本身并发安全，但只有一份），并行跑的用例会互相覆盖
+// 对方的观测目标，断言就落到别人的直方图上了。
 package metrics
 
 import (

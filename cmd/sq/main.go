@@ -386,11 +386,14 @@ func run() error {
 	ds := delay.New(rep, rt, st, pr, logger)
 	srv := rpc.New(cfg, rv, mt, pr, dl, ds, tx, writeBlocked, handleSecret, logger)
 
-	// metrics registry 必须先于任何后台 goroutine 装配：NewRegistry 会写包级
-	// 钩子 store.OnApplyObserve，其契约是「装配阶段设置一次、之后只读」——
-	// retention/delay 的 goroutine 启动即可能走 store.Apply 读这个钩子，
-	// 放到它们之后装配就是契约禁止的无同步并发读写。admin_listen 为空 =
-	// 不装配（钩子保持 nil，Apply 路径零开销）。
+	// metrics registry 的装配位置不再承担正确性责任：它通过
+	// store.SetApplyObserver 挂钩子，而那个钩子本身是并发安全的
+	// （atomic.Pointer，见 store 包）。此处曾要求「必须先于任何后台
+	// goroutine 装配」，但集群档下 cluster.Manager.Start（上方 m.Start）
+	// 拉起的 apply goroutine 一直跑在这之前，那条契约实际从未成立——
+	// 2026-08-14 由带 -race 的 broker 实测抓到（backlog B14）。
+	// 唯一的后果是：装配完成之前发生的 Apply 不会被记入直方图。
+	// admin_listen 为空 = 不装配（钩子保持 nil，Apply 路径零开销）。
 	var reg *prometheus.Registry
 	var sp *metrics.Sampler
 	if cfg.AdminListen != "" {

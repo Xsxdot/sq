@@ -1101,6 +1101,16 @@ func (r *raftStore) LoadRecoverPermit() (recoverPermit, bool, error) {
 	return recoverPermit{GrantedAt: parts[0], Gen: parts[1]}, true, nil
 }
 
+// termBumpReason 区分抬任期的两种来路。它们的严重性差一个数量级，
+// 日志级别必须跟着分开：常规重启是预期动作（代价只是多一轮选举），
+// 签字放行则意味着运维已接受可能丢已确认消息。
+type termBumpReason uint8
+
+const (
+	bumpLocalResume   termBumpReason = iota // mem 档常规重启（pathLocalResume）
+	bumpForcedRecover                       // sq recover --grant 签字放行
+)
+
 // bumpTermsInto 把组 0..dataGroups 每组 HardState 的 Term 加 1、Vote 清空，
 // 逐组经 Persist 落盘（sync=true）。
 //
@@ -1152,7 +1162,7 @@ func (r *raftStore) LoadRecoverPermit() (recoverPermit, bool, error) {
 // 显式分流：为 true 时走 pre-Task-5 的写法（marshal + Set(hsKey(g)) +
 // Sync 批次提交，与 loadLegacy 的读路径配对，让整组继续待在「未迁移」
 // 这一种形态里）；为 false 时保持现状，走 r.Persist（seglog 是权威）。
-func (r *raftStore) bumpTermsInto(dataGroups uint32) error {
+func (r *raftStore) bumpTermsInto(dataGroups uint32, reason termBumpReason) error {
 	for g := uint32(0); g <= dataGroups; g++ {
 		hs, _, _, err := r.Load(g)
 		if err != nil {
@@ -1188,7 +1198,16 @@ func (r *raftStore) bumpTermsInto(dataGroups uint32) error {
 				return fmt.Errorf("组 %d 写 HardState: %w", g, err)
 			}
 		}
-		r.lg.Error("不干净关机后本地恢复：任期已抬、投票已清", "g", g, "term", newTerm, "legacy", pending)
+		// 同一个动作、两种严重性：级别与文案都按来路分开，让读日志的人
+		// 一眼看出这是常规重启还是签字放行。
+		if reason == bumpForcedRecover {
+			r.lg.Error("签字放行的本地恢复：任期已抬、投票已清",
+				"g", g, "term", newTerm, "legacy", pending)
+		} else {
+			r.lg.Warn("mem 档本地恢复：任期已抬、投票已清（投票记录走 NoSync 可能未落盘，"+
+				"抬任期是预期动作，代价是多一轮选举）",
+				"g", g, "term", newTerm, "legacy", pending)
+		}
 	}
 	return nil
 }
@@ -1214,7 +1233,7 @@ func (r *raftStore) bumpTermsInto(dataGroups uint32) error {
 // 注意：commit 位点不动——它由日志重放与 leader 重新告知恢复，抬它没有
 // 意义且会与真实日志脱节。抬 term 的适用范围见 needsTermBump。
 func (r *raftStore) ForceLocalRecover(dataGroups uint32) error {
-	if err := r.bumpTermsInto(dataGroups); err != nil {
+	if err := r.bumpTermsInto(dataGroups, bumpForcedRecover); err != nil {
 		return fmt.Errorf("raftstore ForceLocalRecover: %w", err)
 	}
 	b := r.st.NewBatch()
@@ -1236,7 +1255,7 @@ func (r *raftStore) ForceLocalRecover(dataGroups uint32) error {
 // 投票记录可能没落盘，所以同样要抬任期。见 needsTermBump 的注释；跨组
 // 原子性的取舍见 bumpTermsInto。
 func (r *raftStore) BumpTermsForLocalResume(dataGroups uint32) error {
-	if err := r.bumpTermsInto(dataGroups); err != nil {
+	if err := r.bumpTermsInto(dataGroups, bumpLocalResume); err != nil {
 		return fmt.Errorf("raftstore BumpTermsForLocalResume: %w", err)
 	}
 	return nil

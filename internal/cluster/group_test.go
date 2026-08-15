@@ -773,14 +773,13 @@ func newApplyTestGroup(t *testing.T, onApplied func(g uint32, repr []byte)) (*gr
 	return gr, rs, st
 }
 
-// countApplyCommits 临时接管 store.OnApplyObserve 统计引擎提交次数，
+// countApplyCommits 临时接管 Apply 观测钩子统计引擎提交次数，
 // 测试结束恢复原值。applyEntries 是同步调用，计数无并发。
 func countApplyCommits(t *testing.T) *int {
 	t.Helper()
 	n := new(int)
-	old := store.OnApplyObserve
-	store.OnApplyObserve = func(time.Duration) { *n++ }
-	t.Cleanup(func() { store.OnApplyObserve = old })
+	old := store.SwapApplyObserver(func(time.Duration) { *n++ })
+	t.Cleanup(func() { store.SwapApplyObserver(old) })
 	return n
 }
 
