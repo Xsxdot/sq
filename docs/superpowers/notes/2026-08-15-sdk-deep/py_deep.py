@@ -19,7 +19,7 @@ from rocketmq import (ClientConfiguration, Credentials, FilterExpression,
                       MessageListener, ConsumeResult)
 from rocketmq.grpc_protocol import FilterType
 
-ENDPOINT = "172.19.25.180:28081"
+ENDPOINT = "127.0.0.1:28081"
 ADMIN = "http://" + ENDPOINT.split(":")[0] + ":28082"
 # 每轮换一组 topic：topic 会跨轮次累积消息，而「同组消息是否都在一个队列」
 # 「新消费组从头读到了什么」这两类断言都依赖 topic 里只有本轮写入的数据。
@@ -233,14 +233,18 @@ def test_fifo():
     # 队列，本 topic 有 4 个，所以 await 压短、预算给足。
     c = SimpleConsumer(cfg(), grp, subscription={topic: FilterExpression("*")}, await_duration=1)
     c.startup()
-    got = [m.body.decode() for m in drain(c, n + 8, 150)]
+    # 预算给到 400s：本 topic 有 4 个队列、共 18 条消息，SimpleConsumer 每次
+    # receive 只轮询一个队列，轮空占掉大半时间。150s 只够收到 6/10（顺序正确），
+    # 那是取样不足，不是顺序错——但「收不满」和「顺序错」在结果里长得太像，
+    # 不值得为省几分钟留这个歧义。
+    got = [m.body.decode() for m in drain(c, n + 8, 400)]
     c.shutdown()
     main_seq = [b for b in got if b.startswith("seq-")]
     want = [f"seq-{i:02d}" for i in range(n)]
     if main_seq == want:
         record("fifo-同组顺序", True, f"{n} 条按发送序到达")
     elif len(main_seq) < n:
-        record("fifo-同组顺序", False, f"150s 内只收到 {len(main_seq)}/{n} 条：{main_seq}")
+        record("fifo-同组顺序", False, f"400s 预算内只收到 {len(main_seq)}/{n} 条：{main_seq}")
     else:
         record("fifo-同组顺序", False, f"顺序不符：{main_seq}")
 

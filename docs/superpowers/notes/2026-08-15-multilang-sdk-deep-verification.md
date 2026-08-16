@@ -8,7 +8,7 @@
 
 **Java（参考实现）10/10 全过**，且**挖到一条真缺陷**：sq 不发 `ReceiveMessageResponse`
 信封层的 `delivery_timestamp`，导致官方 **Python SDK 的 PushConsumer 完全不可用**。
-已记为 [B13.8](../backlog.md)。
+已记为 [B13.8](../backlog.md)，**08-16 已修复并验收**（见下方「已修复」一节）。
 
 | 特性 | Java | Python | C# | 判据 |
 |---|---|---|---|---|
@@ -22,7 +22,7 @@
 | 事务 显式提交/回滚 | — | ✅ | — | committed 可见、rolledback 35s 内不可见 |
 | 事务 已裁决不再回查 | — | ✅ | — | checker 未被触发 |
 | **事务 孤儿回查** | ✅ | — | ✅ | broker 主动回查 2 次，COMMIT/ROLLBACK 裁决分别生效 |
-| **PushConsumer + AutoRenew** | ✅ | ❌ B13.8 | ✅ | 处理 45s > 30s 不可见期，零重投 |
+| **PushConsumer + AutoRenew** | ✅ | ✅（08-16 修复后） | ✅ | 处理 45s > 30s 不可见期，零重投 |
 | 定时消息 | ✅ | ✅ | — | 15.1s 后到达；早于 12s 判为未生效 |
 | Recall 撤回（含对照组） | ✅ | ✅ | 服务端已证 | 对照组如期到达 + 被撤回那条始终不出现 |
 
@@ -97,6 +97,44 @@ Go SDK（`simple_consumer.go:257`）、C# SDK 与 **Java 参考实现（5.2.1）
   排除环境偶然。
 - **修法预计极小**：在 `receive.go` 投递消息时补发一帧
   `&pb.ReceiveMessageResponse{Content: &pb.ReceiveMessageResponse_DeliveryTimestamp{...}}`。
+
+### 已修复（2026-08-16）
+
+设计见 [spec](../specs/2026-08-16-receive-delivery-timestamp-design.md)，
+实现见 [plan](../plans/2026-08-16-b13.8-receive-delivery-timestamp.md)。
+改动只有一处：`ReceiveMessage` 在确认本批有消息后、进入发送循环前补发一帧
+信封层 `delivery_timestamp`，取值为该时刻的 `time.Now()`。
+
+两处**刻意偏离参考实现**，判据写在 spec 的 D1/D2：
+
+1. **只在本批确有消息时发**（上游 `ReceiveMessageResponseStreamWriter.onComplete()`
+   在 `finally` 里无条件发）。空长轮询是常态热路径，而没有任何已知 SDK 在空响应
+   下读它——Python 的赋值条件带 `len(messages) > 0`，Go 只把它当
+   `fromProtobuf_MessageView2` 的入参。
+2. **放批首而非批尾**（上游放最后）。sq 的 status 在末尾、被当作「本批已全部
+   发完」的终止信号，其后再挂 metadata 帧自相矛盾；批首也是 proto 注释
+   "start to deliver" 的字面语义。帧序对客户端无影响：Python 与 Go 都是收完
+   整条流再按 oneof 分类。
+
+**验收**（联想真机 `100.90.99.61`，broker 与客户端同机，配置同上文「环境」）：
+
+| 判据 | 结果 |
+|---|---|
+| **承重：Python PushConsumer** | **PASS**——listener 收到 `slow-one`（第 1 次），45s 处理跨过 30s 不可见期零重投 |
+| 客户端日志 | 修复后该轮 `unsupported operand type` **0 次**；修复前同一脚本同一机器在 `23:32:23` 有 1 次 |
+| Python 全套 | **12 项 0 失败**（08-15 是 12 项 2 失败：push=本条、FIFO=取样预算） |
+| Java 深水区 | **10 项 0 失败**——多一帧没有打坏参考实现 |
+| Go e2e 全套 | **48 PASS / 0 FAIL / 2 SKIP**（`cd test/e2e && go test -tags e2e -count=1 -timeout 40m ./...`，1612s）。跳过的两条是吞吐基准（`TestClusterWriteThroughput` / `TestExternalClusterWriteThroughput`，需显式开关），与 08-15 Linux 基线的通过/跳过集合逐条一致 |
+| 单测 | `internal/rpc` 新增 2 条：首帧位置 + 取值落在调用时间窗内；空长轮询仍只有一帧 status。两条各做过变异验证（删发送点 / 取值改定值，都转红） |
+
+**修复前后是真对照**，不是「修完跑一遍」：同一台机器、同一份 `py_deep.py`、
+同一份 broker 配置，只换二进制。修复前 push 用例失败且客户端日志有那条 TypeError，
+修复后用例通过且该条日志不再出现。
+
+**未覆盖**：C# 未回归——它的运行环境在已失联的阿里云机上，联想机没有 .NET 工具链。
+风险判断为可忽略但不为零：C# 与 Java 在这一点上结构相同（都只是把该值存进变量、
+容忍缺失），Java 的 10/10 已经证明「多收一帧不会打坏一个本就容忍缺失的客户端」。
+要彻底消掉这一格，需要在有 .NET 的机器上重跑 `CsDeep.cs`。
 
 ## 环境
 
@@ -174,6 +212,9 @@ Go SDK（`simple_consumer.go:257`）、C# SDK 与 **Java 参考实现（5.2.1）
 - [`2026-08-15-sdk-deep/CsDeep.cs`](2026-08-15-sdk-deep/CsDeep.cs)
 
 broker 地址都写死在文件头部的常量里（`ENDPOINT` / `Endpoint`），换机器只改这一处。
+（08-16 同步：`py_deep.py` 的 `ENDPOINT` 默认值改为 `127.0.0.1:28081`——原值指向
+已失联的阿里云机；FIFO 取样预算 150s → 400s，把 08-15 重跑时的临时改动落进库里，
+此前只有 note 记了结论、脚本没跟上，照库里的脚本复跑会重现那个假红。）
 三者都支持只跑单项：传用例名的子串作为第一个参数，例如
 `python3 py_deep.py FIFO`、`mvn exec:java -Dexec.mainClass=JavaDeep -Dexec.args=PushConsumer`。
 
