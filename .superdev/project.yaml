@@ -1,0 +1,61 @@
+environments:
+    - id: env_43a4aeed68ae981e
+      name: dev
+      is_dev: true
+      order: 0
+id: e205216c-3398-400b-b1ca-397ea3d57b2f
+name: sq
+services:
+    - id: svc_179ba5674fe180a2
+      name: sq
+      required: false
+      order: 0
+      language: go
+      deployments:
+        - id: dep_d504f05273b2d541
+          env: dev
+          location: local
+          control_mode: managed
+          working_dir: .
+          log_type: process
+          runtime:
+            type: language
+            cwd: .
+            config:
+                program: ./cmd/sq
+                program_args:
+                    - -config
+                    - sq.yaml
+          logs:
+            type: process
+          web:
+            enabled: false
+    - id: svc_e3da83b2da80e187
+      name: console
+      required: false
+      order: 1
+      language: node
+      deployments:
+        - id: dep_da7171a43afe7e2e
+          env: dev
+          location: local
+          control_mode: managed
+          working_dir: web
+          log_type: process
+          runtime:
+            type: language
+            cwd: web
+            config:
+                package_manager: npm
+                script: dev
+          logs:
+            type: process
+          web:
+            enabled: true
+            url: http://127.0.0.1:5183
+            default_path: /
+            readiness:
+                type: http
+                timeout_seconds: 60
+            ai_debug:
+                enabled: true

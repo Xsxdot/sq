@@ -1,0 +1,21 @@
+<!--
+  sq 主标志。
+
+  职责：
+  - 以几何化的小写 s 与 q 表达 simple queue 品牌
+  - 提供可无限缩放的透明底矢量资产
+
+  边界：
+  - 不包含口号或依赖外部字体
+  - 品牌主色固定为 #5B4BEF
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 320" role="img" aria-labelledby="title desc">
+  <title id="title">sq — simple queue</title>
+  <desc id="desc">由几何化小写字母 s 和 q 组成的紫色标志</desc>
+
+  <g fill="none" stroke="#5B4BEF" stroke-width="44" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M270 80H138C98 80 76 100 76 132S98 184 138 184H208C248 184 270 204 270 236S248 284 208 284H76"/>
+    <circle cx="420" cy="182" r="102"/>
+    <path d="M482 246L528 292" stroke-width="36"/>
+  </g>
+</svg>

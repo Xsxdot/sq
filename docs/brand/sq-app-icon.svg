@@ -1,0 +1,22 @@
+<!--
+  sq 方形应用图标。
+
+  职责：
+  - 为仓库头像、控制台图标和应用入口提供方形版本
+  - 在小尺寸下保持 sq 主标志的轮廓辨识度
+
+  边界：
+  - 不包含文字说明或依赖外部字体
+  - 仅使用品牌紫与白色
+-->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-labelledby="title desc">
+  <title id="title">sq 应用图标</title>
+  <desc id="desc">紫色圆角方形中的白色 sq 标志</desc>
+
+  <rect x="32" y="32" width="448" height="448" rx="104" fill="#5B4BEF"/>
+  <g transform="translate(54 142) scale(.72)" fill="none" stroke="#FFFFFF" stroke-width="44" stroke-linecap="round" stroke-linejoin="round">
+    <path d="M270 80H138C98 80 76 100 76 132S98 184 138 184H208C248 184 270 204 270 236S248 284 208 284H76"/>
+    <circle cx="420" cy="182" r="102"/>
+    <path d="M482 246L528 292" stroke-width="36"/>
+  </g>
+</svg>
