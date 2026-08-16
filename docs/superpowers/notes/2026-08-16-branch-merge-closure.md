@@ -69,7 +69,10 @@ main    --ff-only--> 0a23542
 
 ## 未做
 
-- **未推 `origin/main`**。本地 main 现领先 origin/main 44 个提交，推送是单独的决定。
+- **未推 `origin/main`**。本地 main 现领先 origin/main **104 个提交**
+  （first-parent 36 个），且这次不再只是 docs——64 个非 docs 文件有差异。
+  推送是单独的决定。**在推之前，远程 handoff 派发不能再用 `--base main`**：
+  基线校验只查 commit 存在性，executor 会拿到 origin 上那份缺 v1.1 全部改动的旧代码。
 - **C# 深水区未针对 B13.8 回归**（环境在已失联的阿里云机上，联想机无 .NET）。
   该缺口在 [多语言 SDK 深水区验证](2026-08-15-multilang-sdk-deep-verification.md)
   里已单独记明，不因合并而消失。
