@@ -44,3 +44,18 @@
 5. 集群 Recall 的 meta leader 路由限制是现有行为约束，不在本计划中修复。
 
 以上发现仅记录，不改变业务代码；Task 7 的每条对外能力描述必须回指本表的结论与处置。
+
+## 重写后复核
+
+- [x] F0：README 不再声称功能列表有固定 16 条，改为按能力归类的表。
+- [x] F15：README 与 `docs/admin-api.md` 均按实际路由写为 12 个控制台页面，并包含 `/cluster`。
+- [x] S1：删除“当前状态”及所有内部里程碑编号。
+- [x] S2：README 写出 Go 48/0/2、Python 12/0、Java 10/0，以及 C# 未回归、C++ 仅冒烟的缺口。
+- [x] S3：删除“未实现：多 broker 集群”，改写为已支持集群与 meta leader 的 Recall 限制。
+- [x] C1：完整根级配置与 `cluster` 嵌套字段移入 `docs/configuration.md`，README 只保留关键默认值入口。
+- [x] C3：升级迁移说明移入 `docs/deployment.md` 的“内部部署历史”，未放入 README。
+- [x] A1：`docs/admin-api.md` 补齐 timeseries、ledger、cluster 和 pprof 路由。
+- [x] A2：`docs/admin-api.md` 按 `web/src/main.tsx` 列出控制台页面，包含 Login 与 Cluster。
+- [x] D1：README 与 `docs/messaging.md` 明确不实现 4.x remoting，定位为 5.x gRPC。
+- [x] D2：README 与 `docs/messaging.md` 明确不实现 PullMessage、UpdateOffset、GetOffset、QueryOffset。
+- [x] D3：README、`docs/messaging.md` 和 `docs/deployment.md` 均写出集群 Recall 只在 meta leader 成立、客户端可能需重试的限制。
