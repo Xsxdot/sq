@@ -1,7 +1,5 @@
 # sq
 
-## 一句话定位
-
 RocketMQ 5.x 协议兼容、单二进制、无 JVM 的轻量消息队列，适合希望少运维组件的中小团队。
 
 ## 为什么不是 RocketMQ
@@ -50,12 +48,6 @@ tar -xzf sq_0.1.0_linux_amd64.tar.gz
 
 细节见 [消息语义](docs/messaging.md)、[配置](docs/configuration.md) 和 [Admin API](docs/admin-api.md)。
 
-过滤表达式的完整语法、失败投递的 DLQ 溯源字段、自动续租边界以及延时撤回的集群限制，都以 [消息语义](docs/messaging.md) 为准。HTTP 管理面和控制台可以关闭，不影响 gRPC 消息面。
-
-默认自动创建 topic，默认每个 topic 16 个队列；队列数主要决定消费并行度，写吞吐更受客户端批量和并发影响。需要人工管理 topic、消费组位点或死信时，可使用 Admin API，也可以直接用 SDK 操作消息面。
-
-认证分成两层：gRPC 使用 `credentials` 中的 AK/SK，Admin 使用独立的用户名和密码。两者默认都关闭；开启后签名通过只代表认证，不提供 topic 或消费组级授权。
-
 ## 部署
 
 Release 包包含二进制、配置样例、许可证、README 和 systemd 安装件，平台为 Linux amd64、Linux arm64、macOS arm64；不发布 Windows 或 386 包。下载后可用 `SHA256SUMS` 校验完整性。Linux 上可执行 `sudo ./install.sh` 安装到 FHS 路径；安装后把 `data_dir` 设为 `/var/lib/sq`，再执行 `systemctl enable --now sq`。也可以直接运行二进制，默认数据目录是当前工作目录下的 `./data`。
@@ -90,11 +82,3 @@ SDK 验证程度不同：Go 官方 SDK 全量 e2e 为 48 PASS / 0 FAIL / 2 SKIP�
 Admin 的 `/metrics` 不要求登录，会暴露 topic、消费组和流量计数；gRPC 签名也不提供重放窗口。生产部署应将管理面和 gRPC 端口限制在可信网络内，并按需配置 TLS 或外部网络隔离。
 
 这些限制是当前公开版本的边界，不代表未列出的 RocketMQ 行为都已经兼容。遇到问题时请先提供 `sq --version` 的三行输出、配置中相关字段和启动日志中的版本/commit。
-
-发布包不包含 `web/dist` 的源码构建中间物；它们只在构建流水线中生成并嵌入二进制。这样仓库保持轻量，同时 Release 二进制仍能在没有 Node 的目标机器上直接打开控制台。
-
-如果只需要消息服务，可以将 `admin_listen` 设为空并通过日志和外部监控运维。需要管理面时，请把它绑定到内网地址而不是公网接口。
-
-问题反馈最好同时附上运行平台、配置模式（单机或集群）以及复现所用 SDK。这样可以区分协议未实现、部署路由问题和具体版本回归。
-
-更多实现细节和验证记录保留在仓库的 `docs/` 与 `docs/superpowers/notes/` 中；后者是开发记录，不构成额外的公开兼容承诺。
