@@ -29,7 +29,7 @@ import (
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // snapRegistryDefaultTTL 是快照视图的默认存活时长：超时未被拉完的

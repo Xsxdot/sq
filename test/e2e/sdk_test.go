@@ -50,7 +50,7 @@ import (
 	sdkpb "github.com/apache/rocketmq-clients/golang/v5/protocol/v2"
 	"gopkg.in/yaml.v3"
 
-	"github.com/xushixin/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/config"
 )
 
 const (

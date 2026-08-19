@@ -27,15 +27,15 @@ import (
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/test/bufconn"
 
-	"github.com/xushixin/sq/internal/config"
-	"github.com/xushixin/sq/internal/core/delay"
-	"github.com/xushixin/sq/internal/core/deliver"
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/core/produce"
-	"github.com/xushixin/sq/internal/core/txn"
-	"github.com/xushixin/sq/internal/replication"
-	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/core/delay"
+	"github.com/Xsxdot/sq/internal/core/deliver"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/core/produce"
+	"github.com/Xsxdot/sq/internal/core/txn"
+	"github.com/Xsxdot/sq/internal/replication"
+	pb "github.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // testEnv 是一套完整的被测环境：真实的 Pebble store（临时目录，测试结束自动

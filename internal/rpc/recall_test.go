@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
+	pb "github.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 // U1 编解码往返。

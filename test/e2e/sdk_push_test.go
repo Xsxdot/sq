@@ -28,7 +28,7 @@ import (
 
 	rmq "github.com/apache/rocketmq-clients/golang/v5"
 	"github.com/apache/rocketmq-clients/golang/v5/credentials"
-	"github.com/xushixin/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/config"
 )
 
 // recv 是一次 listener 调用入口处的值快照。

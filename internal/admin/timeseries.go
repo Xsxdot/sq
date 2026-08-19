@@ -15,9 +15,9 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/metrics"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/metrics"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // rangeSpec 一个 range 档位对应的取数方式。

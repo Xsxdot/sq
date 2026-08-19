@@ -4,7 +4,7 @@ package deliver
 import (
 	"testing"
 
-	"github.com/xushixin/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core"
 )
 
 func TestParseFilterAllPass(t *testing.T) {

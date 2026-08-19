@@ -35,7 +35,7 @@ import (
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // AckMode 决定提案确认的持久化语义。

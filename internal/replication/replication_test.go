@@ -26,9 +26,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xushixin/sq/internal/cluster"
-	"github.com/xushixin/sq/internal/core"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/cluster"
+	"github.com/Xsxdot/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 func openReplTestStore(t *testing.T) *store.Store {

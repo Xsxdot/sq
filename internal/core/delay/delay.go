@@ -33,10 +33,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xushixin/sq/internal/core"
-	"github.com/xushixin/sq/internal/core/produce"
-	"github.com/xushixin/sq/internal/replication"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core/produce"
+	"github.com/Xsxdot/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // scanInterval 扫描间隔。100ms 即延时精度的上界（spec §5：调度器每 100ms

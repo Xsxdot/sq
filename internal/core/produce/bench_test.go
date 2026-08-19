@@ -16,10 +16,10 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/xushixin/sq/internal/core"
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/replication"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // 并发写吞吐基准：真实 store（fsync=sync）+ 多队列 topic + RunParallel。

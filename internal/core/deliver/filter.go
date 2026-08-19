@@ -18,7 +18,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/xushixin/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core"
 )
 
 // Result 过滤判定的三值结果。

@@ -16,7 +16,7 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // testSlog 返回写往测试输出的 slog，便于失败时直接看到 store 日志。

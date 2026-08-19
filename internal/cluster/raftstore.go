@@ -73,8 +73,8 @@ import (
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/xushixin/sq/internal/cluster/seglog"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/cluster/seglog"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // raft 前缀常量。全部 raft 日志键在同一个 store 库内，与 FSM 数据

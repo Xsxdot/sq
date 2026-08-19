@@ -15,7 +15,7 @@ import (
 	"net/http"
 	"testing"
 
-	"github.com/xushixin/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/config"
 )
 
 // adminJSON 带 token 调 admin API 并解析 JSON 响应；expectCode 不符即 Fatal。

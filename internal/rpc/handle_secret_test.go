@@ -16,8 +16,8 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/xushixin/sq/internal/replication"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 func TestHandleSecretPersistsAcrossReopen(t *testing.T) {

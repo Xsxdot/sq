@@ -1,4 +1,4 @@
-module github.com/xushixin/sq/spike/raftshell
+module github.com/Xsxdot/sq/spike/raftshell
 
 go 1.26.1
 

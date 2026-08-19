@@ -12,8 +12,8 @@ import (
 	"context"
 	"errors"
 
-	"github.com/xushixin/sq/internal/replication"
-	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
+	"github.com/Xsxdot/sq/internal/replication"
+	pb "github.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 // ForwardMessageToDeadLetterQueue 按 receipt handle 将消息转入 %DLQ%{group}。

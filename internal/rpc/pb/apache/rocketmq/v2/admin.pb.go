@@ -3418,9 +3418,9 @@ const file_apache_rocketmq_v2_admin_proto_rawDesc = "" +
 	"\x16GetConsumerRunningInfo\x121.apache.rocketmq.v2.GetConsumerRunningInfoRequest\x1a2.apache.rocketmq.v2.GetConsumerRunningInfoResponse\"\x00\x12f\n" +
 	"\rGetTopicRoute\x12(.apache.rocketmq.v2.GetTopicRouteRequest\x1a).apache.rocketmq.v2.GetTopicRouteResponse\"\x00\x12f\n" +
 	"\rQueryTimeSpan\x12(.apache.rocketmq.v2.QueryTimeSpanRequest\x1a).apache.rocketmq.v2.QueryTimeSpanResponse\"\x00\x12{\n" +
-	"\x14GetProxyRuntimeStats\x12/.apache.rocketmq.v2.GetProxyRuntimeStatsRequest\x1a0.apache.rocketmq.v2.GetProxyRuntimeStatsResponse\"\x00B\xdd\x01\n" +
+	"\x14GetProxyRuntimeStats\x12/.apache.rocketmq.v2.GetProxyRuntimeStatsRequest\x1a0.apache.rocketmq.v2.GetProxyRuntimeStatsResponse\"\x00B\xdb\x01\n" +
 	"\x16com.apache.rocketmq.v2B\n" +
-	"AdminProtoP\x01ZDgithub.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2;rocketmqv2\xa0\x01\x01\xd8\x01\x00\xf8\x01\x01\xa2\x02\x03ARX\xaa\x02\x12Apache.Rocketmq.V2\xca\x02\x12Apache\\Rocketmq\\V2\xe2\x02\x1eApache\\Rocketmq\\V2\\GPBMetadata\xea\x02\x14Apache::Rocketmq::V2b\x06proto3"
+	"AdminProtoP\x01ZBgithub.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2;rocketmqv2\xa0\x01\x01\xd8\x01\x00\xf8\x01\x01\xa2\x02\x03ARX\xaa\x02\x12Apache.Rocketmq.V2\xca\x02\x12Apache\\Rocketmq\\V2\xe2\x02\x1eApache\\Rocketmq\\V2\\GPBMetadata\xea\x02\x14Apache::Rocketmq::V2b\x06proto3"
 
 var (
 	file_apache_rocketmq_v2_admin_proto_rawDescOnce sync.Once

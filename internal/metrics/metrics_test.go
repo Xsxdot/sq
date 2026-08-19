@@ -17,13 +17,13 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 
-	"github.com/xushixin/sq/internal/core"
-	"github.com/xushixin/sq/internal/core/deliver"
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/core/produce"
-	"github.com/xushixin/sq/internal/replication"
-	"github.com/xushixin/sq/internal/store"
-	"github.com/xushixin/sq/internal/sysinfo"
+	"github.com/Xsxdot/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core/deliver"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/core/produce"
+	"github.com/Xsxdot/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/sysinfo"
 )
 
 func fixture(t *testing.T) (*store.Store, *meta.Meta, *produce.Producer, *deliver.Deliverer) {

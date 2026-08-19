@@ -27,7 +27,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // 数据组五段键族前缀，与 store/keys.go 的 schema 同值（唯一事实源）。

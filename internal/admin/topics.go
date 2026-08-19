@@ -9,10 +9,10 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/xushixin/sq/internal/config"
-	"github.com/xushixin/sq/internal/core/adminops"
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/core/adminops"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // topicJSON topic 的 API 序列化形状（列表与详情共用）。

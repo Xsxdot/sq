@@ -10,7 +10,7 @@ import (
 	"net/http/httptest"
 	"testing"
 
-	"github.com/xushixin/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/replication"
 )
 
 // testLogger 构造丢弃输出但保留级别过滤的测试日志器（本包测试共享）。

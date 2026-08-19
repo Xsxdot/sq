@@ -14,8 +14,8 @@
 package rpc
 
 import (
-	"github.com/xushixin/sq/internal/core"
-	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
+	"github.com/Xsxdot/sq/internal/core"
+	pb "github.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 // bodyEncodingToCore 协议枚举 → core 表示。第二个返回值为 false 表示生产者

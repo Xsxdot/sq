@@ -18,7 +18,7 @@ import (
 	"path"
 	"strings"
 
-	"github.com/xushixin/sq/web"
+	"github.com/Xsxdot/sq/web"
 )
 
 // consoleHandler 构造控制台静态站 handler。

@@ -19,9 +19,9 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/xushixin/sq/internal/cluster"
-	"github.com/xushixin/sq/internal/replication"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/cluster"
+	"github.com/Xsxdot/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // LoadOrCreateHandleSecret 加载或生成 handle 签名密钥（单机档路径）。

@@ -16,7 +16,7 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/xushixin/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core"
 )
 
 // Match 求值入口：三值求值 AST 根节点。

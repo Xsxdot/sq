@@ -29,7 +29,7 @@ import (
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // recoveryPath 是不干净关机后的恢复路径。

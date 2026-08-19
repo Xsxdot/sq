@@ -1,4 +1,4 @@
-module github.com/xushixin/sq
+module github.com/Xsxdot/sq
 
 go 1.26.1
 

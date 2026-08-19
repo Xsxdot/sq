@@ -57,8 +57,8 @@ import (
 	"google.golang.org/grpc/metadata"
 	"gopkg.in/yaml.v3"
 
-	"github.com/xushixin/sq/internal/config"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // clusterAK/clusterSK 三节点共用的静态凭据：客户端在节点间轮询时任一

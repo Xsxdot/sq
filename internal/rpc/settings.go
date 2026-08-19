@@ -26,8 +26,8 @@ import (
 
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/xushixin/sq/internal/core/produce"
-	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
+	"github.com/Xsxdot/sq/internal/core/produce"
+	pb "github.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 const (

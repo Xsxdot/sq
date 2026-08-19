@@ -11,9 +11,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xushixin/sq/internal/core"
-	"github.com/xushixin/sq/internal/core/deliver"
-	"github.com/xushixin/sq/internal/core/produce"
+	"github.com/Xsxdot/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core/deliver"
+	"github.com/Xsxdot/sq/internal/core/produce"
 )
 
 // seedConsumption 制造一条消费关系：向 t1 写入 3 条、拉取 1 条不 ack，

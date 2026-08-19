@@ -20,14 +20,14 @@ import (
 
 	"google.golang.org/grpc"
 
-	"github.com/xushixin/sq/internal/config"
-	"github.com/xushixin/sq/internal/core/delay"
-	"github.com/xushixin/sq/internal/core/deliver"
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/core/produce"
-	"github.com/xushixin/sq/internal/core/txn"
-	"github.com/xushixin/sq/internal/replication"
-	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
+	"github.com/Xsxdot/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/core/delay"
+	"github.com/Xsxdot/sq/internal/core/deliver"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/core/produce"
+	"github.com/Xsxdot/sq/internal/core/txn"
+	"github.com/Xsxdot/sq/internal/replication"
+	pb "github.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 // errNoLeader 表示某队列所属组尚无 leader（选举窗口）：路由查询整体拒答

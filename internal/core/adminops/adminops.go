@@ -21,9 +21,9 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/replication"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // PurgeTopicData 清理 topic 的全部消息数据：各队列 msg/ 区间、alloc 计数器、

@@ -34,7 +34,7 @@ import (
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/status"
 
-	"github.com/xushixin/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/config"
 )
 
 const (

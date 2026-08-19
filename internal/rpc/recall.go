@@ -25,8 +25,8 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/xushixin/sq/internal/core/delay"
-	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
+	"github.com/Xsxdot/sq/internal/core/delay"
+	pb "github.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 // recallDomain 是 recall 句柄 HMAC 的域前缀。

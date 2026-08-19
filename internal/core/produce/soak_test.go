@@ -19,10 +19,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xushixin/sq/internal/core"
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/replication"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // TestSoak 持续高写入长跑：16 队列 / 64 并发 / 真实 fsync，每 10s 打点吞吐。

@@ -33,7 +33,7 @@ import (
 	"fmt"
 	"log/slog"
 
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // snapInstallLog 是清空重来的包级日志出口。wipeGroupKeys 的签名由计划

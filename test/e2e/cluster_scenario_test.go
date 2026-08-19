@@ -29,7 +29,7 @@ import (
 
 	rmq "github.com/apache/rocketmq-clients/golang/v5"
 
-	"github.com/xushixin/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/config"
 )
 
 // confirmedSet 确认集对账器：producer 每次 Send 成功即登记 msgID，

@@ -17,8 +17,8 @@ package main
 import (
 	"fmt"
 
-	"github.com/xushixin/sq/internal/cluster"
-	"github.com/xushixin/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/cluster"
+	"github.com/Xsxdot/sq/internal/config"
 )
 
 // clusterRouteView 集群路由视图：QueueEndpoint 经 Manager 查队列所属

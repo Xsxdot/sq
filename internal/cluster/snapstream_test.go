@@ -14,7 +14,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // groupForQueueOfKey 解析键的 (topic, queueID) 并返回其归属组

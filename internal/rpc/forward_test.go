@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xushixin/sq/internal/core/deliver"
-	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
+	"github.com/Xsxdot/sq/internal/core/deliver"
+	pb "github.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 func TestForwardMessageToDeadLetterQueue(t *testing.T) {
