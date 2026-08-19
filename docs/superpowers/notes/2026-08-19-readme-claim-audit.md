@@ -7,8 +7,8 @@
 |---|---|---|---|---|---|
 | F0 | 「功能列表」共 16 条 | README.md:35–65 | 实际 `-` 项为 15 条；`grep -c '^- ' README.md` 得 15 | ⚠️ 不精确 | 重写为按能力归类的表，不写未经核实的条数 |
 | F1 | 消息体上限 4MB | README.md:37 | `internal/core/produce/produce.go:30-31`：`MaxBodySize = 4 * 1024 * 1024` | ✅ 属实 | 照写 |
-| F2 | Tag 过滤支持 `*`、单 tag、`a \|\| b` | README.md:38 | `internal/core/filter` 的 TAG 解析与 `internal/rpc/receive.go` 投递过滤；过滤测试覆盖命中、跳过和位点推进 | ✅ 属实 | 照写，细节移 `docs/messaging.md` |
-| F3 | SQL92 属性过滤及示例 | README.md:39–41 | `internal/core/filter` 的比较、逻辑、`BETWEEN`、`IN`、`IS NULL` 解析/求值测试 | ✅ 属实 | 照写支持子集与限制 |
+| F2 | Tag 过滤支持 `*`、单 tag、`a \|\| b` | README.md:38 | `internal/core/deliver/filter.go` 的 TAG 解析与 `internal/rpc/receive.go` 投递过滤；过滤测试覆盖命中、跳过和位点推进 | ✅ 属实 | 照写，细节移 `docs/messaging.md` |
+| F3 | SQL92 属性过滤及示例 | README.md:39–41 | `internal/core/deliver/sql92_parse.go`、`sql92_eval.go` 的比较/逻辑/`BETWEEN`/`IN`/`IS NULL` 解析求值测试 | ✅ 属实 | 照写支持子集与限制 |
 | F4 | 失败重试 10s 起、×2、封顶 5min，转 DLQ | README.md:42–44 | `internal/core/deliver/deliver.go:56-58`；`deliver_test.go:524-530` 断言 10s/20s/40s/5m；DLQ 处理在 `internal/core/deliver` | ✅ 属实 | 照写，细节移 `docs/messaging.md` |
 | F5 | Keys 业务索引 | README.md:45 | `internal/core/query/query.go`；`internal/core/produce/produce_test.go:124`；`internal/admin/messages.go` | ✅ 属实 | 照写 |
 | F6 | retention 默认 3 天 | README.md:46 | `internal/core/meta/meta.go:38`：`DefaultRetentionMs = 3 * 24 * 60 * 60 * 1000`；meta 默认值测试 | ✅ 属实 | 照写 |
