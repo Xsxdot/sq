@@ -1,0 +1,46 @@
+# sq 消息队列的 systemd 单元。
+#
+# 职责：以专用系统用户托管单个 sq 进程，负责重启策略与停机超时。
+# 边界：不负责安装、不负责建用户与目录（那是 install.sh 的事），
+#       也不负责集群编排——多节点部署是各节点各跑一份本单元。
+#
+# 路径约定（与 install.sh 必须一致，改一处就要改两处）：
+#   二进制 /usr/local/bin/sq   配置 /etc/sq/sq.yaml   数据 /var/lib/sq
+
+[Unit]
+Description=sq - RocketMQ 协议兼容的轻量消息队列
+Documentation=https://github.com/Xsxdot/sq
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sq
+Group=sq
+ExecStart=/usr/local/bin/sq --config /etc/sq/sq.yaml
+
+# 工作目录兜住配置里 data_dir 漏写绝对路径的情况——sq 的默认值是
+# 相对路径 ./data，工作目录不定死会写到意想不到的地方。
+WorkingDirectory=/var/lib/sq
+
+# 承重取值，别下调：sq 自身有 30s 的强制中断兜底（gracefulStopTimeout，
+# cmd/sq/main.go），它按 ReceiveMessage 长轮询的服务端上限 20s 加余量取的。
+# systemd 的停机超时必须比它宽裕，否则兜底还没跑完进程就被 SIGKILL，
+# 在途 RPC 被硬切。45 = 30 + 15 余量。
+TimeoutStopSec=45
+
+# sq 正常停机退出码 0、启动失败退出码非 0，故 on-failure 不会因
+# 正常 systemctl stop 而触发重启。
+Restart=on-failure
+RestartSec=5
+
+# 常规加固。ReadWritePaths 只放开数据目录：配置目录对进程只读即可，
+# sq 从不回写配置。
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/sq
+
+[Install]
+WantedBy=multi-user.target
