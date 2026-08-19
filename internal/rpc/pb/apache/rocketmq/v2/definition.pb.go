@@ -3077,8 +3077,8 @@ const file_apache_rocketmq_v2_definition_proto_rawDesc = "" +
 	"\x11QueryOffsetPolicy\x12\r\n" +
 	"\tBEGINNING\x10\x00\x12\a\n" +
 	"\x03END\x10\x01\x12\r\n" +
-	"\tTIMESTAMP\x10\x02B\xdf\x01\n" +
-	"\x16com.apache.rocketmq.v2B\x0fDefinitionProtoP\x01ZDgithub.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2;rocketmqv2\xa0\x01\x01\xd8\x01\x00\xa2\x02\x03ARX\xaa\x02\x12Apache.Rocketmq.V2\xca\x02\x12Apache\\Rocketmq\\V2\xe2\x02\x1eApache\\Rocketmq\\V2\\GPBMetadata\xea\x02\x14Apache::Rocketmq::V2b\x06proto3"
+	"\tTIMESTAMP\x10\x02B\xdd\x01\n" +
+	"\x16com.apache.rocketmq.v2B\x0fDefinitionProtoP\x01ZBgithub.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2;rocketmqv2\xa0\x01\x01\xd8\x01\x00\xa2\x02\x03ARX\xaa\x02\x12Apache.Rocketmq.V2\xca\x02\x12Apache\\Rocketmq\\V2\xe2\x02\x1eApache\\Rocketmq\\V2\\GPBMetadata\xea\x02\x14Apache::Rocketmq::V2b\x06proto3"
 
 var (
 	file_apache_rocketmq_v2_definition_proto_rawDescOnce sync.Once

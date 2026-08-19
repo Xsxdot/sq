@@ -9,9 +9,9 @@ import (
 	"net/http"
 	"sort"
 
-	"github.com/xushixin/sq/internal/core/adminops"
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/core/adminops"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // handleGroupsList GET /admin/groups。

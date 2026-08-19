@@ -11,11 +11,11 @@ import (
 	"log/slog"
 	"testing"
 
-	"github.com/xushixin/sq/internal/config"
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/replication"
-	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/replication"
+	pb "github.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // newSettingsServer 造一个只够跑 negotiateSettings 的最小 Server。

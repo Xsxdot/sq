@@ -11,8 +11,8 @@ package query
 import (
 	"fmt"
 
-	"github.com/xushixin/sq/internal/core"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // defaultLimit 未指定 limit 时的返回上限（控制台单页量级）。

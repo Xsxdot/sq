@@ -11,7 +11,7 @@ package deliver
 import (
 	"testing"
 
-	"github.com/xushixin/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core"
 )
 
 // mustFilter 构建过滤器，表达式非法直接 Fatal——求值用例里的表达式

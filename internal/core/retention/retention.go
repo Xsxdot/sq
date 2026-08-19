@@ -26,11 +26,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/xushixin/sq/internal/core"
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/replication"
-	"github.com/xushixin/sq/internal/store"
-	"github.com/xushixin/sq/internal/sysinfo"
+	"github.com/Xsxdot/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/sysinfo"
 )
 
 // maxPurgePerQueue 单队列/单索引扫描单趟最多清理条数，防止单趟长时间占用。

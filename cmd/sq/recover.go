@@ -24,9 +24,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/xushixin/sq/internal/cluster"
-	"github.com/xushixin/sq/internal/config"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/cluster"
+	"github.com/Xsxdot/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // runRecover 执行 `sq recover` 子命令。

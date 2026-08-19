@@ -14,12 +14,12 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/xushixin/sq/internal/core"
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/core/query"
-	"github.com/xushixin/sq/internal/core/txn"
-	"github.com/xushixin/sq/internal/metrics"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/core/query"
+	"github.com/Xsxdot/sq/internal/core/txn"
+	"github.com/Xsxdot/sq/internal/metrics"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // msgJSON 消息的 API 序列化形状。

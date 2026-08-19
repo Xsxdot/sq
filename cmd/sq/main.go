@@ -34,22 +34,43 @@ import (
 
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/xushixin/sq/internal/admin"
-	"github.com/xushixin/sq/internal/cluster"
-	"github.com/xushixin/sq/internal/config"
-	"github.com/xushixin/sq/internal/core"
-	"github.com/xushixin/sq/internal/core/delay"
-	"github.com/xushixin/sq/internal/core/deliver"
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/core/produce"
-	"github.com/xushixin/sq/internal/core/retention"
-	"github.com/xushixin/sq/internal/core/txn"
-	"github.com/xushixin/sq/internal/metrics"
-	"github.com/xushixin/sq/internal/replication"
-	"github.com/xushixin/sq/internal/rpc"
-	"github.com/xushixin/sq/internal/store"
-	"github.com/xushixin/sq/internal/sysinfo"
+	"github.com/Xsxdot/sq/internal/admin"
+	"github.com/Xsxdot/sq/internal/cluster"
+	"github.com/Xsxdot/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core/delay"
+	"github.com/Xsxdot/sq/internal/core/deliver"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/core/produce"
+	"github.com/Xsxdot/sq/internal/core/retention"
+	"github.com/Xsxdot/sq/internal/core/txn"
+	"github.com/Xsxdot/sq/internal/metrics"
+	"github.com/Xsxdot/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/rpc"
+	"github.com/Xsxdot/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/sysinfo"
 )
+
+// 版本信息由构建期 -ldflags -X 注入，例如：
+//
+//	go build -ldflags "-X main.version=0.1.0 -X main.commit=$(git rev-parse --short HEAD) -X main.buildDate=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+//
+// 默认值刻意不是空串：本地裸 go build 不带 ldflags 也要能跑通 `sq --version`，
+// 空串会打印出三行只有标签没有值的输出，看起来像功能坏了。
+var (
+	version   = "dev"
+	commit    = "none"
+	buildDate = "unknown"
+)
+
+// versionString 返回 `sq --version` 的完整输出（三行，末尾带换行）。
+//
+// 返回值直接喂给 fmt.Print，故必须自带结尾换行，否则会与 shell 提示符黏连。
+// 单独抽成函数而非在调用点拼接，是为了让它可被单测断言——版本输出是用户
+// 报 bug 时唯一的自证材料，格式变了要能当场发现。
+func versionString() string {
+	return fmt.Sprintf("sq %s\ncommit: %s\nbuilt: %s\n", version, commit, buildDate)
+}
 
 func main() {
 	// 子命令分流：只认第一个位置参数，其余一律走原有的 run()。
@@ -93,7 +114,17 @@ func main() {
 // 在途 RPC（理由见下方 errCh 分支注释），两者殊途同归，只是收尾姿态不同。
 func run() error {
 	cfgPath := flag.String("config", "", "配置文件路径（可选）")
+	showVersion := flag.Bool("version", false, "打印版本信息后退出")
 	flag.Parse()
+
+	// --version 必须在配置加载之前处理：用户被要求「报一下你的版本」时，
+	// 机器往往正处于配置写错、端口被占、数据目录不可写的状态——那正是
+	// 需要问版本的场景。放到 config.Load 之后，恰好在最需要它的时候用不了。
+	if *showVersion {
+		fmt.Print(versionString())
+		return nil
+	}
+
 	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return err
@@ -510,12 +541,14 @@ func run() error {
 		logger.Info("sq 已启动（集群模式）", "grpc_listen", cfg.GRPCListen,
 			"advertise", cfg.AdvertiseHost, "data_dir", cfg.DataDir, "fsync", cfg.Fsync,
 			"message_encoding", cfg.MessageEncoding,
+			"version", version, "commit", commit,
 			"node_id", cfg.Cluster.NodeID, "data_groups", cfg.Cluster.DataGroups,
 			"ack", cfg.Cluster.Ack, "peers", len(cfg.Cluster.Peers))
 	} else {
 		logger.Info("sq 已启动（单机模式）", "grpc_listen", cfg.GRPCListen,
 			"advertise", cfg.AdvertiseHost, "data_dir", cfg.DataDir, "fsync", cfg.Fsync,
 			"message_encoding", cfg.MessageEncoding,
+			"version", version, "commit", commit,
 			"txn_check_interval", cfg.TxnCheckInterval, "txn_max_checks", cfg.TxnMaxChecks)
 	}
 

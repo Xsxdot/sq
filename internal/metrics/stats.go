@@ -14,8 +14,8 @@ package metrics
 import (
 	"fmt"
 
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // GroupTopic 组×topic 二元标签键。

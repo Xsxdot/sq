@@ -27,7 +27,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xushixin/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/config"
 )
 
 // procCluster 一组进程级 broker 及其重启所需的全部素材。

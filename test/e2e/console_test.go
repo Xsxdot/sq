@@ -30,7 +30,7 @@ import (
 	rmq "github.com/apache/rocketmq-clients/golang/v5"
 	"github.com/apache/rocketmq-clients/golang/v5/credentials"
 
-	"github.com/xushixin/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/config"
 )
 
 // startBrokerWithAdmin 起一个带 admin HTTP（免登录）的 broker，返回 gRPC 接入点

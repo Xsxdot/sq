@@ -23,8 +23,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/xushixin/sq/internal/replication"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // ErrTopicNotFound topic 不存在且未开自动创建。

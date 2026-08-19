@@ -14,7 +14,7 @@ package admin
 import (
 	"net/http"
 
-	"github.com/xushixin/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/replication"
 )
 
 // handleCluster GET /admin/cluster：成员表 + 每组的 leader/角色/applied，

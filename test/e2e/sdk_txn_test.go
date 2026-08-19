@@ -25,7 +25,7 @@ import (
 	rmq "github.com/apache/rocketmq-clients/golang/v5"
 	"github.com/apache/rocketmq-clients/golang/v5/credentials"
 
-	"github.com/xushixin/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/config"
 )
 
 // txnCheckIntervalE2E 半消息回查间隔压到 2s：孤儿用例要在测试超时内等到

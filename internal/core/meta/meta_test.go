@@ -18,8 +18,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xushixin/sq/internal/replication"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 func newTestMeta(t *testing.T, dir string, autoCreate bool) (*Meta, *store.Store) {

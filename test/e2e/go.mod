@@ -1,10 +1,10 @@
-module github.com/xushixin/sq/test/e2e
+module github.com/Xsxdot/sq/test/e2e
 
 go 1.26.1
 
 require (
 	github.com/apache/rocketmq-clients/golang/v5 v5.1.4
-	github.com/xushixin/sq v0.0.0
+	github.com/Xsxdot/sq v0.0.0
 	google.golang.org/grpc v1.83.0
 	gopkg.in/yaml.v3 v3.0.1
 )
@@ -69,4 +69,4 @@ require (
 	google.golang.org/protobuf v1.36.11 // indirect
 )
 
-replace github.com/xushixin/sq => ../..
+replace github.com/Xsxdot/sq => ../..

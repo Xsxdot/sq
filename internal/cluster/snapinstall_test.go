@@ -17,7 +17,7 @@ import (
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // TestInstallingMarkerSurvivesCrash 安装中崩溃 = 半截状态。

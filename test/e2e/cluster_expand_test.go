@@ -33,8 +33,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xushixin/sq/internal/cluster"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/cluster"
+	"github.com/Xsxdot/sq/internal/store"
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 )

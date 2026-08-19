@@ -23,9 +23,9 @@ import (
 
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/xushixin/sq/internal/core"
-	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/core"
+	pb "github.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // sendTransaction 发送一条 TRANSACTION 半消息，返回 (msgID, txID)。

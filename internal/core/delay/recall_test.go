@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xushixin/sq/internal/core"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // deliveredIDs 扫 msg/ 区，收集指定 topic 的消息 ID。

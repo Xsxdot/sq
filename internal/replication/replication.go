@@ -42,8 +42,8 @@ import (
 	"log/slog"
 	"sort"
 
-	"github.com/xushixin/sq/internal/cluster"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/cluster"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // ErrNotLeader 转发 cluster.ErrNotLeader：协议面（rpc）只依赖本包即可识别

@@ -47,7 +47,7 @@ import (
 
 	rmq "github.com/apache/rocketmq-clients/golang/v5"
 
-	"github.com/xushixin/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/config"
 )
 
 // benchMaxProducers 是 producer 池上限（见 runSendLoad 注释）。

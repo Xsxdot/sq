@@ -14,7 +14,7 @@ package deliver
 import (
 	"time"
 
-	"github.com/xushixin/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core"
 )
 
 // Lease 本次取件的租约参数。

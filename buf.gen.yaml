@@ -3,7 +3,7 @@ managed:
   enabled: true
   override:
     - file_option: go_package_prefix
-      value: github.com/xushixin/sq/internal/rpc/pb
+      value: github.com/Xsxdot/sq/internal/rpc/pb
 plugins:
   - local: protoc-gen-go
     out: internal/rpc/pb

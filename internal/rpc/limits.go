@@ -9,7 +9,7 @@
 //   - 只定义常量，不做任何运行时逻辑
 package rpc
 
-import "github.com/xushixin/sq/internal/core/produce"
+import "github.com/Xsxdot/sq/internal/core/produce"
 
 // grpcFramingSlack 是 gRPC 消息体在 produce.MaxBodySize 之外额外预留的字节数，
 // 用来覆盖 protobuf 帧头（字段 tag + 长度 varint）以及 SystemProperties

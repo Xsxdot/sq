@@ -15,7 +15,7 @@ import (
 	"sort"
 	"sync"
 
-	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
+	pb "github.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 // session 一条已完成 Settings 协商的 Telemetry 流。

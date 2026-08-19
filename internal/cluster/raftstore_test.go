@@ -17,8 +17,8 @@ import (
 	"go.etcd.io/raft/v3/raftpb"
 	"google.golang.org/protobuf/proto"
 
-	"github.com/xushixin/sq/internal/cluster/seglog"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/cluster/seglog"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // openClusterTestStore 打开临时目录下的测试 store，随测试结束自动关闭。

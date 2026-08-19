@@ -13,7 +13,7 @@
 //     集群语义的错误统一经 replication 转发的 ErrNotLeader 识别
 package rpc
 
-import "github.com/xushixin/sq/internal/config"
+import "github.com/Xsxdot/sq/internal/config"
 
 // RouteView 队列归属视图：协议面据此把每条队列指向其所属组的当前 leader，
 // 并在 follower 上快速失败（避免长轮询空等 / 白做批次构造）。

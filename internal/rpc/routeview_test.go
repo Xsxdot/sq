@@ -22,11 +22,11 @@ import (
 
 	"google.golang.org/protobuf/types/known/durationpb"
 
-	"github.com/xushixin/sq/internal/config"
-	"github.com/xushixin/sq/internal/core"
-	"github.com/xushixin/sq/internal/replication"
-	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/replication"
+	pb "github.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // fakeRouteView 测试用假 RouteView：端点解析与 leader 判定都可注入。

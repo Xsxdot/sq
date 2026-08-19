@@ -46,7 +46,7 @@ import (
 	"go.etcd.io/raft/v3/raftpb"
 	"go.etcd.io/raft/v3/tracker"
 
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // MetaGroup 是元数据组的固定组号：成员表引导、全局元数据等与队列无关

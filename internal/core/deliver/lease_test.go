@@ -15,7 +15,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xushixin/sq/internal/core"
+	"github.com/Xsxdot/sq/internal/core"
 )
 
 func TestLeaseEnabled(t *testing.T) {

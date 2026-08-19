@@ -5,7 +5,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // newSampleAt 造一个只带全局读数的采样点，用于归约逻辑的单元测试。

@@ -21,7 +21,7 @@ import (
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
-	"github.com/xushixin/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/store"
 )
 
 // TestManagerStatusExposesRaftState Status(g) 透传 rn.Status()：Task 10

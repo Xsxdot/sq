@@ -1,0 +1,101 @@
+# sq 发布流水线。
+#
+# 职责：从一个 v* tag 产出三平台发布包并建 GitHub Release。
+# 边界：不跑测试（那是另一条线的事，本流水线假定被打 tag 的提交已经绿了），
+#       不发 Docker 镜像（0.1.0 明确不做）。
+#
+# 两种触发：
+#   - push tag v*        完整发布，产物挂到 Release
+#   - workflow_dispatch  手工触发，只传 artifact 供下载核对，不建 Release
+#     （本仓库零 CI 基础，这是第一个 workflow；调试轮次不该污染 Release 页）
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write   # gh release create 需要
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # commit 短哈希需要完整历史
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'   # web/package.json 无 engines 字段，此处首次钉定
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.26.1'   # go.mod 的要求
+
+      # 承重步骤，不可省略：web/dist 只有 .gitkeep 入库，
+      # 用裸 go build 出的二进制控制台是空的，而 README 承诺
+      # 「单二进制，启动即见一切」。这会是 0.1.0 最可能的首个 issue。
+      # 前端是纯静态资源、与 GOARCH 无关，故只编一次、三平台共用。
+      - name: 构建 Web 控制台
+        run: |
+          cd web
+          npm ci
+          npm run build
+          test -f dist/index.html || { echo "::error::web/dist/index.html 缺失，前端构建未产出"; exit 1; }
+
+      - name: 计算版本信息
+        id: meta
+        run: |
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            VERSION="${GITHUB_REF_NAME#v}"     # v0.1.0 -> 0.1.0
+          else
+            VERSION="0.0.0-dev+${GITHUB_SHA::7}"
+          fi
+          echo "version=${VERSION}"                                  >> "$GITHUB_OUTPUT"
+          echo "commit=${GITHUB_SHA::7}"                             >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)"                 >> "$GITHUB_OUTPUT"
+          echo "版本=${VERSION} commit=${GITHUB_SHA::7}"
+
+      - name: 交叉编译三平台并打包
+        env:
+          VERSION: ${{ steps.meta.outputs.version }}
+          COMMIT:  ${{ steps.meta.outputs.commit }}
+          DATE:    ${{ steps.meta.outputs.date }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildDate=${DATE}"
+          for target in linux/amd64 linux/arm64 darwin/arm64; do
+            GOOS="${target%/*}"; GOARCH="${target#*/}"
+            echo "=== 构建 ${GOOS}/${GOARCH} ==="
+            stage="$(mktemp -d)"
+            GOOS="${GOOS}" GOARCH="${GOARCH}" CGO_ENABLED=0 \
+              go build -ldflags "${LDFLAGS}" -o "${stage}/sq" ./cmd/sq
+            cp sq.example.yaml LICENSE README.md "${stage}/"
+            cp deploy/sq.service deploy/install.sh "${stage}/"
+            chmod +x "${stage}/install.sh"
+            tar -czf "dist/sq_${VERSION}_${GOOS}_${GOARCH}.tar.gz" -C "${stage}" .
+            rm -rf "${stage}"
+          done
+          cd dist && sha256sum *.tar.gz > SHA256SUMS
+          echo "=== 产物 ==="; ls -lh; cat SHA256SUMS
+
+      # 手工触发时只传 artifact，供下载核对，不碰 Release 页。
+      - name: 上传 artifact（仅手工触发）
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sq-dist
+          path: dist/
+
+      - name: 建 Release（仅 tag 触发）
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" dist/* \
+            --title "${GITHUB_REF_NAME}" \
+            --generate-notes

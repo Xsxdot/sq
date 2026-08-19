@@ -14,7 +14,7 @@ package rpc
 import (
 	"testing"
 
-	pb "github.com/xushixin/sq/internal/rpc/pb/apache/rocketmq/v2"
+	pb "github.com/Xsxdot/sq/internal/rpc/pb/apache/rocketmq/v2"
 )
 
 func producerSession(topics ...string) *session {

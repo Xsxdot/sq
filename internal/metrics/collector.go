@@ -23,10 +23,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/collectors"
 
-	"github.com/xushixin/sq/internal/core/deliver"
-	"github.com/xushixin/sq/internal/core/meta"
-	"github.com/xushixin/sq/internal/store"
-	"github.com/xushixin/sq/internal/sysinfo"
+	"github.com/Xsxdot/sq/internal/core/deliver"
+	"github.com/Xsxdot/sq/internal/core/meta"
+	"github.com/Xsxdot/sq/internal/store"
+	"github.com/Xsxdot/sq/internal/sysinfo"
 )
 
 // TxnStats 事务回查统计的只读视图（*txn.Manager 天然实现）。
