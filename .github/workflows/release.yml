@@ -23,15 +23,15 @@ jobs:
   release:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0   # commit 短哈希需要完整历史
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v7
         with:
           node-version: '22'   # web/package.json 无 engines 字段，此处首次钉定
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v7
         with:
           go-version: '1.26.1'   # go.mod 的要求
 
@@ -86,7 +86,7 @@ jobs:
       # 手工触发时只传 artifact，供下载核对，不碰 Release 页。
       - name: 上传 artifact（仅手工触发）
         if: github.event_name == 'workflow_dispatch'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sq-dist
           path: dist/
