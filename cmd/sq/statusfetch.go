@@ -66,10 +66,15 @@ func (c *adminClient) login(user, pass string) error {
 	slog.Debug("向管理面登录", "url", url, "user", user)
 	resp, err := c.hc.Post(url, "application/json", bytes.NewReader(body))
 	if err != nil {
+		slog.Error("请求管理面登录失败", "url", url, "err", err)
 		return fmt.Errorf("请求 %s 失败: %w", url, err)
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(resp.Body)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		slog.Error("读取管理面登录响应失败", "url", url, "err", err)
+		return fmt.Errorf("读取 %s 响应失败: %w", url, err)
+	}
 	if resp.StatusCode == http.StatusUnauthorized {
 		slog.Error("管理面登录被拒", "url", url, "user", user, "status", resp.StatusCode)
 		return fmt.Errorf("登录 %s 失败（401，凭据不匹配）：请核对配置里的 admin_username / admin_password", url)
@@ -82,6 +87,7 @@ func (c *adminClient) login(user, pass string) error {
 		Token string `json:"token"`
 	}
 	if err := json.Unmarshal(raw, &out); err != nil || out.Token == "" {
+		slog.Error("管理面登录响应无法解析 token", "url", url, "body", string(raw))
 		return fmt.Errorf("登录 %s 的响应无法解析出 token: %s", url, strings.TrimSpace(string(raw)))
 	}
 	c.token = out.Token
@@ -101,6 +107,7 @@ func (c *adminClient) getJSON(path string, out any) error {
 	url := c.baseURL + path
 	req, err := http.NewRequest(http.MethodGet, url, nil)
 	if err != nil {
+		slog.Error("构造管理面请求失败", "url", url, "err", err)
 		return fmt.Errorf("构造请求 %s 失败: %w", url, err)
 	}
 	if c.token != "" {
@@ -115,6 +122,7 @@ func (c *adminClient) getJSON(path string, out any) error {
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
+		slog.Error("读取管理面响应失败", "url", url, "err", err)
 		return fmt.Errorf("读取 %s 响应失败: %w", url, err)
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -122,6 +130,7 @@ func (c *adminClient) getJSON(path string, out any) error {
 		return fmt.Errorf("请求 %s 返回 HTTP %d: %s", url, resp.StatusCode, strings.TrimSpace(string(raw)))
 	}
 	if err := json.Unmarshal(raw, out); err != nil {
+		slog.Error("解析管理面响应失败", "url", url, "err", err)
 		return fmt.Errorf("解析 %s 响应失败: %w", url, err)
 	}
 	slog.Debug("管理面请求完成", "url", url, "bytes", len(raw))

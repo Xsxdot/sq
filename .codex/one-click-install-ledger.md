@@ -19,3 +19,5 @@
 | 7 | 已完成 | 0 | `.github/workflows/ci.yml`, `.github/workflows/release.yml` |
 | 7 | 记账 | 0 | Docker/Podman 不存在；`runuser`/`setpriv` 均受限，非 root 发布包路径未验证 |
 | 8 | 已完成 | 0 | `README.md`, `docs/deployment.md`, `docs/configuration.md` |
+| 终审 | 修复轮 1 | 0 | 补齐 admin HTTP 登录/取数层的响应读取、构造与解码失败日志 |
+| 终审 | 已完成 | 1 | 相对分支起点的完整 diff 复审无新增发现 |
