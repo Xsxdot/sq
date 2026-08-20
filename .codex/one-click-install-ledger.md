@@ -11,3 +11,8 @@
 | 5 | 修复轮 1 | 0 | 将无限随机管道改为有限随机块循环，消除 `tr` broken pipe |
 | 5 | 修复轮 2 | 0 | 消除 `CRED_GENERATED` 与测试桩的 shellcheck 告警 |
 | 5 | 已完成 | 2 | `deploy/quickstart.sh`, `deploy/quickstart_test.sh` |
+| 6 | 修复轮 1 | 0 | 修正 `grep` 对 `--admin-password` 模式的选项解析 |
+| 6 | 修复轮 2 | 0 | 捕获 warn 的 stderr，并消除 shellcheck 告警与备份变量赋值告警 |
+| 6 | 修复轮 3 | 0 | 防止取版本、校验和、旧口令读取在 `pipefail` 下提前退出 |
+| 6 | 修复轮 4 | 0 | 清理结尾提示命令行的尾随空格并保持输出格式 |
+| 6 | 已完成 | 4 | `deploy/quickstart.sh`, `deploy/quickstart_test.sh` |

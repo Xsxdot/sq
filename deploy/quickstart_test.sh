@@ -94,7 +94,7 @@ render() {
 
 single="$(render)"
 for want in 'data_dir: "/var/lib/sq"' 'advertise_host: "127.0.0.1"' 'admin_username: "admin"' 'admin_password: "FIXEDPASSWORD0123456789A"'; do
-  if grep -qF "${want}" <<< "${single}"; then ok "单机配置含 ${want}"; else bad "单机配置缺 ${want}：\n${single}"; fi
+  if grep -qF -- "${want}" <<< "${single}"; then ok "单机配置含 ${want}"; else bad "单机配置缺 ${want}：\n${single}"; fi
 done
 if grep -q '^cluster:' <<< "${single}"; then bad "单机配置不应有 cluster 段"; else ok "单机配置无 cluster 段"; fi
 
@@ -102,7 +102,7 @@ cl="$(render --cluster --node-id 2 --peers 10.0.0.1,10.0.0.2,10.0.0.3)"
 for want in 'advertise_host: "10.0.0.2"' 'node_id: 2' 'raft_listen: ":9081"' 'data_groups: 3' 'ack: quorum-mem' \
             '{ id: 1, raft_addr: "10.0.0.1:9081", advertise_host: "10.0.0.1", advertise_port: 8081, admin_port: 8082 }' \
             '{ id: 3, raft_addr: "10.0.0.3:9081", advertise_host: "10.0.0.3", advertise_port: 8081, admin_port: 8082 }'; do
-  if grep -qF "${want}" <<< "${cl}"; then ok "集群配置含 ${want}"; else bad "集群配置缺 ${want}：\n${cl}"; fi
+  if grep -qF -- "${want}" <<< "${cl}"; then ok "集群配置含 ${want}"; else bad "集群配置缺 ${want}：\n${cl}"; fi
 done
 
 noauth="$(render --no-admin-auth)"
@@ -112,6 +112,70 @@ explicit="$(render --admin-user ops --admin-password 'sekrit')"
 for want in 'admin_username: "ops"' 'admin_password: "sekrit"'; do
   if grep -qF "${want}" <<< "${explicit}"; then ok "显式凭据原样落盘：${want}"; else bad "显式凭据未落盘：${want}"; fi
 done
+
+echo "== 架构识别 =="
+arch_of() { ( # shellcheck source=/dev/null
+  source "${HERE}/quickstart.sh" >/dev/null 2>&1
+  # shellcheck disable=SC2317 # 由被测 arch_of 间接调用
+  uname() { if [[ "${1:-}" == "-m" ]]; then printf '%s' "$1_STUB"; fi; }
+  detect_arch "$1" ) }
+check "x86_64 → amd64"  "$(arch_of x86_64)"  "amd64"
+check "aarch64 → arm64" "$(arch_of aarch64)" "arm64"
+check "arm64 → arm64"   "$(arch_of arm64)"   "arm64"
+bad_arch="$( ( set +e; # shellcheck source=/dev/null
+  source "${HERE}/quickstart.sh" >/dev/null 2>&1; detect_arch armv7l >/dev/null 2>&1; echo $? ) )"
+if [[ "${bad_arch}" != "0" ]]; then ok "不支持的架构被拒绝"; else bad "armv7l 应当被拒绝"; fi
+
+echo "== 重跑语义 =="
+
+tmp_env() {
+  local d="$1"
+  shift
+  ( export SQ_CFG_DIR="${d}/etc" SQ_DATA_DIR="${d}/data"
+    mkdir -p "${SQ_CFG_DIR}" "${SQ_DATA_DIR}"
+    # shellcheck source=/dev/null
+    source "${HERE}/quickstart.sh" >/dev/null 2>&1
+    "$@" )
+}
+
+d="$(mktemp -d)"
+trap 'rm -rf "${d}"' EXIT
+mkdir -p "${d}/etc"
+printf 'data_dir: "/var/lib/sq"\nadmin_password: "OLDPASSWORD"\n' > "${d}/etc/sq.yaml"
+
+code="$( ( set +e; tmp_env "${d}" eval 'parse_args && validate_args && check_existing' >/dev/null 2>&1; echo $? ) )"
+if [[ "${code}" != "0" ]]; then ok "已有配置时默认拒绝重跑"; else bad "已有配置时应拒绝"; fi
+
+if [[ -f "${d}/etc/sq.yaml" ]] && grep -q OLDPASSWORD "${d}/etc/sq.yaml"; then
+  ok "拒绝重跑时未修改任何文件"
+else
+  bad "拒绝重跑时不应动文件"
+fi
+
+reused="$(tmp_env "${d}" reuse_existing_password)"
+check "--force 从旧配置复用口令" "${reused}" "OLDPASSWORD"
+
+echo "== 结尾提示 =="
+tips="$( ( # shellcheck source=/dev/null
+  source "${HERE}/quickstart.sh" >/dev/null 2>&1
+  # shellcheck disable=SC2317 # 由被测 resolve_credentials 间接调用
+  gen_password() { printf 'FIXEDPASSWORD0123456789A'; }
+  parse_args --cluster --node-id 1 --peers 10.0.0.1,10.0.0.2,10.0.0.3 \
+    && validate_args && resolve_credentials && resolve_advertise_host && print_next_steps ) 2>&1 )"
+for want in 'systemctl enable --now sq' 'sq status' 'FIXEDPASSWORD0123456789A' '--admin-password'; do
+  if grep -qF -- "${want}" <<< "${tips}"; then ok "结尾提示含 ${want}"; else bad "结尾提示缺 ${want}：\n${tips}"; fi
+done
+
+tips_single="$( ( # shellcheck source=/dev/null
+  source "${HERE}/quickstart.sh" >/dev/null 2>&1
+  # shellcheck disable=SC2317 # 由被测 resolve_credentials 间接调用
+  gen_password() { printf 'FIXEDPASSWORD0123456789A'; }
+  parse_args && validate_args && resolve_credentials && resolve_advertise_host && print_next_steps ) 2>&1 )"
+if grep -qF -- '--admin-password' <<< "${tips_single}"; then
+  bad "单机档不应打印集群凭据传递提示"
+else
+  ok "单机档不打印集群凭据传递提示"
+fi
 
 echo
 printf '通过 %d，失败 %d\n' "${PASS}" "${FAIL}"
