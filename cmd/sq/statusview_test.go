@@ -94,6 +94,7 @@ func TestRenderClusterMentionsSelfAndLeader(t *testing.T) {
 	renderStatus(&sb, statusView{
 		Version:    "0.1.0",
 		Cluster:    clusterView(),
+		LocalID:    2,
 		ViewSource: "node 1 (10.0.0.1:8082) — leader",
 		PeerHost:   map[uint64]string{1: "10.0.0.1", 2: "10.0.0.2", 3: "10.0.0.3"},
 	})
@@ -112,7 +113,7 @@ func TestRenderDegradedShowsReason(t *testing.T) {
 		cv.Groups[i].Peers = nil
 	}
 	renderStatus(&sb, statusView{
-		Version: "0.1.0", Cluster: cv, Degraded: true,
+		Version: "0.1.0", Cluster: cv, LocalID: 2, Degraded: true,
 		DegradeReason: "连不上 leader 10.0.0.1:8082",
 		PeerHost:      map[uint64]string{1: "10.0.0.1", 2: "10.0.0.2", 3: "10.0.0.3"},
 	})
@@ -138,5 +139,44 @@ func TestRenderStandalone(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("单机输出缺少 %q：\n%s", want, out)
 		}
+	}
+}
+
+// TestRenderAfterLeaderHopKeepsLocalIdentity 跳转 leader 之后，本机身份不能被
+// leader 的视图冲掉。
+//
+// 这条是 08-20 三机实测抓到的真实缺陷的回归用例：follower 上跳转成功后
+// v.Cluster 被换成 leader 的视图，而渲染当时读的是 Cluster.SelfID / Nodes[].Self，
+// 于是把 leader 那行标成「(本机)」、抬头也印成 leader 的 id。
+//
+// 单机与容器都测不出它——必须是「本机是 follower 且跳转成功」这个组合。
+func TestRenderAfterLeaderHopKeepsLocalIdentity(t *testing.T) {
+	// leader 视角的视图：SelfID=1，且 Nodes[0].Self=true（leader 眼里的自己）
+	cv := clusterView()
+	cv.SelfID = 1
+	for i := range cv.Nodes {
+		cv.Nodes[i].Self = cv.Nodes[i].ID == 1
+	}
+	var sb strings.Builder
+	renderStatus(&sb, statusView{
+		Version: "0.1.0", Cluster: cv,
+		LocalID:    2, // 本机其实是 node 2
+		ViewSource: "node 1 (10.0.0.1:8082) — leader",
+		PeerHost:   map[uint64]string{1: "10.0.0.1", 2: "10.0.0.2", 3: "10.0.0.3"},
+	})
+	out := sb.String()
+	if !strings.Contains(out, "本机 node 2") {
+		t.Fatalf("抬头必须显示本机 node 2，不能显示 leader 的 id：\n%s", out)
+	}
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, "10.0.0.1") && strings.Contains(line, "(本机)") {
+			t.Fatalf("leader 那行被误标为本机：\n%s", out)
+		}
+		if strings.Contains(line, "10.0.0.2") && !strings.Contains(line, "(本机)") && strings.Contains(line, "9081") {
+			t.Fatalf("本机那行没有标记：\n%s", out)
+		}
+	}
+	if !strings.Contains(out, "● 本节点") {
+		t.Fatalf("成员表状态列必须把本机标成本节点：\n%s", out)
 	}
 }

@@ -22,6 +22,7 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/Xsxdot/sq/internal/cluster"
@@ -105,6 +106,9 @@ func collectStatus(cfg *config.Config, localBase string) (statusView, int) {
 		return v, statusUnreachable
 	}
 	v.Cluster = cv
+	// 本机身份在这里定死：下面若跳转 leader 成功，v.Cluster 会被换成
+	// leader 的视图，那份视图的 SelfID/Self 描述的是 leader 不是本机。
+	v.LocalID = cv.SelfID
 
 	if !cv.Enabled {
 		// 单机档：再取两个只在单机档渲染的端点。这两个失败不致命——
@@ -203,7 +207,12 @@ func fetchFromLeader(cfg *config.Config, leaderID uint64) (replication.ClusterVi
 	slog.Debug("跳转到 leader 取完整视图", "leader", leaderID, "base", base)
 	c := newAdminClient(base, statusHTTPTimeout)
 	if err := authenticate(c, cfg, base); err != nil {
-		return zero, "", fmt.Errorf("连不上 leader %s（凭据不匹配？各节点 admin 凭据必须一致）: %w", base, err)
+		// 只有 401 才提凭据。把「连接被拒」也说成凭据问题会把运维引向
+		// 错误方向——08-20 三机实测里挡掉 8082 后就撞到过这个误导。
+		if strings.Contains(err.Error(), "401") {
+			return zero, "", fmt.Errorf("连不上 leader %s（凭据不匹配，各节点 admin 凭据必须一致）: %w", base, err)
+		}
+		return zero, "", fmt.Errorf("连不上 leader %s: %w", base, err)
 	}
 	var cv replication.ClusterView
 	if err := c.getJSON("/admin/cluster", &cv); err != nil {

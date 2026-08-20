@@ -61,8 +61,16 @@ type adminOverview struct {
 type statusView struct {
 	// Version 本二进制的版本号（main.version）
 	Version string
-	// Cluster 集群拓扑。Enabled=false 即单机档
+	// Cluster 集群拓扑。Enabled=false 即单机档。
+	//
+	// 注意：本字段在跳转 leader 成功后装的是 **leader 的视图**，其 SelfID
+	// 与 Nodes[].Self 描述的是 leader 而不是本机。判断「哪一行是本机」一律
+	// 用 LocalID，不要读 Cluster.SelfID——08-20 三机实测踩过这个坑：
+	// follower 上会把 leader 那行标成「(本机)」、抬头也显示成 leader 的 id。
 	Cluster replication.ClusterView
+	// LocalID 执行本命令的这台机器的节点 id，取自**跳转之前**的本机视图。
+	// 它不随视角变化，是成员表里「(本机)」标记的唯一依据。
+	LocalID uint64
 	// Overview / System 只在单机档非 nil
 	Overview *adminOverview
 	System   *adminSystem
@@ -150,7 +158,7 @@ func renderStandalone(w io.Writer, v statusView) {
 // 东西不一样，读者必须先知道自己在看谁的视角，后面的数字才有意义。
 func renderCluster(w io.Writer, v statusView) {
 	fmt.Fprintf(w, "sq %s   本机 node %d   集群 %d 节点   数据组 %d\n",
-		v.Version, v.Cluster.SelfID, len(v.Cluster.Nodes), len(v.Cluster.Groups)-1)
+		v.Version, v.LocalID, len(v.Cluster.Nodes), len(v.Cluster.Groups)-1)
 	if v.Degraded {
 		fmt.Fprintf(w, "视角：本机（%s）——%s\n", "未能跳转到 leader", v.DegradeReason)
 		fmt.Fprintf(w, "      各 peer 的复制进度在本视角下**不可见**（非 leader 节点不维护 peer 进度）\n")
@@ -162,7 +170,9 @@ func renderCluster(w io.Writer, v statusView) {
 	fmt.Fprintf(w, " %-4s %-22s %-22s %s\n", "id", "地址", "raft", "状态")
 	for _, n := range v.Cluster.Nodes {
 		host := v.PeerHost[n.ID]
-		if n.Self {
+		// 用 LocalID 而不是 n.Self：跳转 leader 后这份视图来自 leader，
+		// 它的 Self 标志指的是 leader 自己。
+		if n.ID == v.LocalID {
 			host += "  (本机)"
 		}
 		fmt.Fprintf(w, " %-4d %-22s %-22s %s\n", n.ID, host, n.RaftAddr, peerState(v, n.ID))
@@ -188,7 +198,7 @@ func renderCluster(w io.Writer, v statusView) {
 // 注意：视角降级时一律回「不可见」而不是「活跃」——空的 Peers 表只说明
 // 本节点不是 leader，不说明对端活着。这个区分是退出码 3 存在的同一个理由。
 func peerState(v statusView, id uint64) string {
-	if id == v.Cluster.SelfID {
+	if id == v.LocalID {
 		return "● 本节点"
 	}
 	if v.Degraded {

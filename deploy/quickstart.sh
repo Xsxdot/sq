@@ -479,7 +479,9 @@ print_next_steps() {
     warn "管理面 :${ADMIN_PORT} 无鉴权，请用防火墙限制来源。"
   fi
   [[ ${OPT_CLUSTER} -eq 1 ]] || return 0
-  warn "三台都装完并启动后，集群才会选出 leader（在此之前 sq status 报退出码 2 是预期行为）。"
+  warn "三台都装完并启动前，本节点起不来：启动会阻塞等元数据组选出 leader，60s 超时后退出，"
+  warn "  systemd 会按 Restart=on-failure 反复重启。这是预期行为，凑齐多数派后自然转好；"
+  warn "  这期间 sq status 报退出码 1（管理面尚未监听），不是 2。"
   [[ ${CRED_GENERATED} -eq 1 ]] || return 0
   warn "另外两台必须使用同一组凭据，否则 sq status 无法跨节点查看。在其余机器上执行："
   local i peer_list
