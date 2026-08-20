@@ -8,6 +8,10 @@
 #
 # 用法：./deploy/quickstart_test.sh
 
+# 本文件里的桩函数（gen_password、uname 等）都在子 shell 里覆盖同名函数，
+# 由 source 进来的被测脚本间接调用，shellcheck 静态看不出调用点。
+# shellcheck disable=SC2329
+
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
