@@ -18,3 +18,4 @@
 | 6 | 已完成 | 4 | `deploy/quickstart.sh`, `deploy/quickstart_test.sh` |
 | 7 | 已完成 | 0 | `.github/workflows/ci.yml`, `.github/workflows/release.yml` |
 | 7 | 记账 | 0 | Docker/Podman 不存在；`runuser`/`setpriv` 均受限，非 root 发布包路径未验证 |
+| 8 | 已完成 | 0 | `README.md`, `docs/deployment.md`, `docs/configuration.md` |

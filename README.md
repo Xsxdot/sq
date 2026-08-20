@@ -20,6 +20,22 @@ tar -xzf sq_0.1.0_linux_amd64.tar.gz
 
 从源码构建需要 Go 1.26.1+ **和 Node**——控制台是 `go:embed` 进二进制的，`web/dist` 的构建产物不入库。用 `make build`（含前端）；只用 `go build` 或 `go install` 得到的二进制**控制台是空白的**，其余功能不受影响。详见 [部署说明](docs/deployment.md#从源码构建)。
 
+装完需要自己编辑配置再启动。如果想让脚本把配置也生成好，用同一个包里的 `quickstart.sh`：
+
+```bash
+sudo ./quickstart.sh
+```
+
+它会生成 `/etc/sq/sq.yaml`（数据目录已指向 `/var/lib/sq`）、自动生成控制台口令、装好 systemd 单元，然后打印启动命令。它同样不会自动启动服务。
+
+三节点集群在三台机器上各跑一次，只差 `--node-id`：
+
+```bash
+sudo ./quickstart.sh --cluster --node-id 1 --peers 10.0.0.1,10.0.0.2,10.0.0.3
+```
+
+第一台会自动生成控制台口令，另外两台需要用 `--admin-user`/`--admin-password` 带上同一组凭据，脚本结尾会打印可直接复制的命令。装完用 `sq status` 查看集群状态。
+
 不传 `-config` 时使用进程内默认值，不会自动搜索 `/etc/sq/sq.yaml`。需要自定义配置时显式传入：
 
 ```bash
@@ -44,6 +60,7 @@ tar -xzf sq_0.1.0_linux_amd64.tar.gz
 | 鉴权 | gRPC 多组 AK/SK；Admin 用户名密码可独立开启 |
 | Admin API 与指标 | topic、消费组、消息、DLQ、诊断、Prometheus |
 | Web 控制台 | 12 个页面，静态资源随完整构建的二进制发布 |
+| 安装与自检 | `quickstart.sh` 一条命令完成装盘与配置；`sq status` 查看单机/集群状态 |
 | 集群模式 | 多 broker 复制、节点状态和恢复路径 |
 
 细节见 [消息语义](docs/messaging.md)、[配置](docs/configuration.md) 和 [Admin API](docs/admin-api.md)。

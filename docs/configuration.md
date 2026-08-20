@@ -56,14 +56,17 @@ cluster:
       raft_addr: "10.0.0.1:9081"
       advertise_host: "10.0.0.1"
       advertise_port: 8081
+      admin_port: 8082
     - id: 2
       raft_addr: "10.0.0.2:9081"
       advertise_host: "10.0.0.2"
       advertise_port: 8081
+      admin_port: 8082
     - id: 3
       raft_addr: "10.0.0.3:9081"
       advertise_host: "10.0.0.3"
       advertise_port: 8081
+      admin_port: 8082
 ```
 
 | 字段 | 默认值 | 作用 |
@@ -80,4 +83,8 @@ cluster:
 | `read_barrier` | `false` | 是否为消费读路径启用线性一致读屏障 |
 | `read_barrier_timeout` | `3s` | 单轮 read-index 时间预算 |
 
-`peers` 的 `id`、`raft_addr`、`advertise_host`、`advertise_port` 必须为同一成员的对应信息。`data_groups` 会在首启写入磁盘，不能靠修改配置改变既有数据布局。集群的磁盘预分配和异常恢复注意事项见 [部署说明](deployment.md#集群部署)。
+`peers` 的 `id`、`raft_addr`、`advertise_host`、`advertise_port` 必须为同一成员的对应信息。
+
+- `admin_port`：该节点的管理面端口，可选。留空时 `sq status` 回落取本机 `admin_listen` 的端口（隐含各节点端口一致的假设）。集群运行时不读这个字段，它只服务于 `sq status` 的跨节点查询。`quickstart.sh` 生成的配置会显式写上。
+
+`data_groups` 会在首启写入磁盘，不能靠修改配置改变既有数据布局。集群的磁盘预分配和异常恢复注意事项见 [部署说明](deployment.md#集群部署)。
