@@ -154,11 +154,112 @@ validate_args() {
   fi
 }
 
+# —— 凭据与地址 ——
+CRED_USER=""
+CRED_PASS=""
+CRED_GENERATED=0
+ADVERTISE_HOST=""
+
+# gen_password 生成一个 24 位随机口令（大小写字母 + 数字）写 stdout。
+#
+# 用 /dev/urandom 而不是 $RANDOM：后者是 16 位 LCG，不是密码学随机源。
+# 不用 openssl rand：openssl 不是所有精简发行版都装。
+# LC_ALL=C 是必须的——某些 locale 下 tr 的字符类会按多字节解释而吐出乱码。
+gen_password() {
+  local password=""
+  local chunk
+  while [[ ${#password} -lt 24 ]]; do
+    if ! chunk="$(head -c 128 /dev/urandom | LC_ALL=C tr -dc 'A-Za-z0-9')"; then
+      fail "生成管理面口令失败（读取 /dev/urandom 失败）"
+    fi
+    password+="${chunk}"
+  done
+  printf '%s' "${password:0:24}"
+}
+
+# resolve_credentials 定下最终的管理面凭据，设置 CRED_USER/CRED_PASS/CRED_GENERATED。
+#
+# 默认生成、不默认敞开：一键脚本默默开一个无鉴权管理面是不可接受的默认值。
+# 要免鉴权必须显式 --no-admin-auth。
+resolve_credentials() {
+  if [[ ${OPT_NO_ADMIN_AUTH} -eq 1 ]]; then
+    log "按 --no-admin-auth 关闭管理面鉴权"
+    return 0
+  fi
+  CRED_USER="${OPT_ADMIN_USER:-admin}"
+  if [[ -n "${OPT_ADMIN_PASS}" ]]; then
+    CRED_PASS="${OPT_ADMIN_PASS}"
+    log "使用显式传入的管理面凭据（用户名 ${CRED_USER}）"
+  else
+    CRED_PASS="$(gen_password)"
+    CRED_GENERATED=1
+    log "已自动生成管理面口令（用户名 ${CRED_USER}）"
+  fi
+  [[ -n "${CRED_PASS}" ]] || fail "生成管理面口令失败（/dev/urandom 不可读？）"
+  : "${CRED_GENERATED}"
+}
+
+# resolve_advertise_host 定下本机对外地址，设置 ADVERTISE_HOST。
+#
+# 集群档自动取 peers[node-id-1]——成员表里已经写着本机地址，再让用户
+# 传一次只会制造不一致。单机档默认 127.0.0.1（与进程内默认一致），
+# 此时远程客户端连不上，必须显式警告：这是最常见的「装完连不上」原因。
+resolve_advertise_host() {
+  if [[ -n "${OPT_ADVERTISE_HOST}" ]]; then
+    ADVERTISE_HOST="${OPT_ADVERTISE_HOST}"
+    return 0
+  fi
+  if [[ ${OPT_CLUSTER} -eq 1 ]]; then
+    ADVERTISE_HOST="${OPT_PEERS[$(( OPT_NODE_ID - 1 ))]}"
+    return 0
+  fi
+  ADVERTISE_HOST="127.0.0.1"
+  warn "advertise_host 取默认值 127.0.0.1：远程客户端将连不上本机。需要远程访问请加 --advertise-host <本机对外地址>"
+}
+
+# render_config 把完整的 sq.yaml 写到 stdout。
+#
+# 只写与本机部署形态相关的字段——进程内默认值（internal/config/config.go
+# 的 Load）与 sq.example.yaml 逐字段一致，省略的字段行为完全可预测。
+# 抄那份 100 行注释版会让「脚本决定的」和「默认值」混成一片，出问题时
+# 看不出这台机器的身份是什么。
+render_config() {
+  local shape="单机"
+  [[ ${OPT_CLUSTER} -eq 1 ]] && shape="集群，本机 node_id=${OPT_NODE_ID}"
+  printf '# 本文件由 sq quickstart.sh 生成，形态：%s\n' "${shape}"
+  printf '# 未列出的字段走进程内默认值，字段说明见 %s\n' "${EXAMPLE_DST}"
+  printf 'data_dir: "%s"\n' "${SQ_DATA_DIR}"
+  printf 'advertise_host: "%s"\n' "${ADVERTISE_HOST}"
+  if [[ ${OPT_NO_ADMIN_AUTH} -ne 1 ]]; then
+    printf 'admin_username: "%s"\n' "${CRED_USER}"
+    printf 'admin_password: "%s"\n' "${CRED_PASS}"
+  fi
+  [[ ${OPT_CLUSTER} -eq 1 ]] || return 0
+  printf 'cluster:\n'
+  printf '  node_id: %s\n' "${OPT_NODE_ID}"
+  printf '  raft_listen: ":%s"\n' "${RAFT_PORT}"
+  printf '  data_groups: 3\n'
+  printf '  ack: quorum-mem\n'
+  printf '  peers:\n'
+  local i host
+  for i in "${!OPT_PEERS[@]}"; do
+    host="${OPT_PEERS[$i]}"
+    # admin_port 显式写上而不是留空：留空会走「回落取本机端口」的兼容
+    # 路径，那条路径隐含各节点端口一致的假设。生成的配置没有理由依赖假设。
+    printf '    - { id: %d, raft_addr: "%s:%s", advertise_host: "%s", advertise_port: %s, admin_port: %s }\n' \
+      "$(( i + 1 ))" "${host}" "${RAFT_PORT}" "${host}" "${GRPC_PORT}" "${ADMIN_PORT}"
+  done
+}
+
 # main 是完整安装流程。Task 5/6 会逐步填充它。
 main() {
   parse_args "$@"
   validate_args
   log "参数校验通过"
+  resolve_credentials
+  resolve_advertise_host
+  log "即将写入的配置："
+  render_config | sed 's/^/[quickstart]   /'
 }
 
 # 守卫：被 source 时不执行安装，只导出函数供测试调用。

@@ -8,3 +8,6 @@
 | 4 | 修复轮 1 | 0 | 修正 `deploy/quickstart_test.sh` 的同 shell 组合命令执行方式 |
 | 4 | 修复轮 2 | 0 | 让骨架阶段的跨 task 全局接口变量显式通过 shellcheck |
 | 4 | 已完成 | 2 | `deploy/quickstart.sh`, `deploy/quickstart_test.sh` |
+| 5 | 修复轮 1 | 0 | 将无限随机管道改为有限随机块循环，消除 `tr` broken pipe |
+| 5 | 修复轮 2 | 0 | 消除 `CRED_GENERATED` 与测试桩的 shellcheck 告警 |
+| 5 | 已完成 | 2 | `deploy/quickstart.sh`, `deploy/quickstart_test.sh` |
