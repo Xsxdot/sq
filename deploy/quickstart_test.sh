@@ -131,6 +131,7 @@ echo "== 重跑语义 =="
 tmp_env() {
   local d="$1"
   shift
+  # shellcheck disable=SC2030,SC2031 # 被测脚本在同一子 shell 中读取这些路径变量
   ( export SQ_CFG_DIR="${d}/etc" SQ_DATA_DIR="${d}/data"
     mkdir -p "${SQ_CFG_DIR}" "${SQ_DATA_DIR}"
     # shellcheck source=/dev/null
@@ -176,6 +177,60 @@ if grep -qF -- '--admin-password' <<< "${tips_single}"; then
 else
   ok "单机档不打印集群凭据传递提示"
 fi
+
+echo "== 权限 =="
+
+# 目标平台是 Linux，以下使用 GNU stat 的 -c 形式；BSD stat 的参数形式不同。
+# write_config 的 0600 中间态不需要 root，必须在所有测试环境执行，确保明文
+# 口令从生成到收紧期间没有世界可读的时间窗。
+permission_dir="$(mktemp -d)"
+write_mode="$(
+  (
+    # shellcheck disable=SC2030,SC2031 # 被测脚本在同一子 shell 中读取这些路径变量
+    export SQ_CFG_DIR="${permission_dir}/etc" SQ_DATA_DIR="${permission_dir}/data"
+    # shellcheck source=/dev/null
+    source "${HERE}/quickstart.sh" >/dev/null 2>&1
+    {
+      parse_args --admin-password FIXEDPASSWORD0123456789A
+      validate_args
+      resolve_credentials
+      resolve_advertise_host
+      write_config
+    } >/dev/null 2>&1
+    stat -c '%a' "${CFG_DST}"
+  )
+)"
+check "write_config 产出文件权限为 0600" "${write_mode}" "600"
+
+if [[ ${EUID} -eq 0 ]]; then
+  if id -u sq >/dev/null 2>&1 && getent group sq >/dev/null 2>&1; then
+    tightened="$(
+      (
+        # shellcheck disable=SC2030,SC2031 # 被测脚本在同一子 shell 中读取这些路径变量
+        export SQ_CFG_DIR="${permission_dir}/tightened/etc" SQ_DATA_DIR="${permission_dir}/tightened/data"
+        # shellcheck source=/dev/null
+        source "${HERE}/quickstart.sh" >/dev/null 2>&1
+        # shellcheck disable=SC2034 # 被测 tighten_perms 通过 source 读取该变量
+        PKG_DIR="${HERE}/.."
+        {
+          parse_args --admin-password FIXEDPASSWORD0123456789A
+          validate_args
+          resolve_credentials
+          resolve_advertise_host
+          write_config
+          tighten_perms
+        } >/dev/null 2>&1
+        stat -c '%a %G' "${CFG_DST}"
+      )
+    )"
+    check "tighten_perms 后权限为 0640 且属组为 sq" "${tightened}" "640 sq"
+  else
+    ok "root 环境缺少 sq 用户/组，跳过 tighten_perms 的 0640/root:sq 断言"
+  fi
+else
+  ok "非 root：跳过 tighten_perms 的 0640/root:sq 断言（write_config 的 0600 断言已执行）"
+fi
+rm -rf "${permission_dir}"
 
 echo
 printf '通过 %d，失败 %d\n' "${PASS}" "${FAIL}"
