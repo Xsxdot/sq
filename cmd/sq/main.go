@@ -10,6 +10,7 @@
 //     走 cluster.Rejoin——**先求集群接纳、拿到接纳才清空数据目录**，
 //     求不到接纳则数据分毫不动、进程拒启，并在日志里给出
 //     `sq recover --grant` 的签字出口
+//   - `sq status` 的只读状态报告
 //
 // 边界：只做装配与启停，不含业务逻辑；退出码非 0 表示启动失败。
 package main
@@ -81,6 +82,9 @@ func main() {
 			os.Exit(1)
 		}
 		return
+	}
+	if len(os.Args) > 1 && os.Args[1] == "status" {
+		os.Exit(runStatus(os.Args[2:]))
 	}
 	if err := run(); err != nil {
 		slog.Error("sq 启动失败", "err", err)

@@ -4,3 +4,4 @@
 |---|---|---:|---|
 | 1 | 已完成 | 0 | `internal/config/config.go`, `internal/config/adminaddr.go`, `internal/config/adminaddr_test.go`, `internal/config/config_test.go` |
 | 2 | 已完成 | 0 | `cmd/sq/statusview.go`, `cmd/sq/statusview_test.go` |
+| 3 | 已完成 | 0 | `cmd/sq/statusfetch.go`, `cmd/sq/status.go`, `cmd/sq/statusfetch_test.go`, `cmd/sq/main.go` |
