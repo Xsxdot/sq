@@ -5,3 +5,6 @@
 | 1 | 已完成 | 0 | `internal/config/config.go`, `internal/config/adminaddr.go`, `internal/config/adminaddr_test.go`, `internal/config/config_test.go` |
 | 2 | 已完成 | 0 | `cmd/sq/statusview.go`, `cmd/sq/statusview_test.go` |
 | 3 | 已完成 | 0 | `cmd/sq/statusfetch.go`, `cmd/sq/status.go`, `cmd/sq/statusfetch_test.go`, `cmd/sq/main.go` |
+| 4 | 修复轮 1 | 0 | 修正 `deploy/quickstart_test.sh` 的同 shell 组合命令执行方式 |
+| 4 | 修复轮 2 | 0 | 让骨架阶段的跨 task 全局接口变量显式通过 shellcheck |
+| 4 | 已完成 | 2 | `deploy/quickstart.sh`, `deploy/quickstart_test.sh` |
