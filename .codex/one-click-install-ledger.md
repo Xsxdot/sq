@@ -16,3 +16,5 @@
 | 6 | 修复轮 3 | 0 | 防止取版本、校验和、旧口令读取在 `pipefail` 下提前退出 |
 | 6 | 修复轮 4 | 0 | 清理结尾提示命令行的尾随空格并保持输出格式 |
 | 6 | 已完成 | 4 | `deploy/quickstart.sh`, `deploy/quickstart_test.sh` |
+| 7 | 已完成 | 0 | `.github/workflows/ci.yml`, `.github/workflows/release.yml` |
+| 7 | 记账 | 0 | Docker/Podman 不存在；`runuser`/`setpriv` 均受限，非 root 发布包路径未验证 |

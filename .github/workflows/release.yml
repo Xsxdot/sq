@@ -75,8 +75,8 @@ jobs:
             GOOS="${GOOS}" GOARCH="${GOARCH}" CGO_ENABLED=0 \
               go build -ldflags "${LDFLAGS}" -o "${stage}/sq" ./cmd/sq
             cp sq.example.yaml LICENSE README.md "${stage}/"
-            cp deploy/sq.service deploy/install.sh "${stage}/"
-            chmod +x "${stage}/install.sh"
+            cp deploy/sq.service deploy/install.sh deploy/quickstart.sh "${stage}/"
+            chmod +x "${stage}/install.sh" "${stage}/quickstart.sh"
             tar -czf "dist/sq_${VERSION}_${GOOS}_${GOARCH}.tar.gz" -C "${stage}" .
             rm -rf "${stage}"
           done

@@ -1,0 +1,33 @@
+# ci.yml —— shell 交付件的持续检查。
+#
+# 职责：对 deploy/ 下的脚本跑 shellcheck 与自带的测试脚本。
+# 边界：**刻意不跑 go test**。本仓库的 Go 测试从未在 CI 跑过，全量接进来
+#       会被无关的既有 flake 挡住；要不要给 Go 建 CI 是另一个决定。
+name: ci
+
+on:
+  push:
+    paths:
+      - 'deploy/**'
+      - '.github/workflows/ci.yml'
+  pull_request:
+    paths:
+      - 'deploy/**'
+      - '.github/workflows/ci.yml'
+  workflow_dispatch:
+
+jobs:
+  shell:
+    name: shell 检查
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: 安装 shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq shellcheck
+
+      - name: shellcheck
+        run: shellcheck deploy/*.sh
+
+      - name: quickstart 测试
+        run: ./deploy/quickstart_test.sh
