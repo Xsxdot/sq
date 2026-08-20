@@ -164,6 +164,15 @@ type ClusterPeer struct {
 	RaftAddr      string `yaml:"raft_addr"`      // 该节点的 raft 监听地址（组间复制流量）
 	AdvertiseHost string `yaml:"advertise_host"` // 对外广告地址（路由/协议面广播给客户端）
 	AdvertisePort int    `yaml:"advertise_port"` // 对外广告端口
+	// AdminPort 该节点管理面 HTTP 端口。
+	//
+	// 0 = 未填：此时 Config.PeerAdminAddr 回落取本机 admin_listen 的端口。
+	// 存量配置不含本字段，回落后行为与新增本字段之前完全一致，故非破坏性变更。
+	//
+	// 注意：**集群运行时不读本字段**——raft 复制与协议面路由都不经过管理面。
+	// 它只服务于 `sq status` 的跨节点查询。不要把它当成拓扑的一部分，
+	// 也不要在复制层引用它。
+	AdminPort int `yaml:"admin_port"`
 }
 
 // Load 加载配置。path 为空时返回纯默认值；文件存在则按字段覆盖。
@@ -388,6 +397,11 @@ func Load(path string) (*Config, error) {
 			}
 			if p.AdvertisePort < 1 || p.AdvertisePort > 65535 {
 				return nil, fmt.Errorf("配置 cluster.peers[%d] 的 advertise_port 须在 [1,65535]，得到 %d", i, p.AdvertisePort)
+			}
+			// 0 = 未填（回落本机 admin 端口，见 ClusterPeer.AdminPort 注释）；
+			// 负数与越界是笔误，与 advertise_port 同规格，启动即挡。
+			if p.AdminPort < 0 || p.AdminPort > 65535 {
+				return nil, fmt.Errorf("配置 cluster.peers[%d] 的 admin_port 须在 [1,65535] 或留空，得到 %d", i, p.AdminPort)
 			}
 		}
 		// node_id 必须落在成员表里：不在 = 笔误，启动即挡（raft 需要成员表自洽，

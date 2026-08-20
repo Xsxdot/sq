@@ -34,6 +34,54 @@ func TestLoadDefaults(t *testing.T) {
 	}
 }
 
+func TestLoadRejectsBadAdminPort(t *testing.T) {
+	for _, port := range []int{-1, 65536} {
+		p := filepath.Join(t.TempDir(), "sq.yaml")
+		yml := fmt.Sprintf(`
+cluster:
+  node_id: 1
+  raft_listen: ":9081"
+  peers:
+    - id: 1
+      raft_addr: "127.0.0.1:9081"
+      advertise_host: "127.0.0.1"
+      advertise_port: 8081
+      admin_port: %d
+`, port)
+		if err := os.WriteFile(p, []byte(yml), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Load(p); err == nil {
+			t.Fatalf("admin_port=%d 必须被拒绝", port)
+		}
+	}
+}
+
+func TestLoadAcceptsOmittedAdminPort(t *testing.T) {
+	// 存量配置不含 admin_port —— 必须照常加载，值为 0（回落语义）
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	yml := `
+cluster:
+  node_id: 1
+  raft_listen: ":9081"
+  peers:
+    - id: 1
+      raft_addr: "127.0.0.1:9081"
+      advertise_host: "127.0.0.1"
+      advertise_port: 8081
+`
+	if err := os.WriteFile(p, []byte(yml), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := Load(p)
+	if err != nil {
+		t.Fatalf("存量配置（无 admin_port）必须能加载: %v", err)
+	}
+	if cfg.Cluster.Peers[0].AdminPort != 0 {
+		t.Fatalf("未填时期望 0，得到 %d", cfg.Cluster.Peers[0].AdminPort)
+	}
+}
+
 func TestLoadYAMLOverride(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "sq.yaml")
 	if err := os.WriteFile(p, []byte("grpc_listen: \":9081\"\nfsync: async\n"), 0o644); err != nil {
