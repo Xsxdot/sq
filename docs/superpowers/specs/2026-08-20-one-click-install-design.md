@@ -102,13 +102,18 @@ quickstart.sh
   ├─ 2. 取包（唯一的分叉，两条路径汇合到「一个含 sq+install.sh+sq.service 的目录」）
   │      ├─ 同目录已有 sq 二进制 → 用所在目录（发布包内场景）
   │      └─ 否则 → 按 uname 识别平台 → 拉 tarball + SHA256SUMS 校验 → 解到临时目录
-  ├─ 3. 生成 /etc/sq/sq.yaml（先打到 stdout，再落盘）
-  ├─ 4. 调包内 install.sh（装盘；它会跳过已存在的配置）
-  ├─ 5. 拷 sq.example.yaml → /etc/sq/sq.example.yaml（字段参考）
-  └─ 6. 打印下一步（配置在哪、怎么启动、怎么开机自启、怎么看状态）
+  ├─ 3. 生成 /etc/sq/sq.yaml，权限 0600 root:root（先打到 stdout，再落盘）
+  ├─ 4. 调包内 install.sh（装盘、建 sq 用户；它会跳过已存在的配置）
+  ├─ 5. 回头收权限：chown root:sq + chmod 0640（依赖第 4 步建出的 sq 用户）
+  ├─ 6. 拷 sq.example.yaml → /etc/sq/sq.example.yaml（字段参考）
+  └─ 7. 打印下一步（配置在哪、凭据是什么、怎么启动、怎么开机自启、怎么看状态）
 ```
 
 第 2 步之后的全部步骤两条路径共用。
+
+第 3 步与第 5 步**必须分开**：配置里有明文密码，写出来的那一刻就不能是
+世界可读，所以先 `0600 root:root`；而目标属组 `sq` 要等 install.sh 建完用户
+才存在，所以 `chown` 只能放在其后。理由详见 §4.5。
 
 ## 4. `quickstart.sh` 详细设计
 
@@ -119,8 +124,9 @@ quickstart.sh
 --node-id N               本机是 peers 里的第几个，集群档必填
 --peers ip1,ip2,ip3       全体成员地址，顺序即 node id，集群档必填
 --advertise-host HOST     对外地址；单机档默认 127.0.0.1
---admin-user U            admin 控制台用户名（与 --admin-password 成对）
---admin-password P
+--admin-user U            admin 控制台用户名，默认 admin
+--admin-password P        不给则自动生成（见 §4.5）
+--no-admin-auth           显式关闭管理面鉴权
 --version X.Y.Z           指定下载版本，默认拉最新 release
 --tarball PATH|URL        直接指定包，绕开 GitHub
 --force                   已有配置时备份后覆盖
@@ -133,8 +139,7 @@ quickstart.sh
 - `--peers` 至少一个元素，`--node-id` 须落在 `1..len(peers)`；
 - `--peers` 元素去重校验（重复地址必然是复制粘贴错误）；
 - 偶数个 peers 打警告不拒绝（与 `config.go` 现有行为一致）；
-- `--admin-user` / `--admin-password` 必须成对（与 `config.go` 的成对校验一致，
-  只填一半服务端会拒启，不如在脚本里就挡住）；
+- `--no-admin-auth` 与 `--admin-user` / `--admin-password` 互斥；
 - 非 `--cluster` 时给了 `--node-id` / `--peers` → 报错（避免用户以为装了集群）。
 
 ### 4.2 取包
@@ -195,7 +200,8 @@ cluster:
     - { id: 3, raft_addr: "10.0.0.3:9081", advertise_host: "10.0.0.3", advertise_port: 8081, admin_port: 8082 }
 ```
 
-给了 `--admin-user/--admin-password` 时追加 `admin_username` / `admin_password` 两行。
+两档都追加 `admin_username` / `admin_password` 两行（默认自动生成，见 §4.5）；
+只有显式 `--no-admin-auth` 时这两行才不出现。
 
 为什么是最小配置而不是那份注释版：抄注释版会让「脚本决定的」和「默认值」
 混成一片，出问题时看不出这台机器的身份是什么。最小配置一眼看完，且
@@ -209,14 +215,75 @@ cluster:
 默认 `127.0.0.1`，此时脚本**显式警告**「远程客户端连不上，要连远程请加
 `--advertise-host`」。
 
-### 4.5 结尾提示
+### 4.5 admin 凭据与配置文件权限
+
+**默认生成，不默认敞开。** 用户名默认 `admin`，密码在未给 `--admin-password`
+时自动生成。想要旧的免鉴权行为必须显式 `--no-admin-auth`——一键脚本默默敞开
+一个无鉴权管理面是不可接受的默认值，而"默认安全、要不安全得自己说出口"是
+唯一站得住的取舍。
+
+**生成方式**：`LC_ALL=C tr -dc 'A-Za-z0-9' < /dev/urandom | head -c 24`。
+不用 `openssl rand`——openssl 不是所有精简发行版都装。不用 `$RANDOM`
+（16 位 LCG，不是密码学随机源）。
+
+#### 集群档的一致性问题（承重）
+
+`sq status` 在 follower 上要跳到 leader 的管理面（§6.2 第 6 步），用的是**本机
+配置里的凭据**。三台各自生成会得到三个不同的密码，跳转必然 401，
+`sq status` 从此永远降级到码 3。
+
+处置：**第一台生成，另两台显式携带**。集群档下未给 `--admin-password` 时，
+脚本生成后在结尾提示里打印一条可直接复制的命令，把生成值明码带进另两台的
+调用：
+
+```
+[quickstart] ⚠ 另外两台必须使用同一组凭据，否则 sq status 无法跨节点查看。
+[quickstart]   在机器 10.0.0.2 上执行：
+[quickstart]     ./quickstart.sh --cluster --node-id 2 --peers 10.0.0.1,10.0.0.2,10.0.0.3 \
+[quickstart]       --admin-user admin --admin-password 'K3f9…（完整值见上）'
+```
+
+否掉的两个替代：**集群档拒绝自动生成、强制显式给**（安全等价，但把
+「一键」变成「先自己想个密码」，与本项目标冲突）；**由 `--peers` 派生确定性
+密码**（`--peers` 是公开信息，等于没有密码）。
+
+脚本**无法检测**用户是否真的在另两台带了同一个值——它看不到另两台。所以这条
+只能靠提示的醒目程度兜住，失败模式是 `sq status` 降级到码 3（不是数据损坏，
+可事后改配置重启修复）。这个残余风险是已知且接受的。
+
+#### `--force` 重跑不重新生成密码
+
+`--force` 且未显式给 `--admin-password` 时，从**被备份的旧配置**里提取
+`admin_password` 复用，提取不到才新生成。否则一次无关的重跑（比如改
+`--advertise-host`）会静默换掉密码，让这台机器与另两台失配。
+
+#### 配置文件权限
+
+配置里落明文密码，权限必须收紧。现有 `install.sh` 装配置用的是
+`install -m 0644`（世界可读），但因 quickstart 先写配置、install.sh 走
+「已存在不覆盖」分支，**那行 `0644` 根本不会作用到 quickstart 生成的文件上**
+——install.sh 仍然一字不改。
+
+目标权限：`0640`，属主 `root`，属组 `sq`。systemd 单元以 `User=sq` 运行，
+进程必须读得到；root 之外的普通用户读不到。
+
+**这带来一处执行顺序约束**：`sq` 用户是 install.sh 建的，而 quickstart 先写
+配置——写的时候该用户还不存在，`chown` 会失败。故 §3.3 的链路调整为：
+先以 `0600 root:root` 写配置 → 调 install.sh（建用户、跳过配置） → **回头
+`chown root:sq` + `chmod 0640`**。顺序不能省，也不能把 chown 提前。
+
+### 4.6 结尾提示
 
 ```
 [quickstart] 安装完成。形态：集群 node_id=2 / 3 节点
 
-[quickstart] 配置文件：/etc/sq/sq.yaml   （字段说明见 /etc/sq/sq.example.yaml）
+[quickstart] 配置文件：/etc/sq/sq.yaml   （0640 root:sq，字段说明见 /etc/sq/sq.example.yaml）
 [quickstart] 数据目录：/var/lib/sq
 [quickstart] 二进制  ：/usr/local/bin/sq
+
+[quickstart] 控制台   ：http://10.0.0.2:8082/
+[quickstart] 用户名   ：admin
+[quickstart] 密码     ：K3f9xQ7mB2vLpN4sT8wZ （已自动生成，也在配置文件里）
 
 [quickstart] 立即启动    ：systemctl start sq
 [quickstart] 开机自启    ：systemctl enable sq
@@ -225,12 +292,16 @@ cluster:
 [quickstart] 集群状态    ：sq status -config /etc/sq/sq.yaml
 
 [quickstart] ⚠ 三台都装完并启动后，集群才会选出 leader。
-[quickstart] ⚠ admin 端口 :8082 当前无鉴权，请用防火墙限制来源。
+[quickstart] ⚠ 另外两台必须使用同一组凭据，否则 sq status 无法跨节点查看：
+[quickstart]     ./quickstart.sh --cluster --node-id 3 --peers 10.0.0.1,10.0.0.2,10.0.0.3 \
+[quickstart]       --admin-user admin --admin-password 'K3f9xQ7mB2vLpN4sT8wZ'
 ```
 
-第二条警告在给了 `--admin-user` 时不打印。默认不设鉴权是为了与现有默认
-行为一致、不搞静默变更；但一键脚本默默敞开一个无鉴权管理面是必须说出口的，
-所以宁可多两个 flag 也要给出路。
+凭据三行只在启用了鉴权时打印（即未给 `--no-admin-auth`）；密码自动生成时才
+带「已自动生成」后缀，显式传入时不回显。集群一致性那条警告只在集群档且
+密码为自动生成时打印——用户自己传了密码就说明他知道要传给另两台。
+
+`--no-admin-auth` 时改打一条警告：`⚠ 管理面 :8082 无鉴权，请用防火墙限制来源。`
 
 ## 5. `ClusterPeer.AdminPort` 配置字段
 
@@ -360,15 +431,24 @@ topic 12   消费组 5   消息 1,203,441   磁盘 34% / 水位 85%
 
 - `shellcheck` 进 CI；
 - 参数校验用例：缺 `--node-id`、`--node-id` 越界、`--peers` 有重复、
-  非 `--cluster` 却给了集群参数、`--admin-user` 只给一半、非 root；
-- 配置生成用例：单机档 / 集群档三个 node-id 各生成一次，与期望文本逐字比对；
+  非 `--cluster` 却给了集群参数、`--no-admin-auth` 与 `--admin-password` 同给、非 root；
+- 配置生成用例：单机档 / 集群档三个 node-id 各生成一次，与期望文本逐字比对。
+  密码是随机的，**比对前把 `admin_password:` 那行掩掉**（或用环境变量注入
+  固定的生成器桩），否则用例恒挂；
+- 凭据用例：默认生成时长度为 24 且字符集合法、`--admin-password` 显式传入时
+  原样落盘、`--no-admin-auth` 时 `admin_username`/`admin_password` 两行不出现；
+- 权限用例：生成后立刻是 `0600 root:root`，走完 install.sh 后变为 `0640 root:sq`
+  ——**中间态也要断言**，这是「明文密码不得有世界可读的时间窗」的判据；
+- `--force` 密码复用用例：已有配置含密码 P，`--force` 且不给 `--admin-password`
+  重跑后新配置里仍是 P（而不是新生成值）；旧配置无密码时才新生成；
 - 取包分支用 `file://` 指向本地打好的 tarball 打桩，覆盖校验和不匹配即中止；
 - 重跑语义用例：已有配置时默认退出非零且文件未被修改、`--force` 时备份文件存在。
 
 **真机**
 
-1. 三台 Linux 各跑一次 quickstart（只差 `--node-id`），确认生成的三份配置只有
-   身份字段不同；
+1. 三台 Linux 各跑一次 quickstart：第一台不给密码（走自动生成），后两台按结尾
+   提示带上 `--admin-user/--admin-password`。确认生成的三份配置只有身份字段不同，
+   凭据完全一致，且三份都是 `0640 root:sq`；
 2. 只启动第一台，跑 `sq status` —— 期望退出码 2（无 leader），验证 §9 的
    「首台无 leader 是预期行为」；
 3. 三台全部启动，在三台上分别跑 `sq status` —— 期望全部 0，且 follower 上
@@ -383,7 +463,9 @@ topic 12   消费组 5   消息 1,203,441   磁盘 34% / 水位 85%
 ## 8. 文档改动
 
 - `README.md`：快速开始加 quickstart 一行命令（单机）；「集群模式」提一句三节点用法；
-- `docs/deployment.md`：新增 quickstart 小节（单机 + 三节点完整示例）；
+- `docs/deployment.md`：新增 quickstart 小节（单机 + 三节点完整示例），
+  并写明 admin 密码默认自动生成、集群三台必须共用同一组凭据、配置文件为
+  `0640 root:sq`；
   「明确把 `data_dir` 设为 `/var/lib/sq`」的提醒改为「手工装才需要，走 quickstart 已写好」；
 - `docs/configuration.md`：集群配置补 `admin_port` 字段说明；
 - `.github/workflows/release.yml`：`cp deploy/sq.service deploy/install.sh` 那行加上
@@ -397,5 +479,8 @@ topic 12   消费组 5   消息 1,203,441   磁盘 34% / 水位 85%
   报退出码 2，这是**预期行为**，不是故障。结尾提示里已有对应说明。
 - **`sq status` 依赖 admin 端口跨机可达**（仅集群档且本机非 leader 时）。不可达
   时降级为本机视角，功能不中断但看不到 peer 进度。彻底解法见 §5 的第三个替代方案。
-- **各节点 admin 凭据须一致**（仅集群档且本机非 leader 时）。quickstart 生成的
-  配置天然一致；手工改成不一致的部署，跳转会 401 并降级为本机视角。
+- **各节点 admin 凭据须一致**（仅集群档且本机非 leader 时）。密码默认自动生成，
+  而**自动生成在三台机器上并不天然一致**——这正是 §4.5 要靠结尾提示把第一台的
+  生成值传给另两台的原因。用户没照做时跳转会 401 并降级为本机视角
+  （退出码 3）。脚本看不到另两台，无法检测，只能靠提示兜住。
+  事后修复方式：把三台的 `admin_password` 改成同一个值并重启。
