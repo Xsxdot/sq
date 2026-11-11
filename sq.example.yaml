@@ -40,6 +40,12 @@ auto_renew_enabled: true
 # 它兜的是「消费者进程活着但 handler 卡死」——没有上限这条消息会被永久扣住。
 # 顺序消息尤其要注意：续租期间该队列的顺序锁一直被占，后续消息全部等待。
 auto_renew_max_duration: 10m
+# 消费进度（位点 + 在外未确认记录）的检查点间隔。取件/确认只改 leader 内存
+# 即返回，每隔这么久整体落盘一次：吞吐高，代价是 leader 崩溃（kill -9、断电）
+# 后约一个间隔内的消费进度丢失，表现为重复投递（不丢消息）。0 = 逐次复制：
+# 每次取件/确认都等复制落盘才返回，零重复、吞吐低。正常停机与计划内切换
+# leader 前会先做全量检查点，不产生重复。负值或非法时长启动即拒。
+consume_checkpoint_interval: 1s
 
 # 过期清理扫描间隔（Go duration，如 5m、1h）
 retention_check_interval: 5m
