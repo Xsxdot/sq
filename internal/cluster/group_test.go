@@ -884,3 +884,106 @@ func TestApplyEntriesEmptyEntryAdvancesApplied(t *testing.T) {
 		t.Fatalf("盘上 applied = %d; want 3", got)
 	}
 }
+
+// TestRaftConfigBoundsInflightBytesToLaggingFollower 落后 follower 由探测
+// 转入复制态的那一刻，leader 一口气发出的未确认日志字节有上界。
+//
+// 承重原因（SQ4.10 排查）：窗口外条目经冷读层每次新分配，在途条目在
+// 传输队列里等写出期间全部常驻 leader 堆；只按条数限（256 条 × 每条
+// 1MiB）时一次可压上 256MiB/组/follower，落后量多大就分配多大。按字节
+// 限后，leader 为单个落后 follower 单组持有的在途字节与落后量无关。
+//
+// 用 RawNode 直驱 raftConfig 的真实取值（只关掉异步存储以便同步推进），
+// follower 2 全程不确认复制，统计 leader 发给它的 MsgApp 条目字节。
+func TestRaftConfigBoundsInflightBytesToLaggingFollower(t *testing.T) {
+	u64 := func(v uint64) *uint64 { return &v }
+	ms := raft.NewMemoryStorage()
+	if err := ms.ApplySnapshot(&raftpb.Snapshot{Metadata: &raftpb.SnapshotMetadata{
+		Index: u64(1), Term: u64(1), ConfState: &raftpb.ConfState{Voters: []uint64{1, 2, 3}},
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	limit := raftConfig(1, ms).MaxInflightBytes // NewRawNode 会把 0 改写成「不限」，先取原值
+	cfg := raftConfig(1, ms)
+	cfg.AsyncStorageWrites = false
+	rn, err := raft.NewRawNode(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// drain 推进一轮 Ready：落盘条目、回收外发消息
+	drain := func() []*raftpb.Message {
+		var out []*raftpb.Message
+		for rn.HasReady() {
+			rd := rn.Ready()
+			if !raft.IsEmptyHardState(rd.HardState) {
+				_ = ms.SetHardState(rd.HardState)
+			}
+			if err := ms.Append(rd.Entries); err != nil {
+				t.Fatal(err)
+			}
+			out = append(out, rd.Messages...)
+			rn.Advance(rd)
+		}
+		return out
+	}
+	step := func(typ raftpb.MessageType, from uint64, term, index uint64) {
+		if err := rn.Step(&raftpb.Message{Type: &typ, From: u64(from), To: u64(1), Term: u64(term), Index: u64(index)}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 选举（PreVote 开着：先预选再正选），由 follower 2 投票成多数
+	if err := rn.Campaign(); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 2 && rn.Status().RaftState != raft.StateLeader; i++ {
+		for _, m := range drain() {
+			switch m.GetType() {
+			case raftpb.MessageType_MsgPreVote:
+				if m.GetTo() == 2 {
+					step(raftpb.MessageType_MsgPreVoteResp, 2, m.GetTerm(), 0)
+				}
+			case raftpb.MessageType_MsgVote:
+				if m.GetTo() == 2 {
+					step(raftpb.MessageType_MsgVoteResp, 2, m.GetTerm(), 0)
+				}
+			}
+		}
+	}
+	if rn.Status().RaftState != raft.StateLeader {
+		t.Fatalf("未当选 leader：%v", rn.Status().RaftState)
+	}
+	term := rn.Status().GetTerm()
+	drain() // 新任期空条目（index 2）的首个探测 MsgApp，follower 2 暂不回
+
+	// follower 2 停在探测态期间积压 32MiB（4000 条 × 8KiB）
+	body := make([]byte, 8<<10)
+	const n = 4000
+	for i := 0; i < n; i++ {
+		if err := rn.Propose(body); err != nil {
+			t.Fatal(err)
+		}
+	}
+	drain()
+
+	// follower 2 确认空条目 → 转入复制态，leader 随即按流控连发
+	step(raftpb.MessageType_MsgAppResp, 2, term, 2)
+	var sent uint64
+	for _, m := range drain() {
+		if m.GetType() == raftpb.MessageType_MsgApp && m.GetTo() == 2 {
+			for _, e := range m.GetEntries() {
+				sent += uint64(len(e.GetData()))
+			}
+		}
+	}
+	if sent == 0 {
+		t.Fatal("转入复制态后未向 follower 2 发出任何条目——测试前置不成立")
+	}
+	if limit == 0 {
+		t.Fatalf("raftConfig 未设 MaxInflightBytes：转入复制态后一次发出 %d 字节（积压 %d 字节，全部在途）",
+			sent, uint64(n)*uint64(len(body)))
+	}
+	if bound := limit + cfg.MaxSizePerMsg; sent > bound { // raft 允许最后一条越过上限
+		t.Fatalf("未确认在途 %d 字节（积压 %d 字节）; want ≤ %d（MaxInflightBytes=%d）",
+			sent, uint64(n)*uint64(len(body)), bound, limit)
+	}
+}

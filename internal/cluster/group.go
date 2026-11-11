@@ -380,6 +380,18 @@ func newGroup(g uint32, selfID uint64, storage *raft.MemoryStorage, snaps *snapR
 	return gr
 }
 
+// maxInflightBytes 单组对单个 follower 未确认在途日志字节的上限，取
+// 8 个发送合批（transport maxBatchBytes = 1MiB）的量。
+//
+// 为什么要按字节限（卡 SQ4.10）：窗口外条目经冷读层读出时每次新分配，
+// 在传输队列里等写出期间全部常驻 leader 堆。只有条数上限（256 条 ×
+// MaxSizePerMsg 1MiB）时，落后 follower 一转入复制态，leader 就把整段
+// 积压（最多 256MiB/组/follower）一次读出压进队列——linux-01 停机 5 分钟
+// 实测 leader VmHWM 从基线约 140MiB 涨到 500MiB 以上。按字节限后单组单
+// follower 的在途量与落后量无关；吞吐上界 = 8MiB / 往返时延（含对端
+// 落盘），局域网毫秒级往返下远高于磁盘带宽，不构成瓶颈。
+const maxInflightBytes = 8 * maxBatchBytes
+
 // raftConfig 构造共享的 raft 配置：tick 参数、单消息/在途日志上限、
 // 丢弃日志器（raft 库自身日志噪音大，关键节点由我们的 slog 承担）。
 //
@@ -410,7 +422,9 @@ func raftConfig(id uint64, storage raft.Storage) *raft.Config {
 		Storage:         storage,
 		MaxSizePerMsg:   1 << 20,
 		MaxInflightMsgs: 256,
-		Logger:          &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)},
+		// 见 maxInflightBytes：按字节限住落后 follower 追平时的在途量
+		MaxInflightBytes: maxInflightBytes,
+		Logger:           &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)},
 		// 内核契约：follower 收到提案直接丢弃并返回错误，绝不转发给 leader
 		DisableProposalForwarding: true,
 		// 见 raftConfig 注释：预选阶段挡掉掉队节点的 term bump（安装攒满
