@@ -14,6 +14,7 @@ import (
 	"github.com/Xsxdot/sq/internal/core/deliver"
 	"github.com/Xsxdot/sq/internal/core/meta"
 	"github.com/Xsxdot/sq/internal/core/txn"
+	"github.com/Xsxdot/sq/internal/replication"
 	"github.com/Xsxdot/sq/internal/store"
 )
 
@@ -362,6 +363,12 @@ func (followerRouter) GroupForQueue(string, uint32) uint32       { return 0 }
 func (followerRouter) MetaGroup() uint32                         { return 0 }
 func (followerRouter) IsLeader(uint32) bool                      { return false }
 func (followerRouter) ReadBarrier(context.Context, uint32) error { return nil }
+
+func (followerRouter) WaitWritable(context.Context, uint32) (uint64, error) {
+	return 0, replication.ErrNotLeader
+}
+
+func (followerRouter) WritableEpoch(uint32) (uint64, bool) { return 0, false }
 
 // recordingForwarder 记录 ForwardAppend 被调用的假转发器。
 type recordingForwarder struct {

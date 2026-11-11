@@ -63,6 +63,10 @@ func (f errInjectingReplicator) ApplyAsync(context.Context, uint32, *store.Batch
 	return nil, f.err
 }
 
+func (f errInjectingReplicator) ApplyAsyncAt(context.Context, uint32, *store.Batch, uint64) (replication.Pending, error) {
+	return nil, f.err
+}
+
 // asyncErrReplicator 测试用假 Replicator：Apply 成功（EnsureGroup 建组/
 // 建 topic 路径），ApplyAsync 注入错误（取件写入路径）——模拟「长轮询
 // 期间领导权迁移」：入口探针放行、EnsureGroup 成功，但取件批次提案
@@ -82,6 +86,10 @@ func (f *asyncErrReplicator) Apply(ctx context.Context, _ uint32, b *store.Batch
 func (f *asyncErrReplicator) ApplyAsync(_ context.Context, _ uint32, b *store.Batch) (replication.Pending, error) {
 	b.Close()
 	return nil, f.applyAsyncErr
+}
+
+func (f *asyncErrReplicator) ApplyAsyncAt(ctx context.Context, g uint32, b *store.Batch, _ uint64) (replication.Pending, error) {
+	return f.ApplyAsync(ctx, g, b)
 }
 
 // TestQueryRoutePointsQueuesAtGroupLeaders 注入假 RouteView：队列 0→节点A、

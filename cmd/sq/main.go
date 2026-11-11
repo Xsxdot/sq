@@ -104,8 +104,7 @@ func main() {
 //	→ 打 Error 日志 → st.Close → cluster.Rejoin 自愈）→ Manager.Start → 等 meta 组
 //	出 leader（60s 超时）→ rep/rt/fwd 构造 → meta.New（此时 FSM 完整）→ produce/deliver/
 //	txn/delay/retention 注入 → secret（集群档走 Replicated 变体）→ rpc.New（RouteView）
-//	→ OnApplied/OnLeaderChange 钩子闭包接线（meta.Reload / produce.InvalidateCounters
-//	——闭包内 go 出去，钩子契约不阻塞）→ ControlHandler 注册（ForwardAppend 落
+//	→ OnApplied 钩子闭包接线（meta.Reload——闭包内 go 出去，钩子契约不阻塞）→ ControlHandler 注册（ForwardAppend 落
 //	pr.Append、ForwardApply 落 rep.Apply）→ 其余照旧。停机：gRPC 排空 → 定时器退出
 //	→ Manager.StopClean → st.Close（defer LIFO 序对齐现有注释风格）
 //
@@ -204,15 +203,17 @@ func run() error {
 		// 重载；但只有触及 meta 键族的批次才值得整表重载（消息批次触发
 		// Reload 是纯浪费），用 store.BatchTouchesPrefix 判定。空条目
 		// （选举等）repr 为 nil，直接跳过（Task 2 审查注记）。
-		// OnLeaderChange 触发 produce.InvalidateCounters：重新当选 leader
-		// 后 offset 缓存可能滞后多数派事实，必须失效。
+		//
+		// 不再挂 OnLeaderChange 失效 produce 计数器（卡 SQ1）：换届后的
+		// 计数器重读由 produce 的 epoch 缓存承担（WaitWritable 返回的任期
+		// 变了即从盘重读，且门保证盘上已 apply 越过本任期首条）。钩子失效
+		// 挡不住「重读的盘本身滞后」，且 SoftState 合并时钩子根本不触发。
 		//
 		// 闭包经 atomic.Pointer（mtPtr/prPtr/stPtr/repPtr）读 mt/pr/st/rep：
-		// 装配序把 Start 放在 meta.New 之前，Start 后立即触发的领导权事件
-		//（单节点即刻当选）可能先于变量赋值——钩子触发时若依赖尚未构造，
-		// Load() 得 nil 跳过该次（produce 未装配就没有缓存可失效，语义
-		// 等价）。两个闭包在 NewManager 与 Rejoin 间复用：重入后的新
-		// Manager 同样需要这两条装配线。
+		// 装配序把 Start 放在 meta.New 之前，Start 后立即触发的钩子或控制
+		// 请求可能先于变量赋值——依赖尚未构造时 Load() 得 nil 跳过该次。
+		// 闭包在 NewManager 与 Rejoin 间复用：重入后的新 Manager 同样需要
+		// 这些装配线。
 		onApplied := func(g uint32, repr []byte) {
 			// 空条目（选举/成员变更）repr 为 nil：无 FSM 数据，跳过
 			if len(repr) == 0 {
@@ -239,20 +240,6 @@ func run() error {
 					logger.Error("meta 缓存重载失败（下一条 applied 条目会重试）", "g", g, "err", rerr)
 				}
 			}()
-		}
-		onLeaderChange := func(g uint32, leader uint64, isSelf bool) {
-			if !isSelf {
-				return
-			}
-			prv := prPtr.Load()
-			if prv == nil {
-				return // 装配窗口（Start→produce.New）内无缓存可失效
-			}
-			// 同步调用（评审 I4）：失而复得瞬间到 goroutine 执行之间，
-			// 并发 Append 会用陈旧 offset 覆写已 quorum 提交的消息——
-			// 失效必须在下一次 Append 前完成。只翻布尔锁内操作，不违反
-			// 钩子「不得阻塞」契约（重活才 dispatch）。
-			prv.InvalidateCounters()
 		}
 		// 控制处理器：本节点自己的 PrepareJoin（op=3）由 Manager 自装
 		// 处理，这里只注册转发两个 op——见 cluster.Options 注释。
@@ -303,7 +290,6 @@ func run() error {
 			ReadBarrierTimeout:     cc.ReadBarrierTimeout,
 			StoreOptions:           storeOptions(cfg), // Rejoin 重开 store 时沿用同一组调优参数
 			OnApplied:              onApplied,
-			OnLeaderChange:         onLeaderChange,
 			ControlHandler:         controlHandler,
 		}
 		m, err = cluster.NewManager(opts)
@@ -397,7 +383,7 @@ func run() error {
 	}
 	mtPtr.Store(mt) // OnApplied 钩子闭包原子读
 	pr = produce.New(rep, rt, st, mt, logger)
-	prPtr.Store(pr) // OnLeaderChange 钩子闭包原子读
+	prPtr.Store(pr) // ForwardAppend 控制处理器闭包原子读
 	dl := deliver.New(rep, rt, st, mt, pr, logger)
 
 	// 事务管理器。构造顺序有讲究：rpc.Server 要拿它处理 Send/EndTransaction，

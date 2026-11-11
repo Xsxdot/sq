@@ -69,6 +69,15 @@ func (r fixedLeaderRouter) MetaGroup() uint32                         { return 0
 func (r fixedLeaderRouter) IsLeader(uint32) bool                      { return r.leader }
 func (r fixedLeaderRouter) ReadBarrier(context.Context, uint32) error { return nil }
 
+func (r fixedLeaderRouter) WaitWritable(context.Context, uint32) (uint64, error) {
+	if r.leader {
+		return 0, nil
+	}
+	return 0, replication.ErrNotLeader
+}
+
+func (r fixedLeaderRouter) WritableEpoch(uint32) (uint64, bool) { return 0, r.leader }
+
 // TestPassPurgesExpired 过期消息与索引被清，未过期保留。
 func TestPassPurgesExpired(t *testing.T) {
 	st, mt, rep, rt := newFixtureRouted(t)

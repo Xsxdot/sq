@@ -19,6 +19,12 @@
 //     下次换届前所有写都会失败——活性故障。同任期内「N 未进日志、N+1
 //     成功」本身是安全的（计划 §4.2 失败语义论证）。
 //   - 任期读取入口 leaderTerm()：Ready 循环观察到的当前任期（SQ1 复用）。
+//   - 带期望 epoch 的异步入口 enqueueProposalAt（卡 SQ1 计划修订 R1）：任期
+//     绑定取调用方给定的 epoch（它过可写门时拿到的那一个），而不是入队那一
+//     刻的任期——调用方据该 epoch 读计数器构造批次，门放行后、入队前若本节点
+//     失主又以更高任期复任，按入队时刻绑定会让旧 epoch 构造的批次进新任期
+//     日志、覆盖期间他人已确认的写。入队时 epoch 不符即失败，出队核对沿用
+//     绑定任期的同一条规则。原 enqueueProposal 语义不变。
 //   - ProposalPending：一条提案的等待句柄（Wait 恰好调用一次）。
 //
 // 边界：
@@ -228,6 +234,40 @@ func (gr *group) enqueueProposal(ctx context.Context, data []byte, sync bool) *P
 		// 日志（计划 D1），直接失败。
 		return failedPending(fmt.Errorf("%w: 组 %d 当前无 leader（选举未完成）", ErrNotLeader, gr.g))
 	}
+	return gr.pushProposal(p)
+}
+
+// enqueueProposalAt 异步形态入队，任期绑定为调用方给定的 expected（非阻塞）。
+//
+// 参数：
+//   - ctx/data: 同 enqueueProposal
+//   - expected: 调用方过可写门（waitWritable）时拿到的 epoch；其构造批次所读
+//     的计数器缓存属于该任期
+//
+// 返回：等待句柄。本节点非 leader、或当前任期 != expected（换届已发生：
+// 过期或超前）时入队即失败 ErrNotLeader，经 Wait 报；入队后出队前任期变化
+// 同样失败（proposeOne 第 2 步核对绑定任期）。
+func (gr *group) enqueueProposalAt(ctx context.Context, data []byte, expected uint64) *ProposalPending {
+	if len(data) < ProposalHeaderLen {
+		return failedPending(fmt.Errorf("cluster: 提案缓冲长度 %d 小于保留头 %d（调用方未按单拷贝契约预留）",
+			len(data), ProposalHeaderLen))
+	}
+	es := gr.epoch.Load()
+	if !es.isSelf || es.term != expected {
+		// 换届后的旧 epoch 提案属预期中的可重试失败（客户端重试即拿到新
+		// epoch），记 Debug
+		gr.lg.Debug("提案被拒：期望 epoch 与当前任期不符", "expected", expected,
+			"term", es.term, "is_self", es.isSelf)
+		return failedPending(fmt.Errorf("%w: 组 %d 期望任期 %d，当前任期 %d（leader=%v）",
+			ErrNotLeader, gr.g, expected, es.term, es.isSelf))
+	}
+	p := &ProposalPending{gr: gr, ctx: ctx, data: data, resolved: make(chan struct{}),
+		leadAtEntry: gr.leader(), bound: true, term: expected}
+	return gr.pushProposal(p)
+}
+
+// pushProposal 把已完成任期判定的条目追加进本组队列并唤醒 proposer。
+func (gr *group) pushProposal(p *ProposalPending) *ProposalPending {
 	q := gr.pq
 	q.mu.Lock()
 	if q.closed {

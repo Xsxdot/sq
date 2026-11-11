@@ -73,6 +73,10 @@ type Manager struct {
 	// （消息入队）成功后、第二段（删 half 两键）前调用，用于模拟两段之间
 	// 进程崩溃。生产代码绝不允许设置。
 	afterAppendHook func()
+
+	// afterGateHook 测试专用注入钩子（生产恒为 nil）：End 过 meta 可写门之后、
+	// 读 halfidx 之前调用，用于确定性地注入换届（卡 SQ1 修订 R1.1）。
+	afterGateHook func()
 }
 
 // txnLockShards 事务锁分片数。32 片对「低频但可能并发」的事务决断绰绰有余；
@@ -156,6 +160,23 @@ func (t *Manager) Stage(ctx context.Context, m *core.Message) (*core.Message, st
 // 重试（第一次已生效）、回查决断与客户端决断赛跑输的一方、超限已丢弃。
 // 三者都不是错误，调用方按幂等成功处理（记 Warn 即可）。
 func (t *Manager) End(ctx context.Context, txID string, commit bool) (bool, error) {
+	// meta leader 先过可写门（卡 SQ1，锁外等待）：新当选的 meta leader 在
+	// apply 追平本任期首条之前，本地 FSM 可能缺上任期已提交的 Stage——
+	// 下面「读不到 halfidx 即幂等成功」的判定只在门开之后才权威。
+	metaG := t.rt.MetaGroup()
+	gated := false
+	var gateEpoch uint64
+	if t.rt.IsLeader(metaG) {
+		e, err := t.rt.WaitWritable(ctx, metaG)
+		if err != nil {
+			t.logger.Warn("事务决断被可写门拒绝（meta leader apply 未追平）", "tx_id", txID, "err", err)
+			return false, fmt.Errorf("事务决断等待 meta 可写 (tx=%s): %w", txID, err)
+		}
+		gated, gateEpoch = true, e
+	}
+	if t.afterGateHook != nil {
+		t.afterGateHook()
+	}
 	mu := t.lockFor(txID)
 	mu.Lock()
 	defer mu.Unlock()
@@ -164,16 +185,29 @@ func (t *Manager) End(ctx context.Context, txID string, commit bool) (bool, erro
 		return false, fmt.Errorf("读取 halfidx (tx=%s): %w", txID, err)
 	}
 	if !ok {
-		// 本地读不到 halfidx = 「已决断或从未 Stage」。meta leader 上读权威
-		// （Stage 返回前已 apply），可安全判幂等成功；非 meta leader 上
-		// 本地 FSM 可能滞后于多数派——已提交的 Stage 尚未 apply 到本节点
-		// 时同样读不到，若也判幂等成功，客户端收到 commit OK 但事务实际
-		// 未决断（producer 退出后回查无人应答、maxChecks 耗尽丢弃），是
-		// 假成功。必须报 ErrNotLeader 让 SDK 重试到 meta leader 决断。
-		// rpc EndTransaction handler 把该错误映射为 HA_NOT_AVAILABLE。
-		if !t.rt.IsLeader(t.rt.MetaGroup()) {
-			return false, fmt.Errorf("%w: 非 meta leader 本地读不可决断 (tx=%s)",
+		// 本地读不到 halfidx = 「已决断或从未 Stage」。只有过了可写门的
+		// meta leader 读权威（门保证上任期已提交的 Stage 全已 apply；本任期
+		// 的 Stage 返回前已在本节点 apply），可安全判幂等成功；其余情形
+		// （非 meta leader，或门之后才当选、未过门）本地 FSM 可能滞后于
+		// 多数派——已提交的 Stage 尚未 apply 到本节点时同样读不到，若也判
+		// 幂等成功，客户端收到 commit OK 但事务实际未决断（producer 退出后
+		// 回查无人应答、maxChecks 耗尽丢弃），是假成功。必须报 ErrNotLeader
+		// 让 SDK 重试到 meta leader 决断。rpc EndTransaction handler 把该
+		// 错误映射为 HA_NOT_AVAILABLE。
+		//
+		// 读之后还要复核「门仍开且 epoch 仍是过门时那个」（卡 SQ1 修订
+		// R1.1）：过门与读之间本节点可能失主又以更高任期复任、apply 滞后
+		// （期间他人已 Stage 的事务尚未 apply 到本节点）。同一任期号内不可
+		// 能失主后复任，epoch 相等即读的整个期间领导权连续、FSM 权威。
+		if !gated {
+			return false, fmt.Errorf("%w: 非（已追平的）meta leader 本地读不可决断 (tx=%s)",
 				replication.ErrNotLeader, txID)
+		}
+		if cur, ok := t.rt.WritableEpoch(metaG); !ok || cur != gateEpoch {
+			t.logger.Warn("事务决断期间 meta 换届，读不到 halfidx 不判幂等成功",
+				"tx_id", txID, "gate_epoch", gateEpoch, "cur_epoch", cur, "writable", ok)
+			return false, fmt.Errorf("%w: 读 halfidx 期间 meta 可写 epoch 由 %d 变为 %d（可写=%v）(tx=%s)",
+				replication.ErrNotLeader, gateEpoch, cur, ok, txID)
 		}
 		return false, nil
 	}

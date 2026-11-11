@@ -27,6 +27,15 @@ func (r fixedLeaderRouter) MetaGroup() uint32                         { return 0
 func (r fixedLeaderRouter) IsLeader(uint32) bool                      { return r.leader }
 func (r fixedLeaderRouter) ReadBarrier(context.Context, uint32) error { return nil }
 
+func (r fixedLeaderRouter) WaitWritable(context.Context, uint32) (uint64, error) {
+	if r.leader {
+		return 0, nil
+	}
+	return 0, replication.ErrNotLeader
+}
+
+func (r fixedLeaderRouter) WritableEpoch(uint32) (uint64, bool) { return 0, r.leader }
+
 // flipRouter 可在测试中翻转 IsLeader 的 Router（Run 门控测试用）。
 type flipRouter struct{ leader atomic.Bool }
 
@@ -34,6 +43,15 @@ func (r *flipRouter) GroupForQueue(string, uint32) uint32       { return 0 }
 func (r *flipRouter) MetaGroup() uint32                         { return 0 }
 func (r *flipRouter) IsLeader(uint32) bool                      { return r.leader.Load() }
 func (r *flipRouter) ReadBarrier(context.Context, uint32) error { return nil }
+
+func (r *flipRouter) WaitWritable(context.Context, uint32) (uint64, error) {
+	if r.leader.Load() {
+		return 0, nil
+	}
+	return 0, replication.ErrNotLeader
+}
+
+func (r *flipRouter) WritableEpoch(uint32) (uint64, bool) { return 0, r.leader.Load() }
 
 type fixture struct {
 	st *store.Store

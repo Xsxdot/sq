@@ -178,6 +178,10 @@ type Options struct {
 	// ReadBarrierTimeout 单轮 read-index 的时间预算（0 = 默认 3s）。
 	ReadBarrierTimeout time.Duration
 
+	// WritableWaitTimeout 是 WaitWritable 单次等待可写门的上限（0 = 默认
+	// 3s，见 writegate.go defaultWritableWait）。测试调小以缩短超时路径。
+	WritableWaitTimeout time.Duration
+
 	// BootGen 是机器世代的读取函数（测试注入点，nil 走平台实现）。
 	// 世代用于判断「本地日志在上次不干净关机后是否仍然完整」——见
 	// recovery.go 的判定表与 bootgen.go 的机制说明。
@@ -257,6 +261,9 @@ type Manager struct {
 	// readBarrierTimeout 来自 Options.ReadBarrierTimeout（0 = 保留组默认
 	// 3s）：buildGroup 造组时覆盖每组的单轮 read-index 预算。
 	readBarrierTimeout time.Duration
+	// writableWait 来自 Options.WritableWaitTimeout（0 = 保留组默认 3s）：
+	// buildGroup 造组时覆盖每组的可写门等待上限。
+	writableWait time.Duration
 }
 
 // defaultRetainEntries 是 Options.RetainEntries 的默认值（0 即默认）：
@@ -342,6 +349,7 @@ func NewManager(o Options) (*Manager, error) {
 		doneCh:                 make(chan struct{}),
 		readBarrier:            o.ReadBarrier,
 		readBarrierTimeout:     o.ReadBarrierTimeout,
+		writableWait:           o.WritableWaitTimeout,
 	}
 	m.rs = newRaftStore(o.Store, lg)
 	// 快照注册表：每个 Manager 一份，全组共享（Task 4）。TTL 由配置面
@@ -764,6 +772,10 @@ func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, e
 	// 读屏障每轮的时间预算：装配方经 Options 覆盖（0 保留 newGroup 的默认）
 	if m.readBarrierTimeout > 0 {
 		gr.barrierTimeout = m.readBarrierTimeout
+	}
+	// 可写门等待上限：同上（0 保留 newGroup 的默认）
+	if m.writableWait > 0 {
+		gr.writableWait = m.writableWait
 	}
 	return gr, nil
 }
@@ -1650,6 +1662,24 @@ func (m *Manager) ProposeReservedAsync(ctx context.Context, g uint32, data []byt
 	return gr.enqueueProposal(ctx, data, false)
 }
 
+// ProposeReservedAsyncAt 同 ProposeReservedAsync，但提案的任期绑定为调用
+// 方给定的 epoch（卡 SQ1 计划修订 R1）：调用方用 WaitWritable 返回的 epoch
+// 读计数器构造批次，必须保证该批次只进同一任期的日志。
+//
+// 参数：
+//   - ctx/g/data: 同 ProposeReservedAsync
+//   - epoch: 调用方过可写门时拿到的 epoch
+//
+// 返回：等待句柄，恒非 nil。入队时本节点非 leader 或当前任期 != epoch、
+// 出队时任期已变，均经 Wait 报 ErrNotLeader；其余同 ProposeReservedAsync。
+func (m *Manager) ProposeReservedAsyncAt(ctx context.Context, g uint32, data []byte, epoch uint64) *ProposalPending {
+	gr, ok := m.groups[g]
+	if !ok {
+		return failedPending(fmt.Errorf("cluster: 未知数据组 %d（有效范围 [0, %d]）", g, m.Groups()-1))
+	}
+	return gr.enqueueProposalAt(ctx, data, epoch)
+}
+
 // IsLeader 返回本节点当前是否为指定组的 leader。
 func (m *Manager) IsLeader(g uint32) bool {
 	gr, ok := m.groups[g]
@@ -1681,6 +1711,44 @@ func (m *Manager) ReadBarrier(ctx context.Context, g uint32) error {
 		return fmt.Errorf("%w: 组 %d 不存在于本节点", ErrNotLeader, g)
 	}
 	return gr.readBarrier(ctx)
+}
+
+// WaitWritable 等本节点在 g 组上可做 leader-only 构造（可写门打开，见
+// writegate.go）：本节点是 leader，且 apply 已越过本任期首条——此后本地
+// FSM 包含全部已提交条目，读计数器分配 offset/seq 不会与已确认写重叠。
+//
+// 参数：
+//   - ctx: 调用方等待预算；实际上限 = min(ctx, Options.WritableWaitTimeout)
+//   - g: 组号
+//
+// 返回：
+//   - (epoch, nil)：门开，epoch = 当前任期号。调用方的计数器缓存须与
+//     epoch 绑定——epoch 变了即从盘重读（换届期间他人可能写过）
+//   - ErrNotLeader 包装：非 leader / 等待中失去领导权（立即返回）、等待
+//     超时、组已停止、组不存在（可重试错误，rpc 映射 HA_NOT_AVAILABLE）
+//
+// 注意：稳态 leader 走无锁快路径（几次原子读）；不得持锁调用。
+func (m *Manager) WaitWritable(ctx context.Context, g uint32) (uint64, error) {
+	gr, ok := m.groups[g]
+	if !ok {
+		m.lg.Warn("可写门请求了不存在的组", "g", g)
+		return 0, fmt.Errorf("%w: 组 %d 不存在于本节点", ErrNotLeader, g)
+	}
+	return gr.waitWritable(ctx)
+}
+
+// WritableEpoch 非阻塞查询 g 组可写门的当前状态：门开时返回 (epoch, true)，
+// 否则 (0, false)（非 leader / 换届中 / apply 未追平本任期首条 / 组不存在）。
+//
+// 用途：调用方过门（WaitWritable）拿到 epoch 后做了一段读判定，判定结论要
+// 落成写或回执之前核对「门仍开且 epoch 未变」——同一任期号内本节点不可能
+// 失主后复任，epoch 相等即判定期间领导权连续、本地 FSM 一直权威。
+func (m *Manager) WritableEpoch(g uint32) (uint64, bool) {
+	gr, ok := m.groups[g]
+	if !ok {
+		return 0, false
+	}
+	return gr.writable()
 }
 
 // Leader 返回指定组当前 leader 的节点 ID；尚未选举完成时 ok=false。

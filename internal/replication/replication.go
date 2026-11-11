@@ -182,6 +182,11 @@ type Replicator interface {
 	// Cluster: 入所属组保序提案队列即返回（返回即在同组内定序：返回先于
 	// 同组另一调用发起者先进日志），Wait 阻塞到本节点 apply（quorum+本地）完成。
 	ApplyAsync(ctx context.Context, group uint32, b *store.Batch) (Pending, error)
+	// ApplyAsyncAt 同 ApplyAsync，但提案只允许进 epoch 所属任期的日志（卡
+	// SQ1 计划修订 R1）：epoch 取自 Router.WaitWritable，调用方据它读计数器
+	// 构造批次。Cluster: 入队时或出队时本节点任期 != epoch 即经 Wait 报
+	// ErrNotLeader，绝不提案。Standalone: 无换届，忽略 epoch，同 ApplyAsync。
+	ApplyAsyncAt(ctx context.Context, group uint32, b *store.Batch, epoch uint64) (Pending, error)
 }
 
 // Router 组路由视图。单机实现恒返回 0；集群实现转发 Manager。
@@ -193,6 +198,16 @@ type Router interface {
 	// 本次调用发起之前已被确认的全部写。单机后端恒 nil（无复制、无屏障
 	// 可言）；集群后端在读屏障关闭时同样恒 nil（零开销）。
 	ReadBarrier(ctx context.Context, g uint32) error
+	// WaitWritable 等本节点可在 g 组做 leader-only 构造（读计数器分配
+	// offset/seq、凭「读不到」判定后写）：本节点是 leader 且本地 FSM 已
+	// apply 越过本任期首条（卡 SQ1）。返回 epoch（任期号）——调用方的
+	// 计数器缓存须与之绑定，epoch 变了即从盘重读。失败为 ErrNotLeader
+	// 包装（可重试）。单机后端恒 (0, nil)。
+	WaitWritable(ctx context.Context, g uint32) (epoch uint64, err error)
+	// WritableEpoch 非阻塞查询可写门：门开返回 (epoch, true)，否则 (0, false)。
+	// 用于过门后的读判定在落成结论前复核「门仍开且 epoch 未变」（同一任期内
+	// 领导权连续）。单机后端恒 (0, true)。
+	WritableEpoch(g uint32) (epoch uint64, ok bool)
 }
 
 // Forwarder 跨节点转发原语（仅 Cluster 后端实现；Standalone 上调用属编程错误，panic）。
@@ -266,6 +281,12 @@ func (r *Standalone) ApplyAsync(_ context.Context, _ uint32, b *store.Batch) (Pe
 	return pending{p: p}, err
 }
 
+// ApplyAsyncAt 单机档无换届（WaitWritable 恒返回 epoch 0），忽略 epoch，
+// 同 ApplyAsync。
+func (r *Standalone) ApplyAsyncAt(ctx context.Context, g uint32, b *store.Batch, _ uint64) (Pending, error) {
+	return r.ApplyAsync(ctx, g, b)
+}
+
 // pending 把 store.Pending（值类型，热路径零额外分配）包装为 Pending
 // 接口。接口化会让 Pending 逃逸到堆，但 ApplyAsync 的热路径收益
 // （fsync 等待挪出锁外）远大于这一次小分配，单机档直通语义不受影响。
@@ -292,6 +313,12 @@ func (StandaloneRouter) IsLeader(uint32) bool { return true }
 
 // ReadBarrier 单机档没有复制，本地读天然线性一致，恒放行。
 func (StandaloneRouter) ReadBarrier(context.Context, uint32) error { return nil }
+
+// WaitWritable 单机档无换届，本地 FSM 恒为权威，恒立即放行（epoch 恒 0）。
+func (StandaloneRouter) WaitWritable(context.Context, uint32) (uint64, error) { return 0, nil }
+
+// WritableEpoch 单机档恒可写（epoch 恒 0）。
+func (StandaloneRouter) WritableEpoch(uint32) (uint64, bool) { return 0, true }
 
 // Cluster 集群后端：Apply/ApplyAsync 经 Manager 提进所属组的保序提案队列；兼作 Router（转
 // Manager）与 Forwarder（经控制通道跨节点转发）。
@@ -357,6 +384,16 @@ func (r *Cluster) ApplyAsync(ctx context.Context, group uint32, b *store.Batch) 
 	return r.m.ProposeReservedAsync(ctx, group, data), nil
 }
 
+// ApplyAsyncAt 同 ApplyAsync，但经 ProposeReservedAsyncAt 按 epoch 绑定
+// 任期（见 Replicator.ApplyAsyncAt）。
+func (r *Cluster) ApplyAsyncAt(ctx context.Context, group uint32, b *store.Batch, epoch uint64) (Pending, error) {
+	data := reserveProposal(b.Repr())
+	if err := b.Close(); err != nil {
+		r.l.Warn("复制前回收批次失败（字节已取出，不阻断提案）", "group", group, "err", err)
+	}
+	return r.m.ProposeReservedAsyncAt(ctx, group, data, epoch), nil
+}
+
 // GroupForQueue 转 Manager 的队列→组映射（入盘契约，见 Manager 注释）。
 func (r *Cluster) GroupForQueue(topic string, queueID uint32) uint32 {
 	return r.m.GroupForQueue(topic, queueID)
@@ -372,6 +409,14 @@ func (r *Cluster) IsLeader(g uint32) bool { return r.m.IsLeader(g) }
 func (r *Cluster) ReadBarrier(ctx context.Context, g uint32) error {
 	return r.m.ReadBarrier(ctx, g)
 }
+
+// WaitWritable 转发 Manager.WaitWritable（可写门，见 cluster/writegate.go）。
+func (r *Cluster) WaitWritable(ctx context.Context, g uint32) (uint64, error) {
+	return r.m.WaitWritable(ctx, g)
+}
+
+// WritableEpoch 转发 Manager.WritableEpoch（非阻塞）。
+func (r *Cluster) WritableEpoch(g uint32) (uint64, bool) { return r.m.WritableEpoch(g) }
 
 // ForwardAppend 把一条已编码逻辑消息（core.EncodeMessage 字节）交给 g
 // 组 leader 的 produce 栈追加——offset 分配发生在 leader 侧，

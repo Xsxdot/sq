@@ -209,8 +209,9 @@ func TestLeaderSpreadConverges(t *testing.T) {
 // TestLeaderChangeFiresExactlyOncePerGroup 钩子时序断言：摊布收敛后每个
 // 组的现任 leader 恰好收到一次 isSelf=true（获得 leadership 时触发一次，
 // 不多不漏），其余节点至多一次（初始选举赢家若被摊布转走也触发过）。
-// 这是 Task 11 InvalidateCounters 接线（isSelf==true 时失效计数器）的
-// 时机前提：多次触发会让计数器被无谓失效。
+// OnLeaderChange 是通用装配钩子（契约：每次获得 leadership 恰好一次）。
+// 注意它不是 leader-only 构造的屏障——produce 计数器曾挂在这里失效，
+// 卡 SQ1 起改由可写门 epoch（writegate.go）承担，本钩子不再承载该职责。
 func TestLeaderChangeFiresExactlyOncePerGroup(t *testing.T) {
 	// 注入占位钩子启用收集器（newTestClusterOpts 见 harness 注释）
 	tc := newTestClusterOpts(t, AckQuorumMem, Options{OnLeaderChange: func(g uint32, leader uint64, isSelf bool) {}})
