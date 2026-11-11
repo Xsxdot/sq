@@ -11,6 +11,7 @@
 package seglog
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -27,8 +28,10 @@ import (
 
 // Log 一组的分段追加日志。并发安全：Append（组 run goroutine）、
 // Sync（flusher goroutine）、TruncateTo（截断 goroutine，Task 4）来自不同
-// goroutine，内部单互斥串行化——三者频率都低（每轮 Ready / 200ms /
-// 30s），锁竞争可忽略。
+// goroutine，内部单互斥保护全部字段。Append/TruncateTo/Close 全程持锁；
+// Sync 只在锁内取活动段句柄，落盘系统调用在锁外执行——否则每 200ms 一次
+// 的刷盘会让组 raft 主循环（内联 Append）停顿一次刷盘时长。锁外落盘与
+// 轮转/Close 的并发正确性见 Sync 注释。
 type Log struct {
 	mu        sync.Mutex
 	dir       string
@@ -60,6 +63,11 @@ type Log struct {
 	// 读不回来。非 Linux 平台、以及 fallocate 返回 ENOTSUP 的文件系统上
 	// 恒为 false，落盘全程走完整 fsync，行为与本特性落地之前一致。
 	prealloc bool
+	// syncHook 测试专用注入钩子（生产恒为 nil）：Sync 释放 l.mu 之后、
+	// 发起落盘系统调用之前调用一次，让同包测试把 Sync 停在「已取句柄、
+	// 未落盘」这一点，确定性地制造与 Append/轮转/Close 的并发交错。
+	// 不导出、无生产分支逻辑；先例见 deliver.afterAppendHook。
+	syncHook func()
 }
 
 // SegMaxBytes 单段字节数上限，Append 后据此判定是否轮转到下一段。
@@ -621,24 +629,71 @@ func (l *Log) preallocActive() error {
 // 注意：轮转屏障那次落盘**不能**走本方法——它紧跟在 Truncate 之后，
 // 那一刻文件大小刚变，必须完整 fsync（见 maybeRotate）。
 func (l *Log) syncActive() error {
-	if l.prealloc {
-		return datasync(l.active)
+	return syncSegment(l.active, l.activeSeq, l.prealloc)
+}
+
+// syncSegment 把给定段句柄落盘，不碰 Log 的任何字段，可在锁外调用。
+//
+// 参数：
+//   - f: 段文件句柄
+//   - seq: 段号，仅用于错误信息
+//   - prealloc: 该段是否已预分配；true 走 datasync，false 走完整 fsync
+//
+// 返回：句柄已被关闭时错误满足 errors.Is(err, os.ErrClosed)（两条路径
+// 统一），调用方据此区分「被并发关闭」与真 I/O 错误；其余错误原样包装上抛。
+func syncSegment(f *os.File, seq uint64, prealloc bool) error {
+	if prealloc {
+		return datasync(f)
 	}
-	if err := l.active.Sync(); err != nil {
-		return fmt.Errorf("seglog: fsync 活动段 %s 失败: %w", segName(l.activeSeq), err)
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("seglog: fsync 活动段 %s 失败: %w", segName(seq), err)
 	}
 	return nil
 }
 
 // Sync 刷活动段到盘（mem 档 200ms flusher 的批量刷盘入口）。
+//
+// 覆盖语义：返回 nil 即本次调用之前的全部写入已落盘。
+//
+// 锁内只取「活动段句柄 + 段号 + prealloc 标志」，落盘系统调用在锁外执行，
+// 期间 Append（组 raft 主循环内联调用）不被阻塞。调用前的写入都落在取到
+// 的这一段内（越过段长的写入会在同一次 Append 里轮转），故对该句柄落盘
+// 即覆盖它们；锁外期间新到的写入不在本次覆盖范围内。
+//
+// 句柄在落盘前被并发关闭时回锁复核：
+//   - activeSeq 已前进 = 被轮转关闭：轮转屏障已对旧段 Truncate+完整
+//     fsync，覆盖本次调用前的全部写入，返回 nil；
+//   - 仍是同一段 = 被 Close（或轮转中途失败）关闭：Close 不刷盘，不能
+//     冒称已覆盖，返回「已关闭」错误。
+//
+// 真 I/O 错误（EIO 等）一律原样上抛，绝不吞。
 func (l *Log) Sync() error {
 	l.mu.Lock()
-	defer l.mu.Unlock()
-
 	if l.active == nil {
+		l.mu.Unlock()
 		return fmt.Errorf("seglog: 已关闭，拒绝 Sync")
 	}
-	return l.syncActive()
+	f, seq, prealloc := l.active, l.activeSeq, l.prealloc
+	l.mu.Unlock()
+
+	if l.syncHook != nil {
+		l.syncHook()
+	}
+
+	err := syncSegment(f, seq, prealloc)
+	if err == nil || !errors.Is(err, os.ErrClosed) {
+		return err
+	}
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.activeSeq != seq {
+		// 低频（只在刷盘与轮转撞车时出现），Debug 留痕便于追查交错
+		l.lg.Debug("seglog: Sync 句柄被轮转关闭，由轮转屏障覆盖",
+			"dir", l.dir, "segment", segName(seq), "activeSegment", l.activeSeq)
+		return nil
+	}
+	return fmt.Errorf("seglog: 刷盘期间日志已关闭（段 %s），本次 Sync 未落盘: %w", segName(seq), err)
 }
 
 // Close 关闭活动段句柄。之后任何 Append/Sync 返回错误。

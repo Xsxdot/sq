@@ -53,9 +53,26 @@ func preallocate(f *os.File, size int64) (bool, error) {
 //
 // 前提（调用方负责）：文件已预分配，本次写入不改变文件大小。否则「文件
 // 长了」这件事可能不落盘，掉电后已写入的尾部字节读不回来。
+//
+// 可在不持 Log 锁时调用（Log.Sync 锁外落盘）：经 RawConn.Control 执行
+// fdatasync，回调期间运行时持有 fd 引用，并发 Close 的 close(2) 被推迟到
+// 回调返回之后，fdatasync 必然作用在有效 fd 上；绝不能用 f.Fd() 取裸 fd
+// ——它不持引用，并发 Close 后会撞 EBADF，甚至 fd 号被复用到别的文件。
+//
+// 返回：f 在调用前已被关闭时，错误满足 errors.Is(err, os.ErrClosed)
+// （Control 的返回值只反映 fd 状态，系统调用错误经闭包变量单独带出，
+// 两者不混淆）；fdatasync 本身的错误原样包装上抛。
 func datasync(f *os.File) error {
-	if err := unix.Fdatasync(int(f.Fd())); err != nil {
-		return fmt.Errorf("seglog: fdatasync %s 失败: %w", f.Name(), err)
+	rc, err := f.SyscallConn()
+	if err != nil {
+		return fmt.Errorf("seglog: fdatasync %s 取 RawConn 失败: %w", f.Name(), err)
+	}
+	var serr error
+	if cerr := rc.Control(func(fd uintptr) { serr = unix.Fdatasync(int(fd)) }); cerr != nil {
+		return fmt.Errorf("seglog: fdatasync %s 失败，文件已关闭: %w: %w", f.Name(), os.ErrClosed, cerr)
+	}
+	if serr != nil {
+		return fmt.Errorf("seglog: fdatasync %s 失败: %w", f.Name(), serr)
 	}
 	return nil
 }
