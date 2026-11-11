@@ -38,6 +38,12 @@ const logRetainEntries = 200
 // logRetainProducers 并发发送协程数（每协程按 produceThrottle 节流）。
 const logRetainProducers = 4
 
+// logRetainBody 消息体字节数：让每组停机期间的日志量（数千条 × 8KiB ≈
+// 数十 MiB）超过按字节下界（64MiB / 4 组 = 16MiB）——否则字节下界一条
+// 就把整段日志全留住，「死 peer 宽限期」是否生效用例分辨不出来
+// （宽限判定改成「判死即放弃」的变异在默认 1GiB 下实测仍绿）。
+const logRetainBody = 8 << 10
+
 // TestScenarioFollowerDownCatchesUpByLog S1：停一个「至少领导一个数据组、
 // 且在至少一个数据组是 follower」的节点，持续写入 SQ_E2E_DOWN（缺省 2m）
 // 后重启，判据：
@@ -62,6 +68,12 @@ func TestScenarioFollowerDownCatchesUpByLog(t *testing.T) {
 	pc := startProcCluster(t, 3, func(c *config.Config) {
 		c.Cluster.LogRetainEntries = logRetainEntries
 		c.Cluster.TruncateInterval = 5 * time.Second
+		// 字节下界取允许的最小值（见 logRetainBody）。基线二进制不认识这个
+		// 键（严格解析拒启），跑基线对照（plan E0）时设
+		// SQ_E2E_NO_RETAIN_BYTES=1 不写它——基线本无按字节保留，行为不变
+		if os.Getenv("SQ_E2E_NO_RETAIN_BYTES") == "" {
+			c.Cluster.LogRetainBytes = "64MiB"
+		}
 	})
 	const topic, group = "scn-logretain", "scn-logretain-g"
 	ensureTopic(t, pc.endpoints(), topic)
@@ -151,7 +163,7 @@ func TestScenarioFollowerDownCatchesUpByLog(t *testing.T) {
 	cold := 0
 	var coldSample string
 	for i := range pc.handles {
-		n, s := grepSince(t, pc.handles[i].logPath, stopOffsets[i], "冷读：")
+		n, s := grepColdReads(t, pc.handles[i].logPath, stopOffsets[i])
 		cold += n
 		if coldSample == "" {
 			coldSample = s
@@ -299,6 +311,29 @@ func grepSince(t *testing.T, path string, off int64, needle string) (int, string
 	return n, first
 }
 
+// grepColdReads 统计 off 之后「真有冷读」的冷读 Info 行（reads>0；只有
+// errors 的行是冷读失败，不算条目经磁盘日志发出）。
+func grepColdReads(t *testing.T, path string, off int64) (int, string) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("读日志 %s: %v", path, err)
+	}
+	if off > int64(len(raw)) {
+		off = int64(len(raw))
+	}
+	n, first := 0, ""
+	for _, line := range strings.Split(string(raw[off:]), "\n") {
+		if strings.Contains(line, "冷读：") && !strings.Contains(line, `"reads":0,`) {
+			n++
+			if first == "" {
+				first = line
+			}
+		}
+	}
+	return n, first
+}
+
 // latencyRec 记录 Send 成功的耗时，按窗口取 p99。
 type latencyRec struct {
 	mu sync.Mutex
@@ -331,7 +366,9 @@ func produceTimed(p rmq.Producer, topic string, cs *confirmedSet, lat *latencyRe
 		}
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 		start := time.Now()
-		recs, err := p.Send(ctx, &rmq.Message{Topic: topic, Body: []byte(fmt.Sprintf("logretain #%d", i))})
+		body := make([]byte, logRetainBody)
+		copy(body, fmt.Sprintf("logretain #%d", i))
+		recs, err := p.Send(ctx, &rmq.Message{Topic: topic, Body: body})
 		cancel()
 		if err == nil && len(recs) > 0 {
 			lat.add(time.Since(start))
