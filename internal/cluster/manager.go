@@ -77,6 +77,10 @@ type Options struct {
 	Store      *store.Store
 	Logger     *slog.Logger
 
+	// StoreOptions 是 Rejoin 第 5 步重开 store 时用的 Pebble 调优参数
+	// （SQ4.5）。零值 = store 缺省；不传会让重入后的节点静默退回缺省参数。
+	StoreOptions store.Options
+
 	// OnLeaderChange/OnApplied 是全组共享的装配钩子（batch③，均可为
 	// nil）：在组 Ready 循环内同步触发——钩子不得阻塞（阻塞即卡死该组
 	// 全部 tick/消息/apply 处理），重活自行 dispatch 到独立 goroutine；
@@ -2271,7 +2275,7 @@ func Rejoin(ctx context.Context, o Options, dataDir string) (*Manager, error) {
 	lg.Info("重入编排: 第 4 步 监听重建完成", "node", o.NodeID, "addr", bind, "duration", time.Since(start).Round(time.Millisecond))
 
 	// 第 5 步：新 store + NewManager fresh 路径启动 + Start
-	st, err := store.Open(dataDir, false, lg)
+	st, err := store.OpenWithOptions(dataDir, false, lg, o.StoreOptions)
 	if err != nil {
 		ln.Close()
 		return nil, fmt.Errorf("cluster: 重入编排重开 store: %w", err)

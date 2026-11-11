@@ -54,7 +54,9 @@ func runRecover(args []string) error {
 
 	// Pebble 独占锁天然把「服务运行中误签」这条路堵死：broker 还在跑时
 	// Open 必然失败。这是白送的一道互斥，只需把提示写清楚。
-	st, err := store.Open(cfg.DataDir, cfg.Fsync == "sync", logger)
+	// 与运行期同一组调优参数打开：离线恢复与 broker 读同一份数据，参数一致
+	// 才不会出现「恢复时正常、运行时 OOM」一类的偏差。
+	st, err := store.OpenWithOptions(cfg.DataDir, cfg.Fsync == "sync", logger, storeOptions(cfg))
 	if err != nil {
 		return fmt.Errorf("打开数据目录 %s 失败（若本节点 broker 仍在运行，请先停止它再执行本命令）: %w", cfg.DataDir, err)
 	}

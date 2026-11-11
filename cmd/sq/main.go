@@ -146,7 +146,7 @@ func run() error {
 	// 「已启动」日志在 recover 子命令与启动期失败时不会出现。
 	logger.Info("消息编码档位已装配", "message_encoding", cfg.MessageEncoding)
 
-	st, err := store.Open(cfg.DataDir, cfg.Fsync == "sync", logger)
+	st, err := store.OpenWithOptions(cfg.DataDir, cfg.Fsync == "sync", logger, storeOptions(cfg))
 	if err != nil {
 		return err
 	}
@@ -301,6 +301,7 @@ func run() error {
 			SnapshotViewTTL:        cc.SnapshotViewTTL,
 			ReadBarrier:            cc.ReadBarrier,
 			ReadBarrierTimeout:     cc.ReadBarrierTimeout,
+			StoreOptions:           storeOptions(cfg), // Rejoin 重开 store 时沿用同一组调优参数
 			OnApplied:              onApplied,
 			OnLeaderChange:         onLeaderChange,
 			ControlHandler:         controlHandler,
@@ -746,5 +747,16 @@ func gracefulStop(gs *grpc.Server, logger *slog.Logger) {
 			"timeout", gracefulStopTimeout, "reason", "存在没有自然终点的长流（如 Telemetry）或长轮询未结束")
 		gs.Stop()
 		<-done // Stop 会让上面阻塞中的 GracefulStop 返回，这里等它真正收尾
+	}
+}
+
+// storeOptions 把 config 的 storage 段映射为 store.Options（装配点职责：
+// config 不依赖 store，映射只在这里做一次）。未填写的键为 0，由 store
+// 解析成它的缺省值——这里不写任何缺省数字。
+func storeOptions(cfg *config.Config) store.Options {
+	return store.Options{
+		CacheSize:             cfg.StorageCacheBytes(),
+		MemTableSize:          cfg.StorageMemTableBytes(),
+		CompactionConcurrency: cfg.StorageCompactionConcurrency(),
 	}
 }
