@@ -100,7 +100,7 @@ type proposalQueue struct {
 	items  []*ProposalPending
 	closed bool   // proposer 已退出：此后入队立即失败
 	seq    uint64 // 入队序号（单调递增），作废范围的上界依据
-	warned bool // 已为本次越过阈值记过 Warn
+	warned bool   // 已为本次越过阈值记过 Warn
 	// signal 容量 1：入队后非阻塞投递一次唤醒，proposer 醒来一次取走全部
 	signal chan struct{}
 }
