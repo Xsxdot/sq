@@ -12,6 +12,7 @@ import (
 	"github.com/Xsxdot/sq/internal/core/deliver"
 	"github.com/Xsxdot/sq/internal/core/meta"
 	"github.com/Xsxdot/sq/internal/core/produce"
+	"github.com/Xsxdot/sq/internal/core/query"
 	"github.com/Xsxdot/sq/internal/replication"
 	"github.com/Xsxdot/sq/internal/store"
 )
@@ -175,5 +176,61 @@ func TestRunStopsOnCancel(t *testing.T) {
 	case <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run 未响应取消")
+	}
+}
+
+// countPrefix 统计前缀下的键数（索引存在性断言用）。
+func countPrefix(t *testing.T, st *store.Store, pfx []byte) int {
+	t.Helper()
+	n := 0
+	if err := st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) { n++; return true, nil }); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// TestPurgeDeletesKeyIndexSameBatch S1：经真实 produce.Append 写入带 key 的消息，
+// 保留期缩短后一趟 Pass 同时删掉消息与其全部索引；对照 topic 原样保留。
+func TestPurgeDeletesKeyIndexSameBatch(t *testing.T) {
+	st, mt, rep, rt := newFixtureRouted(t)
+	ctx := context.Background()
+	pr := produce.New(rep, rt, st, mt, slog.Default())
+	write := func(topic string, keys ...string) {
+		t.Helper()
+		if _, err := pr.Append(ctx, &core.Message{Topic: topic, Body: []byte("x"), Keys: keys}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	write("t", "oid")
+	write("t", "oid", "oid") // 同一消息内重复 key
+	write("t", "a/b", "oid") // 含 '/' 的 key
+	write("t", "solo")
+	write("keep", "oid", "a/b") // 对照 topic：默认保留期
+	if _, err := mt.UpdateTopicRetention(ctx, "t", 1); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(10 * time.Millisecond)
+
+	m := New(rep, rt, st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default())
+	n, _, err := m.Pass(ctx)
+	if err != nil || n != 4 {
+		t.Fatalf("Pass: purged=%d err=%v; want 4", n, err)
+	}
+	for _, k := range []string{"oid", "a/b", "solo"} {
+		got, err := query.ByKey(st, "t", k, 0)
+		if err != nil || len(got) != 0 {
+			t.Fatalf("ByKey(t,%q) = %d 条 %v; want 0", k, len(got), err)
+		}
+	}
+	if c := countPrefix(t, st, store.KeyIdxTopicPrefix("t")); c != 0 {
+		t.Fatalf("topic t 索引残留 %d 条; want 0", c)
+	}
+	if c := countPrefix(t, st, store.KeyIdxTopicPrefix("keep")); c != 2 {
+		t.Fatalf("对照 topic keep 索引 %d 条; want 2", c)
+	}
+	for _, k := range []string{"oid", "a/b"} {
+		if got, err := query.ByKey(st, "keep", k, 0); err != nil || len(got) != 1 {
+			t.Fatalf("ByKey(keep,%q) = %d 条 %v; want 1", k, len(got), err)
+		}
 	}
 }
