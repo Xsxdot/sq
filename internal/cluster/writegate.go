@@ -14,8 +14,9 @@
 //  3. applied ≥ termStart：条目按 index 顺序 apply，termStart 之前的全部
 //     条目（含上任期已提交的尾部）都已进 FSM。
 //
-// 门带 epoch（= 当前任期号，取自 leaderTerm 同源的 epoch 快照）：调用方据此
-// 判断计数器缓存是否属于本任期（任期变了缓存必须从盘重读）。
+// 门带 epoch（= 当前任期号，经 SQ2 提供的 leaderTerm() 读取，且必须与
+// 提案任期绑定所用的 epoch 快照一致——不一致说明换届切换进行中，门关）：
+// 调用方据此判断计数器缓存是否属于本任期（任期变了缓存必须从盘重读）。
 //
 // 识别规则用「Term == 当前任期」而非「Term 变大」：合并 Ready 里可能先
 // 出现他人旧任期条目，不能误认。即便取到的不是首条而是本任期后续某条，
@@ -55,11 +56,17 @@ func (gr *group) writable() (uint64, bool) {
 	if !es.isSelf || gr.lead.Load() != gr.selfID {
 		return 0, false
 	}
-	gs := gr.gate.Load()
-	if gs.term != es.term || gs.termStart == 0 || gr.applied.Load() < gs.termStart {
+	// 任期只经 leaderTerm() 读（与提案入队绑定同源）；与 epoch 快照不一致
+	// = Ready 循环正在切换任期，门关
+	term := gr.leaderTerm()
+	if es.term != term {
 		return 0, false
 	}
-	return es.term, true
+	gs := gr.gate.Load()
+	if gs.term != term || gs.termStart == 0 || gr.applied.Load() < gs.termStart {
+		return 0, false
+	}
+	return term, true
 }
 
 // observeTermStart 在 dispatchReady 处理完 SoftState 之后调用（Ready 循环
@@ -87,6 +94,9 @@ func (gr *group) observeTermStart(rd *raft.Ready) {
 	}
 	if cur.term == es.term && cur.termStart != 0 {
 		return // 本任期首条已识别，门由 applied 推进决定
+	}
+	if es.term != gr.leaderTerm() {
+		return // 任期切换进行中（快照与观察任期不一致），下一轮再识别
 	}
 	for _, m := range rd.Messages {
 		if m.GetTo() != raft.LocalAppendThread {

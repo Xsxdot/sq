@@ -5,6 +5,9 @@
 //   - U2 门的开/关/超时：新 leader apply 被卡住时等待超时返回 ErrNotLeader；
 //     等待中失去领导权立即返回 ErrNotLeader（不等到超时）；放开 apply 后
 //     返回当前任期且 applied ≥ termStart。
+//   - U4 门的 epoch 即 raft 当前任期：当选后门打开时 WaitWritable 返回的
+//     epoch 等于该组 rn.Status().Term，跨换届严格递增（守住 SQ2 leaderTerm()
+//     的语义——它是 epoch 的唯一读取入口）。
 package cluster
 
 import (
@@ -93,7 +96,7 @@ func TestWriteGateTermStartIdentified(t *testing.T) {
 // gateApplyBlock 挂在 OnApplied 上的 apply 闸门：armed 后目标节点目标组的
 // 第一条非空条目进入钩子即阻塞，直到 release（与 produce 包 S1 同手法）。
 type gateApplyBlock struct {
-	node    uint64
+	node    atomic.Uint64 // 钩子在 apply 协程读，测试协程写
 	group   uint32
 	armed   atomic.Bool
 	blocked chan struct{}
@@ -103,7 +106,7 @@ type gateApplyBlock struct {
 }
 
 func (b *gateApplyBlock) hook(node uint64, g uint32, repr []byte) {
-	if node != b.node || g != b.group || len(repr) == 0 || !b.armed.Load() {
+	if node != b.node.Load() || g != b.group || len(repr) == 0 || !b.armed.Load() {
 		return
 	}
 	b.once.Do(func() { close(b.blocked) })
@@ -207,7 +210,7 @@ func TestWriteGateBlocksUntilApplyCatchesUp(t *testing.T) {
 	if F == L {
 		F = 2
 	}
-	blk.node = F
+	blk.node.Store(F)
 	write(L, "warm")
 	waitFor(t, 10*time.Second, func() bool { return mgrs[F].AppliedIndex(g) >= mgrs[L].AppliedIndex(g) }, "F 未追平预热")
 	blk.armed.Store(true)
@@ -305,4 +308,55 @@ func TestWriteGateBlocksUntilApplyCatchesUp(t *testing.T) {
 		t.Fatalf("C：放行时 applied=%d < termStart=%d", a, gs2.termStart)
 	}
 	t.Logf("C：放开后 %v 返回 epoch=%d（termStart=%d）", r.el.Round(time.Millisecond), r.epoch, gs2.termStart)
+}
+
+// TestWriteGateEpochEqualsRaftTerm U4：WaitWritable 返回的 epoch == 该组
+// raft 当前任期，跨两次换届。
+func TestWriteGateEpochEqualsRaftTerm(t *testing.T) {
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{LeaderBalancerInterval: time.Hour})
+	const g = uint32(2)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	lead := tc.leaderOf(t, g)
+	check := func(id uint64) uint64 {
+		t.Helper()
+		var epoch uint64
+		waitFor(t, 10*time.Second, func() bool {
+			e, err := tc.mgrs[id].WaitWritable(ctx, g)
+			if err != nil {
+				return false
+			}
+			epoch = e
+			return true
+		}, fmt.Sprintf("节点 %d 的可写门未打开", id))
+		st, _ := tc.mgrs[id].Status(g)
+		if epoch == 0 || epoch != st.GetTerm() {
+			t.Fatalf("节点 %d：WaitWritable epoch=%d，raft Status().Term=%d，应相等", id, epoch, st.GetTerm())
+		}
+		return epoch
+	}
+	prev := check(lead)
+	t.Logf("leader=%d epoch=%d", lead, prev)
+	other := uint64(1)
+	if other == lead {
+		other = 2
+	}
+	from := lead
+	for i, to := range []uint64{other, lead} {
+		waitFor(t, 20*time.Second, func() bool {
+			if tc.mgrs[to].IsLeader(g) {
+				return true
+			}
+			if cur, ok := tc.mgrs[from].Leader(g); ok {
+				tc.mgrs[cur].TransferLeader(g, to)
+			}
+			return false
+		}, fmt.Sprintf("第 %d 次换届：领导权未转到 %d", i+1, to))
+		e := check(to)
+		if e <= prev {
+			t.Fatalf("第 %d 次换届：epoch %d 未严格大于上一任 %d", i+1, e, prev)
+		}
+		t.Logf("第 %d 次换届：leader=%d epoch=%d", i+1, to, e)
+		prev, from = e, to
+	}
 }
