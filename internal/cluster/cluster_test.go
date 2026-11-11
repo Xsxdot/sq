@@ -1731,7 +1731,7 @@ func (h *snapHarness) healPartition(victim *Manager) {
 }
 
 // truncateNow 在组长节点上执行一次截断：直接委托生产 truncateOnce
-// （含 minMatch 逃生门——learner 排除、hardLagCap 绝对上限、
+// （含 minMatch 逃生门——learner 排除、死 peer 宽限期（SQ4.10）、
 // probePeerAlive 存活探测），不再手工重实现「SaveSnapMeta →
 // TruncateLog → mem.Compact」三步——快照用例验证的就是生产路径，
 // 手工复刻反而会绕过逃生门、制造生产根本不会发生的假场景。探测每
