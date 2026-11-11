@@ -32,6 +32,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -70,8 +71,15 @@ type Manager struct {
 	// 观测统计（日志与测试读取；Pass 与补扫分属两个 goroutine，故用原子量）。
 	// 本包内一切 keyidx 迭代都经 scanKeyIdx 并计入对应计数器——
 	// passIdxScanned 是「稳态清理扫描 keyidx 键数」，按设计恒为 0。
-	passIdxScanned atomic.Int64 // 最近一趟 Pass 扫描的 keyidx 键数
-	passIdxDeleted atomic.Int64 // 最近一趟 Pass 同批删除的索引条数
+	passIdxScanned     atomic.Int64 // 最近一趟 Pass 扫描的 keyidx 键数
+	passIdxDeleted     atomic.Int64 // 最近一趟 Pass 同批删除的索引条数
+	backfillScanned    atomic.Int64 // 补扫累计扫描的 keyidx 键数
+	backfillDeleted    atomic.Int64 // 补扫累计删除的孤儿索引条数
+	backfillDoneGroups atomic.Int64 // 已完成补扫的组数
+
+	// backfillDone 已完成补扫的组集合。只由补扫 goroutine（或同步调用
+	// backfillRound 的测试）访问，不加锁。
+	backfillDone map[uint32]bool
 }
 
 // New 构造清理任务。
@@ -87,7 +95,8 @@ func New(rep replication.Replicator, rt replication.Router, st *store.Store, mt 
 	interval time.Duration, dataDir string, watermarkPct int, writeBlocked *atomic.Bool,
 	logger *slog.Logger) *Manager {
 	return &Manager{rep: rep, rt: rt, st: st, mt: mt, interval: interval, dataDir: dataDir,
-		watermarkPct: watermarkPct, writeBlocked: writeBlocked, logger: logger.With("mod", "retention")}
+		watermarkPct: watermarkPct, writeBlocked: writeBlocked, logger: logger.With("mod", "retention"),
+		backfillDone: map[uint32]bool{}}
 }
 
 // Run 阻塞运行清理循环：启动即跑一趟，此后每 interval 一趟；ctx 取消即返回。
@@ -98,8 +107,15 @@ func New(rep replication.Replicator, rt replication.Router, st *store.Store, mt 
 // checkDisk 也无条件执行（本地磁盘水位是本节点的事实，与组 leadership
 // 无关，拒写保护不能等 leader 产生才生效）。Run 层只补「本趟 0 队列
 // 可处理」的 Debug 观测（见下方注释）。
+//
+// 补扫 goroutine 由 Run 拉起、受同一 ctx 约束，Run 返回前等它退出——调用方
+// 「取消 → 等 Run 返回 → 关 store」的停机顺序因此同样覆盖补扫。
 func (m *Manager) Run(ctx context.Context) {
 	m.logger.Info("retention 任务启动", "interval", m.interval.String())
+	var bfWG sync.WaitGroup
+	bfWG.Add(1)
+	go func() { defer bfWG.Done(); m.runBackfill(ctx) }()
+	defer bfWG.Wait()
 	t := time.NewTicker(m.interval)
 	defer t.Stop()
 	for {

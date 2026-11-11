@@ -375,3 +375,129 @@ func TestSteadyPassScansNoKeyIndex(t *testing.T) {
 		t.Fatalf("未过期索引 %d 条; want %d", c, fresh)
 	}
 }
+
+// writeIdx 直写一条索引（不写消息）。
+func writeIdx(t *testing.T, st *store.Store, topic, key string, storeAt int64, off uint64) []byte {
+	t.Helper()
+	k := store.KeyIdxKey(topic, key, storeAt, 0, off)
+	b := st.NewBatch()
+	b.Set(k, nil)
+	if err := st.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	return k
+}
+
+// TestBackfillRemovesOrphans S3：补扫删孤儿（过期且消息不在），保留过期但消息仍在
+// 与未过期的索引；完成后该组记入已完成集合，再跑一轮不再扫描。
+func TestBackfillRemovesOrphans(t *testing.T) {
+	st, mt, rep, rt := newFixtureRouted(t)
+	ctx := context.Background()
+	if _, err := mt.CreateTopic(ctx, "t", 1); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-4 * 24 * time.Hour).UnixMilli()
+	now := time.Now().UnixMilli()
+	var orphans [][]byte
+	for i := 0; i < 5; i++ { // (a) 孤儿：过期、无消息
+		orphans = append(orphans, writeIdx(t, st, "t", fmt.Sprintf("orphan-%d", i), old, uint64(100+i)))
+	}
+	writeMsgAt(t, st, "t", 0, old, "rewound") // (b) 过期但消息仍在（模拟时钟回跳）
+	writeMsgAt(t, st, "t", 1, now, "live")    // (c) 未过期、消息在
+
+	m := New(rep, rt, st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default())
+	if err := m.backfillRound(ctx); err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range orphans {
+		if _, ok, _ := st.Get(k); ok {
+			t.Fatalf("孤儿索引 %q 未删", k)
+		}
+	}
+	if _, ok, _ := st.Get(store.KeyIdxKey("t", "rewound", old, 0, 0)); !ok {
+		t.Fatal("过期但消息仍在的索引被误删")
+	}
+	if _, ok, _ := st.Get(store.KeyIdxKey("t", "live", now, 0, 1)); !ok {
+		t.Fatal("未过期索引被误删")
+	}
+	if got := m.backfillDeleted.Load(); got != 5 {
+		t.Fatalf("补扫删除 %d 条; want 5", got)
+	}
+	if !m.backfillDone[0] {
+		t.Fatal("补扫完成后组 0 未记入已完成集合")
+	}
+	scanned := m.backfillScanned.Load()
+	if scanned == 0 {
+		t.Fatal("补扫扫描计数为 0")
+	}
+	if err := m.backfillRound(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := m.backfillScanned.Load(); got != scanned {
+		t.Fatalf("已完成组再跑一轮仍扫描：%d → %d", scanned, got)
+	}
+}
+
+// TestBackfillSkipsWhenNotLeader I3：非 leader 不发起补扫扫描，孤儿保留。
+func TestBackfillSkipsWhenNotLeader(t *testing.T) {
+	st, mt, rep, _ := newFixtureRouted(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	if _, err := mt.CreateTopic(ctx, "t", 1); err != nil {
+		t.Fatal(err)
+	}
+	orphan := writeIdx(t, st, "t", "orphan", time.Now().Add(-4*24*time.Hour).UnixMilli(), 7)
+	m := New(rep, fixedLeaderRouter{leader: false}, st, mt, 10*time.Millisecond, t.TempDir(), 0, nil, slog.Default())
+	done := make(chan struct{})
+	go func() { m.Run(ctx); close(done) }()
+	time.Sleep(100 * time.Millisecond) // 约 10 个周期
+	cancel()
+	<-done
+	if got := m.backfillScanned.Load(); got != 0 {
+		t.Fatalf("非 leader 补扫扫描 %d 个键; want 0", got)
+	}
+	if _, ok, _ := st.Get(orphan); !ok {
+		t.Fatal("非 leader 删了孤儿索引")
+	}
+}
+
+// TestBackfillInterruptible I4：补扫进行中取消 ctx，Run 在 2s 内返回且该组不记完成。
+func TestBackfillInterruptible(t *testing.T) {
+	st, mt, rep, rt := newFixtureRouted(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := mt.CreateTopic(ctx, "t", 1); err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-4 * 24 * time.Hour).UnixMilli()
+	b := st.NewBatch()
+	for i := 0; i < 50000; i++ {
+		b.Set(store.KeyIdxKey("t", fmt.Sprintf("o-%05d", i), old, 0, uint64(1000+i)), nil)
+	}
+	if err := st.Apply(b); err != nil {
+		t.Fatal(err)
+	}
+	m := New(rep, rt, st, mt, time.Hour, t.TempDir(), 0, nil, slog.Default())
+	done := make(chan struct{})
+	go func() { m.Run(ctx); close(done) }()
+	deadline := time.Now().Add(5 * time.Second)
+	for m.backfillScanned.Load() == 0 {
+		if time.Now().After(deadline) {
+			t.Fatal("补扫未开始")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	cancel()
+	start := time.Now()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("补扫中取消后 Run 未在 2s 内返回")
+	}
+	if m.backfillDone[0] {
+		t.Fatalf("中断的补扫（已扫 %d 键）把组记为已完成", m.backfillScanned.Load())
+	}
+	if c := countPrefix(t, st, store.KeyIdxTopicPrefix("t")); c == 0 {
+		t.Fatal("中断后孤儿已全删——补扫未在块边界中断（用例未覆盖中断路径）")
+	}
+	t.Logf("取消到返回 %v，已扫 %d 键", time.Since(start), m.backfillScanned.Load())
+}
