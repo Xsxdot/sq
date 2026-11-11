@@ -22,6 +22,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -53,6 +54,9 @@ const logRetainBody = 8 << 10
 //	③ 60s 内各数据组上该节点追平停写时的 commit
 //	④ 至少一个节点日志出现冷读 Info 行（窗口外条目确经磁盘日志发出）
 //	⑤ 停写后 SDK 对账：确认集全部可消费
+//
+// SQ_E2E_FREEZE=1 换成「掉电」变体：停机改为 SIGSTOP 冻结进程、恢复改为
+// SIGCONT（不发 RST，TCP 连接停在半开态，近似对端掉电/黑洞）；判据不变。
 func TestScenarioFollowerDownCatchesUpByLog(t *testing.T) {
 	if testing.Short() {
 		t.Skip("场景测试耗时，-short 跳过")
@@ -109,8 +113,18 @@ func TestScenarioFollowerDownCatchesUpByLog(t *testing.T) {
 
 	before := dataGroupCommits(t, pc, -1)
 	stopOffsets := logSizes(t, pc)
-	pc.stopGraceful(t, victim)
-	t.Logf("节点 %d 已停机，停机时长 %s，持续写入中", victim+1, down)
+	freeze := os.Getenv("SQ_E2E_FREEZE") == "1"
+	if freeze {
+		if err := pc.handles[victim].cmd.Process.Signal(syscall.SIGSTOP); err != nil {
+			t.Fatalf("SIGSTOP 节点 %d: %v", victim+1, err)
+		}
+		// 兜底解冻：用例中途失败时，集群清理发的 SIGTERM 对冻结进程不生效
+		proc := pc.handles[victim].cmd.Process
+		t.Cleanup(func() { _ = proc.Signal(syscall.SIGCONT) })
+	} else {
+		pc.stopGraceful(t, victim)
+	}
+	t.Logf("节点 %d 已停机（冻结=%v），停机时长 %s，持续写入中", victim+1, freeze, down)
 	time.Sleep(down)
 	after := dataGroupCommits(t, pc, victim)
 	for g, c := range after {
@@ -123,7 +137,14 @@ func TestScenarioFollowerDownCatchesUpByLog(t *testing.T) {
 
 	restartOffset := logSizes(t, pc)[victim]
 	lat.p99AndReset()
-	pc.restart(t, victim)
+	if freeze {
+		if err := pc.handles[victim].cmd.Process.Signal(syscall.SIGCONT); err != nil {
+			t.Fatalf("SIGCONT 节点 %d: %v", victim+1, err)
+		}
+		t.Logf("节点 %d 已解冻 pid=%d", victim+1, pc.handles[victim].cmd.Process.Pid)
+	} else {
+		pc.restart(t, victim)
+	}
 	time.Sleep(30 * time.Second)
 	catchP99 := lat.p99AndReset()
 	stopWriting()
