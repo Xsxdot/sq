@@ -142,7 +142,7 @@ func (s *Server) handleGroupDelete(w http.ResponseWriter, r *http.Request) {
 		s.httpError(w, http.StatusNotFound, "消费组 %s 不存在", name)
 		return
 	}
-	if err := adminops.PurgeGroupData(r.Context(), s.rep, s.rt, s.fwd, s.st, name, s.logger); err != nil {
+	if err := adminops.PurgeGroupData(r.Context(), s.rep, s.rt, s.fwd, s.st, s.dl, s.mt, name, s.logger); err != nil {
 		s.logger.Error("admin 清理组数据失败", "group", name, "err", err)
 		s.httpError(w, http.StatusInternalServerError, "%v", err)
 		return

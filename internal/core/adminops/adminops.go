@@ -4,7 +4,9 @@
 //   - topic 删除后的 msg/alloc/keyidx 区间清理
 //   - 订阅组删除后的 cursor/inflight 区间清理
 //   - 集群档按 raft 组拆批：每批只含同组键族，本节点 leader 的组本地
-//     rep.Apply 提交，非 leader 的组经 fwd 转发给该组 leader 提案
+//     rep.Apply 提交，非 leader 的组经 fwd 转发给该组 leader 提案；消费状态
+//     （cursor/、inflight/）批次的本地提交改经 deliver 的管理入口
+//     （ConsumeStateAdmin），先失效 leader 内存态再提交（卡 SQ4.1）
 //
 // 边界：
 //   - 跨组拆批无批间原子性：任一队列/桶先清、另一队列/桶后清，中间崩溃留下
@@ -25,6 +27,18 @@ import (
 	"github.com/Xsxdot/sq/internal/replication"
 	"github.com/Xsxdot/sq/internal/store"
 )
+
+// ConsumeStateAdmin 消费状态管理批次的提交入口（deliver.Deliverer 实现；
+// 使用方定义的接口，本包不 import deliver 具体类型）。批次触及的队列内存态
+// 先失效再提交，见 deliver.ApplyAdminBatch。
+type ConsumeStateAdmin interface {
+	ApplyAdminBatch(ctx context.Context, g uint32, b *store.Batch) error
+}
+
+// TopicLister 注册表里的全部 topic（*meta.Meta 实现）。
+type TopicLister interface {
+	Topics() []meta.TopicConfig
+}
 
 // PurgeTopicData 清理 topic 的全部消息数据：各队列 msg/ 区间、alloc 计数器、
 // keyidx/ 索引。logger 为注入式应用日志器（本包内部 With("mod", "adminops")）。
@@ -95,32 +109,32 @@ func PurgeTopicData(ctx context.Context, rep replication.Replicator, rt replicat
 // PurgeGroupData 清理订阅组的 cursor/ 与 inflight/ 全部记录。
 // logger 为注入式应用日志器（同 PurgeTopicData）。
 //
-// 集群档先扫描 cursor/{group}/ 与 inflight/{group}/ 收集 (topic,qid) 全集，
-// 再逐 (topic,qid) 一个批次（该队列两个前缀的 DeleteRange，同组键族同批）：
-// 因为 cursor 与 inflight 键族都归 GroupForQueue(topic,qid)，分桶键必须从
-// 两组扫描里共同枚举——只扫 cursor 会漏掉「有 inflight 无 cursor」的队列。
-// 批次的「本节点 leader ? 本地 rep.Apply : 转发给 leader」分派与回收统一走
-// replication.ApplyOrForward（同 PurgeTopicData）。
+// 枚举 (topic,qid)：pebble 的 cursor/{group}/ 与 inflight/{group}/ 两族扫描
+// （只扫 cursor 会漏掉「有 inflight 无 cursor」的队列）∪ 注册表全部 topic×队列
+// （消费状态的权威在 leader 内存，可能有尚未落盘的队列，卡 SQ4.1）。逐
+// (topic,qid) 一个批次（该队列两个前缀的 DeleteRange，同组键族同批）。
+//
+// 提交（计划 P2）：消费状态批次必须经 deliver 的管理入口——本节点是该组
+// leader 时 cs.ApplyAdminBatch（取队列锁、失效内存态、同步提交）；否则转发给
+// 该组 leader，leader 侧控制处理器同样改走 ApplyAdminBatch。直接 rep.Apply
+// 会被未失效的内存态在下一次提交时写回。
 //
 // 调用顺序契约与 PurgeTopicData 同理：先 Purge 再 meta.DeleteGroup。
 func PurgeGroupData(ctx context.Context, rep replication.Replicator, rt replication.Router,
-	fwd replication.Forwarder, st *store.Store, group string, logger *slog.Logger) error {
+	fwd replication.Forwarder, st *store.Store, cs ConsumeStateAdmin, tl TopicLister, group string, logger *slog.Logger) error {
 	logger = logger.With("mod", "adminops")
-	// 枚举 (topic,qid)：cursor 与 inflight 两族都要扫（见函数注释）
-	set := map[struct {
+	type tq struct {
 		topic string
 		qid   uint32
-	}]struct{}{}
+	}
+	set := map[tq]struct{}{}
 	collect := func(prefix []byte, parse func(k []byte) (string, uint32, error)) error {
 		return st.Scan(prefix, store.PrefixUpperBound(prefix), 0, func(k, v []byte) (bool, error) {
 			topic, qid, perr := parse(k)
 			if perr != nil {
 				return false, perr
 			}
-			set[struct {
-				topic string
-				qid   uint32
-			}{topic, qid}] = struct{}{}
+			set[tq{topic, qid}] = struct{}{}
 			return true, nil
 		})
 	}
@@ -137,16 +151,45 @@ func PurgeGroupData(ctx context.Context, rep replication.Replicator, rt replicat
 	}); err != nil {
 		return fmt.Errorf("扫描 group %s inflight: %w", group, err)
 	}
-	for tq := range set {
-		b := st.NewBatch()
-		ck := store.CursorKey(group, tq.topic, tq.qid)
-		b.DeleteRange(ck, store.PrefixUpperBound(ck))
-		ik := store.InflightPrefix(group, tq.topic, tq.qid)
-		b.DeleteRange(ik, store.PrefixUpperBound(ik))
-		if err := replication.ApplyOrForward(ctx, rep, rt, fwd, rt.GroupForQueue(tq.topic, tq.qid), b, logger); err != nil {
-			return fmt.Errorf("清理 group %s %s/q%d 数据: %w", group, tq.topic, tq.qid, err)
+	onDisk := len(set)
+	for _, tc := range tl.Topics() {
+		for q := uint32(0); q < tc.Queues; q++ {
+			set[tq{tc.Name, q}] = struct{}{}
 		}
 	}
-	logger.Info("消费组数据已清理", "group", group, "queues", len(set))
+	for k := range set {
+		b := st.NewBatch()
+		ck := store.CursorKey(group, k.topic, k.qid)
+		b.DeleteRange(ck, store.PrefixUpperBound(ck))
+		ik := store.InflightPrefix(group, k.topic, k.qid)
+		b.DeleteRange(ik, store.PrefixUpperBound(ik))
+		g := rt.GroupForQueue(k.topic, k.qid)
+		var err error
+		if rt.IsLeader(g) {
+			err = cs.ApplyAdminBatch(ctx, g, b)
+		} else {
+			err = forwardBatch(ctx, fwd, g, b, logger)
+		}
+		if err != nil {
+			return fmt.Errorf("清理 group %s %s/q%d 数据: %w", group, k.topic, k.qid, err)
+		}
+	}
+	logger.Info("消费组数据已清理", "group", group, "queues", len(set), "queues_on_disk", onDisk)
+	return nil
+}
+
+// forwardBatch 把批次转发给 g 组 leader 提案（批次随即回收）。与
+// replication.ApplyOrForward 的转发分支同款；不复用它是因为它在本节点为
+// leader 时会走 rep.Apply 直接提交，绕过消费状态管理入口。
+func forwardBatch(ctx context.Context, fwd replication.Forwarder, g uint32, b *store.Batch, logger *slog.Logger) error {
+	repr := append([]byte(nil), b.Repr()...)
+	if err := b.Close(); err != nil {
+		logger.Warn("转发前回收批次失败（字节已取出，不阻断转发）", "g", g, "err", err)
+	}
+	if err := fwd.ForwardApply(ctx, g, repr); err != nil {
+		logger.Warn("转发消费状态管理批次失败", "g", g, "bytes", len(repr), "err", err)
+		return err
+	}
+	logger.Info("跨节点转发消费状态管理批次", "g", g, "bytes", len(repr))
 	return nil
 }

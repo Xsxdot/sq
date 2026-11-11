@@ -273,3 +273,39 @@ func TestEpochChangeReloadsAndStaleEpochRejected(t *testing.T) {
 		t.Fatalf("旧 epoch 调用应得 ErrNotLeader，得到 %v", err)
 	}
 }
+
+// TestResetCursorNotOverwrittenByInflightDelta S6：重置位点时同队列有旧差量
+// 在途——旧差量失败（属已失效代号）不得把重置后的内存态丢掉；重置的全量批次
+// 落盘后盘上 cursor = 重置值、inflight 为空，下一次取件从新位点投。
+func TestResetCursorNotOverwrittenByInflightDelta(t *testing.T) {
+	f := newHoldFixture(t)
+	f.send(t, 8)
+	f.rep.hold.Store(true)
+	r1 := f.recvAsync(2)
+	waitUntil(t, "取件提案入队", func() bool { return f.rep.n() == 1 })
+	resetDone := make(chan error, 1)
+	go func() { resetDone <- f.dl.ResetCursor(context.Background(), "g", "t", 0, 5) }()
+	waitUntil(t, "重置提案入队", func() bool { return f.rep.n() == 2 })
+	// 重置持队列锁等自己的提案：旧差量的完成回调要等它放锁，故两个提案都
+	// 先放行再收结果（真实复制里两者的落盘互不依赖队列锁）
+	f.rep.call(0).release <- errors.New("注入：旧差量失败")
+	f.rep.call(1).release <- nil
+	if err := <-resetDone; err != nil {
+		t.Fatalf("重置: %v", err)
+	}
+	if res := <-r1; res.err == nil {
+		t.Fatal("旧差量失败，取件应报错")
+	}
+	if _, ok := f.dl.InflightCount("g", "t", 0); !ok {
+		t.Fatal("旧代号差量失败不应丢弃重置后的内存态")
+	}
+	c, inf := diskView(t, f.st, "g", "t", 0)
+	if c != 5 || len(inf) != 0 {
+		t.Fatalf("重置后盘上应 cursor=5、无 inflight: cursor=%d n=%d", c, len(inf))
+	}
+	f.rep.hold.Store(false)
+	got, err := f.dl.Receive(context.Background(), "g", "t", 0, 1, time.Minute, 0, AllPass)
+	if err != nil || len(got) != 1 || got[0].Offset != 5 || got[0].DeliveryAttempt != 1 {
+		t.Fatalf("重置后下一次取件应投 offset 5 首投: %+v %v", got, err)
+	}
+}
