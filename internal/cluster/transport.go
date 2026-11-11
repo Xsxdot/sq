@@ -52,6 +52,41 @@ const (
 	// 读缓冲撑爆；超限即断连，等对端重拨。
 	maxFrameLen = 16 << 20
 
+	// staleMsgAge 信封在队列中的最长寿命 = raft 选举超时（raftElectionTick
+	// × raftTickInterval ≈ 1s）。出队时超龄即丢弃、计入 stale 计数。
+	//
+	// 为什么按年龄丢而不按故障形态丢（卡 SQ4.10 排查）：对端停机期间
+	// leader 每 tick 的心跳与每次提交广播的空 MsgApp 会在队列里攒成数百
+	// 条；对端恢复后逐条回 MsgHeartbeatResp，raft 在 StateProbe 下每收
+	// 一条就从同一 Next 重发一条满 MaxSizePerMsg 的 MsgApp，重发量与
+	// 故障时长成正比。故障形态（拨号立即失败 / 拨号挂起 / 半开连接写
+	// 阻塞）各不相同，但「消息在队列里等了多久」对所有形态都成立。
+	//
+	// 丢弃安全性（逐类核对，raft v3.7.0）：
+	//   - MsgHeartbeat/MsgApp(空/带条目)：leader 每 tick 重发心跳、按
+	//     Progress 重发日志，丢旧的不丢进度；ReadIndex 的确认上下文由
+	//     每次 bcastHeartbeat 携带最新未确认位置（readOnly.heartbeatCtx），
+	//     旧心跳丢了下一次心跳照样确认。
+	//   - MsgVote/MsgPreVote 及其响应：超过选举超时的选票已无意义——候选
+	//     人此时已超时重新竞选（新任期或新一轮预选）。
+	//   - MsgTimeoutNow：leader 在 electionTimeout 内未完成转移即
+	//     abortLeaderTransfer，超龄的 TimeoutNow 送达反而会在转移已放弃后
+	//     触发一次意外竞选，丢弃更安全。
+	//   - MsgSnap：丢弃后对端从不拉取，快照视图无借出活动，
+	//     reportStalledSnapshots 按停滞上报 SnapshotFailure，peer 回 Probe
+	//     重新判定（恢复变慢，不卡死）。
+	//   - MsgReadIndex(follower→leader)：调用方按 ctx 超时，可重试错误。
+	//   - 各类 *Resp：发送方按自身 tick/超时重试，不依赖单条响应送达。
+	staleMsgAge = raftElectionTick * raftTickInterval
+
+	// writeTimeout 单次写批的写期限：半开连接（对端冻结/掉电未发 RST）上
+	// 写会阻塞到 tcp_retries2（约 15 分钟），期限到即断连重拨。1MiB 批
+	// 3s 写不完意味着有效带宽 < 350KiB/s，此时重连同样是正确反应。
+	writeTimeout = 3 * time.Second
+
+	// dialTimeout 拨号超时：对端主机掉电/黑洞时无超时拨号挂约 127s。
+	dialTimeout = 2 * time.Second
+
 	// redialBackoff 断线后重拨间隔。
 	redialBackoff = 500 * time.Millisecond
 
@@ -137,6 +172,7 @@ const (
 type envelope struct {
 	group uint32
 	msg   *raftpb.Message
+	at    time.Time // 入队时刻：出队超过 staleMsgAge 即丢（见其注释）
 }
 
 // transport 是 raft 消息的 TCP 传输层。
@@ -156,8 +192,13 @@ type transport struct {
 	// 「控制通道未装配」错误帧（见 controlFrame）。
 	control func(op byte, payload []byte) ([]byte, error)
 
+	// dial 建立到 peer 的出站连接；newTransport 装配缺省实现，测试可
+	// 替换以模拟「拨号挂起」等故障形态。
+	dial func(ctx context.Context, addr string) (net.Conn, error)
+
 	queues map[uint64]chan envelope
-	drops  map[uint64]*atomic.Uint64 // 队列满丢弃计数（周期上报，防刷屏）
+	drops  map[uint64]*atomic.Uint64 // 队列满/对端不可达丢弃计数（周期上报，防刷屏）
+	stales map[uint64]*atomic.Uint64 // 出队超龄丢弃计数（同上，与 drops 一并上报）
 
 	connsMu sync.Mutex
 	conns   map[net.Conn]struct{} // 活动读连接，ctx 取消时统一关闭
@@ -195,11 +236,16 @@ func newTransport(self uint64, ln net.Listener, peers map[uint64]string,
 		lg:      lg.With("mod", "transport"),
 		queues:  make(map[uint64]chan envelope, len(peers)),
 		drops:   make(map[uint64]*atomic.Uint64, len(peers)),
+		stales:  make(map[uint64]*atomic.Uint64, len(peers)),
 		conns:   make(map[net.Conn]struct{}),
+	}
+	t.dial = func(ctx context.Context, addr string) (net.Conn, error) {
+		return (&net.Dialer{}).DialContext(ctx, "tcp", addr)
 	}
 	for peerID := range peers {
 		t.queues[peerID] = make(chan envelope, peerQueueCap)
 		t.drops[peerID] = &atomic.Uint64{}
+		t.stales[peerID] = &atomic.Uint64{}
 	}
 	return t
 }
@@ -245,6 +291,7 @@ func (t *transport) Send(g uint32, msgs []*raftpb.Message) {
 	if t.partitioned.Load() {
 		return // 测试分区：整段丢弃出站消息（见 setPartitioned）
 	}
+	now := time.Now() // 一批一次取时：入队时刻只用于秒级老化判断
 	for _, m := range msgs {
 		to := m.GetTo()
 		q, ok := t.queues[to]
@@ -254,7 +301,7 @@ func (t *transport) Send(g uint32, msgs []*raftpb.Message) {
 			continue
 		}
 		select {
-		case q <- envelope{group: g, msg: m}:
+		case q <- envelope{group: g, msg: m, at: now}:
 		default:
 			t.drops[to].Add(1) // 队列满：计数丢弃，等 raft 重试
 		}
@@ -292,6 +339,9 @@ func (t *transport) DropPeer(id uint64) {
 	}
 	discardQueued(q)
 	if d, ok := t.drops[id]; ok {
+		d.Store(0)
+	}
+	if d, ok := t.stales[id]; ok {
 		d.Store(0)
 	}
 }
@@ -345,7 +395,9 @@ func (t *transport) sendLoop(ctx context.Context, peerID uint64, addr string) {
 		}
 		// 对端未起时积压在拨号失败处清空、计入丢弃，退避期间周期上报一次。
 		t.logDrops(peerID, drops, &lastDropLog)
-		conn, err := net.Dial("tcp", addr)
+		dctx, dcancel := context.WithTimeout(ctx, dialTimeout)
+		conn, err := t.dial(dctx, addr)
+		dcancel()
 		if err != nil {
 			// 对端不可达：清空积压并计入丢弃。积压的心跳/空 MsgApp 对
 			// raft 毫无价值（raft 按 tick 重发心跳、按 Progress 重发日志），
@@ -377,6 +429,15 @@ func (t *transport) sendLoop(ctx context.Context, peerID uint64, addr string) {
 			t.lg.Info("peer 已连接", "self", t.self, "peer", peerID, "addr", addr)
 		}
 		writeErr := t.writeLoop(ctx, conn, q, peerID, drops, &lastDropLog)
+		// 写期限到期（半开连接）：以 RST 中止而非 FIN 关闭——FIN 会让已
+		// 进对端接收缓冲的陈旧帧在对端恢复（如 SIGCONT）后照常被读出，
+		// RST 令对端内核丢弃该连接上未读的数据。
+		var ne net.Error
+		if errors.As(writeErr, &ne) && ne.Timeout() {
+			if tc, ok := conn.(*net.TCPConn); ok {
+				_ = tc.SetLinger(0)
+			}
+		}
 		// 写循环已返回（断线/取消）：连接退出看门狗集合再关闭。
 		// 与看门狗的双重 Close 安全（net.Conn Close 幂等）。
 		t.unregisterConn(conn)
@@ -402,12 +463,15 @@ func (t *transport) sendLoop(ctx context.Context, peerID uint64, addr string) {
 func (t *transport) writeLoop(ctx context.Context, conn net.Conn, q chan envelope,
 	peerID uint64, drops *atomic.Uint64, lastDropLog *time.Time) error {
 	buf := make([]byte, 0, 4096) // 帧缓冲跨批复用，避免每帧一次分配
+	stales := t.stales[peerID]
 	for {
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case env := <-q:
-			buf = t.appendEnvelope(buf[:0], env, peerID)
+			// 一批一次取时：超龄判断是秒级粒度，批内抽干在微秒级完成。
+			now := time.Now()
+			buf = t.appendFresh(buf[:0], env, now, peerID, stales)
 			// 非阻塞抽干：只收编已排队的信封，队列一空立即写出。
 			// 达到字节上限即停止抽取（上限判断在取下一条之前，单帧
 			// 超限时独立成批照发，不截断）。
@@ -415,13 +479,19 @@ func (t *transport) writeLoop(ctx context.Context, conn net.Conn, q chan envelop
 			for len(buf) < maxBatchBytes {
 				select {
 				case env = <-q:
-					buf = t.appendEnvelope(buf, env, peerID)
+					buf = t.appendFresh(buf, env, now, peerID, stales)
 				default:
 					break drain
 				}
 			}
 			if len(buf) == 0 {
-				continue // 本批全部序列化失败（对正常消息不可达）：无可写
+				continue // 本批全部超龄丢弃或序列化失败：无可写
+			}
+			// 写期限：半开连接上写阻塞到期即返回超时错误，由 sendLoop
+			// 中止连接并重拨（见 writeTimeout）。Go 的期限是运行时定时器，
+			// 不是系统调用，每批设置一次无额外 syscall 开销。
+			if err := conn.SetWriteDeadline(time.Now().Add(writeTimeout)); err != nil {
+				return err
 			}
 			if _, err := conn.Write(buf); err != nil {
 				return err
@@ -436,6 +506,17 @@ func (t *transport) writeLoop(ctx context.Context, conn net.Conn, q chan envelop
 			}
 		}
 	}
+}
+
+// appendFresh 出队老化闸门：信封入队超过 staleMsgAge 即丢弃并计入
+// stales（丢弃安全性见 staleMsgAge 注释），否则照常序列化续写进 buf。
+func (t *transport) appendFresh(buf []byte, env envelope, now time.Time,
+	peerID uint64, stales *atomic.Uint64) []byte {
+	if now.Sub(env.at) > staleMsgAge {
+		stales.Add(1)
+		return buf
+	}
+	return t.appendEnvelope(buf, env, peerID)
 }
 
 // appendEnvelope 把一条信封序列化后以帧格式续写进 buf（append 语义，不清空
@@ -623,14 +704,16 @@ func discardQueued(q chan envelope) int {
 	}
 }
 
-// logDrops 周期上报丢弃计数（队列满 + 对端不可达清空）：丢弃点是高频热路径，逐条 Debug 会
+// logDrops 周期上报累计丢弃计数（队列满 + 对端不可达清空 + 出队超龄）：丢弃点是高频热路径，逐条 Debug 会
 // 刷屏，必须带计数累积、最多每秒一条（instrumenting-code 热循环规则）。
 // 仅在发送 goroutine 内调用（lastDropLog 无锁）。
 func (t *transport) logDrops(peerID uint64, drops *atomic.Uint64, lastDropLog *time.Time) {
 	c := drops.Load()
-	if c == 0 || time.Since(*lastDropLog) < time.Second {
+	st := t.stales[peerID].Load()
+	if (c == 0 && st == 0) || time.Since(*lastDropLog) < time.Second {
 		return
 	}
-	t.lg.Debug("丢弃消息（队列满或对端不可达）", "self", t.self, "peer", peerID, "dropped", c)
+	t.lg.Debug("丢弃消息（队列满/对端不可达/出队超龄）", "self", t.self, "peer", peerID,
+		"dropped", c, "stale", st)
 	*lastDropLog = time.Now()
 }

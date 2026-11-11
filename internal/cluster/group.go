@@ -380,6 +380,14 @@ func newGroup(g uint32, selfID uint64, storage *raft.MemoryStorage, snaps *snapR
 	return gr
 }
 
+const (
+	// raftTickInterval 组主循环的 raft tick 周期（心跳 = 1 tick）。
+	raftTickInterval = 100 * time.Millisecond
+	// raftElectionTick 选举超时的 tick 数：选举超时 ≈ 1s。传输层的
+	// 陈旧消息判据（staleMsgAge）由它推出，改动须同步评估。
+	raftElectionTick = 10
+)
+
 // maxInflightBytes 单组对单个 follower 未确认在途日志字节的上限，取
 // 8 个发送合批（transport maxBatchBytes = 1MiB）的量。
 //
@@ -417,7 +425,7 @@ const maxInflightBytes = 8 * maxBatchBytes
 func raftConfig(id uint64, storage raft.Storage) *raft.Config {
 	return &raft.Config{
 		ID:              id,
-		ElectionTick:    10,
+		ElectionTick:    raftElectionTick,
 		HeartbeatTick:   1,
 		Storage:         storage,
 		MaxSizePerMsg:   1 << 20,
@@ -458,7 +466,7 @@ func raftConfig(id uint64, storage raft.Storage) *raft.Config {
 // 注意：tick 与心跳是高频路径，本循环内零日志（热循环规则）；
 // 关键节点日志全部落在 dispatchReady/阶段协程/propose 等低频路径上。
 func (gr *group) run(ctx context.Context) {
-	ticker := time.NewTicker(100 * time.Millisecond) // ElectionTick=10 → 选举超时约 1s
+	ticker := time.NewTicker(raftTickInterval) // raftElectionTick=10 → 选举超时约 1s
 	defer ticker.Stop()
 	// 两条本地存储阶段协程与主循环同生命周期：doneCh 必须在三者**全部**
 	// 退出之后才关闭，否则测试里 <-gr.done() 返回时仍有协程在碰 store/rs，
