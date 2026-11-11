@@ -6,7 +6,8 @@
 //   - Ack/ChangeInvisible：按 (group,topic,queue,offset,attempt) 定位 inflight——
 //     attempt 是消费者持有句柄的一部分，防止陈旧句柄误伤被重投覆盖的新记录
 //     （见类型注释与方法注释的详细说明）
-//   - 长轮询：produce.Subscribe 的 close-broadcast + 截止时间
+//   - 长轮询：按 (组, topic, 队列) 的唤醒表（wake.go）+ 100ms 兜底 tick +
+//     截止时间；新消息可见（produce 监听）与本组状态变化成功（Ack 一类）都唤醒
 //
 // 消费状态的权威（卡 SQ4.1）：cursor 与 inflight 由队列所属组的可写 leader
 // 在内存持有（state.go），全部读写在队列锁内对内存进行，不再读 pebble 的
@@ -63,6 +64,21 @@ const scanBudget = 1024
 var (
 	retryBackoffBase = 10 * time.Second
 	retryBackoffMax  = 5 * time.Minute
+)
+
+// pollTick 长轮询兜底轮询间隔：唤醒只覆盖「新消息经本节点 Append 可见」与
+// 「本组状态变化」，inflight 到期（时间驱动）与新 leader 提交前任期条目
+// （本节点无 Append 调用）靠它发现（计划 sq4.2 P2）。var 而非 const：测试
+// 注入大值关掉兜底以验证不丢唤醒；运行期只读。
+var pollTick = 100 * time.Millisecond
+
+// roundCause 一轮取件的起因（测试轮次钩子用）。
+type roundCause int
+
+const (
+	roundFirst roundCause = iota // 本次 Receive 的首轮
+	roundWoken                   // 被唤醒表信号唤醒
+	roundTick                    // 兜底 tick 到点
 )
 
 // retryBackoff 第 attempts 次投递的退避下限（attempts >= 2；乘法防溢出走上限）。
@@ -145,6 +161,14 @@ type Deliverer struct {
 	fenceMu sync.Mutex
 	fences  map[uint32]time.Time
 
+	// wk 长轮询唤醒表（wake.go），构造后指针不变。
+	wk *wakeTable
+
+	// roundHook 测试专用观测钩子（生产恒为 nil）：Receive 每轮取件后以
+	// (组, topic, 队列, 起因, 本轮投出条数) 调用，供故事级检查统计唤醒是否
+	// 生效、是否越界唤醒。
+	roundHook func(group, topic string, q uint32, cause roundCause, n int)
+
 	// afterAppendHook 测试专用注入钩子（生产恒为 nil）：在 moveToDLQ 第一段
 	// （死信消息写入）成功后、第二段（删源 inflight）前调用，用于模拟两段
 	// 之间进程崩溃。生产代码绝不允许设置。
@@ -166,7 +190,12 @@ func New(rep replication.Replicator, rt replication.Router, st *store.Store,
 	d := &Deliverer{rep: rep, rt: rt, fwd: fwd, st: st, mt: mt, pr: pr,
 		logger: logger.With("mod", "deliver"), qmu: map[string]*queueState{},
 		skipped: map[FilterSkipKey]uint64{}, ckDirty: map[*queueState]struct{}{},
-		fences: map[uint32]time.Time{}, roundSem: make(chan struct{}, 1)}
+		fences: map[uint32]time.Time{}, roundSem: make(chan struct{}, 1), wk: newWakeTable()}
+	if pr != nil {
+		// 新消息可见即唤醒该队列全部消费组的等待者（回调只取唤醒表叶子锁，
+		// moveToDLQ 持源队列锁写死信时也不会嵌套队列锁，计划 P1）
+		pr.OnVisible(d.wk.wakeQueue)
+	}
 	d.maxInFlight = 1
 	if pc, ok := rep.(replication.PrefixOrderedCommitter); ok && pc.PrefixOrderedCommit() {
 		d.maxInFlight = maxInFlightPrefix
@@ -234,7 +263,8 @@ func skipReasonOf(f Filter, r Result) string {
 
 // Receive 取一批消息，返回的每条消息 DeliveryAttempt 已填充（首投=1）。
 // 先重投本队列已过期的 inflight，再从 fetch 位点取新消息，合计不超过 maxMsgs。
-// 空结果时最长等待 wait（长轮询），期间新消息写入会立即唤醒重试；
+// 空结果时最长等待 wait（长轮询），期间本队列有新消息可见、或本组在本队列
+// 上确认/改不可见/转死信/重置位点成功，会立即唤醒重试；
 // wait<=0 时不等待，取一次就返回。
 // 只投 filter.Match 返回 ResultTrue 的新消息；filter 不得为 nil，不过滤时传
 // AllPass。不匹配的跳过并推进本组位点，不投递、不占 inflight（对该组永久
@@ -258,12 +288,16 @@ func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID ui
 		return nil, err
 	}
 	deadline := time.Now().Add(wait)
+	cause := roundFirst
 	for {
-		// 先订阅再取件：若取件为空后才订阅，"取件为空 → 新消息写入 → 才订阅"
-		// 这个窗口期内的写入会错过 close 广播，导致长轮询白等到超时——
-		// 订阅在前，即便取件与写入之间发生竞态，wakeCh 也一定能收到这次唤醒。
-		wakeCh := d.pr.Subscribe(topic)
+		// 先订阅再取件：若取件为空后才订阅，"取件为空 → 新消息写入/队头被
+		// ack → 才订阅"这个窗口期内的唤醒会错过 close 广播，导致长轮询白等
+		// ——订阅在前，即便取件与唤醒之间发生竞态，wakeCh 也一定能收到。
+		wakeCh := d.wk.subscribe(group, topic, queueID)
 		msgs, err := d.receiveOnce(ctx, group, topic, queueID, maxMsgs, invisible, gc.EffectiveMaxAttempts(), filter, ro.lease)
+		if d.roundHook != nil {
+			d.roundHook(group, topic, queueID, cause, len(msgs))
+		}
 		if err != nil || len(msgs) > 0 {
 			return msgs, err
 		}
@@ -271,10 +305,9 @@ func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID ui
 		if remain <= 0 {
 			return nil, nil
 		}
-		// 100ms 兜底轮询：wakeCh 唤醒信号只覆盖"新消息写入"这一种情况，
-		// 不覆盖"inflight 过期可重投"——过期是时间驱动的，没有事件可订阅，
-		// 只能靠轮询发现。
-		tick := 100 * time.Millisecond
+		// 兜底轮询：唤醒不覆盖"inflight 过期可重投"（时间驱动，无事件可订阅）
+		// 与前任期条目由新 leader 提交（本节点无 Append），只能靠轮询发现。
+		tick := pollTick
 		if remain < tick {
 			tick = remain
 		}
@@ -282,7 +315,9 @@ func (d *Deliverer) Receive(ctx context.Context, group, topic string, queueID ui
 		case <-ctx.Done():
 			return nil, ctx.Err()
 		case <-wakeCh:
+			cause = roundWoken
 		case <-time.After(tick):
+			cause = roundTick
 		}
 	}
 }
@@ -298,13 +333,14 @@ func (d *Deliverer) receiveOnce(ctx context.Context, group, topic string, queueI
 		return nil, err
 	}
 	var (
-		out  []*core.Message
-		rerr error
-		f    *flush
+		out   []*core.Message
+		rerr  error
+		f     *flush
+		moved int
 	)
 	func() {
 		defer qs.mu.Unlock()
-		out, rerr = d.receiveLocked(ctx, qs, maxMsgs, invisible, maxAttempts, filter, lease)
+		out, moved, rerr = d.receiveLocked(ctx, qs, maxMsgs, invisible, maxAttempts, filter, lease)
 		// 出错时 receiveLocked 只留下了已成事实的删除（孤儿清理、已写入死信
 		// 的源 inflight），照常提交，避免下一轮重复转死信
 		f = d.commitLocked(qs)
@@ -319,6 +355,11 @@ func (d *Deliverer) receiveOnce(ctx context.Context, group, topic string, queueI
 			return nil, fmt.Errorf("等待取件批次持久化 (group=%s topic=%s q=%d): %w", group, topic, queueID, werr)
 		}
 	}
+	if moved > 0 {
+		// 超限转死信已成事实（逐次模式已落盘；检查点模式内存即权威）：
+		// 顺序锁可能随之释放，同组同队列的其他等待者不必等兜底 tick
+		d.wk.wakeGroupQueue(group, topic, queueID)
+	}
 	if rerr != nil {
 		return nil, rerr
 	}
@@ -330,9 +371,10 @@ func (d *Deliverer) receiveOnce(ctx context.Context, group, topic string, queueI
 // 重投（判孤儿、判超限转死信、退避、保留 Ordered）；阶段 2 从内存 cursor
 // 扫 msg/ 取新消息。全部改动只进内存并记脏，由调用方提交。
 //
-// 出错时返回 (nil, err)：凡涉及读盘的判定都先做完再改内存（重投与新投递在
+// 返回：交件列表、本轮超限转入死信的条数（调用方据此唤醒同组同队列的等待者）。
+// 出错时交件为 nil：凡涉及读盘的判定都先做完再改内存（重投与新投递在
 // 全部读盘成功后才落到内存），已成事实的删除（孤儿、已写入死信）保留。
-func (d *Deliverer) receiveLocked(ctx context.Context, qs *queueState, maxMsgs int, invisible time.Duration, maxAttempts int32, filter Filter, lease Lease) ([]*core.Message, error) {
+func (d *Deliverer) receiveLocked(ctx context.Context, qs *queueState, maxMsgs int, invisible time.Duration, maxAttempts int32, filter Filter, lease Lease) ([]*core.Message, int, error) {
 	group, topic, queueID := qs.group, qs.topic, qs.q
 	now := time.Now().UnixMilli()
 	expireAt := now + invisible.Milliseconds()
@@ -341,6 +383,7 @@ func (d *Deliverer) receiveLocked(ctx context.Context, qs *queueState, maxMsgs i
 	// 多取无用）；启用时看完全部已到期记录——续租不占 maxMsgs 预算，占了会让
 	// 「一批慢消息正在续租」白白挤掉本轮本可以投出的新消息。
 	var reds []*inflightEntry
+	moved := 0
 	for _, e := range qs.expired(now, maxMsgs, lease.Enabled()) {
 		if renewable(lease, &e.st, now) {
 			// invisible < 1ms 时 Milliseconds() 为 0，newExp == now，会每个兜底
@@ -393,7 +436,7 @@ func (d *Deliverer) receiveLocked(ctx context.Context, qs *queueState, maxMsgs i
 	for _, e := range reds {
 		raw, ok, err := d.st.Get(store.MsgKey(topic, queueID, e.off))
 		if err != nil {
-			return nil, fmt.Errorf("读取重投消息 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, e.off, err)
+			return nil, moved, fmt.Errorf("读取重投消息 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, e.off, err)
 		}
 		if !ok {
 			// 消息已被 retention 清理但 inflight 残留：删除记录（随本次提交
@@ -405,15 +448,16 @@ func (d *Deliverer) receiveLocked(ctx context.Context, qs *queueState, maxMsgs i
 		}
 		m, err := core.DecodeMessage(raw)
 		if err != nil {
-			return nil, fmt.Errorf("解码重投消息 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, e.off, err)
+			return nil, moved, fmt.Errorf("解码重投消息 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, e.off, err)
 		}
 		// 投递次数耗尽：转入死信 topic，不再投递（moveToDLQ 先同步写死信、
 		// 成功后才删内存 inflight）。锁序 deliver → produce 单向，无环。
 		if e.st.Attempts >= maxAttempts {
 			ordered := e.st.Ordered
 			if err := d.moveToDLQ(ctx, qs, e.off, m, e.st.Attempts, "投递次数耗尽（未在不可见期内 ack）"); err != nil {
-				return nil, err
+				return nil, moved, err
 			}
+			moved++
 			if ordered {
 				// 卡住队头的顺序消息已随 inflight 一并移除：顺序锁释放，
 				// 本轮阶段 2 即可投出下一条顺序消息（卡住→超限→推进，spec 流程 4/6）
@@ -502,7 +546,7 @@ func (d *Deliverer) receiveLocked(ctx context.Context, qs *queueState, maxMsgs i
 			return len(redos)+len(news) < maxMsgs, nil
 		})
 		if err != nil {
-			return nil, fmt.Errorf("扫描新消息 (topic=%s q=%d cursor=%d): %w", topic, queueID, cursor, err)
+			return nil, moved, fmt.Errorf("扫描新消息 (topic=%s q=%d cursor=%d): %w", topic, queueID, cursor, err)
 		}
 		if len(skipReasons) > 0 {
 			d.skipMu.Lock()
@@ -541,7 +585,7 @@ func (d *Deliverer) receiveLocked(ctx context.Context, qs *queueState, maxMsgs i
 		d.logger.Debug("投递消息已定序", "group", group, "topic", topic, "queue", queueID,
 			"count", len(out), "redelivered", len(redos), "cursor", newCursor)
 	}
-	return out, nil
+	return out, moved, nil
 }
 
 // Ack 确认消息。attempt 必须与该 offset 当前 InflightState.Attempts 一致——
@@ -621,12 +665,18 @@ func (d *Deliverer) AckBatch(ctx context.Context, group, topic string, queueID u
 			f = d.commitLocked(qs)
 		}
 	}()
-	if f == nil {
+	if acked == 0 {
 		return results, nil
 	}
-	if err := d.awaitCommit(ctx, f); err != nil {
-		return nil, fmt.Errorf("等待批量 ack 持久化 (group=%s topic=%s q=%d n=%d): %w", group, topic, queueID, acked, err)
+	// f == nil 即检查点模式：内存改完即成功，不等落盘
+	if f != nil {
+		if err := d.awaitCommit(ctx, f); err != nil {
+			return nil, fmt.Errorf("等待批量 ack 持久化 (group=%s topic=%s q=%d n=%d): %w", group, topic, queueID, acked, err)
+		}
 	}
+	// 成功后唤醒同组同队列的等待者（顺序锁释放、在外名额空出；锁外发，
+	// 被唤醒者第一件事就是取这把队列锁）
+	d.wk.wakeGroupQueue(group, topic, queueID)
 	d.logger.Debug("消息已确认", "group", group, "topic", topic, "queue", queueID,
 		"requested", len(entries), "acked", acked)
 	return results, nil
@@ -644,7 +694,10 @@ func (d *Deliverer) ChangeInvisible(ctx context.Context, group, topic string, qu
 	if err != nil {
 		return false, err
 	}
-	var f *flush
+	var (
+		f       *flush
+		changed bool
+	)
 	func() {
 		defer qs.mu.Unlock()
 		e, ok := qs.inflight[offset]
@@ -659,14 +712,21 @@ func (d *Deliverer) ChangeInvisible(ctx context.Context, group, topic string, qu
 			return
 		}
 		qs.setExpire(e, time.Now().Add(invisible).UnixMilli())
+		changed = true
 		f = d.commitLocked(qs)
 	}()
-	if f == nil {
+	if !changed {
 		return false, nil
 	}
-	if err := d.awaitCommit(ctx, f); err != nil {
-		return false, fmt.Errorf("等待改不可见时间持久化 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+	// f == nil 即检查点模式：内存改完即成功（不能以 f 判成败，否则检查点
+	// 模式下改成功了也报落空）
+	if f != nil {
+		if err := d.awaitCommit(ctx, f); err != nil {
+			return false, fmt.Errorf("等待改不可见时间持久化 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+		}
 	}
+	// 缩短到期（如 nack 置 0）后同组等待者即可取到重投，不必等兜底 tick
+	d.wk.wakeGroupQueue(group, topic, queueID)
 	d.logger.Debug("已更新不可见时间", "group", group, "topic", topic, "queue", queueID,
 		"offset", offset, "attempt", attempt, "invisible_ms", invisible.Milliseconds())
 	return true, nil
@@ -690,6 +750,7 @@ func (d *Deliverer) ForwardToDLQ(ctx context.Context, group, topic string, queue
 	var (
 		f    *flush
 		ferr error
+		done bool // 源 inflight 已删（转入死信或清理孤儿）
 	)
 	// 锁内段用 defer 放锁：moveToDLQ 的测试钩子会在两段之间 panic 模拟崩溃
 	func() {
@@ -714,6 +775,7 @@ func (d *Deliverer) ForwardToDLQ(ctx context.Context, group, topic string, queue
 			// 消息已被 retention 清理但 inflight 残留：与取件的孤儿清理同理删除止损
 			qs.remove(offset)
 			d.logger.Warn("forward 目标消息已不存在，清理孤儿 inflight", "group", group, "topic", topic, "queue", queueID, "offset", offset)
+			done = true
 			f = d.commitLocked(qs)
 			return
 		}
@@ -726,17 +788,23 @@ func (d *Deliverer) ForwardToDLQ(ctx context.Context, group, topic string, queue
 			ferr = err
 			return
 		}
+		done = true
 		f = d.commitLocked(qs)
 	}()
 	if ferr != nil {
 		return false, ferr
 	}
-	if f == nil {
+	if !done {
 		return false, nil
 	}
-	if err := d.awaitCommit(ctx, f); err != nil {
-		return false, fmt.Errorf("等待删除源 inflight 持久化 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+	// f == nil 即检查点模式：内存删除即成功（同 ChangeInvisible）
+	if f != nil {
+		if err := d.awaitCommit(ctx, f); err != nil {
+			return false, fmt.Errorf("等待删除源 inflight 持久化 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
+		}
 	}
+	// 源 inflight 已删（顺序锁可能释放）：唤醒同组同队列的等待者
+	d.wk.wakeGroupQueue(group, topic, queueID)
 	return true, nil
 }
 
@@ -849,6 +917,13 @@ func (d *Deliverer) ResetCursor(ctx context.Context, group, topic string, queueI
 	if err != nil {
 		return err
 	}
+	ok := false
+	// 先登记、后执行：放锁（下一行 defer）之后才唤醒，成功才唤醒
+	defer func() {
+		if ok {
+			d.wk.wakeGroupQueue(group, topic, queueID)
+		}
+	}()
 	defer qs.mu.Unlock()
 	epoch := qs.epoch
 	d.dropLocked(qs, errors.New("位点重置"))
@@ -865,6 +940,7 @@ func (d *Deliverer) ResetCursor(ctx context.Context, group, topic string, queueI
 		d.dropLocked(qs, err)
 		return fmt.Errorf("重置位点 (group=%s topic=%s q=%d off=%d): %w", group, topic, queueID, offset, err)
 	}
+	ok = true
 	d.logger.Info("消费位点已重置", "group", group, "topic", topic, "queue", queueID, "offset", offset)
 	return nil
 }

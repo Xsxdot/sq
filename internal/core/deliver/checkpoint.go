@@ -341,6 +341,14 @@ func (d *Deliverer) ApplyAdminBatch(ctx context.Context, g uint32, b *store.Batc
 			"queues", len(cqs), "dropped", len(qss), "whole", whole, "err", err)
 		return fmt.Errorf("提交消费状态管理批次 (g=%d): %w", g, err)
 	}
+	// 放锁后唤醒相关队列的等待者，让它们尽快重装、走到管理批次之后的状态：
+	// 已有内存态的队列（含整组失效）+ 批次解析出的队列（无等待者时是空操作）
+	for _, qs := range qss {
+		d.wk.wakeGroupQueue(qs.group, qs.topic, qs.q)
+	}
+	for _, cq := range cqs {
+		d.wk.wakeGroupQueue(cq.Group, cq.Topic, cq.QueueID)
+	}
 	d.logger.Info("消费状态管理批次已提交，相关队列内存态已失效", "g", g,
 		"queues", len(cqs), "dropped", len(qss), "whole", whole)
 	return nil
