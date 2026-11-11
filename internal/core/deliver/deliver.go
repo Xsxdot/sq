@@ -821,6 +821,14 @@ func (d *Deliverer) moveToDLQ(ctx context.Context, qs *queueState, offset uint64
 // 按 epoch 提案并同步等待落盘后才放锁——下一次取件必从新位点开始，不会被
 // 旧内存态或在途的旧差量覆盖（旧差量在同组提案队列里排在本批之前）。
 // 提交失败则内存态失效，下次访问从盘重装。
+//
+// 超时须重试：返回错误（含等待超时）时重置的结局未知——批次可能仍会迟到
+// 落盘，也可能被该队列随后的消费提交覆盖（重装后的第一个提案整体替换，把
+// 重装时读到的旧状态写回，见 queueState.needFull）。调用方（Admin API）
+// 收到失败应重试直至成功，不能把「已报失败」当成「可能已生效」。
+//
+// 提案 ctx 不取调用方 ctx（Background + consumeProposeTimeout）：管理请求
+// 断开不应让一个已入队的重置提前放弃等待、徒增结局未知。
 func (d *Deliverer) ResetCursor(ctx context.Context, group, topic string, queueID uint32, offset uint64) error {
 	qs, g, err := d.acquire(ctx, group, topic, queueID)
 	if err != nil {
@@ -832,7 +840,7 @@ func (d *Deliverer) ResetCursor(ctx context.Context, group, topic string, queueI
 	qs.init(epoch, offset)
 	b := d.st.NewBatch()
 	qs.buildFull(b)
-	pctx, cancel := context.WithTimeout(ctx, consumeProposeTimeout)
+	pctx, cancel := context.WithTimeout(context.Background(), consumeProposeTimeout)
 	defer cancel()
 	p, err := d.rep.ApplyAsyncAt(pctx, g, b, epoch)
 	if err == nil {

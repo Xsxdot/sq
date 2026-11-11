@@ -44,7 +44,7 @@ import (
 // ctx：一次提案承载多个调用方的变更（在途期间挂上来的），某个调用方放弃
 // 不应拖垮其他人；上限防止失去领导权后条目被截断、waiter 永不触发时
 // 等待者无限挂住（超时 = 结果未知，按失败失效重装，后果至多重复投递）。
-const consumeProposeTimeout = 10 * time.Second
+var consumeProposeTimeout = 10 * time.Second // var：测试注入小值制造「结局未知」
 
 // errStateDropped 内存态被丢弃时，挂在「下一次提案」上的变更以它失败。
 // 包装 ErrNotLeader：rpc 层映射为可重试错误，客户端重试即走重装后的状态。
@@ -188,7 +188,13 @@ func (d *Deliverer) proposeLocked(qs *queueState) {
 	qs.inFlight = true
 	qs.cur = f
 	b := d.st.NewBatch()
-	qs.buildDelta(b)
+	if qs.needFull {
+		// 装载后的第一个提案：整体替换，压过可能迟到 apply 的旧条目（见 needFull）
+		qs.buildFull(b)
+		qs.needFull = false
+	} else {
+		qs.buildDelta(b)
+	}
 	g := d.rt.GroupForQueue(qs.topic, qs.q)
 	ctx, cancel := context.WithTimeout(context.Background(), consumeProposeTimeout)
 	p, err := d.rep.ApplyAsyncAt(ctx, g, b, qs.epoch)
@@ -240,10 +246,16 @@ func (d *Deliverer) awaitCommit(ctx context.Context, f *flush) error {
 // 如删除消费组的成片清理（计划 P2）。本节点须为 g 组 leader（非 leader 由
 // 调用方转发给 leader，leader 侧经此入口）。
 //
-// 做法：解析批次触及的全部队列 → 按队列键字典序逐个取锁（不会与其他路径
-// 成环：别处至多持一把队列锁）→ 丢弃这些队列的内存态 → 同步提交 → 放锁。
-// 放锁前提交已 apply，下次访问重装读到的一定是管理批次之后的状态；在途的
-// 旧差量在同组提案队列里排在本批之前，不会把被删的数据写回。
+// 做法：解析批次触及的全部队列 → 对其中本节点已有内存态的队列按队列键字典序
+// 逐个取锁（不会与其他路径成环：别处至多持一把队列锁）→ 丢弃这些队列的内存态
+// → 同步提交 → 放锁。提交成功返回时批次已 apply，此后重装读到的是管理批次之后
+// 的状态；在途的旧提案在同组提案队列里排在本批之前，不会把被删的数据写回。
+// 本节点没有内存态的队列不建空状态（无可失效）；删除期间仍有消费流量属
+// adminops 的「行为未定义」运维契约。
+//
+// 超时须重试：返回错误（含等待超时）时结局未知——批次可能迟到落盘，也可能被
+// 相关队列随后的消费提交覆盖（重装后的第一个提案整体替换，见
+// queueState.needFull）。调用方应重试直至成功。
 //
 // 参数 b 的归属同 Replicator.Apply：调用后不再持有。解析出整组/不可解析的
 // 消费键时保守地失效本节点全部队列内存态。
@@ -254,17 +266,20 @@ func (d *Deliverer) ApplyAdminBatch(ctx context.Context, g uint32, b *store.Batc
 		return fmt.Errorf("解析管理批次 (g=%d): %w", g, err)
 	}
 	var qss []*queueState
+	d.mu.Lock()
 	if whole {
-		d.mu.Lock()
 		for _, qs := range d.qmu {
 			qss = append(qss, qs)
 		}
-		d.mu.Unlock()
 	} else {
 		for _, cq := range cqs {
-			qss = append(qss, d.queue(cq.Group, cq.Topic, cq.QueueID))
+			k := cq.Group + "/" + cq.Topic + "/" + strconv.FormatUint(uint64(cq.QueueID), 10)
+			if qs, ok := d.qmu[k]; ok {
+				qss = append(qss, qs)
+			}
 		}
 	}
+	d.mu.Unlock()
 	sort.Slice(qss, func(i, j int) bool {
 		a, c := qss[i], qss[j]
 		if a.group != c.group {
@@ -284,11 +299,12 @@ func (d *Deliverer) ApplyAdminBatch(ctx context.Context, g uint32, b *store.Batc
 		qs.mu.Unlock()
 	}
 	if err != nil {
-		d.logger.Warn("消费状态管理批次提交失败（相关队列内存态已失效）", "g", g,
-			"queues", len(qss), "whole", whole, "err", err)
+		d.logger.Warn("消费状态管理批次提交失败（结局未知，须重试；相关队列内存态已失效）", "g", g,
+			"queues", len(cqs), "dropped", len(qss), "whole", whole, "err", err)
 		return fmt.Errorf("提交消费状态管理批次 (g=%d): %w", g, err)
 	}
-	d.logger.Info("消费状态管理批次已提交，相关队列内存态已失效", "g", g, "queues", len(qss), "whole", whole)
+	d.logger.Info("消费状态管理批次已提交，相关队列内存态已失效", "g", g,
+		"queues", len(cqs), "dropped", len(qss), "whole", whole)
 	return nil
 }
 

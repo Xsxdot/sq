@@ -100,6 +100,12 @@ type queueState struct {
 	// dirty 自上次构造批次以来变更过的 offset（内存里有 → Set，没有 → Delete）。
 	dirty       map[uint64]struct{}
 	cursorDirty bool
+	// needFull 下一次逐次复制提案必须是整体替换批次（buildFull）而非差量：
+	// 每次从盘装载后置位（审查 I-1）。丢弃内存态的原因可能是一条结局未知的
+	// 提案（超时的重置位点、管理批次、差量），它仍可能排在组内 FIFO 上、晚于
+	// 本次装载才 apply；差量叠在它之上会让盘上 cursor 越过被它删掉的 inflight。
+	// 整体替换批次排在一切迟到条目之后、单独落地即自洽。
+	needFull bool
 
 	// 逐次复制的串行化（checkpoint.go）：inFlight=本代号有一个提案在途；
 	// next=在途期间到达的变更等待的下一次提案（在途结束后才构造，修订 R1）。
@@ -146,6 +152,7 @@ func (qs *queueState) init(epoch, c uint64) {
 	qs.cursor = c
 	qs.inflight = map[uint64]*inflightEntry{}
 	qs.dirty = map[uint64]struct{}{}
+	qs.needFull = false
 	qs.loadedMirror.Store(true)
 }
 
@@ -179,9 +186,10 @@ func (qs *queueState) load(st *store.Store, epoch uint64) error {
 		qs.clear()
 		return fmt.Errorf("装载 inflight (group=%s topic=%s q=%d): %w", qs.group, qs.topic, qs.q, err)
 	}
-	// 装载不是变更：脏集清空（insert 记过脏）
+	// 装载不是变更：脏集清空（insert 记过脏）；装载后的第一个提案整体替换
 	qs.dirty = map[uint64]struct{}{}
 	qs.cursorDirty = false
+	qs.needFull = true
 	return nil
 }
 

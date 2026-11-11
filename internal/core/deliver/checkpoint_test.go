@@ -33,6 +33,7 @@ type heldCall struct {
 	repr    []byte
 	epoch   uint64
 	release chan error
+	ctx     context.Context
 }
 
 // holdRep 包一个真实 Standalone：meta/produce 的提案直通；deliver 的
@@ -41,6 +42,8 @@ type holdRep struct {
 	*replication.Standalone
 	st   *store.Store
 	hold atomic.Bool
+	// holdApply 同步 Apply 也扣住（管理批次迟到用例）；meta 的写不经此路径时才打开
+	holdApply atomic.Bool
 
 	mu    sync.Mutex
 	calls []*heldCall
@@ -50,12 +53,38 @@ func (r *holdRep) ApplyAsyncAt(ctx context.Context, g uint32, b *store.Batch, ep
 	if !r.hold.Load() {
 		return r.Standalone.ApplyAsyncAt(ctx, g, b, epoch)
 	}
-	c := &heldCall{repr: append([]byte(nil), b.Repr()...), epoch: epoch, release: make(chan error, 1)}
+	c := &heldCall{repr: append([]byte(nil), b.Repr()...), epoch: epoch, release: make(chan error, 1), ctx: ctx}
 	b.Close()
 	r.mu.Lock()
 	r.calls = append(r.calls, c)
 	r.mu.Unlock()
 	return heldPending{r: r, c: c}, nil
+}
+
+// Apply holdApply 打开时扣住同步提交（等放行或 ctx 结束，同 heldPending）。
+func (r *holdRep) Apply(ctx context.Context, g uint32, b *store.Batch) error {
+	if !r.holdApply.Load() {
+		return r.Standalone.Apply(ctx, g, b)
+	}
+	c := &heldCall{repr: append([]byte(nil), b.Repr()...), release: make(chan error, 1), ctx: ctx}
+	b.Close()
+	r.mu.Lock()
+	r.calls = append(r.calls, c)
+	r.mu.Unlock()
+	return heldPending{r: r, c: c}.Wait()
+}
+
+// applyLate 把一条已「结局未知」（等待方已超时放弃）的提案迟到落盘——
+// 模拟它在组内 FIFO 上仍排在后续提案之前、只是 apply 晚于等待方超时。
+func (r *holdRep) applyLate(t *testing.T, i int) {
+	t.Helper()
+	b, err := r.st.NewBatchFromRepr(r.call(i).repr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := r.st.Apply(b); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func (r *holdRep) n() int {
@@ -76,8 +105,17 @@ type heldPending struct {
 }
 
 func (p heldPending) Wait() error {
-	if err := <-p.c.release; err != nil {
-		return err
+	var done <-chan struct{}
+	if p.c.ctx != nil {
+		done = p.c.ctx.Done()
+	}
+	select {
+	case err := <-p.c.release:
+		if err != nil {
+			return err
+		}
+	case <-done:
+		return p.c.ctx.Err() // 结局未知：条目可能仍会落盘（见 applyLate）
 	}
 	b, err := p.r.st.NewBatchFromRepr(p.c.repr)
 	if err != nil {
@@ -477,4 +515,68 @@ func TestPrepareTransferFailureLiftsFence(t *testing.T) {
 	if f.dl.fenced(0) {
 		t.Fatal("失败后围栏应已撤除")
 	}
+}
+
+// —— 结局未知后的重装（审查 I-1）——
+
+// lateFixture 逐次模式 + 短提案超时：先投出 offset 0、1 并落盘。
+func lateFixture(t *testing.T) *holdFixture {
+	t.Helper()
+	old := consumeProposeTimeout
+	consumeProposeTimeout = 100 * time.Millisecond
+	t.Cleanup(func() { consumeProposeTimeout = old })
+	f := newHoldFixture(t)
+	f.send(t, 4)
+	got, err := f.dl.Receive(context.Background(), "g", "t", 0, 2, time.Minute, 0, AllPass)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("首取: %d %v", len(got), err)
+	}
+	return f
+}
+
+// lateThenReceive 结局未知的提案 late 之后：内存态已丢弃，再取件（重装后
+// 投出 2、3，其提案被扣住）→ late 按组内 FIFO 先落盘 → 再放行取件提案。
+// 断言盘上 cursor 之下无未覆盖的 offset（本场景无任何 ack）。
+func lateThenReceive(t *testing.T, f *holdFixture, late int) {
+	t.Helper()
+	f.rep.hold.Store(true)
+	r := f.recvAsync(2)
+	waitUntil(t, "重装后的取件提案入队", func() bool { return f.rep.n() == late+2 })
+	f.rep.applyLate(t, late)
+	f.rep.call(late + 1).release <- nil
+	if res := <-r; res.err != nil || len(res.msgs) != 2 || res.msgs[0].Offset != 2 {
+		t.Fatalf("重装后应投出 offset 2、3: %+v %v", res.msgs, res.err)
+	}
+	assertNoUncoveredOffsets(t, f.st)
+}
+
+// TestLateResetAfterTimeoutKeepsI1 ResetCursor 提案结局未知（等待超时）→ 内存
+// 态丢弃 → 同 epoch 内重装再取件 → 重置批次（DeleteRange）迟到落盘：重装后
+// 的第一个提案必须整体替换，否则盘上 cursor 越过被迟到批次删掉的 inflight。
+func TestLateResetAfterTimeoutKeepsI1(t *testing.T) {
+	f := lateFixture(t)
+	f.rep.hold.Store(true)
+	if err := f.dl.ResetCursor(context.Background(), "g", "t", 0, 0); err == nil {
+		t.Fatal("重置提案被扣住，应超时报错")
+	}
+	lateThenReceive(t, f, 0)
+}
+
+// TestLateAdminBatchAfterTimeoutKeepsI1 同族：删组管理批次超时（结局未知）后
+// 迟到落盘。
+func TestLateAdminBatchAfterTimeoutKeepsI1(t *testing.T) {
+	f := lateFixture(t)
+	f.rep.holdApply.Store(true)
+	b := f.st.NewBatch()
+	ck := store.CursorKey("g", "t", 0)
+	b.DeleteRange(ck, store.PrefixUpperBound(ck))
+	ip := store.InflightPrefix("g", "t", 0)
+	b.DeleteRange(ip, store.PrefixUpperBound(ip))
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if err := f.dl.ApplyAdminBatch(ctx, 0, b); err == nil {
+		t.Fatal("管理批次被扣住，应超时报错")
+	}
+	f.rep.holdApply.Store(false)
+	lateThenReceive(t, f, 0)
 }
