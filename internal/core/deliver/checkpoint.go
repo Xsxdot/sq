@@ -488,7 +488,10 @@ func (d *Deliverer) checkpointRound(ctx context.Context, only *uint32, all bool)
 			}
 			b := d.st.NewBatch()
 			qs.buildFull(b)
-			pctx, cancel := context.WithTimeout(context.Background(), consumeProposeTimeout)
+			// 提案 ctx 派生自本轮 ctx：停机/转移前检查点的预算由调用方决定
+			// （失去多数派时提案永不提交，不得等满单提案上限）；整批替换，
+			// 截止后结局未知无妨——下一轮或重装后的首个提案仍整体替换。
+			pctx, cancel := context.WithTimeout(ctx, consumeProposeTimeout)
 			p, err := d.rep.ApplyAsyncAt(pctx, g, b, qs.epoch)
 			if err != nil {
 				p = errPending{err}

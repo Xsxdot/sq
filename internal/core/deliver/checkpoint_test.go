@@ -580,3 +580,27 @@ func TestLateAdminBatchAfterTimeoutKeepsI1(t *testing.T) {
 	f.rep.holdApply.Store(false)
 	lateThenReceive(t, f, 0)
 }
+
+// TestStopBoundedByCtxWhenProposalsHang 停机收尾检查点的提案永不提交（失去
+// 多数派）时，Stop 须在调用方 ctx 截止时返回，而不是等满单提案上限
+// consumeProposeTimeout（10s）——停机预算由调用方 ctx 决定。
+func TestStopBoundedByCtxWhenProposalsHang(t *testing.T) {
+	f := newHoldFixture(t)
+	f.dl = New(f.rep, f.rt, f.st, f.dl.mt, f.pr, slog.Default(), WithCheckpointInterval(time.Hour))
+	f.send(t, 2)
+	if got, err := f.dl.Receive(context.Background(), "g", "t", 0, 2, time.Minute, 0, AllPass); err != nil || len(got) != 2 {
+		t.Fatalf("取件: %d %v", len(got), err)
+	}
+	f.rep.hold.Store(true) // 此后提案永不放行
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := f.dl.Stop(ctx)
+	took := time.Since(start)
+	if err == nil {
+		t.Fatal("提案未提交时 Stop 应返回错误")
+	}
+	if took > 2*time.Second {
+		t.Fatalf("Stop 应受调用方 ctx（200ms）约束，实际耗时 %v", took)
+	}
+}
