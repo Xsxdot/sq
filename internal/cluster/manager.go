@@ -1426,7 +1426,8 @@ func (m *Manager) peerAddrs() map[uint64]string {
 // （顺序契约见 tick 分支内注释，spec §5）。借 WAL 顺序性把此前所有
 // NoSync 写入一并刷盘（spec §2.2「后台批量 fsync」的最简实现）。全组
 // 共享一条 WAL，一个 flusher 即覆盖全部组；seglog 则逐组独立文件，
-// SyncLogs 内部按组循环。
+// SyncLogs 内部各组并行刷、全部完成才返回（各组刷盘在 seglog 锁外执行，
+// 不阻塞组 raft 主循环的追加）。
 //
 // 曾经的实现是「提交空批次 + pebble.Sync」，而 Pebble 会在
 // commitPipeline.Commit 开头把空批次直接短路返回，既不写 WAL 也不

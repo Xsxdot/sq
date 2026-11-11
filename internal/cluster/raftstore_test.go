@@ -724,3 +724,43 @@ func TestForcedRecoverBumpLogsError(t *testing.T) {
 		t.Fatalf("级别是 %v，期望 ERROR；签字放行可能丢已确认消息，不能降级", lvl)
 	}
 }
+
+// TestSyncLogsReportsFailedGroupAndSyncsOthers I4：SyncLogs 等全部组刷完
+// 才返回；任一组失败即返回错误且错误带组号（flusher 日志据此定位坏组），
+// 其余组照常刷、不出现在错误里。
+func TestSyncLogsReportsFailedGroupAndSyncsOthers(t *testing.T) {
+	st := openClusterTestStore(t)
+	rs := newRaftStore(st, testSlog(t))
+	t.Cleanup(rs.CloseLogs)
+	for g := uint32(1); g <= 3; g++ {
+		term, vote, commit := uint64(1), uint64(1), uint64(0)
+		idx, trm, typ := uint64(1), uint64(1), raftpb.EntryNormal
+		hs := &raftpb.HardState{Term: &term, Vote: &vote, Commit: &commit}
+		if err := rs.Persist(g, hs, []*raftpb.Entry{{Index: &idx, Term: &trm, Type: &typ, Data: []byte("x")}}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := rs.SyncLogs(); err != nil {
+		t.Fatalf("三组均正常时 SyncLogs = %v; want nil", err)
+	}
+
+	bad, err := rs.getLog(2)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := bad.Close(); err != nil {
+		t.Fatal(err)
+	}
+	err = rs.SyncLogs()
+	if err == nil {
+		t.Fatal("组 2 已关闭时 SyncLogs 返回 nil; want 错误")
+	}
+	if !strings.Contains(err.Error(), "组 2") {
+		t.Fatalf("SyncLogs 错误 = %v; want 含「组 2」", err)
+	}
+	for _, ok := range []string{"组 1", "组 3"} {
+		if strings.Contains(err.Error(), ok) {
+			t.Fatalf("SyncLogs 错误 = %v; 不应含正常组「%s」", err, ok)
+		}
+	}
+}
