@@ -354,15 +354,23 @@ func (d *Deliverer) ApplyAdminBatch(ctx context.Context, g uint32, b *store.Batc
 	return nil
 }
 
-// InflightCount 本节点内存里某队列的在外条数（原子镜像，不取队列锁）。
-// ok=false 表示本节点未装载该队列（非 leader 或尚未访问），调用方应回落
-// 读 pebble。预留给控制台/指标改读内存（SQ4.9）。
+// InflightCount 本节点内存里某队列的在外条数（原子镜像，不取队列锁，不阻塞）。
+//
+// 返回：ok=false 表示本节点没有该队列的权威内存态，调用方应回落读 pebble：
+// 未装载（非 leader 或尚未访问）、正在装载，或内存态虽在但已不权威——本节点
+// 已失去该组可写门，或门 epoch 已不是装载时的 epoch（SQ4.9 H2：内存态要等下
+// 一次访问或检查点轮次才丢弃，逐次复制模式下可能一直留着，不判就会让前
+// leader 持续报冻结的旧值）。判定用非阻塞的 WritableEpoch，不等可写门。
 func (d *Deliverer) InflightCount(group, topic string, q uint32) (n int, ok bool) {
 	k := group + "/" + topic + "/" + strconv.FormatUint(uint64(q), 10)
 	d.mu.Lock()
 	qs, has := d.qmu[k]
 	d.mu.Unlock()
 	if !has || !qs.loadedMirror.Load() {
+		return 0, false
+	}
+	e, writable := d.rt.WritableEpoch(d.rt.GroupForQueue(topic, q))
+	if !writable || e != qs.epochMirror.Load() {
 		return 0, false
 	}
 	return int(qs.nInflight.Load()), true

@@ -124,9 +124,11 @@ type queueState struct {
 	// 再多，一次取件对索引的访问也是常数级」）。只在 mu 内写。
 	idxVisits uint64
 
-	// 只读镜像：不取锁的查询（InflightCount）读它们。
+	// 只读镜像：不取锁的查询（InflightCount）读它们。epochMirror 先于
+	// loadedMirror 置位，读侧先读 loadedMirror 再读 epochMirror。
 	nInflight    atomic.Int64
 	loadedMirror atomic.Bool
+	epochMirror  atomic.Uint64
 }
 
 func newQueueState(group, topic string, q uint32) *queueState {
@@ -151,6 +153,7 @@ func (qs *queueState) init(epoch, c uint64) {
 	qs.clear()
 	qs.loaded = true
 	qs.epoch = epoch
+	qs.epochMirror.Store(epoch)
 	qs.cursor = c
 	qs.inflight = map[uint64]*inflightEntry{}
 	qs.dirty = map[uint64]struct{}{}
@@ -171,6 +174,8 @@ func (qs *queueState) load(st *store.Store, epoch uint64) error {
 		c = store.GetU64(v)
 	}
 	qs.init(epoch, c)
+	// 扫盘期间 nInflight 只是部分值：镜像在装载完成后才对外标为已装载
+	qs.loadedMirror.Store(false)
 	pfx := store.InflightPrefix(qs.group, qs.topic, qs.q)
 	err = st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) {
 		_, _, _, off, perr := store.ParseInflightKey(k)
@@ -192,6 +197,7 @@ func (qs *queueState) load(st *store.Store, epoch uint64) error {
 	qs.dirty = map[uint64]struct{}{}
 	qs.cursorDirty = false
 	qs.needFull = true
+	qs.loadedMirror.Store(true)
 	return nil
 }
 
