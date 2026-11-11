@@ -204,6 +204,10 @@ type Router interface {
 	// 计数器缓存须与之绑定，epoch 变了即从盘重读。失败为 ErrNotLeader
 	// 包装（可重试）。单机后端恒 (0, nil)。
 	WaitWritable(ctx context.Context, g uint32) (epoch uint64, err error)
+	// WritableEpoch 非阻塞查询可写门：门开返回 (epoch, true)，否则 (0, false)。
+	// 用于过门后的读判定在落成结论前复核「门仍开且 epoch 未变」（同一任期内
+	// 领导权连续）。单机后端恒 (0, true)。
+	WritableEpoch(g uint32) (epoch uint64, ok bool)
 }
 
 // Forwarder 跨节点转发原语（仅 Cluster 后端实现；Standalone 上调用属编程错误，panic）。
@@ -313,6 +317,9 @@ func (StandaloneRouter) ReadBarrier(context.Context, uint32) error { return nil 
 // WaitWritable 单机档无换届，本地 FSM 恒为权威，恒立即放行（epoch 恒 0）。
 func (StandaloneRouter) WaitWritable(context.Context, uint32) (uint64, error) { return 0, nil }
 
+// WritableEpoch 单机档恒可写（epoch 恒 0）。
+func (StandaloneRouter) WritableEpoch(uint32) (uint64, bool) { return 0, true }
+
 // Cluster 集群后端：Apply/ApplyAsync 经 Manager 提进所属组的保序提案队列；兼作 Router（转
 // Manager）与 Forwarder（经控制通道跨节点转发）。
 type Cluster struct {
@@ -407,6 +414,9 @@ func (r *Cluster) ReadBarrier(ctx context.Context, g uint32) error {
 func (r *Cluster) WaitWritable(ctx context.Context, g uint32) (uint64, error) {
 	return r.m.WaitWritable(ctx, g)
 }
+
+// WritableEpoch 转发 Manager.WritableEpoch（非阻塞）。
+func (r *Cluster) WritableEpoch(g uint32) (uint64, bool) { return r.m.WritableEpoch(g) }
 
 // ForwardAppend 把一条已编码逻辑消息（core.EncodeMessage 字节）交给 g
 // 组 leader 的 produce 栈追加——offset 分配发生在 leader 侧，

@@ -368,6 +368,8 @@ func (followerRouter) WaitWritable(context.Context, uint32) (uint64, error) {
 	return 0, replication.ErrNotLeader
 }
 
+func (followerRouter) WritableEpoch(uint32) (uint64, bool) { return 0, false }
+
 // recordingForwarder 记录 ForwardAppend 被调用的假转发器。
 type recordingForwarder struct {
 	called  bool

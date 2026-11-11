@@ -1732,6 +1732,20 @@ func (m *Manager) WaitWritable(ctx context.Context, g uint32) (uint64, error) {
 	return gr.waitWritable(ctx)
 }
 
+// WritableEpoch 非阻塞查询 g 组可写门的当前状态：门开时返回 (epoch, true)，
+// 否则 (0, false)（非 leader / 换届中 / apply 未追平本任期首条 / 组不存在）。
+//
+// 用途：调用方过门（WaitWritable）拿到 epoch 后做了一段读判定，判定结论要
+// 落成写或回执之前核对「门仍开且 epoch 未变」——同一任期号内本节点不可能
+// 失主后复任，epoch 相等即判定期间领导权连续、本地 FSM 一直权威。
+func (m *Manager) WritableEpoch(g uint32) (uint64, bool) {
+	gr, ok := m.groups[g]
+	if !ok {
+		return 0, false
+	}
+	return gr.writable()
+}
+
 // Leader 返回指定组当前 leader 的节点 ID；尚未选举完成时 ok=false。
 func (m *Manager) Leader(g uint32) (nodeID uint64, ok bool) {
 	gr, has := m.groups[g]

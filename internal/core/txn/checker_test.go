@@ -29,6 +29,8 @@ func (r fixedLeaderRouter) WaitWritable(context.Context, uint32) (uint64, error)
 	return 0, replication.ErrNotLeader
 }
 
+func (r fixedLeaderRouter) WritableEpoch(uint32) (uint64, bool) { return 0, r.leader }
+
 // fakeNotifier 记录收到的回查请求，可编程返回值。
 type fakeNotifier struct {
 	got  []string // 收到的 txID 序列

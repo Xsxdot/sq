@@ -72,6 +72,8 @@ func (r fixedLeaderRouter) WaitWritable(context.Context, uint32) (uint64, error)
 	return 0, replication.ErrNotLeader
 }
 
+func (r fixedLeaderRouter) WritableEpoch(uint32) (uint64, bool) { return 0, r.leader }
+
 // TestPassPurgesExpired 过期消息与索引被清，未过期保留。
 func TestPassPurgesExpired(t *testing.T) {
 	st, mt, rep, rt := newFixtureRouted(t)

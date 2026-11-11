@@ -248,6 +248,8 @@ func (r fakeLeaderRouter) WaitWritable(context.Context, uint32) (uint64, error) 
 	return 0, ErrNotLeader
 }
 
+func (r fakeLeaderRouter) WritableEpoch(uint32) (uint64, bool) { return 0, r.leader }
+
 // fakeCaptureForwarder 捕获 ForwardApply 载荷的假转发器。
 type fakeCaptureForwarder struct {
 	g    uint32
