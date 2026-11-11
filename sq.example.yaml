@@ -67,6 +67,15 @@ credentials: []
 # 时序采样落库保留小时数；0 = 只留内存环最近 1 小时；上限 8760
 metrics_retention_hours: 168
 
+# —— 存储引擎（Pebble）调优 ——
+# 不填本段 = 用内置缺省值（下面注释里的数字）。大小写法：非负整数 + 可选单位
+# B/KiB/MiB/GiB（区分大小写，不带单位 = 字节）；不接受 KB/MB/GB。
+# 内存占用估算与 2GB 机器建议见 docs/configuration.md「存储引擎（storage）」节。
+# storage:
+#   cache_size: 256MiB        # block cache，范围 [8MiB, 64GiB]；memtable 从中预留
+#   memtable_size: 32MiB      # 单个 memtable，范围 [1MiB, 1GiB]
+#   compaction_concurrency: 0 # 压实并发上限，0 = min(4, CPU 核数)，范围 [0, 64]
+
 # —— 事务消息 ——
 # 半消息回查间隔（Go duration）；单条最大回查次数，超限丢弃并记日志
 txn_check_interval: 30s
