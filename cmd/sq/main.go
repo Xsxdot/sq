@@ -697,8 +697,11 @@ func handleForwardAppend(payload []byte, pr *produce.Producer) ([]byte, error) {
 	return resp, nil
 }
 
-// consumeStopTimeout 停机收尾检查点的上限（卡 SQ4.1，计划授权 [5s,20s]）。
-const consumeStopTimeout = 10 * time.Second
+// consumeStopTimeout 停机收尾检查点的上限（卡 SQ4.1；计划授权区间由主会话
+// 2026-11-11 改为 [1s,4s]）。必须落在既有「优雅停机 5s 内退出」承诺之内：
+// 有多数派时全量检查点是毫秒级；失去多数派（如全集群停机的最后一个节点）
+// 时提案永远提交不了，等满上限即放弃，后果同 kill -9（有界重复）。
+const consumeStopTimeout = 3 * time.Second
 
 // handleForwardApply 处理 OpForwardApply 控制请求：把构造无关批次
 // （纯 Delete/DeleteRange/绝对值 Set）提交到目标组。

@@ -398,8 +398,15 @@ func (d *Deliverer) Stop(ctx context.Context) error {
 		}
 	}
 	if last != nil {
-		d.logger.Error("停机收尾检查点未全部落盘（重启后这部分进度表现为重复投递）",
-			"queues", total, "took", time.Since(start).String(), "err", last)
+		// 失败的队列已重新登记为脏：其条数即未落盘的队列数
+		d.ckMu.Lock()
+		unflushed := len(d.ckDirty)
+		d.ckMu.Unlock()
+		// 典型成因：本节点是最后停机的成员，其余节点已离开，本节点仍自认
+		// leader（未开 CheckQuorum 不会自降）而提案永远凑不齐多数派——上限
+		// 到期即放弃，与 kill -9 同等后果（有界重复），不丢消息。
+		d.logger.Error("停机收尾检查点未全部落盘（重启后这部分进度表现为重复投递；超时多见于本节点已失去多数派，如全集群停机时最后一个停的节点）",
+			"queues", total, "unflushed_queues", unflushed, "took", time.Since(start).String(), "err", last)
 		return last
 	}
 	d.logger.Info("消费引擎已停止，收尾检查点完成", "queues", total, "took", time.Since(start).String())
