@@ -2,7 +2,8 @@
 //
 // 职责：
 //   - I1：零值 Options 解析为本包缺省常量、显式值原样透传——经「store 已打开」
-//     日志字段断言，穿过 OpenWithOptions → pebble.Open 的真实组装链
+//     日志字段断言，穿过 OpenWithOptions → pebble.Open 的真实组装链；并直接
+//     断言交给 pebble 的 Options（漏传任一项即红）
 //   - I2：布隆过滤器真的写进 SST 并在点查中生效（Filter.Hits > 0）
 //
 // 边界：
@@ -64,6 +65,39 @@ func TestOptionsResolveDefaultsAndPassThrough(t *testing.T) {
 		num(rec, "memtable_size") != fmt.Sprint(2<<20) ||
 		num(rec, "compaction_concurrency") != "3" {
 		t.Fatalf("显式值应原样透传，日志为 %v", rec)
+	}
+}
+
+// TestPebbleOptionsCarryResolvedParams I1 的另一半：日志字段取自 resolve 后
+// 的值，证明不了 pebble 真的收到了它们——组装 pebble.Options 时漏传一项，
+// 日志照样正确而引擎退回出厂值（8MiB 缓存）。这里直接断言交给 pebble.Open
+// 的选项（OpenWithOptions 传的正是 resolve 后的 pebbleOptions 返回值）。
+func TestPebbleOptionsCarryResolvedParams(t *testing.T) {
+	cases := []struct {
+		name string
+		in   Options
+		want Options
+	}{
+		{"零值=缺省", Options{}, Options{DefaultCacheSize, DefaultMemTableSize, min(DefaultMaxCompactionConcurrency, runtime.NumCPU())}},
+		{"显式值透传", Options{16 << 20, 2 << 20, 3}, Options{16 << 20, 2 << 20, 3}},
+	}
+	for _, c := range cases {
+		po := c.in.resolve().pebbleOptions(slog.Default())
+		if po.CacheSize != c.want.CacheSize {
+			t.Fatalf("%s: pebble CacheSize=%d, want %d", c.name, po.CacheSize, c.want.CacheSize)
+		}
+		if po.MemTableSize != c.want.MemTableSize {
+			t.Fatalf("%s: pebble MemTableSize=%d, want %d", c.name, po.MemTableSize, c.want.MemTableSize)
+		}
+		if po.CompactionConcurrencyRange == nil {
+			t.Fatalf("%s: 未设 CompactionConcurrencyRange（pebble 会退回 (1,1)）", c.name)
+		}
+		if lo, hi := po.CompactionConcurrencyRange(); lo != 1 || hi != c.want.CompactionConcurrency {
+			t.Fatalf("%s: 压实并发区间=(%d,%d), want (1,%d)", c.name, lo, hi, c.want.CompactionConcurrency)
+		}
+		if po.Levels[0].FilterPolicy == nil {
+			t.Fatalf("%s: L0 未设布隆过滤器", c.name)
+		}
 	}
 }
 
