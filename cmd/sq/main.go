@@ -292,6 +292,15 @@ func run() error {
 			StoreOptions:           storeOptions(cfg), // Rejoin 重开 store 时沿用同一组调优参数
 			OnApplied:              onApplied,
 			ControlHandler:         controlHandler,
+			// 计划内转移领导权前先把该组消费内存态落盘（卡 SQ4.1 P1）：摊布
+			// 循环同步调用、出错本周期不转移。deliver 晚于 Manager 装配，经
+			// dlPtr 原子读；未就绪时放行（尚无内存态可落）。
+			BeforeLeaderTransfer: func(ctx context.Context, g uint32) error {
+				if d := dlPtr.Load(); d != nil {
+					return d.PrepareTransfer(ctx, g)
+				}
+				return nil
+			},
 		}
 		m, err = cluster.NewManager(opts)
 		if errors.Is(err, cluster.ErrUncleanShutdown) {
@@ -385,8 +394,22 @@ func run() error {
 	mtPtr.Store(mt) // OnApplied 钩子闭包原子读
 	pr = produce.New(rep, rt, st, mt, logger)
 	prPtr.Store(pr) // ForwardAppend 控制处理器闭包原子读
-	dl := deliver.New(rep, rt, st, mt, pr, logger)
-	dlPtr.Store(dl) // ForwardApply 控制处理器闭包原子读（消费状态批次分流）
+	// 消费状态持久化模式（卡 SQ4.1）：consume_checkpoint_interval>0 检查点
+	// 模式（缺省 1s），0 逐次复制；Start 打出模式日志并起检查点循环。
+	dl := deliver.New(rep, rt, st, mt, pr, logger, deliver.WithCheckpointInterval(cfg.ConsumeCheckpoint()))
+	dlPtr.Store(dl) // ForwardApply 控制处理器 / 转移前回调闭包原子读
+	dl.Start(runCtx)
+	// 停机收尾检查点。顺序：gRPC 排空（select 分支，早于全部 defer）→ 本
+	// defer 之后注册的 admin Shutdown / 各后台循环先停（LIFO，不会在收尾
+	// 检查点之后再来一次重置位点或取件）→ 本 defer（关门 + 收尾检查点）→
+	// 更早注册的 Manager.StopClean → st.Close。单机档同一套。
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), consumeStopTimeout)
+		defer cancel()
+		if err := dl.Stop(sctx); err != nil {
+			logger.Error("消费引擎停机收尾检查点失败（重启后表现为重复投递）", "err", err)
+		}
+	}()
 
 	// 事务管理器。构造顺序有讲究：rpc.Server 要拿它处理 Send/EndTransaction，
 	// 回查调度器又要拿 rpc.Server 当 Notifier（下发回查命令）——先建 Manager、
@@ -673,6 +696,9 @@ func handleForwardAppend(payload []byte, pr *produce.Producer) ([]byte, error) {
 	binary.BigEndian.PutUint64(resp[4:], stored.Offset)
 	return resp, nil
 }
+
+// consumeStopTimeout 停机收尾检查点的上限（卡 SQ4.1，计划授权 [5s,20s]）。
+const consumeStopTimeout = 10 * time.Second
 
 // handleForwardApply 处理 OpForwardApply 控制请求：把构造无关批次
 // （纯 Delete/DeleteRange/绝对值 Set）提交到目标组。
