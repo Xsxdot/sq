@@ -293,3 +293,5 @@
 - `internal/cluster/group.go:374` `MaxSizePerMsg: 1 << 20`
 - `~/go/pkg/mod/github.com/apache/rocketmq-clients/golang/v5@v5.1.4/message.go:386` `func (msg *MessageView) GetDeliveryAttempt() int32`
 - SQ1 计划（`.../worktrees/sq1/docs/superpowers/plans/sq1-plan.md`）F1 `WaitWritable(ctx, g) (epoch uint64, err error)`、F2 阻塞上限 min(ctx,3s)、F3 epoch 标签缓存、F4 deliver 挂门交 SQ3；SQ2 计划（`.../worktrees/sq2/docs/superpowers/plans/sq2-plan.md`）D2 入队绑任期、§4.2 失败语义论证、§6「SQ3 用例预期仍红」
+- `~/go/pkg/mod/github.com/apache/rocketmq-clients/golang/v5@v5.1.4/simple_consumer.go:452-463` `Ack` 只在传输层出错时返回 error，响应码非 OK 时仍返回 nil（吞掉 HA_NOT_AVAILABLE / INTERNAL_SERVER_ERROR 等）；`client_options.go:34` 请求超时缺省 3000ms → 基准里的「ack 报错」只能是传输层错误（含 3s 超时），服务端拒绝不可见（入 roadmap：e2e 的 ack 判据需走原始 gRPC 或校验 entry 码）
+- `~/go/pkg/mod/github.com/apache/rocketmq-clients/golang/v5@v5.1.4/loadBalancer.go:144-158` `subscriptionLoadBalancer.index` 零值起步、每次 receive 加一 → 同进程多个 SimpleConsumer 同步轮转到同一队列（修订 R3 的根因读数）

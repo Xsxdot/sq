@@ -41,6 +41,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -411,7 +412,11 @@ var consumeBenchModes = []consumeBenchMode{{name: "default"}}
 // runConsumeLoad 预写约 total 条（并发 64 发送，实发数为准）后，consumers 个 SimpleConsumer
 // 并发收（每次至多 32 条）+ 逐条 ack，直到收齐 total 个不同 msgID，报 msg/s。
 // 计时从消费者开闸到收齐；5 分钟未收齐判失败（数字无意义）。
-func runConsumeLoad(t *testing.T, endpoint, topic, group string, total, consumers int, label string) benchResult {
+//
+// ack 报错（SDK 只对传输层错误返回 error，非 OK 响应码被它吞掉）不判失败，
+// 但有报错时打出错误原文与各 broker 日志尾部——t.TempDir 在用例结束即删，
+// 不在此刻留证就再也看不到（logPaths 为本档全部 broker 的日志路径）。
+func runConsumeLoad(t *testing.T, endpoint, topic, group string, total, consumers int, label string, logPaths ...string) benchResult {
 	t.Helper()
 	pre := runSendLoad(t, endpoint, topic, 64, total, 128, label+"/预写")
 	// 预写按 total/64 整除分摊，实发可能少于 total；以实发成功条数为收齐目标
@@ -428,6 +433,7 @@ func runConsumeLoad(t *testing.T, endpoint, topic, group string, total, consumer
 		seen    = make(map[string]bool, total)
 		wg      sync.WaitGroup
 		ackFail atomic.Int64
+		ackErrs = map[string]int{}
 	)
 	done := make(chan struct{})
 	var once sync.Once
@@ -451,6 +457,9 @@ func runConsumeLoad(t *testing.T, endpoint, topic, group string, total, consumer
 				for _, mv := range mvs {
 					if err := c.Ack(context.Background(), mv); err != nil {
 						ackFail.Add(1)
+						mu.Lock()
+						ackErrs[time.Now().Format("15:04:05")+" "+err.Error()]++
+						mu.Unlock()
 					}
 					mu.Lock()
 					seen[mv.GetMessageId()] = true
@@ -478,10 +487,33 @@ func runConsumeLoad(t *testing.T, endpoint, topic, group string, total, consumer
 	if n < total {
 		t.Fatalf("%s: 5 分钟内只收到 %d/%d 条", label, n, total)
 	}
+	if ackFail.Load() > 0 {
+		for e, c := range ackErrs {
+			t.Logf("%s: ack 报错 x%d: %s", label, c, e)
+		}
+		for _, p := range logPaths {
+			logTail(t, p, 80)
+		}
+	}
 	r := benchResult{label: label, sent: n, elapsed: elapsed}
 	t.Logf("%s: %.0f msg/s（收齐 %d 条 / %v，消费者 %d，ack 报错 %d）",
 		label, r.msgPerSec(), n, elapsed.Round(time.Millisecond), consumers, ackFail.Load())
 	return r
+}
+
+// logTail 打出日志文件末尾 n 行（ack 报错留证用）。
+func logTail(t *testing.T, path string, n int) {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Logf("读取 broker 日志 %s 失败: %v", path, err)
+		return
+	}
+	lines := strings.Split(strings.TrimRight(string(raw), "\n"), "\n")
+	if len(lines) > n {
+		lines = lines[len(lines)-n:]
+	}
+	t.Logf("---- broker 日志尾部 %d 行 (%s) ----\n%s\n---- 尾部结束 ----", len(lines), path, strings.Join(lines, "\n"))
 }
 
 // TestClusterConsumeThroughput 端到端消费吞吐（收 + ack）：三节点 quorum-mem
@@ -510,11 +542,17 @@ func TestClusterConsumeThroughput(t *testing.T) {
 			topic := "cbench-" + m.name
 			ensureTopic(t, pc.endpoints(), topic)
 			waitRouteSpread(t, pc.endpoints(), topic, 60*time.Second)
+			var logs []string
+			for _, h := range pc.handles {
+				logs = append(logs, h.logPath)
+			}
 			results = append(results, runConsumeLoad(t, pc.multi(), topic, "cbench-g", total, consumers,
-				"cluster/quorum-mem/"+m.name))
+				"cluster/quorum-mem/"+m.name, logs...))
 		})
 		t.Run("standalone/"+m.name, func(t *testing.T) {
+			var logPath string
 			endpoint := startBroker(t, func(c *config.Config) {
+				logPath = filepath.Join(filepath.Dir(c.DataDir), "broker.log")
 				c.DefaultQueueNums = uint32(queues)
 				c.DiskWatermarkPercent = 0
 				c.LogLevel = "info"
@@ -526,7 +564,7 @@ func TestClusterConsumeThroughput(t *testing.T) {
 			topic := "cbench-solo-" + m.name
 			ensureTopic(t, []string{endpoint}, topic)
 			results = append(results, runConsumeLoad(t, endpoint, topic, "cbench-g", total, consumers,
-				"standalone/"+m.name))
+				"standalone/"+m.name, logPath))
 		})
 	}
 	t.Log("=== 汇总（msg/s，端到端 SDK 收 + ack）===")
