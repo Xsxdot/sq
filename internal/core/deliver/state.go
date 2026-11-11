@@ -107,12 +107,14 @@ type queueState struct {
 	// 整体替换批次排在一切迟到条目之后、单独落地即自洽。
 	needFull bool
 
-	// 逐次复制的串行化（checkpoint.go）：inFlight=本代号有一个提案在途；
-	// next=在途期间到达的变更等待的下一次提案（在途结束后才构造，修订 R1）。
-	inFlight bool
+	// 逐次复制的在途控制（checkpoint.go）：inFlight=本队列尚未了结（Wait 未
+	// 返回）的提案数，**不分代号**——丢弃内存态后旧代号的提案仍计数，重装须等
+	// 它归零（修订 R3）。上限 Deliverer.maxInFlight（R1：1；前缀有序后端：
+	// maxInFlightPrefix）。next=达到上限期间到达的变更等待的下一次提案（R2）。
+	inFlight int
 	next     *flush
-	// cur 当前在途的逐次复制提案（计划内转移前等它了结用）；无在途为 nil。
-	cur *flush
+	// settled inFlight 归零时关闭（有人等时才创建）：重装与计划内转移等它。
+	settled chan struct{}
 
 	// ckDirty 检查点模式：本队列已登记进 Deliverer 的脏队列集合（避免每次
 	// 变更都去碰那张共享 map）。只在 mu 内读写。
@@ -131,7 +133,7 @@ func newQueueState(group, topic string, q uint32) *queueState {
 	return &queueState{group: group, topic: topic, q: q}
 }
 
-// clear 清空内存态并标记未装载（不动 gen/inFlight/next，由调用方处理）。
+// clear 清空内存态并标记未装载（不动 gen/inFlight/next/settled，由调用方处理）。
 func (qs *queueState) clear() {
 	qs.loaded = false
 	qs.cursor = 0

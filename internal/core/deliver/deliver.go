@@ -121,6 +121,10 @@ type Deliverer struct {
 
 	// interval 检查点间隔；0 = 逐次复制模式。构造后只读。
 	interval time.Duration
+	// maxInFlight 逐次复制模式下每队列在途提案上限（构造后只读）：提交后端
+	// 声明前缀有序（replication.PrefixOrderedCommitter）时为
+	// maxInFlightPrefix，否则为 1（修订 R1/R3）。
+	maxInFlight int
 
 	// ckMu 保护 ckDirty（检查点模式的脏队列集合，叶子锁：可在持队列锁时取）。
 	ckMu    sync.Mutex
@@ -161,11 +165,20 @@ func New(rep replication.Replicator, rt replication.Router, st *store.Store,
 		logger: logger.With("mod", "deliver"), qmu: map[string]*queueState{},
 		skipped: map[FilterSkipKey]uint64{}, ckDirty: map[*queueState]struct{}{},
 		fences: map[uint32]time.Time{}}
+	d.maxInFlight = 1
+	if pc, ok := rep.(replication.PrefixOrderedCommitter); ok && pc.PrefixOrderedCommit() {
+		d.maxInFlight = maxInFlightPrefix
+	}
 	for _, o := range opts {
 		o(d)
 	}
 	return d
 }
+
+// maxInFlightPrefix 前缀有序后端下每队列在途提案上限（计划修订 R3，授权
+// [4,64]）：16 消费者打同一队列时 pebble 约 8 次提交合并一次 fsync，16 =
+// 2× 该并发留余量；超出部分进 R2 的合并提案，在途批次数有界。
+const maxInFlightPrefix = 16
 
 // Option Deliverer 构造选项。
 type Option func(*Deliverer)

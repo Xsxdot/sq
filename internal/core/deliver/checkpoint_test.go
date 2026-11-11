@@ -45,9 +45,19 @@ type holdRep struct {
 	// holdApply 同步 Apply 也扣住（管理批次迟到用例）；meta 的写不经此路径时才打开
 	holdApply atomic.Bool
 
+	// prefix 本假后端是否声明前缀有序提交（修订 R3）。缺省 false：既有 U4
+	// 等用例按集群语义（R1，每队列至多一个在途）测；遮蔽 Standalone 的声明。
+	prefix bool
+
 	mu    sync.Mutex
 	calls []*heldCall
 }
+
+func (r *holdRep) PrefixOrderedCommit() bool { return r.prefix }
+
+// errHeldUnknown 作为 release 值：等待方以 DeadlineExceeded 返回、批次不落盘
+// （结局未知，可随后 applyLate 迟到落盘）。
+var errHeldUnknown = errors.New("held: 结局未知")
 
 func (r *holdRep) ApplyAsyncAt(ctx context.Context, g uint32, b *store.Batch, epoch uint64) (replication.Pending, error) {
 	if !r.hold.Load() {
@@ -111,6 +121,9 @@ func (p heldPending) Wait() error {
 	}
 	select {
 	case err := <-p.c.release:
+		if errors.Is(err, errHeldUnknown) {
+			return context.DeadlineExceeded
+		}
 		if err != nil {
 			return err
 		}
@@ -602,5 +615,107 @@ func TestStopBoundedByCtxWhenProposalsHang(t *testing.T) {
 	}
 	if took > 2*time.Second {
 		t.Fatalf("Stop 应受调用方 ctx（200ms）约束，实际耗时 %v", took)
+	}
+}
+
+// —— 修订 R3：前缀有序后端下的同队列流水化 ——
+
+func newPrefixFixture(t *testing.T) *holdFixture {
+	t.Helper()
+	f := newHoldFixture(t)
+	f.rep.prefix = true
+	f.dl = New(f.rep, f.rt, f.st, f.dl.mt, f.pr, slog.Default())
+	return f
+}
+
+// TestPrefixBackendPipelinesProposals 声明前缀有序的后端下，前序在途时后续
+// 调用立刻提交自己的差量（不再等前序了结）。
+func TestPrefixBackendPipelinesProposals(t *testing.T) {
+	f := newPrefixFixture(t)
+	f.send(t, 4)
+	f.rep.hold.Store(true)
+	r1 := f.recvAsync(2)
+	waitUntil(t, "首个提案入队", func() bool { return f.rep.n() == 1 })
+	r2 := f.recvAsync(2)
+	waitUntil(t, "前序在途时第二个提案也入队", func() bool { return f.rep.n() == 2 })
+	f.rep.call(0).release <- nil
+	f.rep.call(1).release <- nil
+	for _, ch := range []chan recvResult{r1, r2} {
+		if res := <-ch; res.err != nil || len(res.msgs) != 2 {
+			t.Fatalf("取件: %d %v", len(res.msgs), res.err)
+		}
+	}
+	assertNoUncoveredOffsets(t, f.st)
+}
+
+// TestPrefixUnknownFateReloadWaitsSettleKeepsI1 前缀有序后端、同队列 k（取件
+// 2、3）结局未知而 k+1（ack 0）已提交：内存态丢弃后，重装必须等本队列全部
+// 在途了结再读盘——k 迟到生效、k+1 成功后，重装读到的状态里 ack 0 不被撤回，
+// 盘上 I1 成立（cursor 之下的 offset 要么已 ack、要么有 inflight）。
+func TestPrefixUnknownFateReloadWaitsSettleKeepsI1(t *testing.T) {
+	f := newPrefixFixture(t)
+	f.send(t, 4)
+	if got, err := f.dl.Receive(context.Background(), "g", "t", 0, 2, time.Minute, 0, AllPass); err != nil || len(got) != 2 {
+		t.Fatalf("首取: %d %v", len(got), err)
+	}
+	f.rep.hold.Store(true)
+	rk := f.recvAsync(2) // k：投出 2、3
+	waitUntil(t, "k 入队", func() bool { return f.rep.n() == 1 })
+	ack := make(chan error, 1)
+	go func() {
+		ok, err := f.dl.Ack(context.Background(), "g", "t", 0, 0, 1)
+		if err == nil && !ok {
+			err = errors.New("ack 落空")
+		}
+		ack <- err
+	}()
+	waitUntil(t, "k+1（ack 0）流水化入队", func() bool { return f.rep.n() == 2 })
+	f.rep.call(0).release <- errHeldUnknown
+	if res := <-rk; res.err == nil {
+		t.Fatal("k 结局未知，其取件应报错")
+	}
+	// 失效后的访问：须等 k+1 了结才重装
+	r3 := f.recvAsync(2)
+	time.Sleep(50 * time.Millisecond)
+	select {
+	case res := <-r3:
+		t.Fatalf("在途未了结即重装并返回: %d %v", len(res.msgs), res.err)
+	default:
+	}
+	f.rep.applyLate(t, 0)        // k 实际按序生效
+	f.rep.call(1).release <- nil // k+1 成功
+	if err := <-ack; err != nil {
+		t.Fatalf("k+1 的 ack 应成功: %v", err)
+	}
+	// 若重装后还有提案（不应有：无新变更），放行避免挂住
+	go func() {
+		for i := 2; ; i++ {
+			if i >= 64 {
+				return
+			}
+			deadline := time.Now().Add(2 * time.Second)
+			for f.rep.n() <= i {
+				if time.Now().After(deadline) {
+					return
+				}
+				time.Sleep(time.Millisecond)
+			}
+			f.rep.call(i).release <- nil
+		}
+	}()
+	if res := <-r3; res.err != nil || len(res.msgs) != 0 {
+		t.Fatalf("重装后应无新消息可投（2、3 已由迟到的 k 投出）: %d %v", len(res.msgs), res.err)
+	}
+	c, inf := diskView(t, f.st, "g", "t", 0)
+	if c != 4 || len(inf) != 3 {
+		t.Fatalf("盘上应为 cursor=4、inflight{1,2,3}: cursor=%d inflight=%v", c, inf)
+	}
+	for off := uint64(1); off < c; off++ {
+		if _, ok := inf[off]; !ok {
+			t.Fatalf("盘上 cursor=%d 越过了无 inflight 的未 ack offset %d", c, off)
+		}
+	}
+	if n, ok := f.dl.InflightCount("g", "t", 0); !ok || n != 3 {
+		t.Fatalf("重装后内存应为 3 条在外（ack 0 不被撤回）: n=%d ok=%v", n, ok)
 	}
 }

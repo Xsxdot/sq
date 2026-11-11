@@ -73,53 +73,51 @@ func (d *Deliverer) queue(group, topic string, q uint32) *queueState {
 //
 // 返回：已加锁、已装载、epoch == 本次门 epoch 的队列状态（调用方负责解锁）
 // 与队列所属组号。错误：门未开（ErrNotLeader 包装）、本次 epoch 已过时
-// （ErrNotLeader 包装）、装载读盘失败。
+// （ErrNotLeader 包装）、装载读盘失败、等待在途了结期间 ctx 结束。
+//
+// 未装载而本队列仍有未了结的提案（任意代号）时，先放锁等它们全部了结再
+// 重来一遍（修订 R3：重装读盘必须晚于在途了结，盘上才是它们生效后的状态）。
 //
 // 注意：WaitWritable 可能阻塞（新 leader 追 apply，上限 3s），必须在取队列
 // 锁之前调用。
 func (d *Deliverer) acquire(ctx context.Context, group, topic string, q uint32) (*queueState, uint32, error) {
 	g := d.rt.GroupForQueue(topic, q)
 	qs := d.queue(group, topic, q)
-	var e uint64
 	for {
-		if d.closed.Load() {
-			return nil, g, errStopped
-		}
-		if err := d.waitFence(ctx, g); err != nil {
-			return nil, g, err
-		}
-		var err error
-		e, err = d.rt.WaitWritable(ctx, g)
+		e, err := d.lockGated(ctx, qs, g)
 		if err != nil {
 			d.logger.Debug("消费请求未过可写门", "group", group, "topic", topic, "queue", q, "g", g, "err", err)
 			return nil, g, err
 		}
-		qs.mu.Lock()
-		// 锁内复查：停机收尾检查点 / 转移前检查点按队列取锁构造批次，取锁
-		// 晚于它们的调用必须看到关门或围栏，否则改动会落在最后一次检查点之后
-		if d.closed.Load() {
+		if qs.loaded && qs.epoch > e {
+			cur := qs.epoch
 			qs.mu.Unlock()
-			return nil, g, errStopped
+			d.logger.Debug("消费请求持有的 epoch 已过时", "group", group, "topic", topic, "queue", q,
+				"epoch", e, "state_epoch", cur)
+			return nil, g, fmt.Errorf("%w: 组 %d 本次 epoch %d 早于队列状态 epoch %d", replication.ErrNotLeader, g, e, cur)
 		}
-		if !d.fenced(g) {
-			break
+		if qs.loaded && qs.epoch == e {
+			return qs, g, nil
 		}
-		qs.mu.Unlock()
-	}
-	if qs.loaded && qs.epoch > e {
-		cur := qs.epoch
-		qs.mu.Unlock()
-		d.logger.Debug("消费请求持有的 epoch 已过时", "group", group, "topic", topic, "queue", q,
-			"epoch", e, "state_epoch", cur)
-		return nil, g, fmt.Errorf("%w: 组 %d 本次 epoch %d 早于队列状态 epoch %d", replication.ErrNotLeader, g, e, cur)
-	}
-	if !qs.loaded || qs.epoch < e {
 		if qs.loaded {
 			// 换届后重新当选：旧任期内存态里可能有他人任期内已被覆盖的状态，
 			// 一律丢弃从盘重装（门开 = 旧任期条目已全部 apply 或被截断）
 			d.logger.Info("队列消费状态随换届失效，从盘重装", "group", group, "topic", topic,
 				"queue", q, "old_epoch", qs.epoch, "epoch", e)
 			d.dropLocked(qs, fmt.Errorf("换届 epoch %d→%d", qs.epoch, e))
+		}
+		if qs.inFlight > 0 {
+			ch := qs.settledLocked()
+			n := qs.inFlight
+			qs.mu.Unlock()
+			d.logger.Debug("重装前等待本队列在途提案了结", "group", group, "topic", topic, "queue", q,
+				"in_flight", n)
+			select {
+			case <-ch:
+			case <-ctx.Done():
+				return nil, g, ctx.Err()
+			}
+			continue
 		}
 		start := time.Now()
 		if err := qs.load(d.st, e); err != nil {
@@ -130,16 +128,50 @@ func (d *Deliverer) acquire(ctx context.Context, group, topic string, q uint32) 
 		d.logger.Debug("队列消费状态已装载", "group", group, "topic", topic, "queue", q,
 			"epoch", e, "cursor", qs.cursor, "inflight", len(qs.inflight),
 			"took", time.Since(start).String())
+		return qs, g, nil
 	}
-	return qs, g, nil
+}
+
+// lockGated 过停机/围栏/可写门后取队列锁，返回门 epoch（成功时已持 qs.mu）。
+func (d *Deliverer) lockGated(ctx context.Context, qs *queueState, g uint32) (uint64, error) {
+	for {
+		if d.closed.Load() {
+			return 0, errStopped
+		}
+		if err := d.waitFence(ctx, g); err != nil {
+			return 0, err
+		}
+		e, err := d.rt.WaitWritable(ctx, g)
+		if err != nil {
+			return 0, err
+		}
+		qs.mu.Lock()
+		// 锁内复查：停机收尾检查点 / 转移前检查点按队列取锁构造批次，取锁
+		// 晚于它们的调用必须看到关门或围栏，否则改动会落在最后一次检查点之后
+		if d.closed.Load() {
+			qs.mu.Unlock()
+			return 0, errStopped
+		}
+		if !d.fenced(g) {
+			return e, nil
+		}
+		qs.mu.Unlock()
+	}
+}
+
+// settledLocked 返回「本队列在途归零」的等待点（调用方持 qs.mu 且 inFlight>0）。
+func (qs *queueState) settledLocked() <-chan struct{} {
+	if qs.settled == nil {
+		qs.settled = make(chan struct{})
+	}
+	return qs.settled
 }
 
 // dropLocked 丢弃内存态（调用方持 qs.mu）：代号加一（在途提案完成时不再
 // 回写），挂在「下一次提案」上的变更以 errStateDropped 失败，状态置未装载。
 func (d *Deliverer) dropLocked(qs *queueState, cause error) {
 	qs.gen++
-	qs.inFlight = false
-	qs.cur = nil
+	// inFlight 不清零：旧代号的在途提案仍在跑，重装要等它们了结（修订 R3）
 	if f := qs.next; f != nil {
 		qs.next = nil
 		f.err = fmt.Errorf("%w（%v）", errStateDropped, cause)
@@ -150,9 +182,10 @@ func (d *Deliverer) dropLocked(qs *queueState, cause error) {
 
 // commitLocked 逐次复制：本次调用已改了内存（有脏），把变更交给一次提案。
 //
-// 调用方持 qs.mu。无在途提案 → 立即构造差量并提案（ApplyAsyncAt 绑定
-// qs.epoch），起一个 goroutine 等待其落盘；有在途提案 → 变更留在脏集里，
-// 挂到下一次提案（在途提案成功后由 waitFlush 构造）。
+// 调用方持 qs.mu。在途数未达上限 → 立即构造差量并提案（ApplyAsyncAt 绑定
+// qs.epoch），起一个 goroutine 等待其落盘；已达上限 → 变更留在脏集里，
+// 挂到下一次提案（某个在途提案了结后由 finishFlush 构造）。上限为 1 时即
+// R1/R2；前缀有序后端放宽为 maxInFlightPrefix（修订 R3）。
 //
 // 返回：本次变更所在提案的等待点；调用方放锁后经 awaitCommit 等待。无脏返回 nil。
 func (d *Deliverer) commitLocked(qs *queueState) *flush {
@@ -173,20 +206,19 @@ func (d *Deliverer) commitLocked(qs *queueState) *flush {
 		qs.next = &flush{done: make(chan struct{})}
 	}
 	f := qs.next
-	if !qs.inFlight {
+	if qs.inFlight < d.maxInFlight {
 		d.proposeLocked(qs)
 	}
 	return f
 }
 
 // proposeLocked 把 qs.next 变成在途提案：构造差量、按 epoch 提案、起等待
-// goroutine。调用方持 qs.mu 且已确认无在途提案、qs.next 非空。
+// goroutine。调用方持 qs.mu 且已确认在途数未达上限、qs.next 非空。
 func (d *Deliverer) proposeLocked(qs *queueState) {
 	f := qs.next
 	qs.next = nil
 	f.gen = qs.gen
-	qs.inFlight = true
-	qs.cur = f
+	qs.inFlight++
 	b := d.st.NewBatch()
 	if qs.needFull {
 		// 装载后的第一个提案：整体替换，压过可能迟到 apply 的旧条目（见 needFull）
@@ -207,24 +239,30 @@ func (d *Deliverer) proposeLocked(qs *queueState) {
 	}()
 }
 
-// finishFlush 在途提案了结（在等待 goroutine 里调用）：本代号内——失败即
-// 丢弃内存态（下一差量的基线未知，只能从盘重装），成功且有挂起变更即构造
-// 下一个差量（此时上一差量已落盘，修订 R1）。最后唤醒本提案的等待者。
+// finishFlush 在途提案了结（在等待 goroutine 里调用）：在途数减一；本代号
+// 的失败即丢弃内存态（下一差量的基线未知，只能从盘重装，且重装要等本队列
+// 在途全部了结，修订 R3）；有挂起变更且名额空出即构造下一个差量；在途归零
+// 时唤醒等待重装/转移的一方。最后唤醒本提案的等待者。
 func (d *Deliverer) finishFlush(qs *queueState, f *flush, err error) {
 	qs.mu.Lock()
-	if qs.gen == f.gen {
-		qs.inFlight = false
-		qs.cur = nil
-		if err != nil {
-			d.logger.Warn("消费状态提案失败，丢弃队列内存态（下次访问从盘重装）",
-				"group", qs.group, "topic", qs.topic, "queue", qs.q, "epoch", qs.epoch, "err", err)
-			d.dropLocked(qs, err)
-		} else if qs.next != nil {
-			d.proposeLocked(qs)
-		}
-	} else if err != nil {
-		d.logger.Debug("已失效代号的消费状态提案失败（内存态已重建，忽略）",
+	qs.inFlight--
+	switch {
+	case qs.gen == f.gen && err != nil:
+		d.logger.Warn("消费状态提案失败，丢弃队列内存态（在途全部了结后从盘重装）",
+			"group", qs.group, "topic", qs.topic, "queue", qs.q, "epoch", qs.epoch,
+			"in_flight", qs.inFlight, "err", err)
+		d.dropLocked(qs, err)
+	case err != nil:
+		d.logger.Debug("已失效代号的消费状态提案失败（内存态已丢弃或已重建，忽略）",
 			"group", qs.group, "topic", qs.topic, "queue", qs.q, "err", err)
+	}
+	// 挂起的变更属当前代号（旧代号了结同样腾出在途名额，如 ResetCursor 之后）
+	if qs.loaded && qs.next != nil && qs.inFlight < d.maxInFlight {
+		d.proposeLocked(qs)
+	}
+	if qs.inFlight == 0 && qs.settled != nil {
+		close(qs.settled)
+		qs.settled = nil
 	}
 	qs.mu.Unlock()
 	f.err = err
@@ -334,7 +372,7 @@ const stopCheckpointRounds = 3
 // Stop 时循环退出。只可调用一次。
 func (d *Deliverer) Start(ctx context.Context) {
 	if d.interval <= 0 {
-		d.logger.Info("消费状态持久化：逐次复制模式（每次变更落盘后才应答）")
+		d.logger.Info("消费状态持久化：逐次复制模式（每次变更落盘后才应答）", "max_in_flight_per_queue", d.maxInFlight)
 		return
 	}
 	lctx, cancel := context.WithCancel(ctx)
@@ -593,19 +631,18 @@ func (d *Deliverer) awaitInflight(ctx context.Context, g uint32) (int, error) {
 	d.mu.Unlock()
 	n := 0
 	for _, qs := range qss {
-		for {
-			qs.mu.Lock()
-			f := qs.cur
+		qs.mu.Lock()
+		if qs.inFlight == 0 {
 			qs.mu.Unlock()
-			if f == nil {
-				break
-			}
-			n++
-			select {
-			case <-f.done:
-			case <-ctx.Done():
-				return n, ctx.Err()
-			}
+			continue
+		}
+		ch := qs.settledLocked()
+		qs.mu.Unlock()
+		n++
+		select {
+		case <-ch:
+		case <-ctx.Done():
+			return n, ctx.Err()
 		}
 	}
 	return n, nil
