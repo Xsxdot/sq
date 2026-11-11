@@ -107,6 +107,14 @@ type Options struct {
 	// main 注入；测试可注小间隔（cluster 测试 harness 注入 200ms）。
 	LeaderBalancerInterval time.Duration
 
+	// BeforeLeaderTransfer 计划内转移领导权前的同步回调（卡 SQ4.1 P1，可为
+	// nil）：只在摊布循环（balanceOnce）发起 TransferLeader 之前调用，在摊布
+	// 自己的 goroutine 内执行（不在 Ready 循环，可阻塞），ctx 带
+	// beforeTransferTimeout 上限。返回错误即本周期不转移（记 Warn）。用途：
+	// 上层在领导权交出前把只在 leader 内存里的状态落盘（消费检查点），使计划
+	// 内切换不产生重复投递。
+	BeforeLeaderTransfer func(ctx context.Context, g uint32) error
+
 	// AutoPromoteLearners 控制追平后的自动升 voter（batch③，默认 false）：
 	// 开启时 Start 起一个与摊布循环共节拍的循环——对本节点 lead 的每个
 	// 组，把 Status(g).Progress 中「IsLearner 且 Match 已追平本组日志
@@ -210,6 +218,9 @@ type Manager struct {
 	// controlHandler 是控制通道接收处理器（Options 透传，nil 安全）：
 	// 传输层收到 ControlGroup 帧时在读循环内同步调用（transport.control）
 	controlHandler func(op byte, payload []byte) ([]byte, error)
+
+	// beforeTransfer 计划内转移前回调（Options.BeforeLeaderTransfer 透传，nil 安全）
+	beforeTransfer func(ctx context.Context, g uint32) error
 
 	cancel         context.CancelFunc // 运行 ctx 取消句柄（StopClean/kill 用）
 	doneCh         chan struct{}      // 全部组 + flusher 完全退出后关闭
@@ -340,6 +351,7 @@ func NewManager(o Options) (*Manager, error) {
 		groups:                 make(map[uint32]*group, o.DataGroups+1),
 		onLeaderChange:         o.OnLeaderChange,
 		onApplied:              o.OnApplied,
+		beforeTransfer:         o.BeforeLeaderTransfer,
 		leaderBalancerInterval: o.LeaderBalancerInterval,
 		autoPromote:            o.AutoPromoteLearners,
 		retainEntries:          o.RetainEntries,
@@ -1053,6 +1065,17 @@ func (m *Manager) balanceOnce(g uint32, preferred uint64, stableTicks map[uint32
 		m.lg.Debug("摊布：preferred 探测不可达，保持现任", "g", g, "preferred", preferred)
 		return
 	}
+	if m.beforeTransfer != nil {
+		// 转移前回调（P1）：失败即本周期不转移，按转移失败同样退避
+		ctx, cancel := context.WithTimeout(context.Background(), beforeTransferTimeout)
+		err := m.beforeTransfer(ctx, g)
+		cancel()
+		if err != nil {
+			m.lg.Warn("摊布：转移前回调失败，本周期不转移", "g", g, "to", preferred, "err", err)
+			stableTicks[g] = -leaderStableTicks
+			return
+		}
+	}
 	m.lg.Info("摊布：组领导权转移", "g", g, "from", m.nodeID, "to", preferred, "reason", "摊布")
 	m.TransferLeader(g, preferred)
 	// 转移后进入退避：raft 的转移中止时限是 1 个 electionTimeout
@@ -1061,6 +1084,10 @@ func (m *Manager) balanceOnce(g uint32, preferred uint64, stableTicks map[uint32
 	// 2×leaderStableTicks 个周期之后——长于中止时限，窗口不相交。
 	stableTicks[g] = -leaderStableTicks
 }
+
+// beforeTransferTimeout 转移前回调的上限（卡 SQ4.1 P1，计划授权 [1s,3s]）：
+// 上层检查点通常毫秒级；上限防止回调卡住摊布循环。
+const beforeTransferTimeout = 2 * time.Second
 
 // probePeerAlive 探测节点是否存活：控制通道短连接 RPC 发 OpPing——
 // 对端 Manager 自装层直接空应答即视为存活；拨号失败（连接拒绝/超时）

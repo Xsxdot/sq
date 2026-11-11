@@ -317,3 +317,17 @@ func TestApplyOrForwardForwardBranchError(t *testing.T) {
 		t.Fatalf("转发失败应原样上抛，得到 %v", err)
 	}
 }
+
+// TestClusterDoesNotDeclarePrefixOrderedCommit 集群后端不得声明前缀有序提交：
+// SQ2 的作废语义不提供跨调用方的失败前缀性，声明后 deliver 会对同队列流水化
+// 提案，I1（盘上 cursor 不越过其覆盖范围内缺失的 inflight）的前提失效（计划
+// 修订 R1/R3）。
+func TestClusterDoesNotDeclarePrefixOrderedCommit(t *testing.T) {
+	var rep Replicator = (*Cluster)(nil)
+	if pc, ok := rep.(PrefixOrderedCommitter); ok && pc.PrefixOrderedCommit() {
+		t.Fatal("*Cluster 声明了 PrefixOrderedCommitter：给集群声明该能力会使 I1 前提失效（raft/SQ2 不保证同组失败前缀性，见计划修订 R1/R3）")
+	}
+	if _, ok := rep.(PrefixOrderedCommitter); ok {
+		t.Fatal("*Cluster 实现了 PrefixOrderedCommitter：给集群声明该能力会使 I1 前提失效（见计划修订 R1/R3）")
+	}
+}

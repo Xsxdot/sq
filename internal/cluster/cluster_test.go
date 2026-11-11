@@ -206,6 +206,67 @@ func TestLeaderSpreadConverges(t *testing.T) {
 	t.Fatal("leader 摊布未收敛到 preferred 分布")
 }
 
+// TestBeforeLeaderTransferGatesBalancer 卡 SQ4.1 P1：摊布转移前同步调用
+// BeforeLeaderTransfer（调用时本节点仍是该组 leader）；回调报错则不转移，
+// 放行后摊布照常收敛。
+func TestBeforeLeaderTransferGatesBalancer(t *testing.T) {
+	var (
+		allow   atomic.Bool
+		calls   atomic.Int64
+		notLead atomic.Int64
+		tcp     atomic.Pointer[testCluster]
+	)
+	hook := func(ctx context.Context, g uint32) error {
+		calls.Add(1)
+		if tc := tcp.Load(); tc != nil {
+			lead := false
+			for _, m := range tc.mgrs {
+				if m.IsLeader(g) {
+					lead = true
+				}
+			}
+			if !lead {
+				notLead.Add(1)
+			}
+		}
+		if !allow.Load() {
+			return errors.New("测试：拒绝转移")
+		}
+		return nil
+	}
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{BeforeLeaderTransfer: hook})
+	tcp.Store(tc)
+	// 初始选举恰好已与 preferred 一致：摊布不会发起转移，无可拦之物
+	if tc.leadersMatchPreferred(t) {
+		t.Skip("初始选举已与 preferred 一致，无转移可拦")
+	}
+	// 拒绝期：等回调被调用若干次，期间分布不得收敛（收敛 = 绕过回调转移了）
+	deadline := time.Now().Add(10 * time.Second)
+	for calls.Load() < 3 && time.Now().Before(deadline) {
+		if tc.leadersMatchPreferred(t) {
+			t.Fatalf("回调拒绝期间发生了转移（回调调用 %d 次）", calls.Load())
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if calls.Load() < 3 {
+		t.Fatalf("摊布应在转移前调用回调，10s 内仅 %d 次", calls.Load())
+	}
+	if tc.leadersMatchPreferred(t) {
+		t.Fatal("回调拒绝期间不应发生转移（分布却已收敛）")
+	}
+	allow.Store(true)
+	deadline = time.Now().Add(30 * time.Second)
+	for !tc.leadersMatchPreferred(t) {
+		if time.Now().After(deadline) {
+			t.Fatal("回调放行后摊布未收敛")
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	if n := notLead.Load(); n != 0 {
+		t.Fatalf("回调应在本节点仍是 leader 时调用，%d 次调用时无 leader 持有该组", n)
+	}
+}
+
 // TestLeaderChangeFiresExactlyOncePerGroup 钩子时序断言：摊布收敛后每个
 // 组的现任 leader 恰好收到一次 isSelf=true（获得 leadership 时触发一次，
 // 不多不漏），其余节点至多一次（初始选举赢家若被摊布转走也触发过）。
@@ -949,6 +1010,7 @@ func newTestClusterN(t *testing.T, mode AckMode, hookOpts Options, n uint64) *te
 			OnApplied:              onApplied,
 			ControlHandler:         hookOpts.ControlHandler,
 			LeaderBalancerInterval: hookOpts.LeaderBalancerInterval,
+			BeforeLeaderTransfer:   hookOpts.BeforeLeaderTransfer,
 			AutoPromoteLearners:    hookOpts.AutoPromoteLearners,
 			ReadBarrier:            hookOpts.ReadBarrier,
 			ReadBarrierTimeout:     hookOpts.ReadBarrierTimeout,

@@ -1204,6 +1204,10 @@ func TestOldInflightRecordStillRedelivers(t *testing.T) {
 	if err := f.st.Apply(b); err != nil {
 		t.Fatalf("改写旧格式 inflight: %v", err)
 	}
+	// 消费状态的权威在内存（SQ4.1）：直接改盘不影响已装载的内存态。旧格式
+	// 记录只会经「装载」进入内存——换一个 Deliverer（等价于进程重启）让它
+	// 从盘装载这条记录，才测得到「旧格式零迁移直接读」。
+	f.dl = New(f.dl.rep, f.dl.rt, f.st, f.dl.mt, f.pr, slog.Default())
 	time.Sleep(30 * time.Millisecond)
 	// 即便本次取件启用续租，旧格式记录（预算为零）也照常重投
 	red, err := f.dl.Receive(context.Background(), "g", "rt", 0, 10, time.Minute, 0, AllPass,

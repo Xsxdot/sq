@@ -41,8 +41,9 @@ test-web:
 proto:
 	buf generate
 
+# e2e 全量超 go test 缺省 10m（本机实测：其余用例约 28 分钟 + SQ4.1 的 TestConsumeFailover 四档约 8.5 分钟），显式放宽。
 e2e:
-	cd test/e2e && go test -tags e2e -count=1 ./...
+	cd test/e2e && go test -tags e2e -count=1 -timeout 60m ./...
 
 # 写入 soak 长跑（默认 10 分钟，16 队列/64 并发/真实 fsync）。
 # SQ_SOAK_DURATION=2m 缩短；SQ_SOAK_DIR=/path 指定真实磁盘目录

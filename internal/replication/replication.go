@@ -169,6 +169,16 @@ func (r *Cluster) Topology() ClusterView {
 // Pending 一次已定序、待确认的复制提交；Wait 语义与 store.Pending 一致。
 type Pending interface{ Wait() error }
 
+// PrefixOrderedCommitter 可选能力（卡 SQ4.1 修订 R3）：后端保证「前缀有序
+// 提交」——同组的提交按提交（ApplyAsync* 调用）顺序生效；某次提交失败，
+// 其后提交也失败（或进程致命退出）。不实现或返回 false 即不保证。
+//
+// 用途：调用方据此决定同一键族能否有多个在途提交（流水化）而不必等前序
+// 了结。集群后端（raft）不声明：SQ2 的作废语义不提供跨调用方的失败前缀性。
+type PrefixOrderedCommitter interface {
+	PrefixOrderedCommit() bool
+}
+
 // Replicator 是写路径的复制抽象：单机后端零开销直通，集群后端把批次
 // 字节提进所属 raft 组。group 用 cluster.MetaGroup 或
 // Manager.GroupForQueue 的返回值。
@@ -267,6 +277,15 @@ type Standalone struct {
 func NewStandalone(st *store.Store) *Standalone {
 	return &Standalone{st: st}
 }
+
+// PrefixOrderedCommit 单机后端声明前缀有序提交（论证见计划修订 R3）：pebble
+// commit pipeline 按调用顺序定序、发布可见与写 WAL；提交/写 WAL 失败经
+// pebbleLogger.Fatalf 致命退出，WAL fsync 失败在 LogWriter 里粘滞（其后
+// 每次 sync 都以同一错误失败）。
+func (r *Standalone) PrefixOrderedCommit() bool { return true }
+
+// 编译期断言：单机后端必须声明前缀有序提交（deliver 的同队列流水化依赖它）。
+var _ PrefixOrderedCommitter = (*Standalone)(nil)
 
 // Apply 忽略 group，直通 st.Apply。批次归属与 store.Apply 一致。
 func (r *Standalone) Apply(_ context.Context, _ uint32, b *store.Batch) error {

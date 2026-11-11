@@ -127,3 +127,79 @@ func BenchmarkAckBatch32(b *testing.B) {
 		}
 	})
 }
+
+// standingSizes S4 的两档在外规模：「ack/取件成本不随 inflight 增长」的
+// 可检查形态是 10k 档 ns/op ≤ 1k 档的 1.5 倍（卡 SQ4.1）。
+var standingSizes = []struct {
+	name string
+	n    int
+}{{"inflight=1k", 1000}, {"inflight=10k", 10000}}
+
+// preloadStanding 预写 n 条在外不 ack 的 inflight（offset 从 1<<40 起，与
+// 被 ack 的 0..b.N-1 不相交），过期时间远在将来。
+func preloadStanding(b *testing.B, d *Deliverer, topic string, n int) {
+	b.Helper()
+	exp := time.Now().Add(time.Hour).UnixMilli()
+	wb := d.st.NewBatch()
+	for i := 0; i < n; i++ {
+		wb.Set(store.InflightKey("g-bench", topic, 0, 1<<40+uint64(i)),
+			core.EncodeInflight(&core.InflightState{ExpireAtMs: exp, Attempts: 1}))
+	}
+	if err := d.st.Apply(wb); err != nil {
+		b.Fatalf("预写在外 inflight: %v", err)
+	}
+}
+
+// BenchmarkAckParallelStanding 同 BenchmarkAckParallel（fsync 档），另预置
+// 1k/10k 条在外 inflight。计时前做一次落空 ack 让队列状态完成装载（只用现有
+// API，main 上同样可跑，作基线对照）。
+func BenchmarkAckParallelStanding(b *testing.B) {
+	for _, sz := range standingSizes {
+		b.Run(sz.name, func(b *testing.B) {
+			d := newBenchDeliverer(b, b.N, true)
+			preloadStanding(b, d, "t-ack", sz.n)
+			if _, err := d.Ack(context.Background(), "g-bench", "t-ack", 0, 1<<62, 1); err != nil {
+				b.Fatalf("预热 ack: %v", err)
+			}
+			var next atomic.Uint64
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					off := next.Add(1) - 1
+					ok, err := d.Ack(context.Background(), "g-bench", "t-ack", 0, off, 1)
+					if err != nil || !ok {
+						b.Fatalf("ack off=%d: ok=%v err=%v", off, ok, err)
+					}
+				}
+			})
+		})
+	}
+}
+
+// BenchmarkReceiveStandingInflight 单流取件（每次 1 条新消息）在预置 1k/10k
+// 条在外 inflight 下的成本（store async 档，剥离 fsync）。旧实现每次取件全扫
+// 本队列 inflight 并逐条 JSON 解码，成本随在外数线性增长。
+func BenchmarkReceiveStandingInflight(b *testing.B) {
+	for _, sz := range standingSizes {
+		b.Run(sz.name, func(b *testing.B) {
+			d := newBenchDeliverer(b, 0, false)
+			const topic = "t-recv"
+			for i := 0; i < b.N; i++ {
+				if _, err := d.pr.Append(context.Background(), &core.Message{Topic: topic, Body: []byte("x")}); err != nil {
+					b.Fatalf("预写消息: %v", err)
+				}
+			}
+			preloadStanding(b, d, topic, sz.n)
+			if _, err := d.Ack(context.Background(), "g-bench", topic, 0, 1<<62, 1); err != nil {
+				b.Fatalf("预热: %v", err)
+			}
+			b.ResetTimer()
+			for i := 0; i < b.N; i++ {
+				msgs, err := d.Receive(context.Background(), "g-bench", topic, 0, 1, time.Hour, 0, AllPass)
+				if err != nil || len(msgs) != 1 {
+					b.Fatalf("receive #%d: n=%d err=%v", i, len(msgs), err)
+				}
+			}
+		})
+	}
+}

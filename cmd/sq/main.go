@@ -189,6 +189,7 @@ func run() error {
 		prPtr  atomic.Pointer[produce.Producer]
 		stPtr  atomic.Pointer[store.Store]
 		repPtr atomic.Pointer[replication.Cluster]
+		dlPtr  atomic.Pointer[deliver.Deliverer]
 	)
 	stPtr.Store(st)
 	if cfg.ClusterEnabled() {
@@ -267,7 +268,7 @@ func run() error {
 				if cl == nil || st == nil {
 					return nil, errors.New("转发处理器未就绪（装配中）")
 				}
-				return handleForwardApply(payload, st, cl)
+				return handleForwardApply(payload, st, cl, dlPtr.Load())
 			default:
 				return nil, fmt.Errorf("未知控制 op %d", op)
 			}
@@ -291,6 +292,15 @@ func run() error {
 			StoreOptions:           storeOptions(cfg), // Rejoin 重开 store 时沿用同一组调优参数
 			OnApplied:              onApplied,
 			ControlHandler:         controlHandler,
+			// 计划内转移领导权前先把该组消费内存态落盘（卡 SQ4.1 P1）：摊布
+			// 循环同步调用、出错本周期不转移。deliver 晚于 Manager 装配，经
+			// dlPtr 原子读；未就绪时放行（尚无内存态可落）。
+			BeforeLeaderTransfer: func(ctx context.Context, g uint32) error {
+				if d := dlPtr.Load(); d != nil {
+					return d.PrepareTransfer(ctx, g)
+				}
+				return nil
+			},
 		}
 		m, err = cluster.NewManager(opts)
 		if errors.Is(err, cluster.ErrUncleanShutdown) {
@@ -384,7 +394,22 @@ func run() error {
 	mtPtr.Store(mt) // OnApplied 钩子闭包原子读
 	pr = produce.New(rep, rt, st, mt, logger)
 	prPtr.Store(pr) // ForwardAppend 控制处理器闭包原子读
-	dl := deliver.New(rep, rt, st, mt, pr, logger)
+	// 消费状态持久化模式（卡 SQ4.1）：consume_checkpoint_interval>0 检查点
+	// 模式（缺省 1s），0 逐次复制；Start 打出模式日志并起检查点循环。
+	dl := deliver.New(rep, rt, st, mt, pr, logger, deliver.WithCheckpointInterval(cfg.ConsumeCheckpoint()))
+	dlPtr.Store(dl) // ForwardApply 控制处理器 / 转移前回调闭包原子读
+	dl.Start(runCtx)
+	// 停机收尾检查点。顺序：gRPC 排空（select 分支，早于全部 defer）→ 本
+	// defer 之后注册的 admin Shutdown / 各后台循环先停（LIFO，不会在收尾
+	// 检查点之后再来一次重置位点或取件）→ 本 defer（关门 + 收尾检查点）→
+	// 更早注册的 Manager.StopClean → st.Close。单机档同一套。
+	defer func() {
+		sctx, cancel := context.WithTimeout(context.Background(), consumeStopTimeout)
+		defer cancel()
+		if err := dl.Stop(sctx); err != nil {
+			logger.Error("消费引擎停机收尾检查点失败（重启后表现为重复投递）", "err", err)
+		}
+	}()
 
 	// 事务管理器。构造顺序有讲究：rpc.Server 要拿它处理 Send/EndTransaction，
 	// 回查调度器又要拿 rpc.Server 当 Notifier（下发回查命令）——先建 Manager、
@@ -672,6 +697,12 @@ func handleForwardAppend(payload []byte, pr *produce.Producer) ([]byte, error) {
 	return resp, nil
 }
 
+// consumeStopTimeout 停机收尾检查点的上限（卡 SQ4.1；计划授权区间由主会话
+// 2026-11-11 改为 [1s,4s]）。必须落在既有「优雅停机 5s 内退出」承诺之内：
+// 有多数派时全量检查点是毫秒级；失去多数派（如全集群停机的最后一个节点）
+// 时提案永远提交不了，等满上限即放弃，后果同 kill -9（有界重复）。
+const consumeStopTimeout = 3 * time.Second
+
 // handleForwardApply 处理 OpForwardApply 控制请求：把构造无关批次
 // （纯 Delete/DeleteRange/绝对值 Set）提交到目标组。
 //
@@ -682,7 +713,9 @@ func handleForwardAppend(payload []byte, pr *produce.Producer) ([]byte, error) {
 // 控制帧错误文本回传调用方。形参收具体指针 *replication.Cluster（与
 // handleForwardAppend 的 *produce.Producer 同形）——cl == nil 判空
 // 真实生效（评审 m2：接口参数下 typed-nil 会穿透判空，判了等于没判）。
-func handleForwardApply(payload []byte, st *store.Store, cl *replication.Cluster) ([]byte, error) {
+// 触及消费状态（cursor/、inflight/）的批次改走 dl.ApplyAdminBatch（卡
+// SQ4.1：leader 内存态先失效再提交），分流见 routeForwardApply。
+func handleForwardApply(payload []byte, st *store.Store, cl *replication.Cluster, dl *deliver.Deliverer) ([]byte, error) {
 	if cl == nil {
 		return nil, errors.New("转发处理器未就绪（装配中）")
 	}
@@ -696,10 +729,40 @@ func handleForwardApply(payload []byte, st *store.Store, cl *replication.Cluster
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), forwardOpTimeout)
 	defer cancel()
-	if err := cl.Apply(ctx, g, b); err != nil {
+	var admin consumeAdmin
+	if dl != nil { // typed-nil 防护：未装配时保持接口 nil
+		admin = dl
+	}
+	if err := routeForwardApply(ctx, g, b, cl.Apply, admin); err != nil {
 		return nil, err
 	}
 	return nil, nil
+}
+
+// consumeAdmin 消费状态管理批次入口（*deliver.Deliverer 实现）。
+type consumeAdmin interface {
+	ApplyAdminBatch(ctx context.Context, g uint32, b *store.Batch) error
+}
+
+// routeForwardApply 转发批次的提交分流：触及 cursor/ 或 inflight/ 键族的
+// 批次经 admin（deliver 的管理入口，先失效内存态再提交），其余经 apply
+// 直接提交。admin 为 nil（deliver 尚未装配）时拒绝消费状态批次——直接提交
+// 会被稍后装配的 leader 内存态写回；调用方（转发发起方）收到错误可重试。
+func routeForwardApply(ctx context.Context, g uint32, b *store.Batch,
+	apply func(context.Context, uint32, *store.Batch) error, admin consumeAdmin) error {
+	cqs, whole, err := store.BatchConsumeQueues(b.Repr())
+	if err != nil {
+		b.Close()
+		return fmt.Errorf("解析转发批次: %w", err)
+	}
+	if len(cqs) == 0 && !whole {
+		return apply(ctx, g, b)
+	}
+	if admin == nil {
+		b.Close()
+		return errors.New("消费状态批次的处理器未就绪（装配中）")
+	}
+	return admin.ApplyAdminBatch(ctx, g, b)
 }
 
 // gracefulStop 带上限地优雅停机：先让在途 RPC 自然结束，超时则强制中断。

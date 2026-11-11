@@ -228,34 +228,44 @@ func TestTimeseriesEndToEnd(t *testing.T) {
 // TestLedgerReflectsConsumption 验证总账真的能反映消费关系：发 50 条、消费
 // （取到）20 条后，落后量应为 30。
 //
-// pending = 写入头 − fetch 位点：取件即推进位点（见 consumeFetch 注释），
-// 因此取件同步落盘后单次 GET 即可断言，无需轮询。
+// pending = 写入头 − fetch 位点：取件即推进位点（见 consumeFetch 注释）。
+// 总账读 pebble，而消费状态自卡 SQ4.1 起以 leader 内存为准、按
+// consume_checkpoint_interval（缺省 1s）周期落盘，故轮询至检查点落盘
+// （上限 3s，计划真机清单第 2 条）再断言。
 func TestLedgerReflectsConsumption(t *testing.T) {
 	endpoint, adminBase := startBrokerWithAdmin(t)
 	sendViaSDK(t, endpoint, "e2e-ledger", 50)
 	consumeFetch(t, endpoint, "e2e-ledger-g", "e2e-ledger", 20)
 
-	var rows []struct {
+	type row struct {
 		Group   string `json:"group"`
 		Topic   string `json:"topic"`
 		Pending uint64 `json:"pending"`
 	}
-	res, err := http.Get(adminBase + "/admin/ledger")
-	if err != nil {
-		t.Fatalf("请求总账: %v", err)
-	}
-	defer res.Body.Close()
-	if err := json.NewDecoder(res.Body).Decode(&rows); err != nil {
-		t.Fatalf("解析总账: %v", err)
-	}
 	found := false
-	for _, r := range rows {
-		if r.Group == "e2e-ledger-g" && r.Topic == "e2e-ledger" {
-			found = true
-			if r.Pending != 30 {
-				t.Fatalf("落后量应为 30，得到 %d", r.Pending)
+	var last uint64
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
+		var rows []row
+		res, err := http.Get(adminBase + "/admin/ledger")
+		if err != nil {
+			t.Fatalf("请求总账: %v", err)
+		}
+		err = json.NewDecoder(res.Body).Decode(&rows)
+		res.Body.Close()
+		if err != nil {
+			t.Fatalf("解析总账: %v", err)
+		}
+		for _, r := range rows {
+			if r.Group == "e2e-ledger-g" && r.Topic == "e2e-ledger" {
+				found, last = true, r.Pending
 			}
 		}
+		if found && last == 30 {
+			return
+		}
+	}
+	if found {
+		t.Fatalf("落后量应为 30，3s 内最后一次得到 %d", last)
 	}
 	if !found {
 		t.Fatal("总账里应出现 e2e-ledger-g × e2e-ledger 这条消费关系")

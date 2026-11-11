@@ -78,7 +78,7 @@ func TestPurgeTopicData(t *testing.T) {
 }
 
 func TestPurgeGroupData(t *testing.T) {
-	st, _, pr, dl, rep, rt := fixture(t)
+	st, mt, pr, dl, rep, rt := fixture(t)
 	if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestPurgeGroupData(t *testing.T) {
 	if _, err := dl.Receive(context.Background(), "g-keep", "t1", 0, 1, time.Minute, 0, deliver.AllPass); err != nil {
 		t.Fatal(err)
 	}
-	if err := PurgeGroupData(context.Background(), rep, rt, nil, st, "g-del", slog.Default()); err != nil {
+	if err := PurgeGroupData(context.Background(), rep, rt, nil, st, dl, mt, "g-del", slog.Default()); err != nil {
 		t.Fatal(err)
 	}
 	if n := countPrefix(t, st, store.CursorGroupPrefix("g-del")); n != 0 {
@@ -109,7 +109,7 @@ func TestPurgeGroupData(t *testing.T) {
 // 单机 Router 恒零组下无法验证「按组提交」，但能验证「(topic,qid) 枚举
 // 不漏不重」——每条记录都必须被某个桶命中并被删掉。
 func TestPurgeGroupDataBucketsByQueue(t *testing.T) {
-	st, _, pr, dl, rep, rt := fixture(t)
+	st, mt, pr, dl, rep, rt := fixture(t)
 	// topicA 两族都写：q0 消费 1 条不 ack（cursor+inflight）、q1 同（多队列
 	// 验证分桶按 qid 而非 topic）；topicB 只消费不 ack（若 PurgeGroupData 只
 	// 扫 cursor 族，topicB 的 inflight 会残留——分桶必须两族联合枚举）
@@ -134,7 +134,7 @@ func TestPurgeGroupDataBucketsByQueue(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	if err := PurgeGroupData(context.Background(), rep, rt, nil, st, "g", slog.Default()); err != nil {
+	if err := PurgeGroupData(context.Background(), rep, rt, nil, st, dl, mt, "g", slog.Default()); err != nil {
 		t.Fatal(err)
 	}
 	for _, pfx := range [][]byte{store.CursorGroupPrefix("g"), store.InflightGroupPrefix("g")} {
@@ -149,5 +149,87 @@ func TestPurgeGroupDataBucketsByQueue(t *testing.T) {
 	// topicB/q7 的孤儿 inflight 已被清（分桶解析正确性的硬证据）
 	if _, ok, _ := st.Get(store.InflightKey("g", "tB", 7, 99)); ok {
 		t.Fatal("孤儿 inflight 未清理")
+	}
+}
+
+// TestPurgeGroupDataInvalidatesDeliverState S6：删组后下一次取件立刻按新状态
+// 投递——已装载的消费内存态（cursor 已越过、inflight 在外）不得覆盖删除结果；
+// 删后盘上该组 cursor/、inflight/ 无键。
+func TestPurgeGroupDataInvalidatesDeliverState(t *testing.T) {
+	st, mt, pr, dl, rep, rt := fixture(t)
+	for i := 0; i < 2; i++ {
+		if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := dl.Receive(context.Background(), "g-del", "t1", 0, 2, time.Minute, 0, deliver.AllPass)
+	if err != nil || len(got) != 2 {
+		t.Fatalf("首取: %d %v", len(got), err)
+	}
+	if err := PurgeGroupData(context.Background(), rep, rt, nil, st, dl, mt, "g-del", slog.Default()); err != nil {
+		t.Fatal(err)
+	}
+	for _, pfx := range [][]byte{store.CursorGroupPrefix("g-del"), store.InflightGroupPrefix("g-del")} {
+		if n := countPrefix(t, st, pfx); n != 0 {
+			t.Fatalf("删组后 %q 应无键，剩 %d", pfx, n)
+		}
+	}
+	got, err = dl.Receive(context.Background(), "g-del", "t1", 0, 2, time.Minute, 0, deliver.AllPass)
+	if err != nil || len(got) != 2 || got[0].Offset != 0 || got[0].DeliveryAttempt != 1 {
+		t.Fatalf("删组后下一次取件应从 0 首投 2 条: n=%d err=%v", len(got), err)
+	}
+}
+
+// twoGroupRouter 按 qid 奇偶分两组、本节点两组皆 leader（只为验证合批粒度）。
+type twoGroupRouter struct{ replication.StandaloneRouter }
+
+func (twoGroupRouter) GroupForQueue(_ string, q uint32) uint32 { return 1 + q%2 }
+
+// countingAdmin 记录每次管理批次的组与所触及队列数，再交真实 deliver 提交。
+type countingAdmin struct {
+	dl    *deliver.Deliverer
+	calls map[uint32]int
+	qs    map[uint32]int
+}
+
+func (c *countingAdmin) ApplyAdminBatch(ctx context.Context, g uint32, b *store.Batch) error {
+	cqs, _, err := store.BatchConsumeQueues(b.Repr())
+	if err != nil {
+		return err
+	}
+	c.calls[g]++
+	c.qs[g] += len(cqs)
+	return c.dl.ApplyAdminBatch(ctx, g, b)
+}
+
+// TestPurgeGroupDataOneBatchPerRaftGroup m-1：每个 raft 组恰一个批次，含该组
+// 全部队列；不按队列逐个复制。t1 建 4 队列，奇偶两组各 2。
+func TestPurgeGroupDataOneBatchPerRaftGroup(t *testing.T) {
+	st, mt, pr, dl, rep, _ := fixture(t)
+	if _, err := mt.CreateTopic(context.Background(), "t1", 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dl.Receive(context.Background(), "g", "t1", 0, 1, time.Minute, 0, deliver.AllPass); err != nil {
+		t.Fatal(err)
+	}
+	ca := &countingAdmin{dl: dl, calls: map[uint32]int{}, qs: map[uint32]int{}}
+	if err := PurgeGroupData(context.Background(), rep, twoGroupRouter{}, nil, st, ca, mt, "g", slog.Default()); err != nil {
+		t.Fatal(err)
+	}
+	n := uint32(0)
+	for _, tc := range mt.Topics() {
+		n += tc.Queues
+	}
+	if len(ca.calls) != 2 || ca.calls[1] != 1 || ca.calls[2] != 1 {
+		t.Fatalf("应每组恰一批: %v", ca.calls)
+	}
+	if uint32(ca.qs[1]+ca.qs[2]) != n {
+		t.Fatalf("两批合计应覆盖全部 %d 队列: %v", n, ca.qs)
+	}
+	if c := countPrefix(t, st, store.CursorGroupPrefix("g")) + countPrefix(t, st, store.InflightGroupPrefix("g")); c != 0 {
+		t.Fatalf("g 应清空，剩 %d", c)
 	}
 }

@@ -9,6 +9,39 @@
   - **检查点模式（默认）**：每个队列的检查点批次一律**全量替换**——DeleteRange 该队列 inflight 前缀 + Set 当前全部 inflight + Set cursor，同批。任一检查点批次单独落地都自洽（cursor 不会越过盘上缺失的 inflight），前序批次丢弃无害。代价 O(该队列 inflight)/每个检查点间隔，可接受。
   - **逐次复制模式**：差量批次保留，但**每个队列同时至多一个在途消费状态提案**——下一个差量在上一个 `Wait` 成功之后才构造（等待在队列锁外，构造前在锁内确认前序已了结）；前序失败即毒化并从盘重装。由此同队列差量严格前缀有序，不依赖 SQ2。
   - H1 改为核对「SQ2 保证同组调用顺序 = 日志顺序、跨任期条目不进新任期日志」两条（SQ2 已验收）；I2 改写为上述两条机制；U4 补两条用例：①检查点模式下前一批丢弃、后一批落地后从盘重装，cursor 之下的未 ack 消息全部仍在 inflight；②逐次复制模式下前序在途时后续调用不构造新差量。§5「H1 不成立即停下」条款随之按新 H1 判定。
+- **修订 R2（2026-11-11，主会话批准段 A 偏离 1）**：逐次复制模式在 deliver 层合并提交——前序差量在途期间到达的调用只改内存并挂到「下一次提案」，前序 `Wait` 成功后才一次性构造下一个差量（前序失败即丢弃内存态、挂起调用以可重试错误失败）。满足 R1 两条硬约束（每队列至多一个在途、下一差量在前序成功后构造），同时保住同队列 group commit（字面「每调用各自构造→ApplyAsync→Wait」会把同队列吞吐退化为 1/复制往返）。
+- **修订 R3（2026-11-12，主会话裁定段 B 升级 B，方案 (i) 能力化）**：逐次复制模式下，**提交后端声明「前缀有序提交」能力时**，把 R1 的「每队列至多一个在途」放宽为「每队列至多 `maxInFlightPrefix = 16` 个在途」；未声明的后端（集群 raft）仍按 R1/R2（上限 1）。
+  - **能力**：`replication` 包新增可选接口 `PrefixOrderedCommitter{ PrefixOrderedCommit() bool }`（不改 `Replicator`/`Router`/`Forwarder` 签名）。语义：同组提交按提交顺序生效；某次提交失败，则其后的提交也失败（或进程致命退出）。只有 `Standalone`（store 后端）实现并返回 true。deliver 在 `New` 时读一次能力，决定每队列在途上限；deliver 内不出现「是否单机」分支。
+  - **前提核对（pebble v2.1.6，go.mod 锁定版本）**：
+    - ①生效顺序：
+      - `commit.go:159-162` 写明两条不变式：WAL 写入与读可见都按序号序。
+      - `commit.go:455-468` 在 `commitPipeline.mu` 内依次入 pending 队列、分配序号、写 WAL。
+      - `commit.go:475` 起的 `publish` 只按 pending 队列的次序棘轮推进可见序号。
+      - `db.go:826-830` 的 `ApplyNoSyncWait` 走 `Commit`；`Commit` 返回前已 `publish`（`commit.go:336`），即返回时批次已按序可见。
+      - deliver 对同一队列的提交都在队列锁内顺序调用 `ApplyAsyncAt`，故「调用顺序 = 序号序 = 可见序 = WAL 序」。
+    - ②失败语义：
+      - WAL 写入或应用失败：`db.go:882-886` 调 `Logger.Fatalf("pebble: fatal commit error")`；`db.go:953-955`、`db.go:995-997` 在 `WriteRecord` 出错时直接 `panic`。sq 的 `pebbleLogger.Fatalf` 先打 Error 再 `os.Exit(1)`（`internal/store/pebblelog.go:63-65`，经 `internal/store/store.go:149` 装配）。结论：致命退出。
+      - WAL fsync 失败：`record/log_writer.go:732-740` 置 `flusher.err`，此后该字段不再被清零；`record/log_writer.go:710-722` 让此后每个待 sync 的等待方都拿到同一错误返回（粘滞）。即「其后提交全部失败」。
+      - sq 的 `store.Pending.Wait`（`internal/store/store.go:511-525`）只把该错误上抛、不自行终止进程，但 pebble 的粘滞性已满足「其后全部失败」。
+      - 未配置 WAL failover（`internal/store` 无 `WALFailover`）。
+      - `Standalone.ApplyAsyncAt` 忽略 ctx，`Wait` 无超时：单机不存在「等待方超时、结局未知」。
+  - **I1 论证**：设同队列在途提案 k..n（k < … < n，按提交序）。
+    - (a) 全部成功：每个差量都在前一个之上构造，且前缀有序生效。任一前缀都是「从装载点出发的一段合法变更序列」的结果，I1 逐批保持（同 R1 的差量论证）。
+    - (b) k 失败或结局未知（等待方 ctx 超时，可由假后端构造），而 k+1..n 已提交：
+      - k 的等待方返回时，在队列锁内丢弃内存态：代号加一；挂起的「下一次提案」以可重试错误失败；状态置为未装载。
+      - **重装须等本队列全部在途提案（任意代号）了结（`Wait` 返回）后才读盘**；重装后的首个提案仍是 `buildFull`（needFull）。
+      - 前缀有序后端下，k+1..n 的结局只有两种：成功（则 k 也已生效，盘上是 k..n 全部生效后的合法状态，重装读到它），或失败（前缀之后全部失败或进程致命退出）。
+      - 对不提供前缀性的结局未知（假后端、未来后端）：迟到条目按提交序排在重装后的 `buildFull` 之前；`buildFull` 用重装读到的状态整体替换（DeleteRange inflight 前缀 + 全量 Set + cursor）。盘上最终是一个自洽快照：cursor 与 inflight 来自同一次读盘，cursor 不会越过其覆盖范围内缺失的 inflight。
+      - 最坏后果只有两种：已 ack 的删除被整体替换写回、已推进的 cursor 回退。两者都只造成重复投递，**不会丢消息**。
+    - (c) 上限 `maxInFlightPrefix = 16`（在途上限授权 [4,64]，主会话 2026-11-12 裁定），理由：
+      - 实测 16 消费者打同一队列时，pebble group commit 约 8 次提交合并为一次 fsync（读数节 B-stagger）。
+      - 16 = 2× 该并发，留出余量，使同队列满负载时每次提交的时延仍约为一个 fsync 周期。
+      - 超过上限的调用进入 R2 的「下一次提案」合并，所以在途批次数与内存占用有界：每队列 ≤16 个差量批次 + 1 个合并中的提案。
+  - **测试**：
+    - 新增不变式单测：假后端声明该能力；k 结局未知、k+1 落地后重装；断言盘上 I1 成立，且已确认成功的 ack 不被重装状态撤回。
+    - SQ3 四种模式 `-count=10 -race`。
+    - linux-01 上 standalone/perop 与 b0 交替跑三轮，判据：均值 ≥ b0 的 90%，且 commits/fsync 回到 ≈8。
+    - 集群流水化（方案 (ii)）入 roadmap，不在本卡。
 
 ---
 
@@ -207,7 +240,7 @@
 
 - 内存数据结构细节（索引实现、map 选型、`qmu` 是否换 `sync.Map`）、文件内函数划分与命名（含 `InflightCount`、`PrepareTransfer`、`ApplyAdminBatch`、`WithCheckpointInterval` 的命名）。
 - 检查点批次是按队列一个还是同组合并（一个队列不得跨批）、批次大小上限、脏队列集合的实现。
-- 毒化后「等在途了结」的机制；围栏 TTL 在 [2s, 5s]、P1 钩子 ctx 上限在 [1s, 3s]、停机检查点上限在 [5s, 20s] 内取值。
+- 毒化后「等在途了结」的机制；围栏 TTL 在 [2s, 5s]、P1 钩子 ctx 上限在 [1s, 3s]、停机检查点上限在 [1s, 4s] 内取值（主会话 2026-11-11 由 [5s, 20s] 改定：须落在既有优雅停机 5s 预算之内）。
 - `New` 不传选项时的缺省模式（推荐逐次，保住既有测试的落盘断言；main 永远显式传配置值）。
 - e2e 场景的辅助函数组织、等待时长（在不放宽判据的前提下）、`handleForwardApply` 分流测试的手段。
 - 既有测试中断言「两段式 moveToDLQ 的第二次提交」这类**机制**的用例（如 `deliver_test.go:858` 的 `afterAppendHook`）改写为断言语义（死信先于源删除、崩溃后至多重复死信），须在交回物逐条列出。
@@ -231,6 +264,7 @@
 - **检查点与 TOCTOU 残余**：`WaitWritable` 拿到 e 与 SQ2 入队绑任期之间存在微秒级窗口，若期间失去并重新赢得领导权（≥ 一个选举超时，实际不可达），旧 epoch 内存态构造的批次可能进新任期日志。论证其后果只是重复（被写回的只会是更旧的 cursor 与已 ack 的删除），不丢消息；与 SQ1 produce 侧同一残余，记录不修。
 - **e2e 零重复判据的脆性**：(b)(c) 依赖「最终检查点在 gRPC 排空后、StopClean 前」与围栏时序；失败时先看 `broker.log` 中最终检查点与围栏日志，再判是实现问题还是口径问题，口径问题回报主会话，不自行放宽。
 - **大批次**：单队列积压 10k 条在外时一个批次约 800KB（inflight JSON 约 80B/条），低于但接近 raft `MaxSizePerMsg`（1MB，`group.go:374`）；raft 允许单条超限条目，风险是复制延迟尖刺。记录 S4 中最大批次字节数。
+- 残余（入 roadmap，主会话 2026-11-12 审查 M4）：后台检查点轮次预算 `roundBudget = max(间隔, 1s)`，失去多数派时一轮挂满该预算并占住轮次信号量，期间计划内转移前检查点取信号量受其 ctx（2s）约束而失败、该轮转移放弃；间隔配得越大越明显。停机已不受影响（Stop 等循环与取信号量都受调用方 ctx 约束）。
 - 残余（不归本卡，入卡备注）：topic 删除不清 `cursor/`，重建同名 topic 后旧 cursor 残留（`adminops.PurgeTopicData` 现状如此，内存态不使之变好或变坏）。
 
 ## 7. 工作量估计
@@ -260,3 +294,5 @@
 - `internal/cluster/group.go:374` `MaxSizePerMsg: 1 << 20`
 - `~/go/pkg/mod/github.com/apache/rocketmq-clients/golang/v5@v5.1.4/message.go:386` `func (msg *MessageView) GetDeliveryAttempt() int32`
 - SQ1 计划（`.../worktrees/sq1/docs/superpowers/plans/sq1-plan.md`）F1 `WaitWritable(ctx, g) (epoch uint64, err error)`、F2 阻塞上限 min(ctx,3s)、F3 epoch 标签缓存、F4 deliver 挂门交 SQ3；SQ2 计划（`.../worktrees/sq2/docs/superpowers/plans/sq2-plan.md`）D2 入队绑任期、§4.2 失败语义论证、§6「SQ3 用例预期仍红」
+- `~/go/pkg/mod/github.com/apache/rocketmq-clients/golang/v5@v5.1.4/simple_consumer.go:452-463` `Ack` 只在传输层出错时返回 error，响应码非 OK 时仍返回 nil（吞掉 HA_NOT_AVAILABLE / INTERNAL_SERVER_ERROR 等）；`client_options.go:34` 请求超时缺省 3000ms → 基准里的「ack 报错」只能是传输层错误（含 3s 超时），服务端拒绝不可见（入 roadmap：e2e 的 ack 判据需走原始 gRPC 或校验 entry 码）
+- `~/go/pkg/mod/github.com/apache/rocketmq-clients/golang/v5@v5.1.4/loadBalancer.go:144-158` `subscriptionLoadBalancer.index` 零值起步、每次 receive 加一 → 同进程多个 SimpleConsumer 同步轮转到同一队列（修订 R3 的根因读数）

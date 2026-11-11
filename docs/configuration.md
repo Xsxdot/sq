@@ -29,6 +29,7 @@
 | `default_invisible_duration` | `1m` | 客户端未指定时的不可见时长 |
 | `auto_renew_enabled` | `true` | 是否允许消费者自动续租 |
 | `auto_renew_max_duration` | `10m` | 单次投递可续租的总时长上限 |
+| `consume_checkpoint_interval` | `1s` | 消费进度检查点间隔；`0` = 逐次复制。取舍见下文「消费进度持久化」 |
 | `retention_check_interval` | `5m` | retention 清理扫描间隔 |
 | `disk_watermark_percent` | `85` | 超过该磁盘使用率时拒写保读；`0` 关闭 |
 | `log_level` | `info` | `debug`、`info`、`warn` 或 `error` |
@@ -40,6 +41,17 @@
 | `txn_max_checks` | `15` | 单条半消息最大回查次数 |
 
 `credentials` 中每项包含可选的 `name`、成对的 `access_key` 和 `secret_key`。AK 全局唯一；Admin 用户名和密码必须成对设置。`message_encoding` 缺省为 `binary`，与旧版本混跑的边界见 [部署说明](deployment.md#内部部署历史)。
+
+## 消费进度持久化（consume_checkpoint_interval）
+
+消费进度（每个消费组 × topic × 队列的取件位点，与该队列已投未确认的记录）由该队列所属组的 leader 在内存持有，取件、确认、改不可见时间都在内存里完成。它如何落盘由本项决定，是「重复投递」换「吞吐」的取舍：
+
+| 取值 | 行为 | 故障后果 |
+|---|---|---|
+| `1s`（缺省，>0 即检查点模式） | 取件/确认改完内存即返回；每个间隔把有变化的队列整体落盘一次 | leader 进程崩溃（kill -9、断电）后，约一个间隔内的进度丢失：已确认的消息可能再投一次、已投出的消息可能以首投再投一次。**不丢消息** |
+| `0`（逐次复制） | 每次取件/确认都等复制落盘后才返回 | 零重复；每个队列的取件/确认受一次复制往返约束，吞吐低于检查点模式 |
+
+两种模式下，进程正常停机（SIGTERM）与 leader 摊布的计划内转移之前都会先做一次全量检查点，计划内切换不产生重复。负值或非法时长启动即拒。指标与控制台读的是落盘值，检查点模式下最多滞后一个间隔。
 
 ## 存储引擎（storage）
 
