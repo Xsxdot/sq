@@ -408,12 +408,17 @@ type consumeBenchMode struct {
 
 var consumeBenchModes = []consumeBenchMode{{name: "default"}}
 
-// runConsumeLoad 预写 total 条（并发 64 发送）后，consumers 个 SimpleConsumer
+// runConsumeLoad 预写约 total 条（并发 64 发送，实发数为准）后，consumers 个 SimpleConsumer
 // 并发收（每次至多 32 条）+ 逐条 ack，直到收齐 total 个不同 msgID，报 msg/s。
 // 计时从消费者开闸到收齐；5 分钟未收齐判失败（数字无意义）。
 func runConsumeLoad(t *testing.T, endpoint, topic, group string, total, consumers int, label string) benchResult {
 	t.Helper()
-	runSendLoad(t, endpoint, topic, 64, total, 128, label+"/预写")
+	pre := runSendLoad(t, endpoint, topic, 64, total, 128, label+"/预写")
+	// 预写按 total/64 整除分摊，实发可能少于 total；以实发成功条数为收齐目标
+	if pre.failed > 0 {
+		t.Fatalf("%s: 预写失败 %d 条", label, pre.failed)
+	}
+	total = pre.sent
 	cs := make([]rmq.SimpleConsumer, consumers)
 	for i := range cs {
 		cs[i] = newClusterConsumer(t, endpoint, group, topic, clusterConsumerAwaitShort)
