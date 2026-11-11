@@ -21,7 +21,7 @@
 | `grpc_listen` | `:8081` | RocketMQ 5.x gRPC 监听地址 |
 | `advertise_host` / `advertise_port` | `127.0.0.1` / `8081` | 路由响应中的对外地址 |
 | `data_dir` | `./data` | Pebble 数据目录 |
-| `fsync` | `sync` | `sync` 或 `async` 写盘档位 |
+| `fsync` | `sync` | 单机写盘档位：`sync` 每次写入落盘后才应答，掉电不丢已确认消息；`async` 写入后台每 200ms 刷一次盘，掉电最多丢 200ms 内已确认的消息 |
 | `message_encoding` | `json` | `json` 或 `binary` 落盘编码 |
 | `auto_create_topic` | `true` | 未知 topic 是否自动创建 |
 | `default_queue_nums` | `16` | 自动创建 topic 的队列数 |
