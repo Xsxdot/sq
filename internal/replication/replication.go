@@ -182,6 +182,11 @@ type Replicator interface {
 	// Cluster: 入所属组保序提案队列即返回（返回即在同组内定序：返回先于
 	// 同组另一调用发起者先进日志），Wait 阻塞到本节点 apply（quorum+本地）完成。
 	ApplyAsync(ctx context.Context, group uint32, b *store.Batch) (Pending, error)
+	// ApplyAsyncAt 同 ApplyAsync，但提案只允许进 epoch 所属任期的日志（卡
+	// SQ1 计划修订 R1）：epoch 取自 Router.WaitWritable，调用方据它读计数器
+	// 构造批次。Cluster: 入队时或出队时本节点任期 != epoch 即经 Wait 报
+	// ErrNotLeader，绝不提案。Standalone: 无换届，忽略 epoch，同 ApplyAsync。
+	ApplyAsyncAt(ctx context.Context, group uint32, b *store.Batch, epoch uint64) (Pending, error)
 }
 
 // Router 组路由视图。单机实现恒返回 0；集群实现转发 Manager。
@@ -270,6 +275,12 @@ func (r *Standalone) Apply(_ context.Context, _ uint32, b *store.Batch) error {
 func (r *Standalone) ApplyAsync(_ context.Context, _ uint32, b *store.Batch) (Pending, error) {
 	p, err := r.st.ApplyAsync(b)
 	return pending{p: p}, err
+}
+
+// ApplyAsyncAt 单机档无换届（WaitWritable 恒返回 epoch 0），忽略 epoch，
+// 同 ApplyAsync。
+func (r *Standalone) ApplyAsyncAt(ctx context.Context, g uint32, b *store.Batch, _ uint64) (Pending, error) {
+	return r.ApplyAsync(ctx, g, b)
 }
 
 // pending 把 store.Pending（值类型，热路径零额外分配）包装为 Pending
@@ -364,6 +375,16 @@ func (r *Cluster) ApplyAsync(ctx context.Context, group uint32, b *store.Batch) 
 		r.l.Warn("复制前回收批次失败（字节已取出，不阻断提案）", "group", group, "err", err)
 	}
 	return r.m.ProposeReservedAsync(ctx, group, data), nil
+}
+
+// ApplyAsyncAt 同 ApplyAsync，但经 ProposeReservedAsyncAt 按 epoch 绑定
+// 任期（见 Replicator.ApplyAsyncAt）。
+func (r *Cluster) ApplyAsyncAt(ctx context.Context, group uint32, b *store.Batch, epoch uint64) (Pending, error) {
+	data := reserveProposal(b.Repr())
+	if err := b.Close(); err != nil {
+		r.l.Warn("复制前回收批次失败（字节已取出，不阻断提案）", "group", group, "err", err)
+	}
+	return r.m.ProposeReservedAsyncAt(ctx, group, data, epoch), nil
 }
 
 // GroupForQueue 转 Manager 的队列→组映射（入盘契约，见 Manager 注释）。

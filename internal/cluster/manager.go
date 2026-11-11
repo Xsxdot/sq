@@ -1657,6 +1657,24 @@ func (m *Manager) ProposeReservedAsync(ctx context.Context, g uint32, data []byt
 	return gr.enqueueProposal(ctx, data, false)
 }
 
+// ProposeReservedAsyncAt 同 ProposeReservedAsync，但提案的任期绑定为调用
+// 方给定的 epoch（卡 SQ1 计划修订 R1）：调用方用 WaitWritable 返回的 epoch
+// 读计数器构造批次，必须保证该批次只进同一任期的日志。
+//
+// 参数：
+//   - ctx/g/data: 同 ProposeReservedAsync
+//   - epoch: 调用方过可写门时拿到的 epoch
+//
+// 返回：等待句柄，恒非 nil。入队时本节点非 leader 或当前任期 != epoch、
+// 出队时任期已变，均经 Wait 报 ErrNotLeader；其余同 ProposeReservedAsync。
+func (m *Manager) ProposeReservedAsyncAt(ctx context.Context, g uint32, data []byte, epoch uint64) *ProposalPending {
+	gr, ok := m.groups[g]
+	if !ok {
+		return failedPending(fmt.Errorf("cluster: 未知数据组 %d（有效范围 [0, %d]）", g, m.Groups()-1))
+	}
+	return gr.enqueueProposalAt(ctx, data, epoch)
+}
+
 // IsLeader 返回本节点当前是否为指定组的 leader。
 func (m *Manager) IsLeader(g uint32) bool {
 	gr, ok := m.groups[g]

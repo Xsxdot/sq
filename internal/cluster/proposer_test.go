@@ -468,3 +468,33 @@ func TestProposerLeaderTermAtElection(t *testing.T) {
 		t.Fatal("单节点组未当选")
 	}
 }
+
+// TestProposerExpectedEpochMismatchRejected 卡 SQ1 计划修订 R1：带期望 epoch
+// 的异步入口按调用方给定的 epoch 绑定任期——期望 epoch 与入队时任期不同
+// （过期或超前）即以 ErrNotLeader 失败、不进日志；相同则正常提交。
+func TestProposerExpectedEpochMismatchRejected(t *testing.T) {
+	prefix := []byte("exp/")
+	var mu sync.Mutex
+	var applied []uint64
+	gr, st, _ := propTestGroup(t, func(_ uint32, repr []byte) {
+		mu.Lock()
+		applied = append(applied, seqsIn(repr, prefix)...)
+		mu.Unlock()
+	}, nil)
+	waitFor(t, 5*time.Second, func() bool { return gr.epoch.Load().term == gr.leaderTerm() && gr.leaderTerm() != 0 }, "任期快照未就绪")
+	term := gr.leaderTerm()
+	ctx := context.Background()
+	for seq, exp := range map[uint64]uint64{1: term + 1, 2: term - 1, 3: 0} {
+		if err := gr.enqueueProposalAt(ctx, seqBatch(t, st, string(prefix), seq), exp).Wait(); !errors.Is(err, ErrNotLeader) {
+			t.Fatalf("期望 epoch=%d（当前任期 %d）时 Wait=%v，期望 ErrNotLeader", exp, term, err)
+		}
+	}
+	if err := gr.enqueueProposalAt(ctx, seqBatch(t, st, string(prefix), 9), term).Wait(); err != nil {
+		t.Fatalf("期望 epoch=当前任期 %d 时提案失败: %v", term, err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(applied) != 1 || applied[0] != 9 {
+		t.Fatalf("apply 到的序号 %v，期望只有 [9]（失配条目不得进日志）", applied)
+	}
+}
