@@ -68,3 +68,55 @@ func TestLoadOrCreateHandleSecretReplicatedLeaderPath(t *testing.T) {
 		t.Fatalf("重开后密钥变了: %v", err)
 	}
 }
+
+// epochRecRouter 单机路由 + 固定可写门 epoch（集群档 leader 的替身）。
+type epochRecRouter struct {
+	replication.StandaloneRouter
+	epoch uint64
+}
+
+func (r epochRecRouter) WaitWritable(context.Context, uint32) (uint64, error) { return r.epoch, nil }
+
+// epochRecReplicator 记录生成路径走的是哪个提交入口及其 epoch；提交直通 store。
+type epochRecReplicator struct {
+	st         *store.Store
+	applyCalls int
+	atCalls    int
+	atEpoch    uint64
+}
+
+func (r *epochRecReplicator) Apply(_ context.Context, _ uint32, b *store.Batch) error {
+	r.applyCalls++
+	return r.st.Apply(b)
+}
+
+func (r *epochRecReplicator) ApplyAsync(ctx context.Context, g uint32, b *store.Batch) (replication.Pending, error) {
+	return replication.NewStandalone(r.st).ApplyAsync(ctx, g, b)
+}
+
+func (r *epochRecReplicator) ApplyAsyncAt(ctx context.Context, g uint32, b *store.Batch, epoch uint64) (replication.Pending, error) {
+	r.atCalls++
+	r.atEpoch = epoch
+	return replication.NewStandalone(r.st).ApplyAsync(ctx, g, b)
+}
+
+// TestHandleSecretCreateUsesGateEpoch 卡 SQ1 修订 R1.1（审查 M-2）：meta leader
+// 生成密钥的写入必须按过门 epoch 提案（ApplyAsyncAt），不得走按入队时刻绑定
+// 任期的 Apply——否则门放行后失主又复任时，旧判定（「缺失」）会进新任期日志，
+// 覆盖期间他人已写入的密钥。
+func TestHandleSecretCreateUsesGateEpoch(t *testing.T) {
+	st, err := store.Open(t.TempDir(), true, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	rep := &epochRecReplicator{st: st}
+	k, err := LoadOrCreateHandleSecretReplicated(context.Background(), st, rep, epochRecRouter{epoch: 7}, slog.Default())
+	if err != nil || len(k) != 32 {
+		t.Fatalf("生成: %v len=%d", err, len(k))
+	}
+	if rep.applyCalls != 0 || rep.atCalls != 1 || rep.atEpoch != 7 {
+		t.Fatalf("生成路径提交入口: Apply×%d ApplyAsyncAt×%d(epoch=%d)，期望只走 ApplyAsyncAt 且 epoch=7（过门 epoch）",
+			rep.applyCalls, rep.atCalls, rep.atEpoch)
+	}
+}

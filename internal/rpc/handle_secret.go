@@ -15,6 +15,7 @@ package rpc
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -99,7 +100,8 @@ func LoadOrCreateHandleSecretReplicated(ctx context.Context, st *store.Store,
 // 继续轮询——不让启动因一次换届失败。
 func createHandleSecretAsLeader(ctx context.Context, st *store.Store,
 	rep replication.Replicator, rt replication.Router, logger *slog.Logger) ([]byte, bool, error) {
-	if _, err := rt.WaitWritable(ctx, cluster.MetaGroup); err != nil {
+	epoch, err := rt.WaitWritable(ctx, cluster.MetaGroup)
+	if err != nil {
 		logger.Warn("meta 可写门未开，暂不生成 handle 签名密钥，继续轮询", "err", err)
 		return nil, false, nil
 	}
@@ -115,9 +117,21 @@ func createHandleSecretAsLeader(ctx context.Context, st *store.Store,
 	if _, err := rand.Read(key); err != nil {
 		return nil, true, fmt.Errorf("生成 handle 签名密钥: %w", err)
 	}
+	// 按过门 epoch 提案（卡 SQ1 修订 R1.1）：「缺失」是在 epoch 任期内读到
+	// 的判定，门放行后若本节点失主又复任，期间他人可能已写入密钥——按入队
+	// 时刻绑任期的 Apply 会把旧判定写进新任期日志、覆盖它。任期不符即
+	// ErrNotLeader，回轮询重判。
 	b := st.NewBatch()
 	b.Set(store.HandleSecretKey(), key)
-	if err := rep.Apply(ctx, cluster.MetaGroup, b); err != nil {
+	pending, err := rep.ApplyAsyncAt(ctx, cluster.MetaGroup, b, epoch)
+	if err == nil {
+		err = pending.Wait()
+	}
+	if errors.Is(err, replication.ErrNotLeader) {
+		logger.Warn("生成 handle 签名密钥期间 meta 换届，回轮询重判", "epoch", epoch, "err", err)
+		return nil, false, nil
+	}
+	if err != nil {
 		return nil, true, fmt.Errorf("复制持久化 handle 签名密钥: %w", err)
 	}
 	logger.Info("receipt handle 签名密钥已生成并经复制持久化")
