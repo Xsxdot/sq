@@ -208,7 +208,7 @@ func DelayAllocKey() []byte { return []byte(delayAllocKey) }
 
 // HalfKey 事务半消息暂存条目：half/{nextCheckMs:8B}{txID}，值为完整编码消息（spec §4）。
 // nextCheckMs 是下次回查时间（墙钟 UnixMilli 恒为正），大端编码保证扫描按到期升序；
-// txID 由服务端生成（core.NewMessageID，定长 32 位十六进制），天然唯一故无需 seq。
+// txID 由服务端生成（core.NewTransactionID，crypto/rand，定长 32 位十六进制），天然唯一故无需 seq。
 func HalfKey(nextCheckMs int64, txID string) []byte {
 	k := make([]byte, 0, len(halfPrefix)+8+len(txID))
 	k = append(k, halfPrefix...)

@@ -226,3 +226,24 @@ func BenchmarkNewMessageID(b *testing.B) {
 		}
 	})
 }
+
+// NewTransactionID 是凭据类 ID（EndTransaction 只凭它决断事务），格式须与
+// 历史一致：32 位大写十六进制。不可预测性来自 crypto/rand，测试只钉格式与唯一。
+func TestNewTransactionIDFormat(t *testing.T) {
+	seen := make(map[string]struct{}, 1000)
+	for i := 0; i < 1000; i++ {
+		id := NewTransactionID()
+		if len(id) != 32 {
+			t.Fatalf("长度 = %d，期望 32：%q", len(id), id)
+		}
+		for _, c := range id {
+			if !(c >= '0' && c <= '9' || c >= 'A' && c <= 'F') {
+				t.Fatalf("非法字符 %q：%q", c, id)
+			}
+		}
+		if _, dup := seen[id]; dup {
+			t.Fatalf("txID 重复：%s", id)
+		}
+		seen[id] = struct{}{}
+	}
+}

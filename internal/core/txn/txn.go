@@ -128,7 +128,7 @@ func (t *Manager) Stage(ctx context.Context, m *core.Message) (*core.Message, st
 	if err != nil {
 		return nil, "", err
 	}
-	txID := core.NewMessageID()
+	txID := core.NewTransactionID() // 凭据类 ID：EndTransaction 只凭它决断，须 crypto/rand
 	next := time.Now().Add(t.checkInterval).UnixMilli()
 	ref, _ := json.Marshal(&HalfRef{NextCheckMs: next, Checks: 0}) // 结构固定无失败路径
 	// half 条目与反查索引同批原子提交：崩溃后两键要么都在要么都不在，
