@@ -18,7 +18,7 @@
 | B3 | `log_retain_bytes` 的口径 | **按节点总量，均分到各组**：每组字节下界 = `log_retain_bytes / (data_groups + 1)`（+1 是 meta 组），文档写明；默认 1GiB / 默认 3 数据组 ⇒ 每组 256MiB（段粒度 64MiB 向上取整，实际多留不少留） | **按组计**：磁盘常驻随组数线性放大（data_groups 上限 64 ⇒ 65GiB），用户读 `1GiB` 不会想到要乘组数 |
 | B4 | 「磁盘水位告急」的判据与来源 | **复用 `sysinfo.DiskUsage(dataDir)` 与 `disk_watermark_percent`（默认 85）同一阈值**：`cluster.Options` 新增注入函数 `DiskPressure func() bool`，main.go 装配为「`DiskUsage` 用量百分比 ≥ 水位」，截断循环每轮（每组评估前一次）调用；水位为 0（关闭）时恒 false。与 retention 拒写看的是同一个函数同一个阈值（retention.go:110-133），控制台/指标/截断三方口径一致 | ① **读 retention 维护的 `writeBlocked` 原子量**：它只按 retention 间隔刷新（分钟级），且在 main.go:410 才创建、晚于 `cluster.NewManager`（main.go:308），装配序不允许。② **另设更低的告急阈值**：新增用户可见旋钮，spec 未列 |
 | B5 | 现有「绝对上限」`hardLagCap = 10 × retainEntries`（manager.go:262-270）与活着但落后的 peer 怎么处理 | **删除 hardLagCap**：下界规则改为「活 peer 恒作下界；死 peer 宽限期内作下界、超期放弃；磁盘告急时放弃一切 peer 下界（活的也放），只保留按条数与按字节两条下界」。理由：hardLagCap 是条数口径，5k msg/s 下 10 万条约 20 秒即触发，直接让 S1 不成立；它防的「死节点钉死磁盘」改由宽限期 + 磁盘告急兜住 | 保留 hardLagCap：与 S1 冲突（停机 2 分钟必超 10 万条时照样只能拉快照）。把它改成字节口径：与「按字节保留」概念重叠，用户无法预期两个字节数谁生效 |
-| B6 | 热区窗口大小与压缩节奏 | **窗口 = min(`log_retain_entries` 条, 64MiB)（字节上限为内部常量，不对用户暴露）；压缩在 apply 路径触发**：每次 apply 推进后若热区条数或字节 > 2× 窗口，压到「applied − 窗口」（`MemoryStorage.Compact` 每次复制剩余切片，storage.go:268-288，按 2× 触发摊还 O(1)）。热区内存上界 ≈ 2× 窗口 + 未提交尾部 | 沿用 30s 截断循环顺带压缩：两次压缩之间整 30s 的写入全在内存（现状即如此），高写入下远超窗口 |
+| B6 | 热区窗口大小与压缩节奏 | **窗口 = min(`log_retain_entries` 条, 64MiB)（字节上限为内部常量，不对用户暴露）；压缩在 apply 路径触发**：每次 apply 推进后若热区条数或字节 > 2× 窗口，压到「applied − 窗口」（`MemoryStorage.Compact` 每次复制剩余切片，storage.go:268-288，按 2× 触发摊还 O(1)）。热区内存上界 ≈ 2× 窗口 + 未 apply 尾部（实现起点从日志尾量后夹到 ≤ applied，未提交与已提交未 apply 的尾部都留在热区；2026-11-12 审查 M2 订正） | 沿用 30s 截断循环顺带压缩：两次压缩之间整 30s 的写入全在内存（现状即如此），高写入下远超窗口 |
 | B7 | 冷读 I/O 失败怎么回 raft | **映射为 `raft.ErrCompacted` + Warn**：raft 对该 peer 改发快照（raft.go:625-629、646-648），可用性不受损；绝不返回其它错误——raft 对 Storage 的非 ErrCompacted/ErrUnavailable 错误直接 panic（log.go `term()` 末尾、`slice()` :515-520） | fail-stop（panic）：一块坏扇区让 leader 进程退出、整组切主，代价远大于给一个 peer 发快照 |
 
 拍板后逐条回写本节，状态行改「已拍板（日期）」。
@@ -113,7 +113,7 @@ seglog 包（`SegMaxBytes` 调小以跨段，沿用现有测试做法）：
 
 cluster 包（新增 `logretain_test.go` 为主）：
 5. **两级存储读一致**：单节点组（`startSingleNodeGroup`）热区窗口设 100 条、字节下界很大，提案 3000 条后，`gr.stg.FirstIndex()` 仍为 1，`gr.stg.Entries(1, last+1, 无上限)` 逐条等于提案载荷，`Term` 与 MemoryStorage 记录一致。
-6. **`TestColdTier…` 热区有界**：同上设置写 3000 条后，MemoryStorage 内条目数 ≤ 2×100 + 未提交尾部，且 `raftStore` 不再持有条目（结构上删除，编译即证；另断言 `Load` 只返回热区条数）。
+6. **`TestColdTier…` 热区有界**：同上设置写 3000 条后，MemoryStorage 内条目数 ≤ 2×100 + 未 apply 尾部，且 `raftStore` 不再持有条目（结构上删除，编译即证；另断言 `Load` 只返回热区条数）。
 7. **`TestColdTier…` 重启不整份读入**：上例停组重开（`buildGroup` 干净路径），MemoryStorage 条目数 ≤ 窗口，冷读仍逐条正确。
 8. **I-cold**：热区压缩函数被要求压到 > applied 时只压到 applied（或拒绝），永不越过；快照安装后 `FirstIndex()` = 快照 index +1，冷读不返回安装前的旧条目。
 9. **`TestTruncatePeerGrace…`**（三节点 `startThreeNodeCluster`，`PeerGrace` 设 3s、`RetainEntries` 4、`RetainBytes` 1）：`partitionOff` 一个 follower 后写 100 条，立即 `truncateOnce` → upto 不越过其冻结 Match（宽限期内钉住）；等 3s 后再 `truncateOnce` → upto 越过其 Match，日志含宽限超期 Warn。
@@ -184,6 +184,7 @@ go test -race ./internal/cluster/... -count=1
 - **R2 冷读在 raft 主循环里同步做磁盘读**：追平期间每条 MsgApp 一次最多 1MiB 的 `ReadAt`，冷数据不在页缓存时会拖慢该组的 tick/收发。检查点让单次读是顺序小读；E1 记录追平期间写入 p99，恶化 >5 倍即升级（异步预读属后续卡）。
 - **R3 宽限期内磁盘占用上升**：死 peer 钉住截断 10 分钟，期间写入量全部留盘；磁盘告急兜底（B4），文档写明估算。
 - **R4 新 leader 对死 peer 的 Match 从 0 起**（F4）：宽限期内该组完全不截断，比「停机前的 Match」更保守，只多占盘不丢数据；记入文档。
+- **残余（审查 M2，2026-11-12 记）热区上界含未 apply 尾部**：B6 原写「+ 未提交尾部」，实现的压缩点夹到 ≤ applied，apply 落后时已提交未 apply 的尾部也留在热区（上界 ≈ 2× 窗口 + 未 apply 尾部）。apply 长期落后时热区随之增长，本卡不另设上限；finish 时落 `docs/roadmap.md`。
 
 ## 8. 读数与证据
 
