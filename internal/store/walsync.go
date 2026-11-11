@@ -36,7 +36,7 @@ const AsyncWALSyncInterval = 200 * time.Millisecond
 //     丢失窗口回到无上界；若 WAL 真进入不可恢复态，写路径自己会报错
 func RunWALSyncLoop(ctx context.Context, interval time.Duration, sync func() error, logger *slog.Logger) {
 	logger = logger.With("mod", "store") // 与 store.Open 内的绑定一致
-	logger.Info("async 档周期刷盘已启动", "interval", interval)
+	logger.Info("async 档周期刷盘已启动", "interval", interval.String())
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -46,7 +46,7 @@ func RunWALSyncLoop(ctx context.Context, interval time.Duration, sync func() err
 			return
 		case <-ticker.C:
 			if err := sync(); err != nil {
-				logger.Error("async 档周期刷盘失败", "interval", interval, "err", err)
+				logger.Error("async 档周期刷盘失败", "interval", interval.String(), "err", err)
 			}
 		}
 	}

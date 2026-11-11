@@ -6,7 +6,8 @@
 //   - 持续生产 + 多消费者收+ack 的同时注入三类故障：(a) kill -9 承载队列
 //     最多的节点；(c) 同类节点 SIGTERM 优雅停机后重启；(b) 重启后摊布把
 //     preferred 组转回该节点（计划内转移领导权）
-//   - 两种持久化模式（检查点 1s / 逐次复制）各跑一遍
+//   - 两种持久化模式（检查点 / 逐次复制）各跑一遍；检查点间隔 kill9 场景
+//     1s，graceful+transfer 场景抬到 1h（判别力前提，见 cfGracefulTransfer）
 //   - 判据（计划第 4 节「重复」口径）：丢失 = 0（任何模式、任何场景）；
 //     (b)(c) 检查点丢失型重复 = 0；(a) 逐次模式 = 0、检查点模式
 //     ≤ 2 × R × (I + 1s)（P5，R = kill 前 5s 全体消费者实测投递速率）
@@ -29,8 +30,11 @@ import (
 	"crypto/hmac"
 	"crypto/sha1"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -58,6 +62,12 @@ const (
 	cfConsumers  = 4
 	cfAckWindow  = 30 * time.Second
 	cfRateWindow = 5 * time.Second
+	// cfTakeover 场景 (c) 接管期消费者起来后、重启停机节点前的消费时长（见
+	// cfGracefulTransfer 判别力前提 1）
+	cfTakeover = 10 * time.Second
+	// cfTransferCheckpoint 场景 (b) 检查点模式的间隔：远长于用例时长，周期
+	// 检查点不会抢在转移前落盘，见 cfGracefulTransfer 判别力前提 2
+	cfTransferCheckpoint = time.Hour
 )
 
 // cfDelivery 一次投递记录。
@@ -205,13 +215,14 @@ func (a *rawAcker) ack(mv *rmq.MessageView, start int) bool {
 	return false
 }
 
-// runCFConsumers 起 cfConsumers 个 SimpleConsumer 持续收 + 原始 ack，直到 stop 关闭。
-func runCFConsumers(t *testing.T, pc *procCluster, group, topic string, rec *cfRecorder, stop <-chan struct{}) *sync.WaitGroup {
+// runCFConsumers 起 cfConsumers 个 SimpleConsumer 持续收 + 原始 ack，直到 stop
+// 关闭；协程登记到 wg。endpoint 是 SDK 的接入地址串（「;」分隔），SDK 启动时
+// 从它取一次路由、此后每 30s 刷新；ack 一律经全部节点的原始 gRPC。
+func runCFConsumers(t *testing.T, pc *procCluster, endpoint, group, topic string, rec *cfRecorder, stop <-chan struct{}, wg *sync.WaitGroup) {
 	t.Helper()
 	acker := newRawAcker(t, pc.endpoints(), group, topic)
-	var wg sync.WaitGroup
 	for w := 0; w < cfConsumers; w++ {
-		c := newClusterConsumer(t, pc.multi(), group, topic, clusterConsumerAwaitDefault)
+		c := newClusterConsumer(t, endpoint, group, topic, clusterConsumerAwaitDefault)
 		wg.Add(1)
 		go func(w int, c rmq.SimpleConsumer) {
 			defer wg.Done()
@@ -239,7 +250,6 @@ func runCFConsumers(t *testing.T, pc *procCluster, group, topic string, rec *cfR
 			}
 		}(w, c)
 	}
-	return &wg
 }
 
 // drainUntil 等消费集覆盖确认集且时刻不早于 minEnd（或 180s 超时），返回消费集。
@@ -288,7 +298,7 @@ type cfRun struct {
 	stopProd chan struct{}
 	stopCons chan struct{}
 	prodWG   sync.WaitGroup
-	consWG   *sync.WaitGroup
+	consWG   sync.WaitGroup
 }
 
 func cfSetup(t *testing.T, m cfMode, topic, group string) *cfRun {
@@ -301,7 +311,7 @@ func cfSetup(t *testing.T, m cfMode, topic, group string) *cfRun {
 	producer := newClusterProducer(t, r.pc.multi(), topic)
 	r.prodWG.Add(1)
 	go func() { defer r.prodWG.Done(); produceUntil(t, producer, topic, r.cs, r.stopProd) }()
-	r.consWG = runCFConsumers(t, r.pc, group, topic, r.rec, r.stopCons)
+	runCFConsumers(t, r.pc, r.pc.multi(), group, topic, r.rec, r.stopCons, &r.consWG)
 	t.Cleanup(func() { r.stop() })
 	return r
 }
@@ -319,6 +329,23 @@ func (r *cfRun) stop() {
 		close(r.stopCons)
 	}
 	r.consWG.Wait()
+}
+
+// waitRouteAvoids 轮询 endpoint 上的 topic 路由，直到没有任何队列指向 avoid
+// （停机节点领导的组已在存活节点选出新 leader），超时 Fatal。
+func waitRouteAvoids(t *testing.T, endpoint, topic, avoid string, timeout time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		qs, err := tryQueryRoute(endpoint, topic)
+		if err == nil && len(qs) > 0 && routeEndpointCounts(qs)[avoid] == 0 {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%v 内 %s 上 topic %s 的路由仍指向已停节点 %s（err=%v）", timeout, endpoint, topic, avoid, err)
+		}
+		time.Sleep(500 * time.Millisecond)
+	}
 }
 
 func (r *cfRun) victim(t *testing.T, topic string) int {
@@ -387,16 +414,51 @@ func cfKill9(t *testing.T, m cfMode) {
 	}
 }
 
-// cfGracefulTransfer 场景 (c)+(b)：SIGTERM 承载队列最多的节点 → 10s → 重启；
-// 之后等摊布把 preferred 组转回（计划内转移）→ 排空。两段合计重复必须为 0。
+// cfGracefulTransfer 场景 (c)+(b)：SIGTERM 承载队列最多的节点 → 等其组在
+// 存活节点选出新 leader → 接管期消费 → 重启；之后等摊布把 preferred 组转回
+// （计划内转移）→ 排空。两段合计重复必须为 0，且转移前回调必须确实落过盘
+// （防空过）。
+//
+// 判别力的两个前提（审查 M-2：曾把 main.go 的转移前回调改成 return nil，
+// 旧版本 3/3 照样零重复）：
+//
+//  1. 被转移组在存活节点上必须真有消费流量。官方 Go SDK 只在启动时取一次
+//     路由、此后每 30s 刷新（client.go startUp 的 ticker.Tick(f, 30s)；仅把
+//     停机拉长到 40s 等刷新也不可靠：实测一轮变异下只出 2 条重复，推断刷新
+//     失败时 SDK 保留旧路由，未钉死）。旧版本停机只等
+//     10s：整个停机窗口里 SDK 路由仍把该组队列指向已停节点，存活 leader 从
+//     未装载该组消费状态，转移时没有可丢的内存态——有没有回调结果都一样。
+//     现做法：路由显示该组已由存活节点领导后，另起一批只接入存活节点的
+//     「接管期消费者」（启动即取新路由），保证接管期内该组在存活 leader 上
+//     有取件与确认。
+//  2. 转移那一刻该组必须有未落盘的变更。检查点模式在本场景把间隔抬到
+//     cfTransferCheckpoint（远长于用例时长）：周期检查点不会抢先落盘，存活
+//     leader 任期内的全部取件/确认只能靠转移前回调落盘——缺了它，新 leader
+//     从盘装载到停机时的位点，已确认的消息以 attempt=1 再投、ack 后重投
+//     同时显形。抬间隔不放宽语义：「计划内切换零重复」对任何间隔都应成立。
 func cfGracefulTransfer(t *testing.T, m cfMode) {
 	topic, group := "cf-gt-"+m.name, "cf-gt-g-"+m.name
+	if m.interval > 0 {
+		m.interval = cfTransferCheckpoint
+	}
 	r := cfSetup(t, m, topic, group)
 	time.Sleep(8 * time.Second)
 	v := r.victim(t, topic)
-	t.Logf("SIGTERM 节点 %d，确认集 %d", v+1, r.cs.size())
+	victimEP := r.pc.endpointOf(v)
+	t.Logf("SIGTERM 节点 %d，确认集 %d（检查点间隔 %v）", v+1, r.cs.size(), m.interval)
 	r.pc.stopGraceful(t, v)
-	time.Sleep(10 * time.Second)
+	stoppedAt := time.Now()
+	var live []string
+	for i, ep := range r.pc.endpoints() {
+		if i != v {
+			live = append(live, ep)
+		}
+	}
+	waitRouteAvoids(t, live[0], topic, victimEP, 30*time.Second)
+	runCFConsumers(t, r.pc, strings.Join(live, ";"), group, topic, r.rec, r.stopCons, &r.consWG)
+	t.Logf("停机后 %v 路由已避开节点 %d，接管期消费者已起（接入 %v）",
+		time.Since(stoppedAt).Round(time.Second), v+1, live)
+	time.Sleep(cfTakeover)
 	survivors := r.logs(v)
 	before := countLogLines(t, survivors, "摊布：组领导权转移")
 	r.pc.restart(t, v)
@@ -413,19 +475,65 @@ func cfGracefulTransfer(t *testing.T, m cfMode) {
 	if moved == 0 {
 		t.Fatalf("重启后 60s 内存活节点未发起任何摊布转移（(b) 未被覆盖，防空过）")
 	}
-	prepared := countLogLines(t, survivors, "转移前检查点完成")
-	t.Logf("重启后 %v 摊布转移 %d 次（转移前检查点完成日志累计 %d 条）",
-		time.Since(restartAt).Round(time.Second), moved, prepared)
+	movedAt := time.Now()
+	t.Logf("重启后 %v 摊布转移 %d 次", movedAt.Sub(restartAt).Round(time.Second), moved)
 	time.Sleep(15 * time.Second) // 转移后继续生产消费一段
 	close(r.stopProd)
 	r.prodWG.Wait()
-	got := drainUntil(t, r.cs, r.rec, restartAt.Add(cfInvisible+15*time.Second))
+	// 排空到转移后 cfInvisible+15s：转移丢掉的 ack 在原取件的不可见期满后才
+	// 重投（≤ 转移时刻 + cfInvisible），早停会漏计
+	got := drainUntil(t, r.cs, r.rec, movedAt.Add(cfInvisible+15*time.Second))
 	r.stop()
 	after, att1, samples := r.rec.dups()
-	t.Logf("graceful+transfer/%s：确认集 %d 消费集 %d 投递 %d；检查点丢失型重复 ack后重投=%d 首投重复=%d；样例 %v",
-		m.name, r.cs.size(), len(got), len(r.rec.dels), after, att1, samples)
+	prepared, preparedQueues := countPrepared(t, survivors, restartAt)
+	t.Logf("graceful+transfer/%s：确认集 %d 消费集 %d 投递 %d；检查点丢失型重复 ack后重投=%d 首投重复=%d；"+
+		"重启后转移前检查点完成 %d 次、落盘队列 %d；样例 %v",
+		m.name, r.cs.size(), len(got), len(r.rec.dels), after, att1, prepared, preparedQueues, samples)
 	r.cs.assertAllConsumed(t, got)
-	if after+att1 != 0 {
-		t.Fatalf("计划内切换（优雅停机 + 摊布转移）检查点丢失型重复应为 0，得到 %d", after+att1)
+	// 转移前回调确实跑过（a）；检查点模式下还须确实落过该组的未落盘变更（b 的
+	// 前提成立的证据，否则零重复可能只是「无可丢」）。用 Errorf 不中断，让下面
+	// 的零重复断言照样给出读数。
+	if prepared == 0 {
+		t.Errorf("重启后存活节点没有任何「转移前检查点完成」日志：转移前回调未执行")
 	}
+	if m.interval > 0 && preparedQueues == 0 {
+		t.Errorf("转移前检查点没有落盘任何队列：被转移组在存活节点上无未落盘变更，本用例无判别力")
+	}
+	if after+att1 != 0 {
+		t.Fatalf("计划内切换（优雅停机 + 摊布转移）检查点丢失型重复应为 0，得到 %d（ack后重投=%d 首投重复=%d）",
+			after+att1, after, att1)
+	}
+}
+
+// countPrepared 统计 since 之后各日志里「转移前检查点完成」的条数与其 queues
+// 字段之和（JSON 行日志；解析失败的行只计条数并记一笔）。
+func countPrepared(t *testing.T, logPaths []string, since time.Time) (lines, queues int) {
+	t.Helper()
+	for _, p := range logPaths {
+		raw, err := os.ReadFile(p)
+		if err != nil {
+			t.Logf("读取 broker 日志 %s 失败: %v", p, err)
+			continue
+		}
+		for _, ln := range strings.Split(string(raw), "\n") {
+			if !strings.Contains(ln, "转移前检查点完成") {
+				continue
+			}
+			var rec struct {
+				Time   time.Time `json:"time"`
+				Queues int       `json:"queues"`
+			}
+			if err := json.Unmarshal([]byte(ln), &rec); err != nil {
+				t.Logf("解析转移前检查点日志行失败（%v）：%s", err, ln)
+				lines++
+				continue
+			}
+			if rec.Time.Before(since) {
+				continue
+			}
+			lines++
+			queues += rec.Queues
+		}
+	}
+	return lines, queues
 }

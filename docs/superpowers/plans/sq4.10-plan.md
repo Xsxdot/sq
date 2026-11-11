@@ -6,6 +6,9 @@
 > 级别：L2，不出骨架；规模偏大（seglog 读路径 + 两级存储 + 截断策略），计划内拆三个顺序工作单元，不拆卡
 > 冻结对象：无新增跨子系统冻结对象。新增用户可见配置键 `cluster.log_retain_bytes`、`cluster.log_peer_grace`（spec 已定名）。复用契约：`raft.Storage`（go.etcd.io/raft/v3 v3.7.0 storage.go 的六方法与错误约定）、seglog 盘上格式（frame.go，不变）
 > 执行形态：本会话 subagent 实现，独立 subagent 审，主会话验收
+> **修订（2026-11-12，主会话裁决，批级收尾补记）**：
+> 1. 白名单外新增/改动的文件追认：`internal/cluster/transport.go`、`internal/cluster/transport_test.go`（审查 I1 修复：传输队列按年龄丢陈旧消息 + 拨号超时 + 写期限）、`internal/cluster/group_test.go`（Fix 1 / Fix 2 的回归用例）。§2 白名单表不回改，以本条为准。
+> 2. 内存验收判据改为「**追平窗口内 leader RSS ≤ 512MiB，于判定行之前**」（§4.4 原写 VmHWM「只记录不判定」，以本条为准）。重启节点 VmHWM 914MiB 的根因另落 `docs/roadmap.md`。
 
 ---
 
