@@ -78,8 +78,8 @@ func TestPebbleOptionsCarryResolvedParams(t *testing.T) {
 		in   Options
 		want Options
 	}{
-		{"零值=缺省", Options{}, Options{DefaultCacheSize, DefaultMemTableSize, min(DefaultMaxCompactionConcurrency, runtime.NumCPU())}},
-		{"显式值透传", Options{16 << 20, 2 << 20, 3}, Options{16 << 20, 2 << 20, 3}},
+		{"零值=缺省", Options{}, Options{CacheSize: DefaultCacheSize, MemTableSize: DefaultMemTableSize, CompactionConcurrency: min(DefaultMaxCompactionConcurrency, runtime.NumCPU())}},
+		{"显式值透传", Options{CacheSize: 16 << 20, MemTableSize: 2 << 20, CompactionConcurrency: 3}, Options{CacheSize: 16 << 20, MemTableSize: 2 << 20, CompactionConcurrency: 3}},
 	}
 	for _, c := range cases {
 		po := c.in.resolve().pebbleOptions(slog.Default())

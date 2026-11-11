@@ -76,11 +76,15 @@ func observeApply(d time.Duration) {
 // Apply 是全项目唯一的写入口：core 把一次语义操作（写消息/ack/位点推进）
 // 组装为一个 Batch 原子提交。v2 引入 Raft 时，只需在 Apply 前插入日志复制，
 // core 与本层其余代码不动——这是 spec §3 Command 化写路径的落地形态。
+//
+// 新增写入口必须经 commitTracked（prefixcount.go）：登记前缀的内存计数以
+// 「一切键值写入都过这一点」为前提，绕开它计数会永久漂移。
 type Store struct {
 	db     *pebble.DB
 	dir    string
 	sync   bool
 	logger *slog.Logger
+	pc     *prefixCounter // 登记前缀计数；nil = 未登记（提交路径零额外工作）
 }
 
 // Pebble 调优参数的缺省值（SQ4.5）。这是全仓唯一真值：config 未填写的键
@@ -120,6 +124,10 @@ type Options struct {
 	// CompactionConcurrency 压实并发上限；0 = min(4, CPU 核数)。常态
 	// 只跑 1 路，L0 积压/压实欠账过高时 Pebble 才升到这个上限。
 	CompactionConcurrency int
+	// CountPrefixes 要维护精确内存计数的键前缀（SQ4.9，由装配方登记，store
+	// 不解释其语义）：Open 扫一次建基数，之后每次提交维护，PrefixCount 零
+	// 扫描读取。空 = 不计数。不是 Pebble 参数、不影响盘上格式。
+	CountPrefixes []string
 }
 
 // resolve 把零值字段替换为缺省值，返回实际生效的参数。
@@ -182,11 +190,33 @@ func OpenWithOptions(dir string, syncWrites bool, logger *slog.Logger, opts Opti
 			"memtable_size", eff.MemTableSize, "err", err)
 		return nil, fmt.Errorf("打开 Pebble(%s): %w", dir, err)
 	}
+	s := &Store{db: db, dir: dir, sync: syncWrites, logger: l}
+	pc, err := newPrefixCounter(opts.CountPrefixes)
+	if err != nil {
+		db.Close()
+		l.Error("计数前缀登记非法", "prefixes", opts.CountPrefixes, "err", err)
+		return nil, err
+	}
+	if pc != nil {
+		// 此刻尚无任何写入方：扫一次即精确基数（积压百万级时是秒级一次性成本）
+		start := time.Now()
+		if err := pc.rebase(s); err != nil {
+			db.Close()
+			l.Error("建立前缀计数基数失败", "dir", dir, "err", err)
+			return nil, fmt.Errorf("建立前缀计数基数(%s): %w", dir, err)
+		}
+		counts := make([]any, 0, 2*len(pc.fams))
+		for _, f := range pc.fams {
+			counts = append(counts, f.prefix, f.n.Load())
+		}
+		l.Info("前缀计数基数已建立", "took", time.Since(start).String(), "counts", fmt.Sprint(counts...))
+		s.pc = pc
+	}
 	l.Info("store 已打开", "dir", dir, "sync", syncWrites,
 		"cache_size", eff.CacheSize, "memtable_size", eff.MemTableSize,
 		"compaction_concurrency", eff.CompactionConcurrency,
-		"bloom_bits_per_key", bloomBitsPerKey)
-	return &Store{db: db, dir: dir, sync: syncWrites, logger: l}, nil
+		"bloom_bits_per_key", bloomBitsPerKey, "count_prefixes", len(opts.CountPrefixes))
+	return s, nil
 }
 
 // Close 关闭底层库。之后任何操作都会 panic（Pebble 语义），不做二次防护。
@@ -395,13 +425,16 @@ func BatchConsumeQueues(repr []byte) (qs []ConsumeQueue, whole bool, err error) 
 //
 // 失败/成功的批次归属与 Apply 完全一致（见 Apply 注释）。
 func (s *Store) ApplyWith(b *Batch, sync bool) error {
-	opt := pebble.NoSync
-	if sync {
-		opt = pebble.Sync
-	}
 	start := time.Now()
-	if err := b.b.Commit(opt); err != nil {
+	waitSync, err := s.commitTracked(b.b, sync, false)
+	if err != nil {
 		return fmt.Errorf("store ApplyWith: %w", err)
+	}
+	// 计数路径上的 sync 提交不在计数锁内等 fsync（prefixcount.go），在此补等
+	if waitSync {
+		if err := b.b.SyncWait(); err != nil {
+			return fmt.Errorf("store ApplyWith: %w", err)
+		}
 	}
 	// OnApplyObserve 只观测成功提交：失败路径由调用方打日志，
 	// 混进观测会污染 fsync 延迟直方图分布。
@@ -493,17 +526,15 @@ type Pending struct {
 // 失败时批次按 Apply 同款约定丢给 GC，调用方不得再碰（理由见 Apply 注释）。
 func (s *Store) ApplyAsync(b *Batch) (Pending, error) {
 	start := time.Now()
-	if !s.sync {
-		if err := b.b.Commit(pebble.NoSync); err != nil {
-			return Pending{}, fmt.Errorf("store ApplyAsync: %w", err)
-		}
+	// sync 档经 ApplyNoSyncWait（要求 opts.Sync=true，Pebble 契约）：批次进入
+	// commit pipeline 排队等待 WAL fsync，但本调用不阻塞等它完成。
+	waitSync, err := s.commitTracked(b.b, s.sync, true)
+	if err != nil {
+		return Pending{}, fmt.Errorf("store ApplyAsync: %w", err)
+	}
+	if !waitSync {
 		observeApply(time.Since(start))
 		return Pending{b: b.b}, nil
-	}
-	// ApplyNoSyncWait 要求 opts.Sync=true（Pebble 契约）：批次进入 commit
-	// pipeline 排队等待 WAL fsync，但本调用不阻塞等它完成。
-	if err := s.db.ApplyNoSyncWait(b.b, pebble.Sync); err != nil {
-		return Pending{}, fmt.Errorf("store ApplyAsync: %w", err)
 	}
 	return Pending{b: b.b, start: start, needSync: true}, nil
 }
