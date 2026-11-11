@@ -1,8 +1,8 @@
 // Package deliver —— 卡 SQ4.2 唤醒的不变式单测与故事级检查 S2。
 //
 // 职责（测试文件）：
-//   - W1：先订阅再取件，不丢唤醒（关掉兜底 tick 后，并发写入 / 并发 ack
-//     释放顺序锁都必须在 500ms 内唤醒等待中的 Receive）
+//   - W1：先订阅再取件，不丢唤醒（关掉兜底 tick，经轮次钩子在「空取件之后、
+//     等待之前」确定性地写入 / ack 释放顺序锁，都必须在 500ms 内唤醒 Receive）
 //   - W2（deliver 侧）：死信写入只唤醒死信 topic 的队列 0，不唤醒源队列的其他组
 //   - W3：Ack 一类每个方法成功后只唤醒同 (组, topic, 队列)，两种持久化模式各一遍；
 //     失败路径不 panic
@@ -16,7 +16,6 @@ import (
 	"context"
 	"fmt"
 	"hash/fnv"
-	"math/rand"
 	"sync"
 	"testing"
 	"time"
@@ -130,37 +129,55 @@ func withPollTick(t *testing.T, d time.Duration) {
 	t.Cleanup(func() { pollTick = old })
 }
 
-// TestWakeNoLostWakeup W1：关掉兜底 tick，Receive 与唤醒源并发竞态 500 次，
-// 每次都须 500ms 内拿到消息（丢一次唤醒即等满 2s）。
+// TestWakeNoLostWakeup W1：关掉兜底 tick，把「取件为空之后、开始等待之前」
+// 这个竞态窗口变成每轮必经的路径——轮次钩子（Receive 里紧跟 receiveOnce 的
+// 第一条语句）在首轮空取件后同步触发唤醒源（Append / Ack 队头），等待者必须
+// 在 500ms 内拿到消息。订阅若挪到 receiveOnce（及钩子）之后，唤醒先于订阅
+// 发出即丢失，等满 2s，每轮必红。500 轮各一遍。
 func TestWakeNoLostWakeup(t *testing.T) {
 	withPollTick(t, time.Hour)
 	const iters = 500
 	ctx := context.Background()
 
+	// run 每轮起一个 Receive(wait=2s)，钩子在其首轮空取件后同步调 trigger 一次
+	run := func(t *testing.T, f *wakeFixture, topic string, trigger func() error, check func(i int, ms []*core.Message)) {
+		for i := 0; i < iters; i++ {
+			fired := false
+			f.dl.roundHook = func(_, _ string, _ uint32, cause roundCause, n int) {
+				if cause != roundFirst || n != 0 || fired {
+					return
+				}
+				fired = true
+				if err := trigger(); err != nil {
+					t.Errorf("第 %d 轮触发唤醒源: %v", i, err)
+				}
+			}
+			start := time.Now()
+			ms, err := f.dl.Receive(ctx, "g", topic, 0, 1, 30*time.Second, 2*time.Second, AllPass)
+			f.dl.roundHook = nil
+			if err != nil {
+				t.Fatalf("第 %d 轮 Receive: %v", i, err)
+			}
+			if !fired {
+				t.Fatalf("第 %d 轮：首轮未空取件，竞态窗口未被走到（夹具前置不成立）", i)
+			}
+			if len(ms) != 1 || time.Since(start) > 500*time.Millisecond {
+				t.Fatalf("第 %d 轮：唤醒源已触发，%v 后才返回 %d 条（丢唤醒）", i, time.Since(start), len(ms))
+			}
+			check(i, ms)
+		}
+	}
+
 	t.Run("append", func(t *testing.T) {
 		f := newWakeFixture(t, 16)
-		for i := 0; i < iters; i++ {
-			done := make(chan []*core.Message, 1)
-			go func() {
-				ms, err := f.dl.Receive(ctx, "g", "w1a", 0, 1, 30*time.Second, 2*time.Second, AllPass)
-				if err != nil {
-					t.Errorf("Receive: %v", err)
-				}
-				done <- ms
-			}()
-			time.Sleep(time.Duration(rand.Intn(2000)) * time.Microsecond)
-			start := time.Now()
-			if _, err := f.pr.Append(ctx, &core.Message{Topic: "w1a", Body: []byte("x")}); err != nil {
-				t.Fatalf("Append: %v", err)
-			}
-			ms := <-done
-			if len(ms) != 1 || time.Since(start) > 500*time.Millisecond {
-				t.Fatalf("第 %d 轮：Append 后 %v 才返回 %d 条（丢唤醒）", i, time.Since(start), len(ms))
-			}
+		run(t, f, "w1a", func() error {
+			_, err := f.pr.Append(ctx, &core.Message{Topic: "w1a", Body: []byte("x")})
+			return err
+		}, func(i int, ms []*core.Message) {
 			if ok, err := f.dl.Ack(ctx, "g", "w1a", 0, ms[0].Offset, ms[0].DeliveryAttempt); err != nil || !ok {
-				t.Fatalf("Ack: ok=%v err=%v", ok, err)
+				t.Fatalf("第 %d 轮 Ack: ok=%v err=%v", i, ok, err)
 			}
-		}
+		})
 	})
 
 	t.Run("ordered-ack", func(t *testing.T) {
@@ -174,29 +191,19 @@ func TestWakeNoLostWakeup(t *testing.T) {
 		if err != nil || len(head) != 1 {
 			t.Fatalf("取队头: %v %d", err, len(head))
 		}
-		for i := 0; i < iters; i++ {
-			done := make(chan []*core.Message, 1)
-			go func() {
-				ms, err := f.dl.Receive(ctx, "g", "w1o", 0, 1, 30*time.Second, 2*time.Second, AllPass)
-				if err != nil {
-					t.Errorf("Receive: %v", err)
-				}
-				done <- ms
-			}()
-			time.Sleep(time.Duration(rand.Intn(2000)) * time.Microsecond)
-			start := time.Now()
-			if ok, err := f.dl.Ack(ctx, "g", "w1o", 0, head[0].Offset, head[0].DeliveryAttempt); err != nil || !ok {
-				t.Fatalf("Ack 队头: ok=%v err=%v", ok, err)
+		// 队头在外 → 首轮被顺序锁拦下空取件；钩子里 ack 队头释放顺序锁
+		run(t, f, "w1o", func() error {
+			ok, err := f.dl.Ack(ctx, "g", "w1o", 0, head[0].Offset, head[0].DeliveryAttempt)
+			if err == nil && !ok {
+				err = fmt.Errorf("ack 队头落空")
 			}
-			ms := <-done
-			if len(ms) != 1 || time.Since(start) > 500*time.Millisecond {
-				t.Fatalf("第 %d 轮：Ack 队头后 %v 才返回 %d 条（丢唤醒）", i, time.Since(start), len(ms))
-			}
+			return err
+		}, func(i int, ms []*core.Message) {
 			if ms[0].Offset != head[0].Offset+1 {
 				t.Fatalf("第 %d 轮：期望 offset %d，得 %d", i, head[0].Offset+1, ms[0].Offset)
 			}
 			head = ms
-		}
+		})
 	})
 }
 

@@ -628,7 +628,9 @@ type AckResult struct {
 // 返回：与 entries 同序的结果；error 时任何条目都不算已确认（提案失败则
 // 内存态随之失效重装，被删的 inflight 回到盘上状态）。
 //
-// 落盘前绝不向调用方报告确认成功（语义红线 1）；全部落空不提案。
+// 成功的含义按持久化模式：逐次复制模式下落盘后才报告确认成功（语义红线 1）；
+// 检查点模式下内存删除即成功，落盘随下一轮检查点（卡 SQ4.1 已批准的取舍，
+// 故障时表现为有界重复投递）。全部落空不提案。
 func (d *Deliverer) AckBatch(ctx context.Context, group, topic string, queueID uint32, entries []AckEntry) ([]AckResult, error) {
 	if len(entries) == 0 {
 		return nil, nil
@@ -688,7 +690,8 @@ func (d *Deliverer) AckBatch(ctx context.Context, group, topic string, queueID u
 // "别人正在处理的新一轮投递"上。
 //
 // inflight 不存在或 attempt 不匹配都返回 (false, nil)，幂等，不算错误。
-// 成功返回前新的过期时间必然已落盘（语义红线 1）。
+// 成功的含义按持久化模式：逐次复制模式下成功返回前新的过期时间已落盘（语义
+// 红线 1）；检查点模式下内存改完即成功，落盘随下一轮检查点。
 func (d *Deliverer) ChangeInvisible(ctx context.Context, group, topic string, queueID uint32, offset uint64, attempt int32, invisible time.Duration) (bool, error) {
 	qs, _, err := d.acquire(ctx, group, topic, queueID)
 	if err != nil {
