@@ -30,7 +30,7 @@ test:
 
 # internal/cluster 专用入口：该包有一次未复现的偶发失败（B12）。
 #   -count=1  防测试缓存给出假绿——追偶发时缓存命中等于没跑。
-#   -timeout 5m 该包全量约 72–85s，5m 是约 3.5 倍余量；真挂死时比默认的 10m
+#   -timeout 5m 该包全量约 130s（SQ4 批后实测），5m 约 2.3 倍余量；真挂死时比默认的 10m
 #              早 5 分钟触发栈转储。
 test-cluster:
 	set -o pipefail; go test -timeout 5m -count=1 ./internal/cluster/... 2>&1 | tee test-cluster.log
