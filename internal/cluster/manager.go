@@ -1604,8 +1604,9 @@ func (m *Manager) Propose(ctx context.Context, g uint32, batchRepr []byte) error
 	return m.ProposeReserved(ctx, g, data)
 }
 
-// ProposeReserved 单拷贝提案入口：data 前 ProposalHeaderLen 字节为保留
-// 提案头（由 group.propose 回填），data[ProposalHeaderLen:] 为批次载荷。
+// ProposeReserved 单拷贝提案入口（同步形态 = 入本组保序提案队列 + 等到
+// 本节点 apply）：data 前 ProposalHeaderLen 字节为保留提案头（由 proposer
+// 回填），data[ProposalHeaderLen:] 为批次载荷。
 //
 // 契约（与 group.propose、replication.Cluster.Apply 互引，详见
 // ProposalHeaderLen 常量注释）：
@@ -1617,6 +1618,32 @@ func (m *Manager) ProposeReserved(ctx context.Context, g uint32, data []byte) er
 		return fmt.Errorf("cluster: 未知数据组 %d（有效范围 [0, %d]）", g, m.Groups()-1)
 	}
 	return gr.propose(ctx, data)
+}
+
+// ProposeReservedAsync 单拷贝提案的异步入口：入本组保序提案队列后立即
+// 返回等待句柄，等待挪到 ProposalPending.Wait（produce/deliver 持队列锁
+// 调用、锁外等待的形态，经 replication.Cluster.ApplyAsync 使用）。
+//
+// 定序契约：本调用返回先于同组另一提案调用发起，且二者都进了日志，则
+// 本条 index 更小（同组全局 FIFO，见 proposer.go）。跨组不承诺顺序。
+//
+// 与 ProposeReserved 的差别只在 leader 未知（选举窗口）时：本入口直接
+// 失败 ErrNotLeader，不排队等下一任期（调用方是 leader-only 构造，旧任期
+// 计数器构造的批次不得进新任期日志）。
+//
+// 参数：
+//   - ctx: 条目 ctx（出队前已取消则不提案）与 Wait 的等待预算
+//   - g: 组号
+//   - data: 单拷贝契约缓冲（同 ProposeReserved），所有权随调用移交
+//
+// 返回：等待句柄，恒非 nil；一切失败（未知组、组已停止、非 leader 等）
+// 都经 Wait 报，本方法从不同步返回错误。
+func (m *Manager) ProposeReservedAsync(ctx context.Context, g uint32, data []byte) *ProposalPending {
+	gr, ok := m.groups[g]
+	if !ok {
+		return failedPending(fmt.Errorf("cluster: 未知数据组 %d（有效范围 [0, %d]）", g, m.Groups()-1))
+	}
+	return gr.enqueueProposal(ctx, data, false)
 }
 
 // IsLeader 返回本节点当前是否为指定组的 leader。

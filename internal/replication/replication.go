@@ -6,9 +6,9 @@
 //     的 34 个写点统一改到该抽象上
 //   - Standalone：今天的路径，Apply 直通 store.Apply、ApplyAsync 直通
 //     store.ApplyAsync（group commit 合并 fsync 的既有机制），零额外开销
-//   - Cluster：把批次物理字节（Repr）提进 Manager.Propose 的所属组；
-//     ApplyAsync 把等待拆到 Pending.Wait——集群档的「定序」由 raft 内部
-//     批量完成，拆分只为把等待挪出调用方队列锁，与单机同形不同机制
+//   - Cluster：把批次物理字节（Repr）提进所属 raft 组；ApplyAsync 入组的
+//     保序提案队列后立即返回、等待拆到 Pending.Wait——返回即在同组内定序
+//     （cluster/proposer.go 的每组 FIFO），与单机同形不同机制
 //   - Router：组路由视图——Standalone 恒返回 MetaGroup，Cluster 转 Manager
 //   - Forwarder：跨节点转发原语（仅 Cluster 实现）——ForwardAppend 把
 //     已编码消息交 g 组 leader 的 produce 栈追加、ForwardApply 把构造
@@ -179,7 +179,8 @@ type Replicator interface {
 	Apply(ctx context.Context, group uint32, b *store.Batch) error
 	// ApplyAsync 定序返回、Wait 等确认——produce/deliver 热路径的锁外等待形态。
 	// Standalone: store.ApplyAsync 直通（group commit 合并 fsync 的既有机制）。
-	// Cluster: 提案发出即返回，Wait 阻塞到本节点 apply（quorum+本地）完成。
+	// Cluster: 入所属组保序提案队列即返回（返回即在同组内定序：返回先于
+	// 同组另一调用发起者先进日志），Wait 阻塞到本节点 apply（quorum+本地）完成。
 	ApplyAsync(ctx context.Context, group uint32, b *store.Batch) (Pending, error)
 }
 
@@ -292,7 +293,7 @@ func (StandaloneRouter) IsLeader(uint32) bool { return true }
 // ReadBarrier 单机档没有复制，本地读天然线性一致，恒放行。
 func (StandaloneRouter) ReadBarrier(context.Context, uint32) error { return nil }
 
-// Cluster 集群后端：Apply/ApplyAsync = m.Propose；兼作 Router（转
+// Cluster 集群后端：Apply/ApplyAsync 经 Manager 提进所属组的保序提案队列；兼作 Router（转
 // Manager）与 Forwarder（经控制通道跨节点转发）。
 type Cluster struct {
 	m *cluster.Manager
@@ -306,7 +307,7 @@ func NewCluster(m *cluster.Manager) *Cluster {
 
 // reserveProposal 把批次字节拷进「预留 cluster.ProposalHeaderLen 提案头」
 // 的新缓冲——单拷贝契约的调用方半边（另一半见 cluster.ProposalHeaderLen
-// 与 Manager.ProposeReserved 注释）：前 16B 留白由 group.propose 回填
+// 与 Manager.ProposeReserved 注释）：前 16B 留白由 cluster 的 proposer（proposer.go）回填
 // 提案者/waiter id，本函数不写它们；缓冲所有权随 ProposeReserved 移交
 // raft，构造后本包不再读写。
 //
@@ -334,38 +335,27 @@ func (r *Cluster) Apply(ctx context.Context, group uint32, b *store.Batch) error
 	return r.m.ProposeReserved(ctx, group, data)
 }
 
-// ApplyAsync 拷贝 repr 并立即返回，等待挪到 Pending.Wait——produce 热
-// 路径的锁外等待形态。拷贝同 Apply 走 reserveProposal（单拷贝契约）。
+// ApplyAsync 拷贝 repr、入所属组的保序提案队列并立即返回，等待挪到
+// Pending.Wait——produce/deliver 持队列锁调用、锁外等待的形态。拷贝同
+// Apply 走 reserveProposal（单拷贝契约）。
 //
-// 与单机档同形不同机制：集群档的「定序」发生在 raft 内部批量（并发
-// 在途提案经 Ready 循环合并推进），这里拆出 goroutine 只为把等待挪出
-// 调用方队列锁；Wait 阻塞到本节点 apply（quorum+本地）完成，读己之写
-// 语义与 Apply 一致。批次归属同 Apply：字节取出后 Close（失败仅记
-// Warn，不阻断提案）。
+// 定序（与单机档同形不同机制）：本方法返回时提案已在组内排定位置——
+// 返回先于同组另一提案调用发起，且二者都进了日志，则本条先进日志、先
+// apply（Manager.ProposeReservedAsync，每组单 proposer FIFO）。调用方
+// 在 qs.mu 下先后调用即保证 offset 顺序 = 日志顺序。入队非阻塞：选举
+// 窗口内 leader 未知时不排队等待，而是经 Wait 报 ErrNotLeader——调用方
+// 是 leader-only 构造，旧任期计数器构造的批次不得进新任期日志。
 //
-// goroutine 为什么必须保留（勿「优化」成调用方同步 Propose）：调用方
-// produce.Append 在持有队列锁 qs.mu 时调用本方法，依赖它立即返回才能
-// 把 fsync/quorum 等待挪到锁外；而 rn.Propose 在 leader 未知（选举窗口）
-// 时会阻塞到 leader 产生——同步执行会让选举窗口内 qs.mu 被长期占住，
-// 是行为回退。rn.Propose 没有非阻塞变体，等待无法拆进 Wait，故保留
-// goroutine，本轮只消除第二次整拷。
+// Wait 阻塞到本节点 apply（quorum+本地）完成，读己之写语义与 Apply 一致；
+// 一切失败经 Wait 报，本方法从不返回错误。批次归属同 Apply：字节取出后
+// Close（失败仅记 Warn，不阻断提案）。
 func (r *Cluster) ApplyAsync(ctx context.Context, group uint32, b *store.Batch) (Pending, error) {
 	data := reserveProposal(b.Repr())
 	if err := b.Close(); err != nil {
 		r.l.Warn("复制前回收批次失败（字节已取出，不阻断提案）", "group", group, "err", err)
 	}
-	ch := make(chan error, 1)
-	go func() { ch <- r.m.ProposeReserved(ctx, group, data) }()
-	return chanPending(ch), nil
+	return r.m.ProposeReservedAsync(ctx, group, data), nil
 }
-
-// chanPending 把单结果 channel 包装为 Pending：Wait 恰好读一次（与
-// store.Pending 的恰好一次 Wait 语义一致）。缓冲 1 保证 goroutine 永不
-// 阻塞——Propose 失败路径同样经 channel 带回，错误不丢失。
-type chanPending chan error
-
-// Wait 返回一次提案结果：读 channel（Propose 完成即就绪）。
-func (p chanPending) Wait() error { return <-p }
 
 // GroupForQueue 转 Manager 的队列→组映射（入盘契约，见 Manager 注释）。
 func (r *Cluster) GroupForQueue(topic string, queueID uint32) uint32 {

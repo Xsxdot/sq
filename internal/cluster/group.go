@@ -189,6 +189,15 @@ type group struct {
 	// 数据源）：HardState 只在有变化的那一轮非空，直接读
 	// rd.HardState.GetTerm() 在空轮次恒为 0——详见 currentTerm 注释
 	lastTerm atomic.Uint64
+	// obsTerm 是 Ready 循环观察到的当前任期（leaderTerm 的数据源），在
+	// dispatchReady 处理 SoftState 之前从 rd.HardState 更新——与 lastTerm
+	// 的区别见 leaderTerm 注释（proposer.go）。
+	obsTerm atomic.Uint64
+	// epoch 是本节点对本组的领导权快照（任期 + 是否 leader + 本任期 ctx），
+	// 提案入队绑定与出队核对读它；只由 Ready 循环切换（switchEpoch）。
+	epoch atomic.Pointer[epochState]
+	// pq 是本组的保序提案队列（proposer.go），proposer 协程随 run 启停。
+	pq *proposalQueue
 
 	// confState 是当前成员表（rn.ApplyConfChange 的返回值，ConfChange
 	// apply 时同步更新）。重启时由 newGroup 从持久化值初始化（见
@@ -305,7 +314,9 @@ func newGroup(g uint32, selfID uint64, storage *raft.MemoryStorage, snaps *snapR
 		ccWaiters:      make(map[uint64]chan struct{}),
 		readWaiters:    make(map[uint64]*readWait),
 		doneCh:         make(chan struct{}),
+		pq:             newProposalQueue(),
 	}
+	gr.epoch.Store(&epochState{})
 	// 提案 id 用时间戳做种子（终审 R4）：干净重启后计数器从远离旧值
 	// 的位置继续，配合条目头的提案者校验双保险——旧进程的等待者已随
 	// 进程消亡，新进程的 id 空间不得与旧进程重叠（否则重启回零是
@@ -413,9 +424,12 @@ func (gr *group) run(ctx context.Context) {
 	// 退出之后才关闭，否则测试里 <-gr.done() 返回时仍有协程在碰 store/rs，
 	// -race 下是稳定的 use-after-close。
 	var stages sync.WaitGroup
-	stages.Add(2)
+	stages.Add(3)
 	go func() { defer stages.Done(); gr.runAppend(ctx) }()
 	go func() { defer stages.Done(); gr.runApply(ctx) }()
+	// proposer 协程（proposer.go）同生共死：退出时让全部未处理提案以停止
+	// 错误失败，doneCh 关闭前它必已退出——Wait 的「组退出」分支据此有界返回。
+	go func() { defer stages.Done(); gr.runProposer(ctx) }()
 	defer func() {
 		stages.Wait()
 		// 组退出汇总：本地阶段的阻塞总量是「存储侧跟不上」的唯一量化
@@ -545,6 +559,9 @@ func (gr *group) dispatchReady(ctx context.Context, rd raft.Ready) {
 	//    readIndex 是本轮读屏障的下界。真正放行由 index<=applied 决定，
 	//    apply 阶段每批之后还会再扫一次（见 applyOnce）。
 	gr.stepReadStates(rd.ReadStates)
+	// 任期观测先于 SoftState 处理（proposer.go observeTerm）：钩子与入队
+	// 看到的必须是当选任期，而不是 persistPhase 才更新的 lastTerm。
+	gr.observeTerm(ctx, &rd)
 	// 4. leader 变更观测：SoftState 变化是切换的第一信号。
 	//    顺序即屏障（batch③ 评审 m1）：先跑钩子（同步失效计数器缓存），
 	//    再让 lead.Store 把 leader 身份对外可见。反过来会留下
@@ -552,6 +569,9 @@ func (gr *group) dispatchReady(ctx context.Context, rd raft.Ready) {
 	//    陈旧 offset 覆写已 quorum 提交的消息。
 	if rd.SoftState != nil {
 		gr.notifyLeaderChange(rd.SoftState.Lead)
+		// 领导权快照切换夹在钩子与 lead.Store 之间：失去领导权时本任期
+		// ctx 取消（在途提案解阻塞、旧任期条目出队即失败）先于撤销可见
+		gr.switchEpoch(ctx, rd.SoftState.Lead == gr.selfID)
 		gr.lead.Store(rd.SoftState.Lead)
 		gr.lg.Info("组 leader 变更", "lead", rd.SoftState.Lead, "term", gr.currentTerm())
 	}
@@ -1546,27 +1566,29 @@ func (gr *group) notifyApplied(data []byte) {
 //
 // 单拷贝契约（与 replication.Cluster.Apply/ApplyAsync 互引）：调用方
 // 构造 data 时必须预留前 ProposalHeaderLen 字节（内容任意，通常为零），
-// 载荷从 data[ProposalHeaderLen:] 开始；group.propose 只回填这 16B，
+// 载荷从 data[ProposalHeaderLen:] 开始；proposer（proposer.go proposeOne）只回填这 16B，
 // 不再二次分配拷贝。这样批次字节从 store.Batch.Repr 到 raft 日志条目
 // 全程只发生一次 memcpy（消息体上限 4MB，第二次整拷不可忽略）。
 const ProposalHeaderLen = 16
 
-// propose 提交一条提案并阻塞直到它在本节点 apply 完成。
+// propose 提交一条提案并阻塞直到它在本节点 apply 完成（同步形态 =
+// 入队 + Wait，见 proposer.go）。
 //
 // 等 apply 而非等 commit（读己之写）：propose 返回后调用方立即可读
 // 自己写入的数据；commit 只代表多数派确认，本节点 FSM 可能尚未追上，
 // 只等 commit 会让「写入后立即可读」落空。
 //
-// 实现：分配自增提案 id → 注册 waiter（propWaiters）→ 提案者与 id
-// 各 8B 大端回填进 data 的保留头 → rn.Propose → 等 waiter 通知或
-// ctx 超时。
+// 定序：经本组保序提案队列（proposer.go）——本调用返回先于另一调用发起，
+// 且二者都进了日志，则本条 index 更小。
 //
 // 非 leader 的提案路径（ErrNotLeader，见 raftConfig 的
 // DisableProposalForwarding 契约）：
-//   - 已知 leader 是他人：入口快速失败，不等 raft 静默丢弃
-//   - leader 未知（选举进行中，lead=0）：不在此拒绝——本节点可能即将
-//     当选，raft 的 Propose 会阻塞至 leader 产生再处理（单节点/启动
-//     窗口期靠它保住读己之写，见 node.go run 循环的 propc 门闩）
+//   - 已知 leader 是他人：入队即失败，不等 raft 静默丢弃
+//   - leader 未知（选举进行中，lead=0）：不在此拒绝——入队、不绑任期，
+//     proposer 的 rn.Propose 阻塞至 leader 产生再处理（单节点/启动窗口期
+//     靠它保住读己之写，见 node.go run 循环的 propc 门闩）；异步形态
+//     （enqueueProposal sync=false）在此直接失败，见计划 D1
+//   - 入队时本节点是 leader：绑定任期，出队时任期已变/已非 leader 即失败
 //   - raft 层丢弃（ErrProposalDropped）：包装 ErrNotLeader 返回
 //   - 等待超时且期间 leader 已变更：同样归入 ErrNotLeader——未提交的
 //     低任期条目会被新 leader 追齐时截断，提案已丢
@@ -1574,7 +1596,7 @@ const ProposalHeaderLen = 16
 // 参数：
 //   - ctx: 控制等待；超时/取消后 waiter 被移除（条目可能仍会被提交，
 //     调用方已放弃等待，apply 时 notify 找不到它即可）
-//   - data: 前 ProposalHeaderLen 字节为保留提案头（由本函数回填，调用
+//   - data: 前 ProposalHeaderLen 字节为保留提案头（由 proposer 回填，调用
 //     方不得填写有效内容），data[ProposalHeaderLen:] 为提案载荷
 //     （store.Batch.Repr() 的物理字节）。所有权随调用移交：rn.Propose
 //     之后 raft 长期持有该切片，调用方不得再读写。契约详见
@@ -1582,69 +1604,10 @@ const ProposalHeaderLen = 16
 //
 // 返回：
 //   - nil：条目已 apply
-//   - error：Propose 失败、ctx 超时/取消，或 ErrNotLeader（调用方带
-//     上下文处理，协议面按可重试码翻译）
+//   - error：Propose 失败、ctx 超时/取消、组已停止，或 ErrNotLeader（调用方
+//     带上下文处理，协议面按可重试码翻译）
 func (gr *group) propose(ctx context.Context, data []byte) error {
-	// 保留头缺失属编程错误（调用方没按单拷贝契约构造缓冲），fail-stop
-	// 直接报错，绝不能把载荷前 16B 当头覆盖掉。
-	if len(data) < ProposalHeaderLen {
-		return fmt.Errorf("cluster: 提案缓冲长度 %d 小于保留头 %d（调用方未按单拷贝契约预留）",
-			len(data), ProposalHeaderLen)
-	}
-	// 快速失败：已探明 leader 是他人（follower 提案在 DisableProposal
-	// Forwarding 下必被丢弃），立即返回 ErrNotLeader 让客户端经
-	// Leader(g) 重试——等待 raft 处理周期或等到超时都是客户端不可
-	// 接受的失败模式。高频场景（客户端错发是常态不是异常）记 Debug。
-	if lead := gr.leader(); lead != 0 && lead != gr.selfID {
-		gr.lg.Debug("提案被拒：本节点非 leader", "lead", lead)
-		return gr.notLeaderErr()
-	}
-	// 超时判定基线：等待期间 leader 变更 = 提案可能已被新任期截断丢弃
-	leadAtEntry := gr.leader()
-	id := gr.nextID.Add(1)
-	ch := make(chan struct{})
-	gr.mu.Lock()
-	gr.propWaiters[id] = ch
-	gr.mu.Unlock()
-
-	// 提案头布局（终审 R4）：[8B 提案者 nodeID][8B waiter id]——apply
-	// 时据此回调对应 waiter，且只有提案者为本节点的条目才被唤醒
-	// （waiter id 是每节点独立计数器，跨节点可能撞车，裸 id 通知会
-	// 把别节点丢失的提案误判成自己的成功）。
-	// 只回填调用方预留的保留头，不再分配新缓冲——第二次整拷在此消除
-	// （单拷贝契约，见 ProposalHeaderLen 注释）。
-	binary.BigEndian.PutUint64(data[:8], gr.selfID)
-	binary.BigEndian.PutUint64(data[8:16], id)
-
-	if err := gr.rn.Propose(ctx, data); err != nil {
-		gr.removeWaiter(gr.propWaiters, id)
-		// follower 提案被 raft 丢弃（DisableProposalForwarding）——
-		// 归入 ErrNotLeader，客户端据此重试；其余错误（ctx 超期等）
-		// 原样返回
-		if errors.Is(err, raft.ErrProposalDropped) {
-			return gr.notLeaderErr()
-		}
-		return err
-	}
-	select {
-	case <-ch:
-		gr.lg.Debug("提案已 apply", "id", id)
-		return nil
-	case <-ctx.Done():
-		// 超时：条目可能仍会被提交，但调用方已放弃等待；删除
-		// waiter 防泄漏（测试断言超时后 map 为空），后续 apply 时
-		// notify 找不到它即可
-		gr.removeWaiter(gr.propWaiters, id)
-		// 等待期间 leader 已变更：未提交条目在新 leader 追齐时被截断，
-		// 提案已丢——归入 ErrNotLeader 让客户端重试，而非当作不可重试
-		// 的 deadline；leader 未变（如仍是我方但无 quorum）时条目仍
-		// 可能提交，保持 ctx.Err()
-		if cur := gr.leader(); cur != leadAtEntry && cur != gr.selfID {
-			return gr.notLeaderErr()
-		}
-		gr.lg.Debug("propose 等待超时", "id", id, "err", ctx.Err())
-		return ctx.Err()
-	}
+	return gr.enqueueProposal(ctx, data, true).Wait()
 }
 
 // notLeaderErr 构造带组号与当前 leader 上下文的 ErrNotLeader 包装错误，

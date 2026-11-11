@@ -231,7 +231,7 @@ var _ Router = (*StandaloneRouter)(nil)
 var _ Router = (*Cluster)(nil)
 var _ Forwarder = (*Cluster)(nil)
 var _ Pending = pending{}
-var _ Pending = (chanPending)(nil)
+var _ Pending = (*cluster.ProposalPending)(nil)
 
 // fakeLeaderRouter 可编程的 Router：IsLeader 按字段返回（转发分支测试用）。
 type fakeLeaderRouter struct{ leader bool }
