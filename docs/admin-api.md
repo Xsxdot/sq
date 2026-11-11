@@ -37,6 +37,8 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8082/admin/topics
 
 删除 topic 或消费组是即时物理删除，操作前先停止对应流量。Admin token 只保存在进程内存，重启后需要重新登录。`/metrics` 不设防，只应绑定在可信内网地址。
 
+`/metrics` 的业务指标（`sq_topics`、`sq_groups`、`sq_delay_depth`、`sq_half_messages`、`sq_topic_messages_written_total`、`sq_group_pending_messages`、`sq_group_inflight_messages`）取自时序采样器最近一次的快照，最多滞后一个采样间隔（5 秒），抓取本身不扫描存储。采样代价与延时、半消息积压量无关：延时与半消息深度由存储层内存计数，在途数在消费队列 leader 上读内存、在 follower 上逐队列读盘。检查点模式下 leader 的在途数是内存值、落后量取盘上位点，两者最多相差一个检查点间隔的投递量。事务、连接、过滤跳过与系统类指标仍在抓取时实时读取。
+
 ## 诊断端点
 
 以下 pprof 路由也挂在 Admin 面，并遵循同一鉴权中间件：

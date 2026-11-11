@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand"
+	"os"
 	"sync"
 	"testing"
 )
@@ -276,4 +277,51 @@ func TestPrefixCountSnapshotShapedBatch(t *testing.T) {
 		t.Fatal(err)
 	}
 	assertCountsMatch(t, s, "快照后分块")
+}
+
+// BenchmarkOpenCountedPrefixes 真机清单第 4 条：库内有 SQ49_OPEN_KEYS（缺省
+// 1 万）条 delay 键（值 1KB）时，带计数前缀 Open（含建基数）的耗时。只记录、
+// 不判定。1M 档：SQ49_OPEN_KEYS=1000000。
+func BenchmarkOpenCountedPrefixes(b *testing.B) {
+	n := 10000
+	if v := os.Getenv("SQ49_OPEN_KEYS"); v != "" {
+		if _, err := fmt.Sscan(v, &n); err != nil {
+			b.Fatal(err)
+		}
+	}
+	dir := b.TempDir()
+	s, err := OpenWithOptions(dir, false, slog.Default(), Options{})
+	if err != nil {
+		b.Fatal(err)
+	}
+	val := make([]byte, 1024)
+	bt := s.NewBatch()
+	for i := 0; i < n; i++ {
+		bt.Set(DelayKey(1<<40, uint64(i)), val)
+		if (i+1)%10000 == 0 {
+			if err := s.Apply(bt); err != nil {
+				b.Fatal(err)
+			}
+			bt = s.NewBatch()
+		}
+	}
+	if err := s.Apply(bt); err != nil {
+		b.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		b.Fatal(err)
+	}
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		s, err := OpenWithOptions(dir, false, slog.Default(), Options{CountPrefixes: testCountPrefixes})
+		if err != nil {
+			b.Fatal(err)
+		}
+		if got, _ := s.PrefixCount("delay/"); got != int64(n) {
+			b.Fatalf("计数 %d ≠ %d", got, n)
+		}
+		b.StopTimer()
+		s.Close()
+		b.StartTimer()
+	}
 }

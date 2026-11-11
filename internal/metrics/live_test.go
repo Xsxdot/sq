@@ -337,8 +337,11 @@ func TestSampleCostIndependentOfBacklog(t *testing.T) {
 func TestMetricNamesAndLabelsUnchanged(t *testing.T) {
 	f := newLiveFixture(t, t.TempDir(), 0)
 	ctx := context.Background()
-	if _, err := f.pr.Append(ctx, &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
-		t.Fatal(err)
+	// 每队列 2 条、取 1 条不 ack：pending 与 inflight 两族都有样本
+	for i := 0; i < 8; i++ {
+		if _, err := f.pr.Append(ctx, &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+			t.Fatal(err)
+		}
 	}
 	if _, err := f.dl.Receive(ctx, "g1", "t1", 0, 1, time.Hour, 0, deliver.AllPass); err != nil {
 		t.Fatal(err)
