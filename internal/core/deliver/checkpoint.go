@@ -5,11 +5,11 @@
 //     变大即从 pebble 装载；持有更旧 epoch 的调用返回 ErrNotLeader
 //   - 失效（dropLocked）：换届、管理批次、前序提案失败时丢弃内存态，下次
 //     访问重装；等待中的后续变更一并以可重试错误失败
-//   - 逐次复制（commitLocked / waitFlush）：每次变更以「cursor + 变更的
-//     inflight 同批」差量提案，落盘后才交件/应答。同队列至多一个差量在途
-//     （计划修订 R1）：在途期间到达的变更只改内存并挂到「下一次提案」，在途
-//     提案成功后才构造下一个差量——下一差量的基线恒为已落盘状态；在途提案
-//     失败即丢弃内存态、从盘重装
+//   - 逐次复制（commitLocked / finishFlush）：每次变更以「cursor + 变更的
+//     inflight 同批」差量提案，落盘后才交件/应答。同队列至多 maxInFlight 个
+//     差量在途（R1 为 1；前缀有序后端放宽，见计划修订 R3）：达到上限期间到达
+//     的变更只改内存并挂到「下一次提案」，有名额空出才构造下一个差量；在途
+//     提案失败即丢弃内存态，等本队列在途全部了结后从盘重装
 //   - 检查点（checkpointRound）：检查点模式下变更只改内存、登记脏队列；后台
 //     循环每个间隔对脏队列做一轮整体替换落盘（修订 R1：DeleteRange inflight
 //     前缀 + Set 全部 inflight + Set cursor，同批）——任一检查点批次单独落地
@@ -408,7 +408,7 @@ func (d *Deliverer) roundBudget() time.Duration {
 
 // Stop 停止消费引擎（正常停机）：关门（此后新调用一律 ErrNotLeader）→ 停
 // 检查点循环 → 对全部脏队列做收尾检查点并等待落盘。ctx 为收尾上限（计划
-// 授权 [5s,20s]，由调用方给）。逐次复制模式只关门。重复调用为空操作。
+// 授权 [1s,4s]，由调用方给），等循环退出与收尾轮次都受它约束。逐次复制模式只关门。重复调用为空操作。
 //
 // 调用时机（main）：gRPC 排空之后、Manager.StopClean 与 store.Close 之前。
 // 返回收尾检查点未全部落盘时的错误（后果：未落盘的进度在重启后表现为重复投递）。
@@ -422,7 +422,13 @@ func (d *Deliverer) Stop(ctx context.Context) error {
 	}
 	if d.loopCancel != nil {
 		d.loopCancel()
-		<-d.loopDone
+		select {
+		case <-d.loopDone:
+		case <-ctx.Done():
+			// 后台轮次挂在提交不了的提案上（如已失去多数派）：不再等它，收尾
+			// 轮次随后在同一 ctx 下取轮次信号量失败即返回错误
+			d.logger.Warn("停机：等后台检查点轮次退出超时，继续收尾", "err", ctx.Err())
+		}
 	}
 	start := time.Now()
 	var last error
@@ -471,10 +477,15 @@ type ckPending struct {
 // 故障后果，表现为重复投递）。批次失败：队列保留内存态并重新登记为脏，下一轮
 // 重写（全量替换不依赖盘上基线，重试安全）。
 //
-// 返回：写出的队列数与首个失败原因。轮与轮串行（roundMu）。
+// 返回：写出的队列数与首个失败原因。轮与轮串行（roundSem；等候受 ctx 约束，
+// ctx 先到期返回其错误、本轮不做）。
 func (d *Deliverer) checkpointRound(ctx context.Context, only *uint32, all bool) (int, error) {
-	d.roundMu.Lock()
-	defer d.roundMu.Unlock()
+	select {
+	case d.roundSem <- struct{}{}:
+	case <-ctx.Done():
+		return 0, ctx.Err()
+	}
+	defer func() { <-d.roundSem }()
 	var cands []*queueState
 	if all {
 		d.mu.Lock()

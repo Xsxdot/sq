@@ -284,6 +284,9 @@ func NewStandalone(st *store.Store) *Standalone {
 // 每次 sync 都以同一错误失败）。
 func (r *Standalone) PrefixOrderedCommit() bool { return true }
 
+// 编译期断言：单机后端必须声明前缀有序提交（deliver 的同队列流水化依赖它）。
+var _ PrefixOrderedCommitter = (*Standalone)(nil)
+
 // Apply 忽略 group，直通 st.Apply。批次归属与 store.Apply 一致。
 func (r *Standalone) Apply(_ context.Context, _ uint32, b *store.Batch) error {
 	return r.st.Apply(b)

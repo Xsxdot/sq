@@ -97,7 +97,8 @@ func RetryBackoff(attempts int32) time.Duration {
 //
 // 持久化两种模式（checkpoint.go），区别只在「谁、何时」把内存态写成批次：
 //   - 逐次复制（WithCheckpointInterval(0) 或不传选项）：每次变更以「cursor +
-//     变更的 inflight 同批」差量提案，落盘后才交件/应答；同队列至多一个提案在途
+//     变更的 inflight 同批」差量提案，落盘后才交件/应答；同队列至多 maxInFlight
+//     个提案在途（前缀有序后端放宽，见计划修订 R3）
 //   - 检查点（间隔 > 0，Start 起后台循环）：变更只改内存即返回；每个间隔把
 //     脏队列整体替换落盘一次（DeleteRange inflight 前缀 + 全部 inflight + cursor）
 type Deliverer struct {
@@ -129,8 +130,9 @@ type Deliverer struct {
 	// ckMu 保护 ckDirty（检查点模式的脏队列集合，叶子锁：可在持队列锁时取）。
 	ckMu    sync.Mutex
 	ckDirty map[*queueState]struct{}
-	// roundMu 串行化检查点轮次（后台循环、停机收尾、计划内转移前检查点）。
-	roundMu sync.Mutex
+	// roundSem 串行化检查点轮次（后台循环、停机收尾、计划内转移前检查点）：
+	// 容量 1 的信号量而非互斥锁——取用须受调用方 ctx 约束（停机预算）。
+	roundSem chan struct{}
 	// closed Stop 之后为真：新的消费调用一律 ErrNotLeader（停机收尾检查点
 	// 之后不得再有内存变更）。
 	closed atomic.Bool
@@ -164,7 +166,7 @@ func New(rep replication.Replicator, rt replication.Router, st *store.Store,
 	d := &Deliverer{rep: rep, rt: rt, fwd: fwd, st: st, mt: mt, pr: pr,
 		logger: logger.With("mod", "deliver"), qmu: map[string]*queueState{},
 		skipped: map[FilterSkipKey]uint64{}, ckDirty: map[*queueState]struct{}{},
-		fences: map[uint32]time.Time{}}
+		fences: map[uint32]time.Time{}, roundSem: make(chan struct{}, 1)}
 	d.maxInFlight = 1
 	if pc, ok := rep.(replication.PrefixOrderedCommitter); ok && pc.PrefixOrderedCommit() {
 		d.maxInFlight = maxInFlightPrefix
@@ -176,7 +178,7 @@ func New(rep replication.Replicator, rt replication.Router, st *store.Store,
 }
 
 // maxInFlightPrefix 前缀有序后端下每队列在途提案上限（计划修订 R3，授权
-// [4,64]）：16 消费者打同一队列时 pebble 约 8 次提交合并一次 fsync，16 =
+// [4,64]，主会话 2026-11-12 裁定）：16 消费者打同一队列时 pebble 约 8 次提交合并一次 fsync，16 =
 // 2× 该并发留余量；超出部分进 R2 的合并提案，在途批次数有界。
 const maxInFlightPrefix = 16
 

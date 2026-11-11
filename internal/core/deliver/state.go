@@ -276,8 +276,9 @@ func (qs *queueState) hasDirty() bool {
 // 批次 = Set(cursor) + 对每个脏 offset：内存里有 → Set(编码后的 inflight)，
 // 没有 → Delete(inflight 键)。非空即恒写 cursor：盘上状态 = 上一批落盘后的
 // 状态 + 本批 = 构造时刻的内存态，cursor 推进与它越过区间里新增的 inflight
-// 必在同一批。差量的正确性依赖「上一批已落盘」——由调用方保证同队列至多一个
-// 差量在途（修订 R1）。
+// 必在同一批。差量的正确性依赖「前序差量按序生效」——由调用方保证同队列
+// 至多 maxInFlight 个差量在途（R1 为 1、前一批成功才构造下一批；前缀有序
+// 后端放宽，按提交序生效、失败则其后全部失败，见计划修订 R3）。
 func (qs *queueState) buildDelta(b *store.Batch) {
 	b.Set(store.CursorKey(qs.group, qs.topic, qs.q), store.PutU64(qs.cursor))
 	for off := range qs.dirty {

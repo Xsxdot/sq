@@ -719,3 +719,29 @@ func TestPrefixUnknownFateReloadWaitsSettleKeepsI1(t *testing.T) {
 		t.Fatalf("重装后内存应为 3 条在外（ack 0 不被撤回）: n=%d ok=%v", n, ok)
 	}
 }
+
+// TestStopBoundedByCtxWhileLoopRoundHangs 后台检查点轮次正挂在永不提交的
+// 提案上（失去多数派；轮次预算 = 间隔 2s）时调用 Stop：等循环退出、取轮次
+// 串行锁都须受调用方 ctx 约束，ctx 到期即放弃收尾返回错误，不等满轮次预算。
+func TestStopBoundedByCtxWhileLoopRoundHangs(t *testing.T) {
+	f := newHoldFixture(t)
+	f.dl = New(f.rep, f.rt, f.st, f.dl.mt, f.pr, slog.Default(), WithCheckpointInterval(2*time.Second))
+	f.dl.Start(context.Background())
+	f.send(t, 2)
+	if got, err := f.dl.Receive(context.Background(), "g", "t", 0, 2, time.Minute, 0, AllPass); err != nil || len(got) != 2 {
+		t.Fatalf("取件: %d %v", len(got), err)
+	}
+	f.rep.hold.Store(true) // 此后提案永不放行
+	waitUntil(t, "后台轮次的检查点批次入队", func() bool { return f.rep.n() == 1 })
+	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	defer cancel()
+	start := time.Now()
+	err := f.dl.Stop(ctx)
+	took := time.Since(start)
+	if err == nil {
+		t.Fatal("收尾检查点未落盘时 Stop 应返回错误")
+	}
+	if took > time.Second {
+		t.Fatalf("Stop 应受调用方 ctx（200ms）约束，实际耗时 %v", took)
+	}
+}
