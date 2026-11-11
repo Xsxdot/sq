@@ -105,8 +105,9 @@ func sq42RunOrderedAck(t *testing.T, s *sq3Stack) {
 	if delivered > 0 {
 		ratio = float64(woke) / float64(delivered)
 	}
-	t.Logf("[SQ42-S1] %s: %d 条用时 %v，吞吐 %.1f 条/秒；投出轮 %d，其中被唤醒 %d（%.1f%%）",
-		t.Name(), sq42N, el.Round(time.Millisecond), rate, delivered, woke, ratio*100)
+	first, tick := rounds.causes()
+	t.Logf("[SQ42-S1] %s: %d 条用时 %v，吞吐 %.1f 条/秒；投出轮 %d，其中被唤醒 %d（%.1f%%）、首轮 %d、tick %d",
+		t.Name(), sq42N, el.Round(time.Millisecond), rate, delivered, woke, ratio*100, first, tick)
 
 	if strings.Contains(t.Name(), "checkpoint") {
 		if rate < sq42MinRate {

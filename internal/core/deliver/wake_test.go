@@ -30,8 +30,8 @@ import (
 
 // roundCounter S1 用：投出了消息的取件轮数，及其中「被唤醒」起因的轮数。
 type roundCounter struct {
-	mu              sync.Mutex
-	woke, delivered int
+	mu                          sync.Mutex
+	woke, delivered, tick, frst int
 }
 
 func (r *roundCounter) observe(_, _ string, _ uint32, cause roundCause, n int) {
@@ -40,10 +40,22 @@ func (r *roundCounter) observe(_, _ string, _ uint32, cause roundCause, n int) {
 	}
 	r.mu.Lock()
 	r.delivered++
-	if cause == roundWoken {
+	switch cause {
+	case roundWoken:
 		r.woke++
+	case roundTick:
+		r.tick++
+	default:
+		r.frst++
 	}
 	r.mu.Unlock()
+}
+
+// causes 投出轮按起因的分布（首轮 / tick），只用于诊断日志。
+func (r *roundCounter) causes() (first, tick int) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.frst, r.tick
 }
 
 func (r *roundCounter) snapshot() (woke, delivered int) {
