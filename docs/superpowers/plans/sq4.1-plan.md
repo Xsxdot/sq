@@ -5,6 +5,10 @@
 - 前置（硬依赖，本卡实现前 rebase 到其上）：SQ2（每组 FIFO 提案队列、入队绑任期）、SQ1（`Router.WaitWritable(ctx, g) (epoch, err)`、删 `InvalidateCounters`）。两卡目前只有已拍板计划，代码未落地。
 - 级别：**L2（待 P1 拍板确认）**。不改 `replication.Replicator` / `Router` 签名（`WaitWritable` 是 SQ1 新增，复用不算本卡新增）；唯一可能被视为跨子系统契约面变化的是 P1 给 `cluster.Options` 加一个可选钩子。无骨架、无冻结对象；复用契约：`replication.Replicator`（Apply/ApplyAsync，SQ2 补齐「返回即定序」后的版本）、`replication.Router`（含 SQ1 的 `WaitWritable`）、`replication.Forwarder.ForwardApply`（wire 不变）、盘上 `cursor/`、`inflight/` 键与 inflight JSON 值（不变）。
 - 状态：**已拍板（2026-11-11，主会话）**——P1–P6 均按推荐：P1 cluster.Options 新增可选钩子 BeforeLeaderTransfer，仅 balanceOnce 转移前调用，按装配点钩子处理、维持 L2；P2 管理批次统一经 deliver.ApplyAdminBatch；P3 围栏期阻塞 ≤3s；P4 S2(c) 取被消费队列 leader 所在 broker SIGTERM 重启；P5 S3 判据 ≤2×R×(I+1s)、逐次复制模式为 0；P6 分段 A（内存态+逐次复制，根治 SQ3）/段 B（检查点+钩子+故障注入 e2e）交付，卡验收以段 B 为准。新增不变式 I2（消费状态提案用生命周期 ctx、失败毒化整组）采纳。实现前置：SQ2、SQ1 落地并 rebase，第 1 步先核 SQ2 同任期失败前缀性，不成立即停下升级
+- **修订 R1（2026-11-11，主会话，依 SQ2 独立审查 I-1）**：SQ2 落地后的作废语义只覆盖「丢弃那一刻已在队列里的同任期条目」，**不提供跨调用方的同任期失败前缀性**，原 H1 与 I2 的推导前提不成立。I1 的保证改为不依赖 SQ2 前缀性：
+  - **检查点模式（默认）**：每个队列的检查点批次一律**全量替换**——DeleteRange 该队列 inflight 前缀 + Set 当前全部 inflight + Set cursor，同批。任一检查点批次单独落地都自洽（cursor 不会越过盘上缺失的 inflight），前序批次丢弃无害。代价 O(该队列 inflight)/每个检查点间隔，可接受。
+  - **逐次复制模式**：差量批次保留，但**每个队列同时至多一个在途消费状态提案**——下一个差量在上一个 `Wait` 成功之后才构造（等待在队列锁外，构造前在锁内确认前序已了结）；前序失败即毒化并从盘重装。由此同队列差量严格前缀有序，不依赖 SQ2。
+  - H1 改为核对「SQ2 保证同组调用顺序 = 日志顺序、跨任期条目不进新任期日志」两条（SQ2 已验收）；I2 改写为上述两条机制；U4 补两条用例：①检查点模式下前一批丢弃、后一批落地后从盘重装，cursor 之下的未 ack 消息全部仍在 inflight；②逐次复制模式下前序在途时后续调用不构造新差量。§5「H1 不成立即停下」条款随之按新 H1 判定。
 
 ---
 
