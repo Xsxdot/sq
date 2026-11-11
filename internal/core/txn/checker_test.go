@@ -22,6 +22,13 @@ func (r fixedLeaderRouter) MetaGroup() uint32                         { return 0
 func (r fixedLeaderRouter) IsLeader(uint32) bool                      { return r.leader }
 func (r fixedLeaderRouter) ReadBarrier(context.Context, uint32) error { return nil }
 
+func (r fixedLeaderRouter) WaitWritable(context.Context, uint32) (uint64, error) {
+	if r.leader {
+		return 0, nil
+	}
+	return 0, replication.ErrNotLeader
+}
+
 // fakeNotifier 记录收到的回查请求，可编程返回值。
 type fakeNotifier struct {
 	got  []string // 收到的 txID 序列

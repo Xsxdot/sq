@@ -193,6 +193,12 @@ type Router interface {
 	// 本次调用发起之前已被确认的全部写。单机后端恒 nil（无复制、无屏障
 	// 可言）；集群后端在读屏障关闭时同样恒 nil（零开销）。
 	ReadBarrier(ctx context.Context, g uint32) error
+	// WaitWritable 等本节点可在 g 组做 leader-only 构造（读计数器分配
+	// offset/seq、凭「读不到」判定后写）：本节点是 leader 且本地 FSM 已
+	// apply 越过本任期首条（卡 SQ1）。返回 epoch（任期号）——调用方的
+	// 计数器缓存须与之绑定，epoch 变了即从盘重读。失败为 ErrNotLeader
+	// 包装（可重试）。单机后端恒 (0, nil)。
+	WaitWritable(ctx context.Context, g uint32) (epoch uint64, err error)
 }
 
 // Forwarder 跨节点转发原语（仅 Cluster 后端实现；Standalone 上调用属编程错误，panic）。
@@ -293,6 +299,9 @@ func (StandaloneRouter) IsLeader(uint32) bool { return true }
 // ReadBarrier 单机档没有复制，本地读天然线性一致，恒放行。
 func (StandaloneRouter) ReadBarrier(context.Context, uint32) error { return nil }
 
+// WaitWritable 单机档无换届，本地 FSM 恒为权威，恒立即放行（epoch 恒 0）。
+func (StandaloneRouter) WaitWritable(context.Context, uint32) (uint64, error) { return 0, nil }
+
 // Cluster 集群后端：Apply/ApplyAsync 经 Manager 提进所属组的保序提案队列；兼作 Router（转
 // Manager）与 Forwarder（经控制通道跨节点转发）。
 type Cluster struct {
@@ -371,6 +380,11 @@ func (r *Cluster) IsLeader(g uint32) bool { return r.m.IsLeader(g) }
 // ReadBarrier 转发 Manager.ReadBarrier；读屏障关闭时 Manager 内部即恒 nil。
 func (r *Cluster) ReadBarrier(ctx context.Context, g uint32) error {
 	return r.m.ReadBarrier(ctx, g)
+}
+
+// WaitWritable 转发 Manager.WaitWritable（可写门，见 cluster/writegate.go）。
+func (r *Cluster) WaitWritable(ctx context.Context, g uint32) (uint64, error) {
+	return r.m.WaitWritable(ctx, g)
 }
 
 // ForwardAppend 把一条已编码逻辑消息（core.EncodeMessage 字节）交给 g
