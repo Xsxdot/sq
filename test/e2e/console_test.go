@@ -231,7 +231,7 @@ func TestTimeseriesEndToEnd(t *testing.T) {
 // pending = 写入头 − fetch 位点：取件即推进位点（见 consumeFetch 注释）。
 // 总账读 pebble，而消费状态自卡 SQ4.1 起以 leader 内存为准、按
 // consume_checkpoint_interval（缺省 1s）周期落盘，故轮询至检查点落盘
-// （上限 10s）再断言。
+// （上限 3s，计划真机清单第 2 条）再断言。
 func TestLedgerReflectsConsumption(t *testing.T) {
 	endpoint, adminBase := startBrokerWithAdmin(t)
 	sendViaSDK(t, endpoint, "e2e-ledger", 50)
@@ -244,7 +244,7 @@ func TestLedgerReflectsConsumption(t *testing.T) {
 	}
 	found := false
 	var last uint64
-	for deadline := time.Now().Add(10 * time.Second); time.Now().Before(deadline); time.Sleep(200 * time.Millisecond) {
+	for deadline := time.Now().Add(3 * time.Second); time.Now().Before(deadline); time.Sleep(100 * time.Millisecond) {
 		var rows []row
 		res, err := http.Get(adminBase + "/admin/ledger")
 		if err != nil {
@@ -265,7 +265,7 @@ func TestLedgerReflectsConsumption(t *testing.T) {
 		}
 	}
 	if found {
-		t.Fatalf("落后量应为 30，10s 内最后一次得到 %d", last)
+		t.Fatalf("落后量应为 30，3s 内最后一次得到 %d", last)
 	}
 	if !found {
 		t.Fatal("总账里应出现 e2e-ledger-g × e2e-ledger 这条消费关系")
