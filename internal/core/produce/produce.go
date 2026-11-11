@@ -10,6 +10,9 @@
 //   - 延时判定入口在此（AppendDelay），到期搬运是 delay 包的事；事务（M6）仍在 Append 之前分流
 //   - 不做消费可见性判断（deliver 的事）
 //   - 锁结构：p.mu 护共享 map；每 (topic,queue) 一把锁护写入；delayMu 护延时暂存
+//   - leader-only 构造前置：三个写入口在读计数器前过 Router.WaitWritable
+//     （集群档新 leader apply 追平本任期首条前不分配，卡 SQ1），计数器缓存
+//     与返回的 epoch 绑定——epoch 变了即从盘重读
 package produce
 
 import (
@@ -37,6 +40,11 @@ type queueState struct {
 	mu     sync.Mutex
 	next   uint64 // 下一 offset（懒加载自 alloc/ key）
 	loaded bool
+	// epoch 是 next 所属的可写门 epoch（集群档 = 所属组的 leader 任期；
+	// 单机档恒 0）。缓存只在同一 epoch 内有效：本任期内本节点是唯一写者，
+	// 内存值即权威；换届期间他人可能写过，必须从盘重读（门已保证盘上
+	// 包含本任期首条之前的全部已提交写）。
+	epoch uint64
 }
 
 // Producer 写入引擎。并发安全。
@@ -60,6 +68,7 @@ type Producer struct {
 	delayMu     sync.Mutex
 	delayNext   uint64
 	delayLoaded bool
+	delayEpoch  uint64 // delayNext 所属的元数据组 epoch，语义同 queueState.epoch
 }
 
 // New 构造 Producer。offset 缓存懒加载（首写某队列时读一次 alloc/ key）。
@@ -79,29 +88,6 @@ func New(rep replication.Replicator, rt replication.Router, st *store.Store,
 // 仅作 map key，语义与原 Sprintf 完全一致。
 func qkey(topic string, q uint32) string {
 	return topic + "/" + strconv.FormatUint(uint64(q), 10)
-}
-
-// InvalidateCounters 使全部 offset/seq 计数缓存失效（集群档组 leader 变更时
-// 由 OnLeaderChange 钩子触发；单机档无变更事件，正常不会调用）。
-//
-// 为什么必须失效：offset 计数器只在所属组的 leader 上权威——follower 节点
-// 的 alloc/ 值可能滞后（复制在途）；本节点重新当选 leader 时，若沿用旧内存
-// 值（重新当选前跟随期间可能已落后多笔写），会出现重复分配（内存值高于盘上
-// 多数派事实）或跳号（内存值低于多数派事实）。置 loaded=false 后，重新当选
-// 后的第一笔写强制从 alloc/ 重读——复制保证盘上是多数派事实，重读即回到
-// 权威值。seq（delay）计数器同理。
-func (p *Producer) InvalidateCounters() {
-	p.mu.Lock()
-	for _, qs := range p.qstates {
-		qs.mu.Lock()
-		qs.loaded = false
-		qs.mu.Unlock()
-	}
-	p.mu.Unlock()
-	p.delayMu.Lock()
-	p.delayLoaded = false
-	p.delayMu.Unlock()
-	p.logger.Info("leader 变更，offset 缓存失效")
 }
 
 // Append 写入一条普通消息（spec §5 流程 1）：队列选择、offset 分配、消息与
@@ -163,12 +149,19 @@ func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, 
 	}
 	p.mu.Unlock()
 
+	// 过可写门（不持任何锁等待）：QueueID 已在段 1 确定，g 是「队列→组」
+	// 的入盘映射（Task 4 约定）。epoch 绑定段 2 的 offset 缓存。
+	g := p.rt.GroupForQueue(m.Topic, m.QueueID)
+	epoch, err := p.rt.WaitWritable(ctx, g)
+	if err != nil {
+		p.logger.Debug("写入被可写门拒绝", "topic", m.Topic, "queue", m.QueueID, "group", g, "err", err)
+		return nil, fmt.Errorf("写入消息 %s (topic=%s q=%d): %w", m.ID, m.Topic, m.QueueID, err)
+	}
+
 	// 段 2（qs.mu）：offset 分配 + 编码 + 落盘。同队列串行（offset 顺序 ==
 	// 落盘顺序，FIFO 根基），跨队列并行（group commit 合并 fsync）。
-	// 组号 g 必须在此锁内、offset 分配之后计算——QueueID 到此刻才确定，
-	// GroupForQueue 是「队列→组」的入盘映射（Task 4 约定），提前算会错组。
 	qs.mu.Lock()
-	off, err := qs.nextOffsetLocked(p.st, m.Topic, m.QueueID)
+	off, err := qs.nextOffsetLocked(p.st, m.Topic, m.QueueID, epoch)
 	if err != nil {
 		qs.mu.Unlock()
 		return nil, err
@@ -193,7 +186,6 @@ func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, 
 		}
 		b.Set(store.KeyIdxKey(m.Topic, key, m.StoreAtMs, m.QueueID, m.Offset), nil)
 	}
-	g := p.rt.GroupForQueue(m.Topic, m.QueueID)
 	pending, err := p.rep.ApplyAsync(ctx, g, b)
 	if err != nil {
 		qs.mu.Unlock()
@@ -206,13 +198,11 @@ func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, 
 	//
 	// 为什么敢在 Wait 之前推进 qs.next：内存 offset 缓存烧掉无害——任何
 	// 让 Wait 失败的场景都不丢消息：
-	//   - 集群档提案失败（ErrNotLeader：提交期间领导权迁移）：offset
-	//     缓存的失效只发生在重新当选时——onLeaderChange 的 isSelf==true
-	//     分支触发 InvalidateCounters 置 qs.loaded=false（I4 同步失效）；
-	//     非 leader 期间提案必然被 ErrNotLeader 拒，不存在「缓存已烧、
-	//     却返回成功」的路径；重获 leadership 的窗口已由 group.go 的
-	//     顺序屏障关闭（OnLeaderChange 钩子先于 IsLeader 对外可见），
-	//     后续读取从 store 重读实际状态，绝不返回烧掉的 offset；
+	//   - 集群档提案失败（ErrNotLeader：提交期间领导权迁移）：缓存带着
+	//     本任期 epoch，换届后 WaitWritable 返回新 epoch，首次分配从盘
+	//     重读；而门只在 apply 越过新任期首条后才放行——此时盘上已含上
+	//     任期全部已提交写，重读值不会与任何已确认消息重叠。同任期内被
+	//     丢弃的提案只烧掉 offset（跳号），不重复；
 	//   - 集群档 WaitSync 失败 ≠ Pebble 不可恢复：raft 副本仍持数据，
 	//     offset 分配是 leader-only 构造，本节点重启以 learner 追平即恢复；
 	//   - 单机档 Pebble 真坏（WAL sync 失败 = 不可恢复态）：进程只能重启，
@@ -220,6 +210,7 @@ func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, 
 	//     烧掉的 offset 无害。
 	qs.next = off + 1
 	qs.loaded = true
+	qs.epoch = epoch
 	qs.mu.Unlock()
 
 	// 锁外等待持久化：fsync 完成之前绝不返回、绝不唤醒（语义红线 1）。
@@ -287,8 +278,16 @@ func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (*core.Mess
 	if err != nil {
 		return nil, 0, false, err
 	}
+	// 延时暂存区键族归元数据组（delay/ 与队列无关，无 GroupForQueue 映射）。
+	// 过可写门（不持 delayMu 等待），epoch 绑定 seq 缓存。
+	g := p.rt.MetaGroup()
+	epoch, err := p.rt.WaitWritable(ctx, g)
+	if err != nil {
+		p.logger.Debug("延时写入被可写门拒绝", "topic", m.Topic, "group", g, "err", err)
+		return nil, 0, false, fmt.Errorf("写入延时消息 %s (topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
+	}
 	p.delayMu.Lock()
-	seq, err := p.nextDelaySeqLocked()
+	seq, err := p.nextDelaySeqLocked(epoch)
 	if err != nil {
 		p.delayMu.Unlock()
 		return nil, 0, false, err
@@ -296,8 +295,6 @@ func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (*core.Mess
 	b := p.st.NewBatch()
 	b.Set(store.DelayKey(m.DeliverAtMs, seq), raw)
 	b.Set(store.DelayAllocKey(), store.PutU64(seq+1))
-	// 延时暂存区键族归元数据组（delay/ 与队列无关，无 GroupForQueue 映射）
-	g := p.rt.MetaGroup()
 	pending, err := p.rep.ApplyAsync(ctx, g, b)
 	if err != nil {
 		p.delayMu.Unlock()
@@ -309,6 +306,7 @@ func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (*core.Mess
 	// 重启后 seq 计数器与条目由同批原子提交保证一致，内存里烧掉的 seq 无害。
 	p.delayNext = seq + 1
 	p.delayLoaded = true
+	p.delayEpoch = epoch
 	p.delayMu.Unlock()
 
 	// 锁外等待持久化：fsync 完成之前绝不确认（语义红线 1）
@@ -320,11 +318,17 @@ func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (*core.Mess
 	return m, seq, true, nil
 }
 
-// nextDelaySeqLocked 取下一延时 seq。缓存未命中时读盘上 delayalloc 计数器，
-// 崩溃/重启后 O(1) 恢复。调用方必须持有 p.delayMu。
-func (p *Producer) nextDelaySeqLocked() (uint64, error) {
+// nextDelaySeqLocked 取下一延时 seq。缓存未命中（未装载或 epoch 不同）
+// 时读盘上 delayalloc 计数器，崩溃/重启/换届后 O(1) 恢复。调用方必须持有
+// p.delayMu。epoch 语义与过期判定同 queueState.nextOffsetLocked。
+func (p *Producer) nextDelaySeqLocked(epoch uint64) (uint64, error) {
 	if p.delayLoaded {
-		return p.delayNext, nil
+		if epoch == p.delayEpoch {
+			return p.delayNext, nil
+		}
+		if epoch < p.delayEpoch {
+			return 0, staleEpochErr("delay seq", epoch, p.delayEpoch)
+		}
 	}
 	v, ok, err := p.st.Get(store.DelayAllocKey())
 	if err != nil {
@@ -406,10 +410,17 @@ func (p *Producer) AppendBatch(ctx context.Context, msgs []*core.Message) ([]*co
 	}
 	p.mu.Unlock()
 
-	// 段 2（qs.mu）：连续 offset 段分配 + 编码 + 单批定序。组号 g 同
-	// Append：锁内、qid 分配后计算（队列→组映射此时才可判定）。
+	// 过可写门（不持锁等待），理由同 Append。
+	g := p.rt.GroupForQueue(topic, qid)
+	epoch, err := p.rt.WaitWritable(ctx, g)
+	if err != nil {
+		p.logger.Debug("批量写入被可写门拒绝", "topic", topic, "queue", qid, "group", g, "err", err)
+		return nil, fmt.Errorf("批量写入 %d 条 (topic=%s q=%d): %w", len(msgs), topic, qid, err)
+	}
+
+	// 段 2（qs.mu）：连续 offset 段分配 + 编码 + 单批定序。
 	qs.mu.Lock()
-	off, err := qs.nextOffsetLocked(p.st, topic, qid)
+	off, err := qs.nextOffsetLocked(p.st, topic, qid, epoch)
 	if err != nil {
 		qs.mu.Unlock()
 		return nil, err
@@ -435,7 +446,6 @@ func (p *Producer) AppendBatch(ctx context.Context, msgs []*core.Message) ([]*co
 	}
 	// alloc 计数器一次写到 off+N，与全部消息同批原子（语义红线 3 的批量形态）
 	b.Set(store.AllocKey(topic, qid), store.PutU64(off+uint64(len(msgs))))
-	g := p.rt.GroupForQueue(topic, qid)
 	pending, err := p.rep.ApplyAsync(ctx, g, b)
 	if err != nil {
 		qs.mu.Unlock()
@@ -444,6 +454,7 @@ func (p *Producer) AppendBatch(ctx context.Context, msgs []*core.Message) ([]*co
 	// 提前推进的理由与 Append 完全相同（见其注释）
 	qs.next = off + uint64(len(msgs))
 	qs.loaded = true
+	qs.epoch = epoch
 	qs.mu.Unlock()
 
 	// 锁外等待持久化：fsync 完成之前绝不返回、绝不唤醒（语义红线 1）
@@ -458,11 +469,22 @@ func (p *Producer) AppendBatch(ctx context.Context, msgs []*core.Message) ([]*co
 	return msgs, nil
 }
 
-// nextOffsetLocked 取该队列下一 offset，懒加载盘上 alloc/ 计数器。
-// 调用方必须持有 qs.mu。
-func (qs *queueState) nextOffsetLocked(st *store.Store, topic string, q uint32) (uint64, error) {
+// nextOffsetLocked 取该队列下一 offset：同 epoch 命中内存缓存，否则读盘上
+// alloc/ 计数器。调用方必须持有 qs.mu。
+//
+// 参数 epoch：调用方刚从 Router.WaitWritable 拿到的可写门 epoch。
+//
+// 返回错误的情形之一是 epoch 比缓存的旧（ErrNotLeader 包装，可重试）：调用
+// 方拿到 epoch 后、进锁前已换届，且新任期已有写者推进了缓存——此时新任期
+// 的在途写可能尚未 apply，按旧 epoch 重读盘会与之重叠，绝不能分配。
+func (qs *queueState) nextOffsetLocked(st *store.Store, topic string, q uint32, epoch uint64) (uint64, error) {
 	if qs.loaded {
-		return qs.next, nil
+		if epoch == qs.epoch {
+			return qs.next, nil
+		}
+		if epoch < qs.epoch {
+			return 0, staleEpochErr(topic+"/"+strconv.FormatUint(uint64(q), 10), epoch, qs.epoch)
+		}
 	}
 	v, ok, err := st.Get(store.AllocKey(topic, q))
 	if err != nil {
@@ -472,6 +494,12 @@ func (qs *queueState) nextOffsetLocked(st *store.Store, topic string, q uint32) 
 		return 0, nil
 	}
 	return store.GetU64(v), nil
+}
+
+// staleEpochErr 调用方持有的可写门 epoch 已被更新的任期取代（ErrNotLeader
+// 包装：客户端重试即拿到新 epoch）。
+func staleEpochErr(what string, got, cur uint64) error {
+	return fmt.Errorf("%w: %s 计数器缓存已属任期 %d，调用方 epoch %d 已过期", replication.ErrNotLeader, what, cur, got)
 }
 
 // Subscribe 返回 topic 的唤醒信号：下一次 Append 该 topic 时该 chan 被 close。

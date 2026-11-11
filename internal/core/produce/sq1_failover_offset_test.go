@@ -17,8 +17,12 @@
 // 立即经 F 的 Producer 写一条，再放开钩子。
 //
 // 装配与 cmd/sq/main.go 一致：每节点真实 store + cluster.Manager +
-// replication.Cluster + meta.Meta + Producer，OnLeaderChange(isSelf) 同步
-// 调 Producer.InvalidateCounters。
+// replication.Cluster + meta.Meta + Producer（换届后计数器重读由 produce
+// 的 epoch 缓存承担，不再挂 OnLeaderChange 失效钩子，同 main.go）。
+//
+// 修复后（可写门）第 7 步改为反例断言：门关着时经 F 的 Append 不得返回、
+// F 的 commit 不得越过 c0——证明是门挡在提案之前，而非时序碰巧；放开后
+// Append 必须成功且 offset 严格大于全部已确认 offset。第 9 步判据不变。
 package produce
 
 import (
@@ -41,13 +45,12 @@ import (
 
 // sq1Node 是一个进程内节点的全套装配。
 type sq1Node struct {
-	id  uint64
-	st  *store.Store
-	m   *cluster.Manager
-	cl  *replication.Cluster
-	mt  *meta.Meta
-	pr  *Producer
-	prP atomic.Pointer[Producer]
+	id uint64
+	st *store.Store
+	m  *cluster.Manager
+	cl *replication.Cluster
+	mt *meta.Meta
+	pr *Producer
 }
 
 // sq1ApplyGate 挂在 OnApplied 钩子上的 apply 闸门：armed 后，目标节点
@@ -105,15 +108,6 @@ func TestSQ1FailoverStaleOffsetOverwritesAckedMessage(t *testing.T) {
 		m, err := cluster.NewManager(cluster.Options{
 			NodeID: i, Peers: peers, Listener: lns[i-1], DataGroups: 3,
 			Mode: cluster.AckQuorumMem, Store: st, Logger: lg,
-			// 与 main.go:243-256 同：本节点当选即同步失效计数器缓存
-			OnLeaderChange: func(g uint32, leader uint64, isSelf bool) {
-				if !isSelf {
-					return
-				}
-				if p := n.prP.Load(); p != nil {
-					p.InvalidateCounters()
-				}
-			},
 			OnApplied: func(g uint32, repr []byte) { gate.hook(id, g, repr) },
 			// 不开摊布循环：领导权只由本测试显式转移
 		})
@@ -145,7 +139,6 @@ func TestSQ1FailoverStaleOffsetOverwritesAckedMessage(t *testing.T) {
 		}
 		n.mt = mt
 		n.pr = New(n.cl, n.cl, n.st, mt, lg)
-		n.prP.Store(n.pr)
 	}
 
 	leaderOf := func(g uint32) uint64 {
@@ -273,7 +266,9 @@ func TestSQ1FailoverStaleOffsetOverwritesAckedMessage(t *testing.T) {
 		time.Sleep(20 * time.Millisecond)
 	}
 
-	// 7. apply 追平前立即经 F 写入（F 的 propose 等本地 apply，故异步发起）
+	// 7. apply 追平前立即经 F 写入（异步发起）。反例断言：观测约 500ms
+	//    （小于可写门等待上限 3s），其间 Append 不得返回、F 的 commit 不得
+	//    越过 c0——门挡在提案之前，没有任何新条目进日志。
 	type res struct {
 		m   *core.Message
 		err error
@@ -283,17 +278,19 @@ func TestSQ1FailoverStaleOffsetOverwritesAckedMessage(t *testing.T) {
 		m, err := nodes[F].pr.Append(ctx, &core.Message{Topic: topic, Body: []byte("x-after-failover")})
 		done <- res{m, err}
 	}()
-	// 新写入已进日志且被多数派提交（不依赖 F 的 apply）
-	for {
-		st, _ := nodes[F].m.Status(g)
-		if st.HardState.GetCommit() > c0 {
-			break
+	for obsEnd := time.Now().Add(500 * time.Millisecond); time.Now().Before(obsEnd); {
+		select {
+		case r := <-done:
+			t.Fatalf("apply 未追平时经 F 的 Append 已返回（门未挡住）: m=%+v err=%v", r.m, r.err)
+		default:
 		}
-		if ctx.Err() != nil {
-			t.Fatal("F 上的新写入未提交")
+		st, _ := nodes[F].m.Status(g)
+		if c := st.HardState.GetCommit(); c > c0 {
+			t.Fatalf("apply 未追平时 F 的 commit 越过基线: %d > c0=%d（新写入已在门前提案）", c, c0)
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	t.Logf("门关着 500ms：Append 未返回，F.commit 停在 c0=%d", c0)
 
 	// 8. 放开 apply，等结果与全节点追平
 	releaseGate()
@@ -301,6 +298,12 @@ func TestSQ1FailoverStaleOffsetOverwritesAckedMessage(t *testing.T) {
 	if r.err != nil {
 		t.Fatalf("经新 leader F Append 失败: %v", r.err)
 	}
+	for _, a := range acks {
+		if a.q == r.m.QueueID && r.m.Offset <= a.off {
+			t.Fatalf("新 leader 分配的 offset=%d 不大于已确认 offset=%d（%s）", r.m.Offset, a.off, a.id)
+		}
+	}
+	t.Logf("放开后 Append 成功：q=%d off=%d（预期 %d）", r.m.QueueID, r.m.Offset, nTail+2)
 	acks = append(acks, acked{id: r.m.ID, q: r.m.QueueID, off: r.m.Offset, via: F})
 	for {
 		a := nodes[F].m.AppliedIndex(g)
