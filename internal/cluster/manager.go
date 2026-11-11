@@ -328,6 +328,9 @@ type deadPeer struct {
 	match uint64
 	// expired 已打过「宽限超期」Warn（只在翻转时打）
 	expired bool
+	// warned 已打过「判死」Warn：判死是节点级事实，一轮内多个组先后
+	// 登记同一 peer 只报一次
+	warned bool
 }
 
 // defaultTruncateInterval 是 Options.TruncateInterval 的默认值（0 即
@@ -1410,16 +1413,24 @@ func (m *Manager) checkDiskPressure(g uint32) bool {
 }
 
 // markDead 登记 peer 本轮判死并返回自首次判死起的时长。now 取探测发起
-// 时刻（判死至少历时一次探测）。首次判死、宽限超期各在翻转时打一行 Warn；
-// 判死记录在 Match 前进（证明它活着）时作废重计。
+// 时刻（判死至少历时一次探测）。首次判死、宽限超期各在翻转时打一行 Warn
+// （节点级，每节点一次）；判死记录在 Match 前进（证明它活着）时作废重计。
+//
+// 同一轮（同一 now）里各组 Match 不同，记录会按更大的 Match 重建——
+// 这不是「复活后再死」，沿用本轮已打日志的标记，不重复报。
 func (m *Manager) markDead(g uint32, id, match uint64, now time.Time) time.Duration {
 	m.deadMu.Lock()
-	d, ok := m.deadPeers[id]
-	if !ok || match > d.match {
+	prev, ok := m.deadPeers[id]
+	d := prev
+	if !ok || match > prev.match {
 		d = deadPeer{since: now, match: match}
+		if ok && prev.since.Equal(now) {
+			d.warned, d.expired = prev.warned, prev.expired
+		}
 	}
 	deadFor := time.Since(d.since)
-	enter := !ok || d.since.Equal(now)
+	enter := !d.warned
+	d.warned = true
 	expire := !d.expired && deadFor >= m.peerGrace
 	if expire {
 		d.expired = true

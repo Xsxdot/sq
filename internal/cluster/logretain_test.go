@@ -12,7 +12,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
@@ -403,4 +405,32 @@ func TestTruncateKeepsRetainBytes(t *testing.T) {
 		t.Fatalf("upto=%d 未被字节下界压低（applied-retain=%d）", upto, applied-10)
 	}
 	t.Logf("截断前 %d 段 → 后 %d 段，upto=%d，剩余 %d 字节（每组下界 %d）", before, len(segs), upto, kept, perGroup)
+}
+
+// TestMarkDeadWarnsOncePerNode 判死是节点级事实：同一轮里多个组先后对
+// 同一死 peer 调 markDead（各组 Match 不同，记录会按更大的 Match 重建），
+// 「peer 判死」Warn 只打一行；宽限计时逻辑不变。
+func TestMarkDeadWarnsOncePerNode(t *testing.T) {
+	var buf bytes.Buffer
+	m := &Manager{
+		lg:        slog.New(slog.NewTextHandler(&buf, nil)),
+		deadPeers: make(map[uint64]deadPeer),
+		peerGrace: time.Hour,
+	}
+	now := time.Now()
+	// 第一轮：3 个组、Match 先小后大（触发同轮记录重建）
+	for g, match := range []uint64{400, 1000, 700} {
+		m.markDead(uint32(g+1), 3, match, now)
+	}
+	// 第二轮：同一死 peer，Match 未前进
+	later := now.Add(30 * time.Second)
+	for g, match := range []uint64{400, 1000, 700} {
+		m.markDead(uint32(g+1), 3, match, later)
+	}
+	if n := strings.Count(buf.String(), "peer 判死，宽限期内仍以其 Match 为下界"); n != 1 {
+		t.Fatalf("判死 Warn 打了 %d 行; want 1（节点级事实只报一次）\n%s", n, buf.String())
+	}
+	if d := m.deadPeers[3]; !d.since.Equal(now) || d.match != 1000 {
+		t.Fatalf("判死记录 since=%v match=%d; want since=首轮时刻 match=1000（计时逻辑不变）", d.since, d.match)
+	}
 }
