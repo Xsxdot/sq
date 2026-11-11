@@ -15,6 +15,7 @@ package store
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -314,6 +315,75 @@ func BatchTouchesPrefix(repr []byte, prefix []byte) (bool, error) {
 		}
 		if bytes.HasPrefix(ukey, prefix) {
 			return true, nil
+		}
+	}
+}
+
+// ConsumeQueue 一个消费队列坐标 (group, topic, queueID)——cursor/ 与 inflight/
+// 键族的归属单位。
+type ConsumeQueue struct {
+	Group   string
+	Topic   string
+	QueueID uint32
+}
+
+// BatchConsumeQueues 列出复制批次字节触及的消费队列（cursor/、inflight/ 键族），
+// 只遍历键、不解码值；同 BatchTouchesPrefix 的解析边界。
+//
+// 返回：
+//   - qs：按出现顺序去重的队列坐标（DeleteRange 取起始键：CursorKey 或
+//     InflightPrefix/InflightKey 均可解析出队列）
+//   - whole：存在属于这两族但解析不出单个队列的键（如整组前缀的 DeleteRange）
+//     ——调用方应按「可能触及任意队列」处理
+//   - err：坏字节
+func BatchConsumeQueues(repr []byte) (qs []ConsumeQueue, whole bool, err error) {
+	r := batchrepr.Read(repr)
+	if r == nil {
+		return nil, false, nil
+	}
+	seen := map[ConsumeQueue]bool{}
+	add := func(cq ConsumeQueue) {
+		if !seen[cq] {
+			seen[cq] = true
+			qs = append(qs, cq)
+		}
+	}
+	for {
+		_, ukey, _, ok, nerr := r.Next()
+		if nerr != nil {
+			return nil, false, fmt.Errorf("store BatchConsumeQueues 解析批次: %w", nerr)
+		}
+		if !ok {
+			return qs, whole, nil
+		}
+		switch {
+		case bytes.HasPrefix(ukey, []byte(cursorPrefix)):
+			g, t, q, perr := ParseCursorKey(ukey)
+			if perr != nil {
+				whole = true
+				continue
+			}
+			add(ConsumeQueue{g, t, q})
+		case bytes.HasPrefix(ukey, []byte(inflightPrefix)):
+			if g, t, q, _, perr := ParseInflightKey(ukey); perr == nil {
+				add(ConsumeQueue{g, t, q})
+				continue
+			}
+			// InflightPrefix：两段名字 + 4B 队列号（无 8B offset 尾）
+			rest := ukey[len(inflightPrefix):]
+			i := bytes.IndexByte(rest, '/')
+			if i < 0 {
+				whole = true
+				continue
+			}
+			g := string(rest[:i])
+			rest = rest[i+1:]
+			j := bytes.IndexByte(rest, '/')
+			if j < 0 || len(rest)-j-1 != 4 {
+				whole = true
+				continue
+			}
+			add(ConsumeQueue{g, string(rest[:j]), binary.BigEndian.Uint32(rest[j+1:])})
 		}
 	}
 }

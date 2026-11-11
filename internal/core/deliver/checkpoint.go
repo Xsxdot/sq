@@ -1,0 +1,262 @@
+// checkpoint.go 队列消费状态的装载、失效与持久化（卡 SQ4.1）。
+//
+// 职责：
+//   - 前置（acquire）：过可写门拿 epoch → 取队列锁 → 内存态未装载或 epoch
+//     变大即从 pebble 装载；持有更旧 epoch 的调用返回 ErrNotLeader
+//   - 失效（dropLocked）：换届、管理批次、前序提案失败时丢弃内存态，下次
+//     访问重装；等待中的后续变更一并以可重试错误失败
+//   - 逐次复制（commitLocked / waitFlush）：每次变更以「cursor + 变更的
+//     inflight 同批」差量提案，落盘后才交件/应答。同队列至多一个差量在途
+//     （计划修订 R1）：在途期间到达的变更只改内存并挂到「下一次提案」，在途
+//     提案成功后才构造下一个差量——下一差量的基线恒为已落盘状态；在途提案
+//     失败即丢弃内存态、从盘重装
+//   - 管理批次（ApplyAdminBatch）：删消费组等旁路批次经此串行化，先失效再提交
+//
+// 边界：
+//   - 一切消费状态提案经 ApplyAsyncAt 绑定内存态装载时的 epoch：内存态只在
+//     该 epoch 内权威，绝不让它的差量进入其他任期的日志（主会话裁决）
+//   - 不判定领导权本身（Router.WaitWritable 是唯一来源）；不碰 cluster 内部
+//   - 检查点模式（周期落盘、停机/转移前全量检查点）属本卡段 B，不在本文件当前版本
+package deliver
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strconv"
+	"time"
+
+	"github.com/Xsxdot/sq/internal/replication"
+	"github.com/Xsxdot/sq/internal/store"
+)
+
+// consumeProposeTimeout 单个消费状态提案的等待上限。提案 ctx 不取调用方
+// ctx：一次提案承载多个调用方的变更（在途期间挂上来的），某个调用方放弃
+// 不应拖垮其他人；上限防止失去领导权后条目被截断、waiter 永不触发时
+// 等待者无限挂住（超时 = 结果未知，按失败失效重装，后果至多重复投递）。
+const consumeProposeTimeout = 10 * time.Second
+
+// errStateDropped 内存态被丢弃时，挂在「下一次提案」上的变更以它失败。
+// 包装 ErrNotLeader：rpc 层映射为可重试错误，客户端重试即走重装后的状态。
+var errStateDropped = fmt.Errorf("%w: 队列消费状态已失效", replication.ErrNotLeader)
+
+// queue 返回 (group,topic,queueID) 的队列状态，不存在则创建（未装载）。
+// 只在 d.mu 内读写 map 本身；返回值的 mu 由调用方在 d.mu 之外取。
+func (d *Deliverer) queue(group, topic string, q uint32) *queueState {
+	// 每次取件与每 100ms 的兜底轮询都要拼一次键，是热路径——手工拼接绕开
+	// fmt.Sprintf 的反射与临时分配；键无人解析，仅作 map key。
+	k := group + "/" + topic + "/" + strconv.FormatUint(uint64(q), 10)
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	qs, ok := d.qmu[k]
+	if !ok {
+		qs = newQueueState(group, topic, q)
+		d.qmu[k] = qs
+	}
+	return qs
+}
+
+// acquire 公共前置：过可写门 → 取队列锁 → 按 epoch 装载/重装。
+//
+// 返回：已加锁、已装载、epoch == 本次门 epoch 的队列状态（调用方负责解锁）
+// 与队列所属组号。错误：门未开（ErrNotLeader 包装）、本次 epoch 已过时
+// （ErrNotLeader 包装）、装载读盘失败。
+//
+// 注意：WaitWritable 可能阻塞（新 leader 追 apply，上限 3s），必须在取队列
+// 锁之前调用。
+func (d *Deliverer) acquire(ctx context.Context, group, topic string, q uint32) (*queueState, uint32, error) {
+	g := d.rt.GroupForQueue(topic, q)
+	e, err := d.rt.WaitWritable(ctx, g)
+	if err != nil {
+		d.logger.Debug("消费请求未过可写门", "group", group, "topic", topic, "queue", q, "g", g, "err", err)
+		return nil, g, err
+	}
+	qs := d.queue(group, topic, q)
+	qs.mu.Lock()
+	if qs.loaded && qs.epoch > e {
+		cur := qs.epoch
+		qs.mu.Unlock()
+		d.logger.Debug("消费请求持有的 epoch 已过时", "group", group, "topic", topic, "queue", q,
+			"epoch", e, "state_epoch", cur)
+		return nil, g, fmt.Errorf("%w: 组 %d 本次 epoch %d 早于队列状态 epoch %d", replication.ErrNotLeader, g, e, cur)
+	}
+	if !qs.loaded || qs.epoch < e {
+		if qs.loaded {
+			// 换届后重新当选：旧任期内存态里可能有他人任期内已被覆盖的状态，
+			// 一律丢弃从盘重装（门开 = 旧任期条目已全部 apply 或被截断）
+			d.logger.Info("队列消费状态随换届失效，从盘重装", "group", group, "topic", topic,
+				"queue", q, "old_epoch", qs.epoch, "epoch", e)
+			d.dropLocked(qs, fmt.Errorf("换届 epoch %d→%d", qs.epoch, e))
+		}
+		start := time.Now()
+		if err := qs.load(d.st, e); err != nil {
+			qs.mu.Unlock()
+			d.logger.Error("装载队列消费状态失败", "group", group, "topic", topic, "queue", q, "err", err)
+			return nil, g, err
+		}
+		d.logger.Debug("队列消费状态已装载", "group", group, "topic", topic, "queue", q,
+			"epoch", e, "cursor", qs.cursor, "inflight", len(qs.inflight),
+			"took", time.Since(start).String())
+	}
+	return qs, g, nil
+}
+
+// dropLocked 丢弃内存态（调用方持 qs.mu）：代号加一（在途提案完成时不再
+// 回写），挂在「下一次提案」上的变更以 errStateDropped 失败，状态置未装载。
+func (d *Deliverer) dropLocked(qs *queueState, cause error) {
+	qs.gen++
+	qs.inFlight = false
+	if f := qs.next; f != nil {
+		qs.next = nil
+		f.err = fmt.Errorf("%w（%v）", errStateDropped, cause)
+		close(f.done)
+	}
+	qs.clear()
+}
+
+// commitLocked 逐次复制：本次调用已改了内存（有脏），把变更交给一次提案。
+//
+// 调用方持 qs.mu。无在途提案 → 立即构造差量并提案（ApplyAsyncAt 绑定
+// qs.epoch），起一个 goroutine 等待其落盘；有在途提案 → 变更留在脏集里，
+// 挂到下一次提案（在途提案成功后由 waitFlush 构造）。
+//
+// 返回：本次变更所在提案的等待点；调用方放锁后经 awaitCommit 等待。无脏返回 nil。
+func (d *Deliverer) commitLocked(qs *queueState) *flush {
+	if !qs.hasDirty() {
+		return nil
+	}
+	if qs.next == nil {
+		qs.next = &flush{done: make(chan struct{})}
+	}
+	f := qs.next
+	if !qs.inFlight {
+		d.proposeLocked(qs)
+	}
+	return f
+}
+
+// proposeLocked 把 qs.next 变成在途提案：构造差量、按 epoch 提案、起等待
+// goroutine。调用方持 qs.mu 且已确认无在途提案、qs.next 非空。
+func (d *Deliverer) proposeLocked(qs *queueState) {
+	f := qs.next
+	qs.next = nil
+	f.gen = qs.gen
+	qs.inFlight = true
+	b := d.st.NewBatch()
+	qs.buildDelta(b)
+	g := d.rt.GroupForQueue(qs.topic, qs.q)
+	ctx, cancel := context.WithTimeout(context.Background(), consumeProposeTimeout)
+	p, err := d.rep.ApplyAsyncAt(ctx, g, b, qs.epoch)
+	go func() {
+		defer cancel()
+		if err == nil {
+			err = p.Wait()
+		}
+		d.finishFlush(qs, f, err)
+	}()
+}
+
+// finishFlush 在途提案了结（在等待 goroutine 里调用）：本代号内——失败即
+// 丢弃内存态（下一差量的基线未知，只能从盘重装），成功且有挂起变更即构造
+// 下一个差量（此时上一差量已落盘，修订 R1）。最后唤醒本提案的等待者。
+func (d *Deliverer) finishFlush(qs *queueState, f *flush, err error) {
+	qs.mu.Lock()
+	if qs.gen == f.gen {
+		qs.inFlight = false
+		if err != nil {
+			d.logger.Warn("消费状态提案失败，丢弃队列内存态（下次访问从盘重装）",
+				"group", qs.group, "topic", qs.topic, "queue", qs.q, "epoch", qs.epoch, "err", err)
+			d.dropLocked(qs, err)
+		} else if qs.next != nil {
+			d.proposeLocked(qs)
+		}
+	} else if err != nil {
+		d.logger.Debug("已失效代号的消费状态提案失败（内存态已重建，忽略）",
+			"group", qs.group, "topic", qs.topic, "queue", qs.q, "err", err)
+	}
+	qs.mu.Unlock()
+	f.err = err
+	close(f.done)
+}
+
+// awaitCommit 等本次变更所在提案落盘。调用方 ctx 结束即返回 ctx 错误（变更
+// 仍随提案落盘或失效，与旧实现「Wait 超时、条目可能仍进日志」同语义）。
+func (d *Deliverer) awaitCommit(ctx context.Context, f *flush) error {
+	select {
+	case <-f.done:
+		return f.err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ApplyAdminBatch 提交一个触及消费状态（cursor/、inflight/ 键族）的管理批次，
+// 如删除消费组的成片清理（计划 P2）。本节点须为 g 组 leader（非 leader 由
+// 调用方转发给 leader，leader 侧经此入口）。
+//
+// 做法：解析批次触及的全部队列 → 按队列键字典序逐个取锁（不会与其他路径
+// 成环：别处至多持一把队列锁）→ 丢弃这些队列的内存态 → 同步提交 → 放锁。
+// 放锁前提交已 apply，下次访问重装读到的一定是管理批次之后的状态；在途的
+// 旧差量在同组提案队列里排在本批之前，不会把被删的数据写回。
+//
+// 参数 b 的归属同 Replicator.Apply：调用后不再持有。解析出整组/不可解析的
+// 消费键时保守地失效本节点全部队列内存态。
+func (d *Deliverer) ApplyAdminBatch(ctx context.Context, g uint32, b *store.Batch) error {
+	cqs, whole, err := store.BatchConsumeQueues(b.Repr())
+	if err != nil {
+		b.Close()
+		return fmt.Errorf("解析管理批次 (g=%d): %w", g, err)
+	}
+	var qss []*queueState
+	if whole {
+		d.mu.Lock()
+		for _, qs := range d.qmu {
+			qss = append(qss, qs)
+		}
+		d.mu.Unlock()
+	} else {
+		for _, cq := range cqs {
+			qss = append(qss, d.queue(cq.Group, cq.Topic, cq.QueueID))
+		}
+	}
+	sort.Slice(qss, func(i, j int) bool {
+		a, c := qss[i], qss[j]
+		if a.group != c.group {
+			return a.group < c.group
+		}
+		if a.topic != c.topic {
+			return a.topic < c.topic
+		}
+		return a.q < c.q
+	})
+	for _, qs := range qss {
+		qs.mu.Lock()
+		d.dropLocked(qs, errors.New("管理批次"))
+	}
+	err = d.rep.Apply(ctx, g, b)
+	for _, qs := range qss {
+		qs.mu.Unlock()
+	}
+	if err != nil {
+		d.logger.Warn("消费状态管理批次提交失败（相关队列内存态已失效）", "g", g,
+			"queues", len(qss), "whole", whole, "err", err)
+		return fmt.Errorf("提交消费状态管理批次 (g=%d): %w", g, err)
+	}
+	d.logger.Info("消费状态管理批次已提交，相关队列内存态已失效", "g", g, "queues", len(qss), "whole", whole)
+	return nil
+}
+
+// InflightCount 本节点内存里某队列的在外条数（原子镜像，不取队列锁）。
+// ok=false 表示本节点未装载该队列（非 leader 或尚未访问），调用方应回落
+// 读 pebble。预留给控制台/指标改读内存（SQ4.9）。
+func (d *Deliverer) InflightCount(group, topic string, q uint32) (n int, ok bool) {
+	k := group + "/" + topic + "/" + strconv.FormatUint(uint64(q), 10)
+	d.mu.Lock()
+	qs, has := d.qmu[k]
+	d.mu.Unlock()
+	if !has || !qs.loadedMirror.Load() {
+		return 0, false
+	}
+	return int(qs.nInflight.Load()), true
+}
