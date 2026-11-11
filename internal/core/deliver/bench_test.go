@@ -4,6 +4,8 @@
 //   - BenchmarkAckParallel 量化"队列锁跨 fsync 导致同队列 ack 串行"的确认吞吐基线，
 //     以及拆分提交后的收益（改锁前后各跑一轮对比）
 //   - BenchmarkAckBatch32 量化 AckBatch 批量一次 fsync 的收益（Task 2 引入）
+//   - BenchmarkAckParallelAsync 去掉 fsync 后的 ack 路径开销，主要量 inflight
+//     点查（store.Get）的缓存命中情况（SQ4.5 pebble 调参前后对比）
 //
 // 边界：
 //   - 只跑基准，不包含断言测试
@@ -25,12 +27,13 @@ import (
 	"github.com/Xsxdot/sq/internal/store"
 )
 
-// newBenchDeliverer 构造真实 fsync 的单队列 Deliverer，并预写 n 条
-// attempt=1、过期时间远在将来的 inflight 记录（offset 0..n-1）。
+// newBenchDeliverer 构造单队列 Deliverer，并预写 n 条 attempt=1、过期时间
+// 远在将来的 inflight 记录（offset 0..n-1）。syncWrites 决定写盘档位：
+// 默认基准量的是 fsync 合并（传 true），Async 变体传 false。
 // Ack 只读 inflight 不读消息本体，因此无需预写 msg/ 键。
-func newBenchDeliverer(b *testing.B, n int) *Deliverer {
+func newBenchDeliverer(b *testing.B, n int, syncWrites bool) *Deliverer {
 	b.Helper()
-	st, err := store.Open(b.TempDir(), true, slog.Default())
+	st, err := store.Open(b.TempDir(), syncWrites, slog.Default())
 	if err != nil {
 		b.Fatalf("store: %v", err)
 	}
@@ -66,7 +69,26 @@ func newBenchDeliverer(b *testing.B, n int) *Deliverer {
 // （云服务器验收用 -test.cpu 64）。改锁前（队列锁跨 fsync）此数≈单流 fsync
 // 速率；拆分提交后应放大约「合并深度」倍。
 func BenchmarkAckParallel(b *testing.B) {
-	d := newBenchDeliverer(b, b.N)
+	d := newBenchDeliverer(b, b.N, true)
+	var next atomic.Uint64
+	b.ResetTimer()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			off := next.Add(1) - 1
+			ok, err := d.Ack(context.Background(), "g-bench", "t-ack", 0, off, 1)
+			if err != nil || !ok {
+				b.Fatalf("ack off=%d: ok=%v err=%v", off, ok, err)
+			}
+		}
+	})
+}
+
+// BenchmarkAckParallelAsync 与 BenchmarkAckParallel 同形，但 store 用 async
+// 写盘：去掉 fsync 后 ack 的主要耗时是 inflight 点查，用于观察 pebble 缓存/
+// 布隆过滤器参数对读路径的影响（SQ4.5）。预写量随 b.N 变化，对比时须用
+// 固定 -benchtime Nx 保证前后数据量一致（数据量决定是否超出缓存）。
+func BenchmarkAckParallelAsync(b *testing.B) {
+	d := newBenchDeliverer(b, b.N, false)
 	var next atomic.Uint64
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
@@ -83,7 +105,7 @@ func BenchmarkAckParallel(b *testing.B) {
 // BenchmarkAckBatch32 批量确认基准：每次迭代 = 一批 32 条一次 fsync。
 // 换算 msg/s 时乘 32（ns/op 是「每批」耗时，不是每条）。
 func BenchmarkAckBatch32(b *testing.B) {
-	d := newBenchDeliverer(b, b.N*32)
+	d := newBenchDeliverer(b, b.N*32, true)
 	var next atomic.Uint64
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
