@@ -364,6 +364,9 @@ func NewManager(o Options) (*Manager, error) {
 		writableWait:           o.WritableWaitTimeout,
 	}
 	m.rs = newRaftStore(o.Store, lg)
+	// 重启时读回内存的热区条数 = 热区窗口（卡 SQ4.10 B6，与 buildGroup
+	// 给组设的窗口同一个值）
+	m.rs.hotEntries = o.RetainEntries
 	// 快照注册表：每个 Manager 一份，全组共享（Task 4）。TTL 由配置面
 	// 注入（cluster.snapshot_view_ttl），未填时落回装配默认常量。
 	viewTTL := o.SnapshotViewTTL
@@ -608,42 +611,79 @@ func NewManager(o Options) (*Manager, error) {
 func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, error) {
 	storage := raft.NewMemoryStorage()
 	applied := uint64(0)
+	// 冷区播种（卡 SQ4.10）：bound=0 表示无冷区（纯 mem 视图）；否则 raft
+	// 视角的日志起点 = boundFirst（锚点+1 或盘上日志起点），热区之前的
+	// [boundFirst, 热区起点) 留在盘上经冷读取。
+	var boundFirst, boundPrevTerm uint64
 	if clean {
 		hs, ents, snapMeta, err := m.rs.Load(g)
 		if err != nil {
 			return nil, fmt.Errorf("cluster: 组 %d 恢复读取: %w", g, err)
 		}
+		// 成员表：锚点自带的优先，其次 Task 2 持久化成员表，都没有（旧数据
+		// 目录首次升级）才重放日志合成——截断过的组必有持久化成员表
+		resolveCS := func(cs *raftpb.ConfState) (*raftpb.ConfState, error) {
+			if len(cs.GetVoters()) > 0 {
+				return cs, nil
+			}
+			persisted, ok, err := m.rs.LoadConfState(g)
+			if err != nil {
+				return nil, fmt.Errorf("cluster: 组 %d 读成员表: %w", g, err)
+			}
+			if ok {
+				return persisted, nil
+			}
+			all, err := m.rs.LoadAllEntries(g)
+			if err != nil {
+				return nil, fmt.Errorf("cluster: 组 %d 读全量日志合成成员表: %w", g, err)
+			}
+			cs, err = confStateFromEntries(all, hs.GetCommit())
+			if err != nil {
+				return nil, fmt.Errorf("cluster: 组 %d 成员表合成: %w", g, err)
+			}
+			m.lg.Info("成员表由日志重放合成（旧数据目录首次升级）", "g", g,
+				"voters", cs.GetVoters(), "learners", cs.GetLearners())
+			return cs, nil
+		}
+		logFirst, hasLog, err := m.rs.LogFirstIndex(g)
+		if err != nil {
+			return nil, fmt.Errorf("cluster: 组 %d 读日志起点: %w", g, err)
+		}
 		if snapMeta != nil {
 			// 截断过的组：锚点是权威位点与成员表来源——即使日志被全量
-			// 截断（len(ents)==0）也必须 ApplySnapshot，否则
-			// RestartNode 拿不到 ConfState（InitialState 只认快照）与
-			// 任期基线，节点以空成员表启动直接变哑（Task 2 遗留缺口）。
-			snapIndex, snapTerm := snapMeta.GetIndex(), snapMeta.GetTerm()
-			cs := snapMeta.GetConfState()
-			if len(cs.GetVoters()) == 0 {
-				// 锚点未带成员表：回退 Task 2 持久化成员表——那是
-				// ConfChange apply 时整表落盘的权威来源
-				persisted, ok, err := m.rs.LoadConfState(g)
-				if err != nil {
-					return nil, fmt.Errorf("cluster: 组 %d 读成员表: %w", g, err)
-				}
-				if !ok {
-					// 从未持久化过成员表（旧数据目录首次升级）：日志
-					// 若还有条目则重放合成，否则空表——截断过的组
-					// 必有持久化成员表，此分支实际不可达
-					cs, err = confStateFromEntries(ents, hs.GetCommit())
-					if err != nil {
-						return nil, fmt.Errorf("cluster: 组 %d 成员表合成: %w", g, err)
-					}
-					m.lg.Info("成员表由日志重放合成（旧数据目录首次升级）", "g", g,
-						"voters", cs.GetVoters(), "learners", cs.GetLearners())
-				} else {
-					cs = persisted
+			// 截断（热区为空）也必须 ApplySnapshot，否则 RestartNode 拿
+			// 不到 ConfState（InitialState 只认快照）与任期基线，节点以
+			// 空成员表启动直接变哑（Task 2 遗留缺口）。
+			boundFirst, boundPrevTerm = snapMeta.GetIndex()+1, snapMeta.GetTerm()
+		} else if hasLog {
+			// 未截断过的组：日志起点即下界，用首条条目的 term 近似「起点−1
+			// 的 term」（逐字沿用原实现：raft 只在任期比较时用到它，两条
+			// 恢复路径都不会触发该比较，见 B8.2）
+			boundFirst = logFirst
+			if boundPrevTerm, err = m.rs.ColdTerm(g, logFirst); err != nil {
+				return nil, fmt.Errorf("cluster: 组 %d 读日志起点任期: %w", g, err)
+			}
+		}
+		if boundFirst > 0 {
+			// MemoryStorage 以「热区起点−1」为快照元数据起点：热区为空时
+			// 就是下界−1；否则取冷区任期表里该位点的任期
+			hotStart := boundFirst
+			if len(ents) > 0 {
+				hotStart = ents[0].GetIndex()
+			}
+			memSnapIndex, memSnapTerm := hotStart-1, boundPrevTerm
+			if hotStart > boundFirst {
+				if memSnapTerm, err = m.rs.ColdTerm(g, memSnapIndex); err != nil {
+					return nil, fmt.Errorf("cluster: 组 %d 读热区起点前一条任期（index %d）: %w", g, memSnapIndex, err)
 				}
 			}
+			cs, err := resolveCS(snapMeta.GetConfState())
+			if err != nil {
+				return nil, err
+			}
 			snap := &raftpb.Snapshot{Metadata: &raftpb.SnapshotMetadata{
-				Index:     &snapIndex,
-				Term:      &snapTerm,
+				Index:     &memSnapIndex,
+				Term:      &memSnapTerm,
 				ConfState: cs,
 			}}
 			if err := storage.ApplySnapshot(snap); err != nil {
@@ -654,41 +694,8 @@ func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, e
 					return nil, fmt.Errorf("cluster: 组 %d 重放条目: %w", g, err)
 				}
 			}
-		} else if len(ents) > 0 {
-			first := ents[0]
-			snapIndex := first.GetIndex() - 1
-			// snapTerm 用首条条目的 term 近似「缺失条目 index-1 的 term」：
-			// raft 只在任期比较时用到它，而两条路径都不会触发该比较——
-			// 不干净路径空存储启动（snapTerm=0）只与新鲜 leader 的 term(0)
-			// 相遇；干净路径 leader 的 Progress 仍保留，追齐从不会回退到
-			// index-1 对账（若未来做快照压缩，需按真实 term 补快照，见 B8.2）
-			snapTerm := first.GetTerm()
-			// 成员表优先取持久化值（Task 2）：截断之后日志前缀已被删，
-			// 重放合成不再可能。仅当从未持久化过（batch③ 及更早的数据
-			// 目录首次升级到本版本）才回退到日志重放合成。
-			cs, ok, err := m.rs.LoadConfState(g)
-			if err != nil {
-				return nil, fmt.Errorf("cluster: 组 %d 读成员表: %w", g, err)
-			}
-			if !ok {
-				cs, err = confStateFromEntries(ents, hs.GetCommit())
-				if err != nil {
-					return nil, fmt.Errorf("cluster: 组 %d 成员表合成: %w", g, err)
-				}
-				m.lg.Info("成员表由日志重放合成（旧数据目录首次升级）", "g", g,
-					"voters", cs.GetVoters(), "learners", cs.GetLearners())
-			}
-			snap := &raftpb.Snapshot{Metadata: &raftpb.SnapshotMetadata{
-				Index:     &snapIndex,
-				Term:      &snapTerm,
-				ConfState: cs,
-			}}
-			if err := storage.ApplySnapshot(snap); err != nil {
-				return nil, fmt.Errorf("cluster: 组 %d 重放快照: %w", g, err)
-			}
-			if err := storage.Append(ents); err != nil {
-				return nil, fmt.Errorf("cluster: 组 %d 重放条目: %w", g, err)
-			}
+			m.lg.Info("组日志两级播种", "g", g, "bound", boundFirst, "hotStart", hotStart,
+				"hotEntries", len(ents), "anchor", snapMeta.GetIndex())
 		}
 		if !raft.IsEmptyHardState(hs) {
 			if err := storage.SetHardState(hs); err != nil {
@@ -724,11 +731,18 @@ func (m *Manager) buildGroup(g uint32, clean bool, peers []raft.Peer) (*group, e
 			// 上面从旧磁盘状态 seed 的 mem（锚点快照 + 条目 + HardState）
 			// 随日志清空一并作废：换全新空存储启动（firstIndex=1），
 			// leader 的探测一路回退到日志起点，只能全量重放或发快照，
-			// 两条路径都完整——杜绝静默丢段。
+			// 两条路径都完整——杜绝静默丢段。冷区下界随之作废。
 			storage = raft.NewMemoryStorage()
+			boundFirst = 0
 		}
 	}
 	gr := newGroup(g, m.nodeID, storage, m.snaps, m.rs, m.st, m.send, m.mode, m.onLeaderChange, m.onApplied, m.lg)
+	if boundFirst > 0 {
+		gr.stg.setBound(boundFirst, boundPrevTerm)
+	}
+	// 热区窗口 = min(RetainEntries 条, 64MiB)（plan B6；字节上限是 newGroup
+	// 的内部默认常量）
+	gr.hotEntries = m.retainEntries
 	// raft 节点在 newGroup 之后装配：Config.Storage 必须用包了快照生成
 	// 器的 stg——raft 给落后 follower 发 MsgSnap 时调用的是
 	// groupStorage.Snapshot() 的现场生成，而非 MemoryStorage 的预置快照；
@@ -1277,6 +1291,10 @@ func (m *Manager) truncateOnceWith(g uint32, probed map[uint64]bool) (uint64, bo
 		m.lg.Error("截断放弃：锚点落盘失败", "g", g, "upto", upto, "err", err)
 		return 0, false
 	}
+	// 锚点已落：raft 视角的日志起点先前进到锚点之后，再删盘上段——顺序
+	// 反过来会让 raft 在删段与下界前进之间读到「下界说有、盘上已删」的
+	// 空窗（冷读失败只会退化为发快照，但无谓）
+	gr.stg.advanceBound(upto+1, term)
 	if err := m.rs.TruncateLog(g, upto); err != nil {
 		m.lg.Error("截断放弃：删条目失败", "g", g, "upto", upto, "err", err)
 		return 0, false

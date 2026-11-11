@@ -2021,7 +2021,7 @@ func TestInstallingMarkerRestartClearsRaftLog(t *testing.T) {
 	// A1+1..P1。锚点 index 与截断循环同形（applied - retain），term
 	// 取未截断节点日志里的真实 term（leader 的日志已截到 96，查不到）。
 	a1 := xApplied - uint64(8)
-	a1Term, err := other.groups[0].mem.Term(a1)
+	a1Term, err := other.groups[0].stg.Term(a1)
 	if err != nil {
 		t.Fatalf("锚点位 %d 的 term 不可查: %v", a1, err)
 	}

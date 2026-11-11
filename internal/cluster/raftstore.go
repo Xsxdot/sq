@@ -10,6 +10,9 @@
 //     旧的更高 index 条目不是被物理删掉，而是在重放/读取时按「后写的赢」
 //     规则从可见结果里裁掉——覆盖语义由「同批物理删除」变成了「读时重放
 //     裁剪」，对调用方完全透明（见 Persist/Load 的注释）
+//   - 冷区读入口（卡 SQ4.10）：ColdEntries/ColdTerm 经 seglog 读路径按
+//     index 读盘上日志，供 groupStorage 在内存热区之外取条目；本层不持有
+//     条目本体缓存（内存不随保留量增长），Load 只读回热区
 //   - 成员表的持久化（SaveConfState/LoadConfState）与重启恢复
 //     （Load + 干净关机判定）：成员表优先读持久化值，confStateFromEntries
 //     的日志重放合成仅作为旧数据目录的迁移路径
@@ -64,6 +67,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -113,41 +117,28 @@ type raftStore struct {
 	lg *slog.Logger
 
 	// seglog 组日志：惰性打开（首个 Persist/Load 触发）。logsMu 只保护
-	// 两张 map 本身的读写，Log 与 recovered 的元素一旦写入，各自的并发
-	// 安全性由 seglog.Log（内部自带锁）与 Persist 的更新规则保证。
-	logsMu    sync.Mutex
-	logs      map[uint32]*seglog.Log
-	recovered map[uint32]*logRecovered
-}
+	// map 本身的读写，Log 的并发安全由 seglog.Log 内部锁保证。
+	//
+	// 卡 SQ4.10 删除了原 recovered 全量条目缓存：它把截断前的全部条目指针
+	// 钉在内存里（内存随保留量线性增长）。HardState 改取 seglog 的最新值，
+	// 条目改经 seglog 读路径按需读。
+	logsMu sync.Mutex
+	logs   map[uint32]*seglog.Log
 
-// logRecovered 是某一组当前应被 Load 读到的 (HardState, Entries) 状态。
-//
-// 初值来自 seglog.Open 扫描恢复出的快照（open 时刻），此后每次同一组的
-// Persist 都会原地更新它——不这样做的话，Load 在同一进程内会一直读到
-// open 时刻的陈旧状态，看不见期间发生的 Persist（尤其是换届覆盖，见
-// Persist 的注释）。
-//
-// 别名约定（finding 5）：hs/ents 保留的是调用方（raft 库 rd.HardState/
-// rd.Entries）交下来的指针，Load 对外返回的也是这份共享指针（未做深拷贝）；
-// 调用方必须把它们当只读数据，不得原地修改——MemoryStorage 只拷贝指针，
-// 不拷贝值。
-//
-// 切片本身（不是元素）则是写时复制的：Persist 做换届回退裁剪时，若真的
-// 裁掉了尾巴，会另分配一条新切片再拼接，绝不在原底层数组上覆盖写。这样
-// 一来，Load 之前返回给调用方的那个切片头即便还被持有，它指向的元素也不
-// 会被后来的 Persist 改掉——见 Persist 里的裁剪代码。
-type logRecovered struct {
-	hs   *raftpb.HardState
-	ents []*raftpb.Entry
+	// hotEntries 是 Load 读回的内存热区条数窗口（Manager 装配时置为
+	// min(RetainEntries, …)，见 buildGroup）：热区起点 = applied+1−窗口
+	// （不低于盘上日志起点 / 锚点+1），起点之前的条目留在盘上走冷读。
+	// 0 = 不设窗口（读回全部现存条目）。
+	hotEntries uint64
 }
 
 // newRaftStore 构造 raft 日志持久层。lg 绑定 mod=raftstore 键。
 func newRaftStore(st *store.Store, lg *slog.Logger) *raftStore {
 	return &raftStore{
-		st:        st,
-		lg:        lg.With("mod", "raftstore"),
-		logs:      make(map[uint32]*seglog.Log),
-		recovered: make(map[uint32]*logRecovered),
+		st:         st,
+		lg:         lg.With("mod", "raftstore"),
+		logs:       make(map[uint32]*seglog.Log),
+		hotEntries: defaultRetainEntries,
 	}
 }
 
@@ -174,12 +165,11 @@ func (r *raftStore) getLog(g uint32) (*seglog.Log, error) {
 		return l, nil
 	}
 	dir := groupLogDir(r.st.Dir(), g)
-	l, hs, ents, err := seglog.Open(dir, r.lg)
+	l, _, err := seglog.Open(dir, r.lg)
 	if err != nil {
 		return nil, fmt.Errorf("raftstore 组 %d 打开段日志 %s: %w", g, dir, err)
 	}
 	r.logs[g] = l
-	r.recovered[g] = &logRecovered{hs: hs, ents: ents}
 	return l, nil
 }
 
@@ -196,7 +186,6 @@ func (r *raftStore) wipeLog(g uint32) error {
 	r.logsMu.Lock()
 	l, hadLog := r.logs[g]
 	delete(r.logs, g)
-	delete(r.recovered, g)
 	r.logsMu.Unlock()
 
 	if hadLog {
@@ -231,6 +220,7 @@ func (r *raftStore) wipeLog(g uint32) error {
 //     完全透明（Load 的返回值与旧实现等价）。
 //   - Append 本身失败即返回错误（fail-stop，见 seglog.Log.Append 注释），
 //     本层不重试。
+//
 // Sync 把组 g 的活动段刷到盘。
 //
 // 参数：
@@ -263,70 +253,31 @@ func (r *raftStore) Persist(g uint32, hs *raftpb.HardState, ents []*raftpb.Entry
 		return fmt.Errorf("raftstore Persist 组 %d: %w", g, err)
 	}
 
-	// 同步刷新 recovered 缓存：它是 Load 的数据源，初值只是 seglog.Open
-	// 那一刻的快照，若不在这里跟着更新，同一进程内「Persist 后紧接着
-	// Load」（如换届覆盖场景）会读到过期状态——这正是 TestPersistTruncates
-	// ConflictTail 验证的行为，必须在内存缓存里也成立，不能只指望重启
-	// 后重新 Open 才生效。
-	r.logsMu.Lock()
-	rec := r.recovered[g]
-	if rec == nil {
-		rec = &logRecovered{}
-		r.recovered[g] = rec
-	}
-	if hs != nil {
-		rec.hs = hs
-	}
-	if len(ents) > 0 {
-		// 与 seglog.Open 重放同一条「后写的赢」规则：本批次首条 index
-		// 就是新日志尾要覆盖的起点，缓存里 >= 该 index 的旧条目全部作废。
-		// 批内 ents 本身升序、彼此不冲突（raft Ready 契约），因此只需按
-		// 首条 index 裁一次，不必逐条比对。
-		first := ents[0].GetIndex()
-		cut := len(rec.ents)
-		for cut > 0 && rec.ents[cut-1].GetIndex() >= first {
-			cut--
-		}
-		if cut < len(rec.ents) {
-			// 真发生了回退裁剪：必须换一条新底层数组，不能 append 回原地。
-			// 原因是 Load 返回的只是切片头的浅拷贝，元素与这里共享——若在
-			// 原数组上从 cut 位置覆盖写，一个已经拿到 [1..10] 的调用方会在
-			// 毫无察觉的情况下看到自己手里的第 8..10 项变成新领导者的条目。
-			// 代价只是换届时的一次分配（低频事件），换掉的是一个只在时序
-			// 巧合下才会显形的隐患。无裁剪的常规追加走下面的 append 原路，
-			// 热路径零额外开销。
-			kept := make([]*raftpb.Entry, cut, cut+len(ents))
-			copy(kept, rec.ents[:cut])
-			rec.ents = kept
-		}
-		rec.ents = append(rec.ents, ents...)
-	}
-	r.logsMu.Unlock()
 	return nil
 }
 
-// Load 读回一组的 HardState、现存日志条目与快照元数据（截断锚点）。
+// Load 读回一组的 HardState、内存热区条目与快照元数据（截断锚点）。
 //
 // 返回：
 //   - hs: 从未持久化过时为空 HardState（raft.IsEmptyHardState 为真）
-//   - ents: 按 index 升序的现存条目，可能为空。**不保证**截断过的组
-//     一定不含 ≤ 锚点 index 的条目：本进程内 TruncateLog 之后的 Load
-//     确实读不到它们（内存视图被主动裁到锚点之后），但重启后重新 Open
-//     扫描是按段粒度回收的物理结果，同段内 index ≤ 锚点的条目会照样读
-//     回来。多读回的旧条目是安全方向——MemoryStorage 按快照锚点自行
-//     丢弃，详见 TruncateLog 的注释
+//   - ents: 热区条目（按 index 升序、连续，可能为空）：[热区起点, 日志尾]。
+//     热区起点 = max(盘上日志起点, 锚点+1, applied+1−hotEntries)，且
+//     ≤ applied+1——起点之前的条目全部 ≤ applied（已提交、永不改写），
+//     留在盘上经 ColdEntries/ColdTerm 按需读（冷区不变式 I-cold，见
+//     groupStorage）。重启因此不再把整份日志读进内存（卡 SQ4.10 S3）
 //   - snapMeta: 组的快照元数据（截断锚点）；从未截断过时为 nil
 //   - err: 读取或反序列化失败
 //
 // legacy 回退（为什么只读、绝不顺手迁移）：
 //
 //	迁移前的旧数据目录里，日志仍在 Pebble 的 hsKey/entPrefix 键族下；
-//	legacyPending 命中即说明这组还没迁移，直接走 loadLegacy 原样读旧键。
-//	读路径本身绝不做迁移写入——恢复判定命令（sq recover）与迁移步骤自身
-//	都要求「读」是无副作用的：前者可能在决定是否允许启动之前就调用 Load，
-//	若这里顺手写盘，一次只读的诊断操作就会悄悄改变磁盘状态；后者
-//	（Manager 启动序里的 migrateRaftLogs）需要自己独占控制迁移的时机与
-//	原子性，读路径抢先做了等于把迁移逻辑拆成两处，且时序不可控。
+//	legacyPending 命中即说明这组还没迁移，直接走 loadLegacy 原样读旧键
+//	（legacy 路径不分冷热，读回全量——一次性升级路径）。读路径本身绝不
+//	做迁移写入——恢复判定命令（sq recover）与迁移步骤自身都要求「读」是
+//	无副作用的：前者可能在决定是否允许启动之前就调用 Load，若这里顺手
+//	写盘，一次只读的诊断操作就会悄悄改变磁盘状态；后者（Manager 启动序
+//	里的 migrateRaftLogs）需要自己独占控制迁移的时机与原子性，读路径抢先
+//	做了等于把迁移逻辑拆成两处，且时序不可控。
 func (r *raftStore) Load(g uint32) (*raftpb.HardState, []*raftpb.Entry, *raftpb.SnapshotMetadata, error) {
 	pending, err := r.legacyPending(g)
 	if err != nil {
@@ -336,29 +287,11 @@ func (r *raftStore) Load(g uint32) (*raftpb.HardState, []*raftpb.Entry, *raftpb.
 		return r.loadLegacy(g)
 	}
 
-	if _, err := r.getLog(g); err != nil { // 惰性 Open；恢复态随之入缓存
+	l, err := r.getLog(g) // 惰性 Open：扫描重建读索引
+	if err != nil {
 		return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 打开段日志: %w", g, err)
 	}
-
-	// hs 与 ents 必须在同一次持锁区间内一起读出：Persist/TruncateLog 都是
-	// 在持锁期间原地更新 rec.hs/rec.ents 的（见二者的注释），若解锁后才
-	// 分别取用两个字段，会撞上「先取到旧 hs、解锁后被并发 Persist 换成新
-	// ents」这类撕裂读。rec 本身也可能是 nil——getLog 与这里重新加锁取值
-	// 之间，CloseLogs 可能把 recovered 整体替换成一张新的空 map，此时按
-	// 旧组号查到的就是 nil，必须当空日志防御性处理，不能直接解引用。
-	// ents 只做切片头（指针/长度/容量）的浅拷贝：按 logRecovered 的别名
-	// 约定，底层 Entry 元素仍与内部缓存共享指针；浅拷贝拿到的是这份切片
-	// 头在锁内那一刻的快照，之后即便同一组发生新的 Persist/TruncateLog
-	// 重新指向别处，也不会影响调用方已经拿到手的这个切片头。
-	r.logsMu.Lock()
-	rec := r.recovered[g]
-	var hs *raftpb.HardState
-	var ents []*raftpb.Entry
-	if rec != nil {
-		hs = rec.hs
-		ents = rec.ents
-	}
-	r.logsMu.Unlock()
+	hs := l.HardState()
 	if hs == nil {
 		hs = &raftpb.HardState{} // 调用方契约：从未持久化过时返回空 HardState 而非 nil
 	}
@@ -369,10 +302,105 @@ func (r *raftStore) Load(g uint32) (*raftpb.HardState, []*raftpb.Entry, *raftpb.
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 读快照元数据: %w", g, err)
 	}
-	// 重启排障的第一行证据：组号、条目数、commit 位、锚点位。
-	r.lg.Debug("raft 日志已读回（seglog）", "g", g, "entries", len(ents),
+	applied, err := r.Applied(g)
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 读 applied: %w", g, err)
+	}
+	var ents []*raftpb.Entry
+	first, ok := l.FirstIndex()
+	last, _ := l.LastIndex()
+	hot := hotStart(first, snapMeta, applied, r.hotEntries)
+	if ok && hot <= last {
+		ents, err = l.ReadEntries(hot, last+1, math.MaxUint64)
+		if err != nil {
+			return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 读热区 [%d,%d]: %w", g, hot, last, err)
+		}
+		if n := len(ents); n == 0 || ents[n-1].GetIndex() != last {
+			// 热区内出现覆盖空洞：锚点之后的日志必须连续（空洞只可能落在
+			// 快照安装的锚点之前），否则盘上日志与锚点不一致
+			return nil, nil, nil, fmt.Errorf("raftstore Load 组 %d 热区 [%d,%d] 不连续（读回 %d 条）", g, hot, last, n)
+		}
+	}
+	// 重启排障的第一行证据：组号、热区起点与条数、盘上范围、commit 位、锚点位。
+	r.lg.Info("raft 日志已读回（seglog，热区）", "g", g, "hotStart", hot, "hotEntries", len(ents),
+		"logFirst", first, "logLast", last, "applied", applied,
 		"commit", hs.GetCommit(), "snap", snapMeta.GetIndex())
 	return hs, ents, snapMeta, nil
+}
+
+// hotStart 计算 Load 的热区起点：max(盘上日志起点, 锚点+1, applied+1−窗口)。
+// 结果恒 ≤ applied+1 与（窗口>0 时）≥ 锚点+1——冷区 [起点之前] 只含已
+// apply 条目（I-cold）。window=0 表示不设窗口。
+func hotStart(logFirst uint64, snapMeta *raftpb.SnapshotMetadata, applied, window uint64) uint64 {
+	start := max(logFirst, 1)
+	if snapMeta != nil {
+		start = max(start, snapMeta.GetIndex()+1)
+	}
+	if window > 0 && applied+1 > window {
+		start = max(start, applied+1-window)
+	}
+	return start
+}
+
+// ColdEntries 经 seglog 读路径读组 g 盘上日志的 [lo, hi)（冷区读入口，
+// groupStorage 在内存热区之外取条目时调用，raft node goroutine 内执行）。
+//
+// 返回：语义同 seglog.Log.ReadEntries；段日志打不开时带上下文的错误。
+// 调用方负责把一切错误映射成 raft.ErrCompacted（plan B7）。
+func (r *raftStore) ColdEntries(g uint32, lo, hi, maxSize uint64) ([]*raftpb.Entry, error) {
+	l, err := r.getLog(g)
+	if err != nil {
+		return nil, fmt.Errorf("raftstore ColdEntries 组 %d: %w", g, err)
+	}
+	return l.ReadEntries(lo, hi, maxSize)
+}
+
+// ColdTerm 查组 g 盘上日志中 index 为 i 的条目任期（纯内存索引查询）。
+func (r *raftStore) ColdTerm(g uint32, i uint64) (uint64, error) {
+	l, err := r.getLog(g)
+	if err != nil {
+		return 0, fmt.Errorf("raftstore ColdTerm 组 %d: %w", g, err)
+	}
+	return l.Term(i)
+}
+
+// LogFirstIndex 返回组 g 盘上日志仍可读的最小 index（无条目 ok=false）。
+func (r *raftStore) LogFirstIndex(g uint32) (uint64, bool, error) {
+	l, err := r.getLog(g)
+	if err != nil {
+		return 0, false, fmt.Errorf("raftstore LogFirstIndex 组 %d: %w", g, err)
+	}
+	first, ok := l.FirstIndex()
+	return first, ok, nil
+}
+
+// LoadAllEntries 读回组 g 盘上全部现存条目（legacy 组走 loadLegacy）。
+//
+// 只给一次性升级路径用：旧数据目录从未持久化过成员表时，buildGroup 要
+// 重放整份日志合成成员表（confStateFromEntries）。常规启动不调用。
+func (r *raftStore) LoadAllEntries(g uint32) ([]*raftpb.Entry, error) {
+	pending, err := r.legacyPending(g)
+	if err != nil {
+		return nil, err
+	}
+	if pending {
+		_, ents, _, err := r.loadLegacy(g)
+		return ents, err
+	}
+	l, err := r.getLog(g)
+	if err != nil {
+		return nil, fmt.Errorf("raftstore LoadAllEntries 组 %d: %w", g, err)
+	}
+	first, ok := l.FirstIndex()
+	if !ok {
+		return nil, nil
+	}
+	last, _ := l.LastIndex()
+	ents, err := l.ReadEntries(first, last+1, math.MaxUint64)
+	if err != nil {
+		return nil, fmt.Errorf("raftstore LoadAllEntries 组 %d: %w", g, err)
+	}
+	return ents, nil
 }
 
 // legacyPending 判定一组是否仍停留在迁移前的 Pebble 键族形态：
@@ -459,8 +487,8 @@ func (r *raftStore) loadLegacy(g uint32) (*raftpb.HardState, []*raftpb.Entry, *r
 //  3. loadLegacy(g) 只读旧值（不写，遵守 Load 的 legacy 回退只读契约），
 //     经 r.Persist(g, hs, ents, true) 写进刚清空的新 seglog——Persist 内部
 //     调用 Append，HS 先于条目、fsync（seglog.Log.Append 保证的帧序），
-//     并且会同步更新 r.recovered 缓存，migrateLog 返回后同进程内的
-//     Load(g) 立刻能读到迁移后的内容，不会因为缓存陈旧看到假的空日志。
+//     seglog 读索引随 Append 同步推进，migrateLog 返回后同进程内的
+//     Load(g) 立刻能读到迁移后的内容。
 //  4. Pebble 单批 Sync 删 hsKey(g) + DeleteRange(entPrefix(g))——这一步
 //     落盘之后 legacyPending(g) 才会翻假，是「迁移生效」的唯一判据。
 //
@@ -495,8 +523,7 @@ func (r *raftStore) migrateLog(g uint32) error {
 		return fmt.Errorf("raftstore migrateLog 组 %d 读旧日志: %w", g, err)
 	}
 
-	// ③ 分块写入刚清空的新 seglog（Persist 顺带保证 recovered 缓存是最新
-	// 的，见函数注释）。为什么分块：seglog.Append 会把一次调用的全部条目
+	// ③ 分块写入刚清空的新 seglog（读索引随 Append 推进，见函数注释）。为什么分块：seglog.Append 会把一次调用的全部条目
 	// 组装进单个内存缓冲，迁移是唯一可能一次性拿到全量日志的调用方——
 	// 整块写入会让该缓冲膨胀到整份日志的大小（最坏 = 截断保留窗口内的
 	// 全部消息体）。按块追加把峰值压到块大小；HS 只随首块写一次（帧序
@@ -814,19 +841,9 @@ func deleteInstallingKey(b *store.Batch, g uint32) error {
 //
 // 幂等：重复截断到同一位点，TruncateTo 找不到可回收的段即为无操作。
 //
-// 注意（recovered 缓存必须跟着裁剪，为什么）：
-//
-//	seglog.TruncateTo 只按整段删除物理文件，不知道、也不该知道
-//	raftStore 内存里还缓存着一份 rec.ents——若不在这里同步裁掉
-//	index ≤ upto 的部分，同一进程内「TruncateLog 后紧接着 Load」
-//	（如本方法的调用方 flusher/快照压缩后立即读一次）会继续读到已经
-//	逻辑上不该再可见的旧条目，与「本进程已经声明截断到 upto」的意图
-//	相悖。注意方向不要理解反了：这里是缓存视图主动收窄到锚点之后，
-//	不代表盘面也精确同步到同一粒度——seglog 按整段回收，物理删除的
-//	粒度比这里粗得多，重启后重新 Open 完全可能读回比这里裁剪后更多
-//	的条目（该段里 index ≤ upto 的条目所在段还没被回收）。这是安全
-//	方向：多出来的旧条目会被重放进 MemoryStorage，MemoryStorage 自己
-//	会按快照锚点把 index ≤ upto 的部分丢弃，不会造成状态错误。
+// 注意：seglog 按整段回收，盘上可能仍留有 index ≤ upto 的条目（同段内
+// 锚点之前的部分）。这是安全方向：Load 的热区起点与 groupStorage 的磁盘
+// 下界都按锚点+1 裁定，锚点之前的条目对 raft 不可见。
 func (r *raftStore) TruncateLog(g uint32, upto uint64) error {
 	meta, ok, err := r.LoadSnapMeta(g)
 	if err != nil {
@@ -846,16 +863,6 @@ func (r *raftStore) TruncateLog(g uint32, upto uint64) error {
 	if err := l.TruncateTo(upto); err != nil {
 		return fmt.Errorf("raftstore TruncateLog 组 %d: %w", g, err)
 	}
-
-	r.logsMu.Lock()
-	if rec := r.recovered[g]; rec != nil {
-		cut := 0
-		for cut < len(rec.ents) && rec.ents[cut].GetIndex() <= upto {
-			cut++
-		}
-		rec.ents = rec.ents[cut:]
-	}
-	r.logsMu.Unlock()
 
 	r.lg.Info("raft 日志已截断（按段回收）", "g", g, "upto", upto)
 	return nil
@@ -910,7 +917,6 @@ func (r *raftStore) CloseLogs() {
 	r.logsMu.Lock()
 	logs := r.logs
 	r.logs = make(map[uint32]*seglog.Log)
-	r.recovered = make(map[uint32]*logRecovered)
 	r.logsMu.Unlock()
 	failed := 0
 	for g, l := range logs {
