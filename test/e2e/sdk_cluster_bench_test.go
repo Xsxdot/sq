@@ -11,7 +11,10 @@
 //     用于每机一节点的跨机测量——与共置档同一个 runSendLoad，差值即共置税
 //
 // 边界：
-//   - 不测消费侧吞吐（投递路径另有长轮询节拍变量，见 newClusterConsumer）
+//   - 消费侧吞吐（TestClusterConsumeThroughput，卡 SQ4.1）：预写 N 条后 C 个
+//     SimpleConsumer 收 + ack 排空，报 msg/s；三节点 quorum-mem + 单机基线，
+//     按 consumeBenchModes 逐个持久化模式跑（本文件不引用任何新配置项，可
+//     原样拷到旧版本上跑基线——那时只有 "default" 一档）
 //   - 不做正确性断言（那是 TestThreeNodeClusterE2E 的职责）；本文件只在
 //     发送失败率超阈值时失败——失败率不明的吞吐数字没有意义
 //   - 默认不随套件运行：必须显式 SQ_BENCH=1 开启。它要跑满机器数十秒，
@@ -31,6 +34,7 @@
 //	SQ_BENCH_MSGS    每个档位发送的消息总数（默认 20000）
 //	SQ_BENCH_BODY    消息体字节数（默认 128）
 //	SQ_BENCH_QUEUES  topic 队列数（默认 24，需 ≥ 数据组数才能摊到各组）
+//	SQ_BENCH_CONSUMERS 消费吞吐基准的 SimpleConsumer 数（默认 16）
 package e2e
 
 import (
@@ -393,4 +397,135 @@ func startBenchCluster(t *testing.T, ack string, queues int) (string, func()) {
 		c.LogLevel = "info"
 	})
 	return pc.endpointOf(0), func() { pc.stopAll(t) }
+}
+
+// consumeBenchMode 消费吞吐基准的一档持久化模式：mutate 为 nil 即用二进制缺省。
+// 扩展点：定义了新配置项的版本在别的文件 init 里覆盖它（本文件保持可移植）。
+type consumeBenchMode struct {
+	name   string
+	mutate func(*config.Config)
+}
+
+var consumeBenchModes = []consumeBenchMode{{name: "default"}}
+
+// runConsumeLoad 预写 total 条（并发 64 发送）后，consumers 个 SimpleConsumer
+// 并发收（每次至多 32 条）+ 逐条 ack，直到收齐 total 个不同 msgID，报 msg/s。
+// 计时从消费者开闸到收齐；5 分钟未收齐判失败（数字无意义）。
+func runConsumeLoad(t *testing.T, endpoint, topic, group string, total, consumers int, label string) benchResult {
+	t.Helper()
+	runSendLoad(t, endpoint, topic, 64, total, 128, label+"/预写")
+	cs := make([]rmq.SimpleConsumer, consumers)
+	for i := range cs {
+		cs[i] = newClusterConsumer(t, endpoint, group, topic, clusterConsumerAwaitShort)
+	}
+	var (
+		mu      sync.Mutex
+		seen    = make(map[string]bool, total)
+		wg      sync.WaitGroup
+		ackFail atomic.Int64
+	)
+	done := make(chan struct{})
+	var once sync.Once
+	start := make(chan struct{})
+	for i := range cs {
+		wg.Add(1)
+		go func(c rmq.SimpleConsumer) {
+			defer wg.Done()
+			<-start
+			for {
+				select {
+				case <-done:
+					return
+				default:
+				}
+				mvs, err := c.Receive(context.Background(), 32, time.Minute)
+				if err != nil {
+					time.Sleep(10 * time.Millisecond)
+					continue
+				}
+				for _, mv := range mvs {
+					if err := c.Ack(context.Background(), mv); err != nil {
+						ackFail.Add(1)
+					}
+					mu.Lock()
+					seen[mv.GetMessageId()] = true
+					n := len(seen)
+					mu.Unlock()
+					if n >= total {
+						once.Do(func() { close(done) })
+					}
+				}
+			}
+		}(cs[i])
+	}
+	t0 := time.Now()
+	close(start)
+	select {
+	case <-done:
+	case <-time.After(5 * time.Minute):
+		once.Do(func() { close(done) })
+	}
+	elapsed := time.Since(t0)
+	wg.Wait()
+	mu.Lock()
+	n := len(seen)
+	mu.Unlock()
+	if n < total {
+		t.Fatalf("%s: 5 分钟内只收到 %d/%d 条", label, n, total)
+	}
+	r := benchResult{label: label, sent: n, elapsed: elapsed}
+	t.Logf("%s: %.0f msg/s（收齐 %d 条 / %v，消费者 %d，ack 报错 %d）",
+		label, r.msgPerSec(), n, elapsed.Round(time.Millisecond), consumers, ackFail.Load())
+	return r
+}
+
+// TestClusterConsumeThroughput 端到端消费吞吐（收 + ack）：三节点 quorum-mem
+// 与同机单机档，各持久化模式一档。默认跳过：SQ_BENCH=1 才跑。
+func TestClusterConsumeThroughput(t *testing.T) {
+	if os.Getenv("SQ_BENCH") == "" {
+		t.Skip("吞吐基准默认不随套件运行：设 SQ_BENCH=1 开启")
+	}
+	total := benchEnvInt("SQ_BENCH_MSGS", 20000)
+	queues := benchEnvInt("SQ_BENCH_QUEUES", 24)
+	consumers := benchEnvInt("SQ_BENCH_CONSUMERS", 16)
+	t.Logf("参数：总条数=%d 队列数=%d 消费者=%d 模式=%d 档", total, queues, consumers, len(consumeBenchModes))
+	var results []benchResult
+	for _, m := range consumeBenchModes {
+		m := m
+		t.Run("cluster-quorum-mem/"+m.name, func(t *testing.T) {
+			pc := startProcCluster(t, 3, func(c *config.Config) {
+				c.Cluster.Ack = "quorum-mem"
+				c.DefaultQueueNums = uint32(queues)
+				c.LogLevel = "info"
+				if m.mutate != nil {
+					m.mutate(c)
+				}
+			})
+			defer pc.stopAll(t)
+			topic := "cbench-" + m.name
+			ensureTopic(t, pc.endpoints(), topic)
+			waitRouteSpread(t, pc.endpoints(), topic, 60*time.Second)
+			results = append(results, runConsumeLoad(t, pc.multi(), topic, "cbench-g", total, consumers,
+				"cluster/quorum-mem/"+m.name))
+		})
+		t.Run("standalone/"+m.name, func(t *testing.T) {
+			endpoint := startBroker(t, func(c *config.Config) {
+				c.DefaultQueueNums = uint32(queues)
+				c.DiskWatermarkPercent = 0
+				c.LogLevel = "info"
+				c.Credentials = []config.Credential{{Name: "bench", AccessKey: clusterAK, SecretKey: clusterSK}}
+				if m.mutate != nil {
+					m.mutate(c)
+				}
+			})
+			topic := "cbench-solo-" + m.name
+			ensureTopic(t, []string{endpoint}, topic)
+			results = append(results, runConsumeLoad(t, endpoint, topic, "cbench-g", total, consumers,
+				"standalone/"+m.name))
+		})
+	}
+	t.Log("=== 汇总（msg/s，端到端 SDK 收 + ack）===")
+	for _, r := range results {
+		t.Logf("%-40s %8.0f msg/s", r.label, r.msgPerSec())
+	}
 }
