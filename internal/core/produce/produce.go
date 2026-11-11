@@ -69,6 +69,11 @@ type Producer struct {
 	delayNext   uint64
 	delayLoaded bool
 	delayEpoch  uint64 // delayNext 所属的元数据组 epoch，语义同 queueState.epoch
+
+	// afterGateHook 测试专用注入点（生产恒为 nil，同 txn.Manager.afterAppendHook
+	// 的约定）：Append 过可写门拿到 epoch 之后、进 qs.mu 之前调用，用于在
+	// 「门已放行、提案未入队」之间确定性地注入换届（卡 SQ1 计划修订 R1）。
+	afterGateHook func(g uint32, epoch uint64)
 }
 
 // New 构造 Producer。offset 缓存懒加载（首写某队列时读一次 alloc/ key）。
@@ -157,6 +162,9 @@ func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, 
 		p.logger.Debug("写入被可写门拒绝", "topic", m.Topic, "queue", m.QueueID, "group", g, "err", err)
 		return nil, fmt.Errorf("写入消息 %s (topic=%s q=%d): %w", m.ID, m.Topic, m.QueueID, err)
 	}
+	if p.afterGateHook != nil {
+		p.afterGateHook(g, epoch)
+	}
 
 	// 段 2（qs.mu）：offset 分配 + 编码 + 落盘。同队列串行（offset 顺序 ==
 	// 落盘顺序，FIFO 根基），跨队列并行（group commit 合并 fsync）。
@@ -186,7 +194,7 @@ func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, 
 		}
 		b.Set(store.KeyIdxKey(m.Topic, key, m.StoreAtMs, m.QueueID, m.Offset), nil)
 	}
-	pending, err := p.rep.ApplyAsync(ctx, g, b)
+	pending, err := p.rep.ApplyAsyncAt(ctx, g, b, epoch)
 	if err != nil {
 		qs.mu.Unlock()
 		return nil, fmt.Errorf("写入消息 %s (topic=%s q=%d off=%d): %w", m.ID, m.Topic, m.QueueID, m.Offset, err)
@@ -203,6 +211,10 @@ func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, 
 	//     重读；而门只在 apply 越过新任期首条后才放行——此时盘上已含上
 	//     任期全部已提交写，重读值不会与任何已确认消息重叠。同任期内被
 	//     丢弃的提案只烧掉 offset（跳号），不重复；
+	//   - 提案经 ApplyAsyncAt 按 epoch 绑定任期：门放行后、入队前若本节点
+	//     失主又以更高任期复任（期间他人可能写过同一队列），本批是用旧
+	//     epoch 缓存构造的，入队/出队核对任期不符即失败，绝不进新任期日志
+	//     （卡 SQ1 计划修订 R1）；
 	//   - 集群档 WaitSync 失败 ≠ Pebble 不可恢复：raft 副本仍持数据，
 	//     offset 分配是 leader-only 构造，本节点重启以 learner 追平即恢复；
 	//   - 单机档 Pebble 真坏（WAL sync 失败 = 不可恢复态）：进程只能重启，
@@ -295,7 +307,7 @@ func (p *Producer) AppendDelay(ctx context.Context, m *core.Message) (*core.Mess
 	b := p.st.NewBatch()
 	b.Set(store.DelayKey(m.DeliverAtMs, seq), raw)
 	b.Set(store.DelayAllocKey(), store.PutU64(seq+1))
-	pending, err := p.rep.ApplyAsync(ctx, g, b)
+	pending, err := p.rep.ApplyAsyncAt(ctx, g, b, epoch)
 	if err != nil {
 		p.delayMu.Unlock()
 		return nil, 0, false, fmt.Errorf("写入延时消息 %s (topic=%s due=%d): %w", m.ID, m.Topic, m.DeliverAtMs, err)
@@ -446,7 +458,7 @@ func (p *Producer) AppendBatch(ctx context.Context, msgs []*core.Message) ([]*co
 	}
 	// alloc 计数器一次写到 off+N，与全部消息同批原子（语义红线 3 的批量形态）
 	b.Set(store.AllocKey(topic, qid), store.PutU64(off+uint64(len(msgs))))
-	pending, err := p.rep.ApplyAsync(ctx, g, b)
+	pending, err := p.rep.ApplyAsyncAt(ctx, g, b, epoch)
 	if err != nil {
 		qs.mu.Unlock()
 		return nil, fmt.Errorf("批量写入 %d 条 (topic=%s q=%d off=%d): %w", len(msgs), topic, qid, off, err)
