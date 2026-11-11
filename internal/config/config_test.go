@@ -792,3 +792,43 @@ func TestStorageConfig(t *testing.T) {
 		}
 	})
 }
+
+// TestConsumeCheckpointInterval S5（卡 SQ4.1）：缺省 1s；0、0s = 逐次复制；
+// 负值或非法时长 Load 即拒且报错含键名与示例；空串（e2e yaml.Marshal 写出
+// 的形态）按缺省 1s；&Config{} 字面量也取 1s。
+func TestConsumeCheckpointInterval(t *testing.T) {
+	cfg, err := Load("")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.ConsumeCheckpoint(); got != time.Second {
+		t.Fatalf("缺省应为 1s，得到 %v", got)
+	}
+	if got := (&Config{}).ConsumeCheckpoint(); got != time.Second {
+		t.Fatalf("字面量构造应为 1s，得到 %v", got)
+	}
+	p := filepath.Join(t.TempDir(), "sq.yaml")
+	for _, c := range []struct {
+		val  string
+		want time.Duration
+	}{{`"0"`, 0}, {"0s", 0}, {`""`, time.Second}, {"250ms", 250 * time.Millisecond}} {
+		os.WriteFile(p, []byte("consume_checkpoint_interval: "+c.val+"\n"), 0o644)
+		cfg, err := Load(p)
+		if err != nil {
+			t.Fatalf("%s 应合法: %v", c.val, err)
+		}
+		if got := cfg.ConsumeCheckpoint(); got != c.want {
+			t.Fatalf("%s 应解析为 %v，得到 %v", c.val, c.want, got)
+		}
+	}
+	for _, bad := range []string{"-1s", "abc"} {
+		os.WriteFile(p, []byte("consume_checkpoint_interval: "+bad+"\n"), 0o644)
+		_, err := Load(p)
+		if err == nil {
+			t.Fatalf("%s 应启动即拒", bad)
+		}
+		if !strings.Contains(err.Error(), "consume_checkpoint_interval") || !strings.Contains(err.Error(), "1s") {
+			t.Fatalf("%s 的报错应含键名与示例: %v", bad, err)
+		}
+	}
+}

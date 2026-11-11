@@ -83,8 +83,15 @@ type Config struct {
 	// 死信队列永远等不到它。
 	AutoRenewMaxDuration   string `yaml:"auto_renew_max_duration"`
 	RetentionCheckInterval string `yaml:"retention_check_interval"` // 过期清理扫描间隔（Go duration 格式）
-	DiskWatermarkPercent   int    `yaml:"disk_watermark_percent"`   // 超过即拒写，0=关闭
-	LogLevel               string `yaml:"log_level"`                // debug|info|warn|error
+	// ConsumeCheckpointInterval 消费状态（位点 + 在外未确认记录）的检查点间隔
+	// （Go duration 格式，卡 SQ4.1）。缺省 1s：取件/确认只改 leader 内存即返回，
+	// 每隔一个间隔整体落盘一次——吞吐高，代价是 leader 崩溃（kill -9 / 断电）
+	// 后约一个间隔内的消费进度丢失，表现为重复投递（不丢消息）。0 = 逐次复制：
+	// 每次取件/确认都等复制落盘后才返回，零重复、吞吐低。正常停机与计划内
+	// 切换领导权前会先做全量检查点，不产生重复。空串按缺省 1s。
+	ConsumeCheckpointInterval string `yaml:"consume_checkpoint_interval"`
+	DiskWatermarkPercent      int    `yaml:"disk_watermark_percent"` // 超过即拒写，0=关闭
+	LogLevel                  string `yaml:"log_level"`              // debug|info|warn|error
 	// —— M5 认证与管理面 ——
 	AdminListen   string `yaml:"admin_listen"`   // Admin HTTP 监听地址，"" = 关闭；默认 :8082
 	AdminUsername string `yaml:"admin_username"` // Admin API 登录用户名（与密码成对，均空 = 免登录）
@@ -295,15 +302,16 @@ func Load(path string) (*Config, error) {
 		AutoCreateTopic: true, DefaultQueueNums: 16, // 16：队列数决定消费并行度（每队列一路消费）；写吞吐自队列内 group commit 后与队列数基本无关
 
 		DefaultMaxAttempts: 16, LogLevel: "info",
-		DefaultInvisibleDuration: "1m",
-		AutoRenewEnabled:         true,
-		AutoRenewMaxDuration:     "10m",
-		RetentionCheckInterval:   "5m",
-		DiskWatermarkPercent:     85,
-		AdminListen:              ":8082",
-		MetricsRetentionHours:    168,
-		TxnCheckInterval:         "30s",
-		TxnMaxChecks:             15,
+		DefaultInvisibleDuration:  "1m",
+		AutoRenewEnabled:          true,
+		AutoRenewMaxDuration:      "10m",
+		RetentionCheckInterval:    "5m",
+		ConsumeCheckpointInterval: "1s",
+		DiskWatermarkPercent:      85,
+		AdminListen:               ":8082",
+		MetricsRetentionHours:     168,
+		TxnCheckInterval:          "30s",
+		TxnMaxChecks:              15,
 	}
 	if path == "" {
 		return cfg, nil
@@ -371,6 +379,11 @@ func Load(path string) (*Config, error) {
 	// 都不能让 retention 任务以 0 间隔空转或整趟跳过，启动时挡住。
 	if d, err := time.ParseDuration(cfg.RetentionCheckInterval); err != nil || d <= 0 {
 		return nil, fmt.Errorf("配置 retention_check_interval 须为正 duration（如 5m），得到 %q", cfg.RetentionCheckInterval)
+	}
+	// consume_checkpoint_interval：0 合法（逐次复制）；负值或拼写错误启动即拒——
+	// 静默回落缺省会让以为关掉了检查点（要零重复）的运维实际跑在检查点模式下。
+	if _, err := parseCheckpointInterval(cfg.ConsumeCheckpointInterval); err != nil {
+		return nil, err
 	}
 	// disk_watermark_percent 必须在 [0,99]：100 意味着"永不触发拒写"却保留着
 	// 拒写逻辑的错觉，99 才是"留 1% 余量"的真实语义；负数/超限是配置笔误，
@@ -556,6 +569,32 @@ func (c *Config) AutoRenewMax() time.Duration {
 	d, err := time.ParseDuration(c.AutoRenewMaxDuration)
 	if err != nil || d <= 0 {
 		return 10 * time.Minute
+	}
+	return d
+}
+
+// parseCheckpointInterval 解析 consume_checkpoint_interval：空串 → 缺省 1s；
+// "0" 或 0 时长 → 0（逐次复制）；负值或非法 → 带键名与示例的错误。
+func parseCheckpointInterval(s string) (time.Duration, error) {
+	if s == "" {
+		return time.Second, nil
+	}
+	if s == "0" {
+		return 0, nil
+	}
+	d, err := time.ParseDuration(s)
+	if err != nil || d < 0 {
+		return 0, fmt.Errorf("配置 consume_checkpoint_interval 须为非负 duration（如 1s；0 = 逐次复制），得到 %q", s)
+	}
+	return d, nil
+}
+
+// ConsumeCheckpoint 解析后的消费状态检查点间隔：0 = 逐次复制模式。解析失败
+// 兜底 1s（Load 已校验；&Config{} 字面量构造时为空串，同样取缺省 1s）。
+func (c *Config) ConsumeCheckpoint() time.Duration {
+	d, err := parseCheckpointInterval(c.ConsumeCheckpointInterval)
+	if err != nil {
+		return time.Second
 	}
 	return d
 }
