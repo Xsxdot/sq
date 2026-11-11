@@ -9,7 +9,11 @@
 // 判据（计划 sq4.2 第 4 节 S1）：
 //   - 全部 ack、无重复、按 offset 有序
 //   - 检查点模式吞吐 ≥ 200 条/秒（单机与集群）
-//   - 逐次模式只报吞吐，另以轮次钩子验「被唤醒」起因占投出轮数 ≥ 90%
+//   - 四档都以轮次钩子验：投出了消息的取件轮中，兜底 tick 起因的占比 ≤ 1%
+//     （主会话 2026-11-12 裁定：首轮无需等待不计未达标——原判据「被唤醒占
+//     投出轮 ≥ 90%」把「Receive 进来时队头已被 ack、首轮直接取到」也算作
+//     未达标，-race 降速下首轮占比升高而误红；唤醒失效的真实形态是投出要
+//     等 tick，故改判 tick 占比）。逐次模式吞吐只报不判
 //
 // 装配复用 sq3_cluster_race_test.go 的 {standalone, cluster} × {checkpoint, perop}。
 package deliver
@@ -24,9 +28,9 @@ import (
 )
 
 const (
-	sq42N         = 500
-	sq42MinRate   = 200.0 // 条/秒，检查点模式硬阈值
-	sq42MinWokeRt = 0.90  // 逐次模式「被唤醒」占投出轮数下限
+	sq42N           = 500
+	sq42MinRate     = 200.0 // 条/秒，检查点模式硬阈值
+	sq42MaxTickRate = 0.01  // tick 起因占投出轮数上限（主会话 2026-11-12 裁定）
 )
 
 func TestSQ42OrderedAckThroughput(t *testing.T) {
@@ -101,22 +105,19 @@ func sq42RunOrderedAck(t *testing.T, s *sq3Stack) {
 	cancel()
 	rate := float64(sq42N) / el.Seconds()
 	woke, delivered := rounds.snapshot()
-	ratio := 0.0
-	if delivered > 0 {
-		ratio = float64(woke) / float64(delivered)
-	}
 	first, tick := rounds.causes()
-	t.Logf("[SQ42-S1] %s: %d 条用时 %v，吞吐 %.1f 条/秒；投出轮 %d，其中被唤醒 %d（%.1f%%）、首轮 %d、tick %d",
-		t.Name(), sq42N, el.Round(time.Millisecond), rate, delivered, woke, ratio*100, first, tick)
-
-	if strings.Contains(t.Name(), "checkpoint") {
-		if rate < sq42MinRate {
-			t.Fatalf("检查点模式吞吐 %.1f 条/秒 < %.0f", rate, sq42MinRate)
-		}
-		return
+	tickRate := 1.0
+	if delivered > 0 {
+		tickRate = float64(tick) / float64(delivered)
 	}
-	if ratio < sq42MinWokeRt {
-		t.Fatalf("逐次模式被唤醒占比 %.1f%% < %.0f%%（投出轮 %d，被唤醒 %d）",
-			ratio*100, sq42MinWokeRt*100, delivered, woke)
+	t.Logf("[SQ42-S1] %s: %d 条用时 %v，吞吐 %.1f 条/秒；投出轮 %d：被唤醒 %d、首轮 %d、tick %d（tick 占 %.1f%%）",
+		t.Name(), sq42N, el.Round(time.Millisecond), rate, delivered, woke, first, tick, tickRate*100)
+
+	if tickRate > sq42MaxTickRate {
+		t.Errorf("tick 起因占投出轮 %.1f%% > %.0f%%（投出轮 %d，tick %d）：投出在等兜底轮询，唤醒未生效",
+			tickRate*100, sq42MaxTickRate*100, delivered, tick)
+	}
+	if strings.Contains(t.Name(), "checkpoint") && rate < sq42MinRate {
+		t.Errorf("检查点模式吞吐 %.1f 条/秒 < %.0f", rate, sq42MinRate)
 	}
 }
