@@ -11,11 +11,10 @@
 package core
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	cryptorand "crypto/rand"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"math/rand/v2"
 )
 
 // BodyEncoding 消息体的编码/压缩方式。
@@ -93,11 +92,44 @@ type Message struct {
 	DeliveryAttempt int32 `json:"-"`
 }
 
-// NewMessageID 生成 32 位大写十六进制消息 ID（16 随机字节）。
+// upperHex 大写十六进制字母表：直接按它编码，省掉 hex 编码后再 ToUpper 的二次分配。
+const upperHex = "0123456789ABCDEF"
+
+// NewMessageID 生成 32 位大写十六进制消息 ID（128 位随机），每次只分配结果字符串。
+//
+// 随机源用 math/rand/v2 的全局函数（运行时 ChaCha8 源，由操作系统熵播种、
+// 每个 M 独立无锁）而非 crypto/rand：ID 只要求全局唯一、不要求抗预测（不作
+// 凭据用——receipt handle 另有 HMAC 签名），而 crypto/rand 在 macOS 上走
+// 带全局锁的 arc4random，剖析中占写入路径约三分之一 CPU（SQ4.6）。
+//
+// 注意：不可用于凭据——math/rand/v2 官方不保证输出适合安全敏感用途。
+// 凭据类 ID（持有即可决断的句柄）用 NewTransactionID。
 func NewMessageID() string {
-	b := make([]byte, 16)
-	rand.Read(b) // crypto/rand 在受支持平台不会失败
-	return strings.ToUpper(hex.EncodeToString(b))
+	var buf [32]byte
+	for half := 0; half < 2; half++ {
+		v := rand.Uint64()
+		for i := 0; i < 16; i++ {
+			buf[half*16+i] = upperHex[v>>60]
+			v <<= 4
+		}
+	}
+	return string(buf[:])
+}
+
+// NewTransactionID 生成事务 ID（32 位大写十六进制，128 位 crypto/rand 随机）。
+//
+// 与 NewMessageID 格式相同但随机源不同：EndTransaction 只凭 txID 决断事务、
+// 无属主校验，txID 实为凭据，必须不可预测。事务是低频路径，crypto/rand 的
+// 开销（macOS arc4random 全局锁）可忽略。
+func NewTransactionID() string {
+	var raw [16]byte
+	cryptorand.Read(raw[:]) // Go 1.24+ crypto/rand.Read 失败即进程崩溃，不返回错误
+	var buf [32]byte
+	for i, b := range raw {
+		buf[2*i] = upperHex[b>>4]
+		buf[2*i+1] = upperHex[b&0x0F]
+	}
+	return string(buf[:])
 }
 
 // InflightState 已投未确认消息的持久状态（inflight key 的 value）。
