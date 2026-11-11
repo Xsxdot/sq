@@ -600,25 +600,26 @@ func loadYAML(t *testing.T, body string) (*Config, error) {
 	return Load(p)
 }
 
-// TestMessageEncodingDefault 缺省必须是 json：binary 只能显式开启。
+// TestMessageEncodingDefault 缺省是 binary（SQ4.7）；json 只能显式写出。
 //
-// 为什么默认值本身值得钉一条用例：这个默认值是「升级不改配置就零风险」
-// 的全部依据。若某次重构把默认翻成 binary，升级后混版集群里旧节点立刻
-// 解不开新节点转发的消息，而单元测试全绿——只有直接断言默认值拦得住。
+// 为什么默认值本身值得钉一条用例：binary 省掉 base64 膨胀与 JSON 编解码，
+// 是写入路径的默认性能档；而默认值翻动直接决定升级后的盘上格式与混跑
+// 边界（v0.1.0 之前的版本解不开 binary），只有直接断言默认值拦得住
+// 无意的回退或翻转。
 func TestMessageEncodingDefault(t *testing.T) {
 	cfg, err := Load("")
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.MessageEncoding != "json" {
-		t.Fatalf("message_encoding 默认值 = %q, 应为 json", cfg.MessageEncoding)
+	if cfg.MessageEncoding != "binary" {
+		t.Fatalf("message_encoding 默认值 = %q, 应为 binary", cfg.MessageEncoding)
 	}
 }
 
 // TestMessageEncodingOverrideAndValidation 覆盖生效 + 非法值启动即拒。
 //
-// 非法值必须挡在启动期：静默回落默认档会让运维以为 binary 已生效，
-// 而盘上格式与预期不符是事后极难察觉的偏差（数据没坏，只是没省下）。
+// 非法值必须挡在启动期：静默回落默认档会让运维以为所配档位已生效，
+// 而盘上格式与预期不符是事后极难察觉的偏差。
 func TestMessageEncodingOverrideAndValidation(t *testing.T) {
 	write := func(t *testing.T, body string) string {
 		t.Helper()
@@ -629,11 +630,12 @@ func TestMessageEncodingOverrideAndValidation(t *testing.T) {
 		return p
 	}
 
-	cfg, err := Load(write(t, "message_encoding: binary\n"))
+	// 缺省已是 binary，覆盖用 json 才验得出「显式写 json 的部署行为不变」
+	cfg, err := Load(write(t, "message_encoding: json\n"))
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	if cfg.MessageEncoding != "binary" {
+	if cfg.MessageEncoding != "json" {
 		t.Fatalf("覆盖未生效: %q", cfg.MessageEncoding)
 	}
 

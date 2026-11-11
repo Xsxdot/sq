@@ -22,7 +22,7 @@
 | `advertise_host` / `advertise_port` | `127.0.0.1` / `8081` | 路由响应中的对外地址 |
 | `data_dir` | `./data` | Pebble 数据目录 |
 | `fsync` | `sync` | `sync` 或 `async` 写盘档位 |
-| `message_encoding` | `json` | `json` 或 `binary` 落盘编码 |
+| `message_encoding` | `binary` | `binary` 或 `json` 落盘编码；读方向始终两种都认 |
 | `auto_create_topic` | `true` | 未知 topic 是否自动创建 |
 | `default_queue_nums` | `16` | 自动创建 topic 的队列数 |
 | `default_max_attempts` | `16` | 新消费组的最大投递次数 |
@@ -39,7 +39,7 @@
 | `txn_check_interval` | `30s` | 半消息回查间隔 |
 | `txn_max_checks` | `15` | 单条半消息最大回查次数 |
 
-`credentials` 中每项包含可选的 `name`、成对的 `access_key` 和 `secret_key`。AK 全局唯一；Admin 用户名和密码必须成对设置。`message_encoding: binary` 的集群升级顺序见 [部署说明](deployment.md#内部部署历史)。
+`credentials` 中每项包含可选的 `name`、成对的 `access_key` 和 `secret_key`。AK 全局唯一；Admin 用户名和密码必须成对设置。`message_encoding` 缺省为 `binary`，与旧版本混跑的边界见 [部署说明](deployment.md#内部部署历史)。
 
 ## 集群配置
 
