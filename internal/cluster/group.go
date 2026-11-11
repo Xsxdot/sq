@@ -199,6 +199,16 @@ type group struct {
 	// pq 是本组的保序提案队列（proposer.go），proposer 协程随 run 启停。
 	pq *proposalQueue
 
+	// 可写门（writegate.go，卡 SQ1）：gate 只由 Ready 循环切换
+	// （observeTermStart）；gateCh 是等待者的广播 channel（gateMu 护
+	// 换新），gateWaiters 是在等人数（0 时 gateKick 零开销）；writableWait
+	// 是单次等待上限（Manager 经 Options.WritableWaitTimeout 覆盖）。
+	gate         atomic.Pointer[gateState]
+	gateMu       sync.Mutex
+	gateCh       chan struct{}
+	gateWaiters  atomic.Int32
+	writableWait time.Duration
+
 	// confState 是当前成员表（rn.ApplyConfChange 的返回值，ConfChange
 	// apply 时同步更新）。重启时由 newGroup 从持久化值初始化（见
 	// newGroup）；Task 4 的 Storage.Snapshot() 现场取用它生成快照。
@@ -315,8 +325,11 @@ func newGroup(g uint32, selfID uint64, storage *raft.MemoryStorage, snaps *snapR
 		readWaiters:    make(map[uint64]*readWait),
 		doneCh:         make(chan struct{}),
 		pq:             newProposalQueue(),
+		gateCh:         make(chan struct{}),
+		writableWait:   defaultWritableWait,
 	}
 	gr.epoch.Store(&epochState{})
+	gr.gate.Store(&gateState{})
 	// 提案 id 用时间戳做种子（终审 R4）：干净重启后计数器从远离旧值
 	// 的位置继续，配合条目头的提案者校验双保险——旧进程的等待者已随
 	// 进程消亡，新进程的 id 空间不得与旧进程重叠（否则重启回零是
@@ -562,11 +575,13 @@ func (gr *group) dispatchReady(ctx context.Context, rd raft.Ready) {
 	// 任期观测先于 SoftState 处理（proposer.go observeTerm）：钩子与入队
 	// 看到的必须是当选任期，而不是 persistPhase 才更新的 lastTerm。
 	gr.observeTerm(ctx, &rd)
-	// 4. leader 变更观测：SoftState 变化是切换的第一信号。
-	//    顺序即屏障（batch③ 评审 m1）：先跑钩子（同步失效计数器缓存），
-	//    再让 lead.Store 把 leader 身份对外可见。反过来会留下
-	//    「IsLeader 已放行、缓存尚未失效」的窗口，并发 Append 拿到
-	//    陈旧 offset 覆写已 quorum 提交的消息。
+	// 4. leader 变更观测：SoftState 变化是切换的第一信号。先跑钩子，再让
+	//    lead.Store 把 leader 身份对外可见。
+	//
+	//    这里**不是** leader-only 构造的屏障：IsLeader 放行时本地 FSM 可能
+	//    还没 apply 完上任期已提交的尾部（钩子失效计数器缓存也挡不住——
+	//    重读的就是滞后的盘，卡 SQ1）。屏障由下面第 5 步的可写门承担：
+	//    leader-only 构造一律先过 waitWritable。
 	if rd.SoftState != nil {
 		gr.notifyLeaderChange(rd.SoftState.Lead)
 		// 领导权快照切换夹在钩子与 lead.Store 之间：失去领导权时本任期
@@ -575,6 +590,9 @@ func (gr *group) dispatchReady(ctx context.Context, rd raft.Ready) {
 		gr.lead.Store(rd.SoftState.Lead)
 		gr.lg.Info("组 leader 变更", "lead", rd.SoftState.Lead, "term", gr.currentTerm())
 	}
+	// 5. 可写门（writegate.go）：在 epoch 切换之后识别本任期首条 / 失去
+	//    领导权时关门。termStart 晚于 lead.Store 可见只会让门多关一会儿。
+	gr.observeTermStart(&rd)
 }
 
 // enqueueLocal 把一条本地存储消息可靠投递进指定阶段通道，返回是否成功。
@@ -901,6 +919,8 @@ func (gr *group) applyOnce(ctx context.Context, m *raftpb.Message) {
 	// 读屏障放行必须晚于 apply：applied 是本批 apply 推进的，早于它扫描
 	// 只会白扫一遍，屏障要多等一整批才放行。
 	gr.notifyReadWaiters(gr.applied.Load())
+	// 可写门：applied 推进可能越过本任期首条（无等待者时零开销）
+	gr.gateKick()
 }
 
 // deliverResponses 投递一条本地存储消息的响应集合。
@@ -1213,6 +1233,8 @@ func (gr *group) installSnapshot(ctx context.Context, snap *raftpb.Snapshot) err
 		gr.confState.Store(cs)
 	}
 	gr.applyMu.Unlock()
+	// applied 跳到快照位点：唤醒可写门等待者（同 applyOnce 末尾）
+	gr.gateKick()
 	// e2e 用这条日志当快照路径证据（文案不许改，见
 	// TestLaggingFollowerCatchesUpBySnapshot 的 countLog 断言）
 	gr.lg.Info("快照安装完成", "g", gr.g, "snap_id", desc.ID, "index", idx,
