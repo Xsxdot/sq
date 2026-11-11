@@ -307,7 +307,7 @@ func NewCluster(m *cluster.Manager) *Cluster {
 
 // reserveProposal 把批次字节拷进「预留 cluster.ProposalHeaderLen 提案头」
 // 的新缓冲——单拷贝契约的调用方半边（另一半见 cluster.ProposalHeaderLen
-// 与 Manager.ProposeReserved 注释）：前 16B 留白由 group.propose 回填
+// 与 Manager.ProposeReserved 注释）：前 16B 留白由 cluster 的 proposer（proposer.go）回填
 // 提案者/waiter id，本函数不写它们；缓冲所有权随 ProposeReserved 移交
 // raft，构造后本包不再读写。
 //

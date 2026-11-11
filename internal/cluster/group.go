@@ -1566,7 +1566,7 @@ func (gr *group) notifyApplied(data []byte) {
 //
 // 单拷贝契约（与 replication.Cluster.Apply/ApplyAsync 互引）：调用方
 // 构造 data 时必须预留前 ProposalHeaderLen 字节（内容任意，通常为零），
-// 载荷从 data[ProposalHeaderLen:] 开始；group.propose 只回填这 16B，
+// 载荷从 data[ProposalHeaderLen:] 开始；proposer（proposer.go proposeOne）只回填这 16B，
 // 不再二次分配拷贝。这样批次字节从 store.Batch.Repr 到 raft 日志条目
 // 全程只发生一次 memcpy（消息体上限 4MB，第二次整拷不可忽略）。
 const ProposalHeaderLen = 16
