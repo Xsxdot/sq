@@ -66,12 +66,17 @@ func waitErr(t *testing.T, errc <-chan error) error {
 	}
 }
 
+// openTestLog 打开日志并以 t.Cleanup 注册 Close（Close 幂等）。不用 defer：
+// 失败路径上 defer 先于 Cleanup 执行，若此时 Sync 仍被钩子挡在锁内（变异
+// 场景），defer 的 Close 会抢锁死等；Cleanup 按 LIFO 执行，blockSync 后
+// 注册的 release 一定先于这里的 Close，失败即快速报红而不是挂到超时。
 func openTestLog(t *testing.T, dir string) *Log {
 	t.Helper()
 	l, _, _, err := Open(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(func() { l.Close() })
 	return l
 }
 
@@ -79,7 +84,6 @@ func openTestLog(t *testing.T, dir string) *Log {
 // （含 HS）必须照常返回。
 func TestSyncDoesNotBlockAppend(t *testing.T) {
 	l := openTestLog(t, t.TempDir())
-	defer l.Close()
 	if err := l.Append(hs(1, 1, 0), []*raftpb.Entry{ent(1, 1, "a")}, false); err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +125,6 @@ func TestSyncPreemptedByRotationReturnsNil(t *testing.T) {
 
 	dir := t.TempDir()
 	l := openTestLog(t, dir)
-	defer l.Close()
 	if err := l.Append(hs(1, 1, 0), []*raftpb.Entry{ent(1, 1, "a")}, false); err != nil {
 		t.Fatal(err)
 	}
@@ -188,7 +191,30 @@ func TestRotateConcurrentWithSyncNoLoss(t *testing.T) {
 
 	const total = 5000
 	dir := t.TempDir()
-	l := openTestLog(t, dir)
+	rec := &recordHandler{}
+	l, _, _, err := Open(dir, slog.New(rec))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { l.Close() })
+	// 拉宽「已取句柄、未落盘」窗口：不拉宽时锁外窗口只有几条指令，并发几乎
+	// 撞不上「句柄被轮转关闭」这条分支，压测就测不到它。钩子等到下一次轮转
+	// 发生（或 20ms 上限）再放行落盘，让多数 Sync 都与轮转撞车。
+	l.syncHook = func() {
+		l.mu.Lock()
+		seq := l.activeSeq
+		l.mu.Unlock()
+		deadline := time.Now().Add(20 * time.Millisecond)
+		for time.Now().Before(deadline) {
+			l.mu.Lock()
+			rotated := l.activeSeq != seq
+			l.mu.Unlock()
+			if rotated {
+				return
+			}
+			time.Sleep(100 * time.Microsecond)
+		}
+	}
 
 	data := func(i uint64) string { return fmt.Sprintf("payload-%06d", i) }
 
@@ -243,6 +269,12 @@ func TestRotateConcurrentWithSyncNoLoss(t *testing.T) {
 	}
 	t.Logf("段数 %d，并发 Sync %d 次", len(segs), syncs)
 
+	collided := rec.countMsg(slog.LevelDebug, "Sync 句柄被轮转关闭")
+	if collided == 0 {
+		t.Fatal("压测期间没有一次 Sync 与轮转撞车，未覆盖「被轮转关闭」分支")
+	}
+	t.Logf("Sync 与轮转撞车 %d 次", collided)
+
 	_, gotHS, gotEnts, err := Open(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
@@ -260,4 +292,17 @@ func TestRotateConcurrentWithSyncNoLoss(t *testing.T) {
 	if gotHS.GetTerm() != lastHS.GetTerm() || gotHS.GetVote() != lastHS.GetVote() || gotHS.GetCommit() != lastHS.GetCommit() {
 		t.Fatalf("重开 HS = %v; want %v", gotHS, lastHS)
 	}
+}
+
+// countMsg 统计指定级别、消息包含 sub 的记录条数。
+func (h *recordHandler) countMsg(lv slog.Level, sub string) int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	n := 0
+	for _, r := range h.records {
+		if r.Level == lv && strings.Contains(r.Message, sub) {
+			n++
+		}
+	}
+	return n
 }
