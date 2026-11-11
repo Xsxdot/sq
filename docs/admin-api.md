@@ -23,8 +23,8 @@ curl -H "Authorization: Bearer $TOKEN" localhost:8082/admin/topics
 | GET/PATCH/DELETE | `/admin/topics/{name}` | 查看、修改 retention 或删除 topic |
 | GET | `/admin/groups` | 消费组列表 |
 | GET | `/admin/groups/{name}` | 查看组详情 |
-| POST | `/admin/groups/{name}/reset-cursor` | 重置指定 topic/queue 的消费位点 |
-| DELETE | `/admin/groups/{name}` | 删除消费组 |
+| POST | `/admin/groups/{name}/reset-cursor` | 重置指定 topic/queue 的消费位点；返回错误（含超时）时结局未知，须重试直至成功 |
+| DELETE | `/admin/groups/{name}` | 删除消费组；返回错误（含超时）时结局未知，须重试直至成功 |
 | GET | `/admin/messages` | 按 key 检索，或按 topic/queue 顺序浏览 |
 | POST | `/admin/messages/send` | 发送测试消息，支持普通、延时和顺序字段 |
 | POST | `/admin/dlq/{group}/resend` | 按队列和 offset 重发死信 |

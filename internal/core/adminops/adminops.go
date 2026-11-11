@@ -112,12 +112,15 @@ func PurgeTopicData(ctx context.Context, rep replication.Replicator, rt replicat
 // 枚举 (topic,qid)：pebble 的 cursor/{group}/ 与 inflight/{group}/ 两族扫描
 // （只扫 cursor 会漏掉「有 inflight 无 cursor」的队列）∪ 注册表全部 topic×队列
 // （消费状态的权威在 leader 内存，可能有尚未落盘的队列，卡 SQ4.1）。逐
-// (topic,qid) 一个批次（该队列两个前缀的 DeleteRange，同组键族同批）。
+// raft 组一个批次（含该组全部队列两个前缀的 DeleteRange，同组键族同批）。
 //
 // 提交（计划 P2）：消费状态批次必须经 deliver 的管理入口——本节点是该组
 // leader 时 cs.ApplyAdminBatch（取队列锁、失效内存态、同步提交）；否则转发给
 // 该组 leader，leader 侧控制处理器同样改走 ApplyAdminBatch。直接 rep.Apply
 // 会被未失效的内存态在下一次提交时写回。
+//
+// 返回错误（含超时）时结局未知，调用方须重试直至成功（见
+// deliver.ApplyAdminBatch 注释）。
 //
 // 调用顺序契约与 PurgeTopicData 同理：先 Purge 再 meta.DeleteGroup。
 func PurgeGroupData(ctx context.Context, rep replication.Replicator, rt replication.Router,
@@ -157,24 +160,39 @@ func PurgeGroupData(ctx context.Context, rep replication.Replicator, rt replicat
 			set[tq{tc.Name, q}] = struct{}{}
 		}
 	}
+	// 按 raft 组合批：每组一个批次，含该组全部队列的两个前缀 DeleteRange
+	// （同组键族同批，一组一次复制往返；队列数多时不逐队列串行复制）
+	byG := map[uint32]*store.Batch{}
+	var order []uint32
 	for k := range set {
-		b := st.NewBatch()
+		g := rt.GroupForQueue(k.topic, k.qid)
+		b, ok := byG[g]
+		if !ok {
+			b = st.NewBatch()
+			byG[g] = b
+			order = append(order, g)
+		}
 		ck := store.CursorKey(group, k.topic, k.qid)
 		b.DeleteRange(ck, store.PrefixUpperBound(ck))
 		ik := store.InflightPrefix(group, k.topic, k.qid)
 		b.DeleteRange(ik, store.PrefixUpperBound(ik))
-		g := rt.GroupForQueue(k.topic, k.qid)
+	}
+	for i, g := range order {
 		var err error
 		if rt.IsLeader(g) {
-			err = cs.ApplyAdminBatch(ctx, g, b)
+			err = cs.ApplyAdminBatch(ctx, g, byG[g])
 		} else {
-			err = forwardBatch(ctx, fwd, g, b, logger)
+			err = forwardBatch(ctx, fwd, g, byG[g], logger)
 		}
 		if err != nil {
-			return fmt.Errorf("清理 group %s %s/q%d 数据: %w", group, k.topic, k.qid, err)
+			// 未提交的批次自行回收；失败批次归属同 Apply/转发契约，不再 Close
+			for _, og := range order[i+1:] {
+				byG[og].Close()
+			}
+			return fmt.Errorf("清理 group %s 组 %d 数据（超时须重试）: %w", group, g, err)
 		}
 	}
-	logger.Info("消费组数据已清理", "group", group, "queues", len(set), "queues_on_disk", onDisk)
+	logger.Info("消费组数据已清理", "group", group, "queues", len(set), "queues_on_disk", onDisk, "raft_groups", len(order))
 	return nil
 }
 
