@@ -1,19 +1,34 @@
 // seglog.go 提供单个 raft 组的分段追加日志实现：段扫描恢复、追加、
-// fsync 与关闭。
+// fsync、关闭与按 index 的随机读（卡 SQ4.10 冷区）。
 //
 // 职责：
-//   - Open 时按序扫描全部段文件，重放出连续的 HardState + Entry 状态
-//   - Append 把一轮 Ready 的 HardState/Entries 编码为帧写入活动段
+//   - Open 时按序扫描全部段文件，按「后写的赢」重建 HardState 与读索引
+//     （连续段 run + 检查点 + 任期变化点），不在内存里累积条目本体
+//   - Append 把一轮 Ready 的 HardState/Entries 编码为帧写入活动段，并以
+//     与 Open 扫描同一个函数（noteEntry）维护读索引
+//   - ReadEntries/Term：按 index 区间读回条目、按 index 查任期（raft 冷区
+//     读路径，调用方是 cluster.groupStorage）
 //   - 处理掉电导致的 torn tail（仅末段合法）与非末段真损坏（拒绝启动）
 //
 // 边界：
-//   - 不提供随机读接口：raft 侧读日志走 MemoryStorage 双记账（spec §3）
+//   - 盘上格式（帧、段命名）不因读路径改变：读索引全部是内存派生结构，
+//     重启由 Open 扫描重建
+//   - 读路径只保证「已写入文件的条目」可读；条目是否已提交、是否会被换届
+//     改写由调用方保证（cluster 侧不变式 I-cold：冷区只读 index ≤ applied
+//     的条目，已提交条目永不被改写）
+//   - 锁纪律（与 SQ4.4 锁外刷盘一致）：读路径锁内只取索引快照与段的已写
+//     长度，打开文件与 ReadAt 全在锁外，用独立只读句柄——不与 Append 争锁
+//     做 I/O，轮转关闭写句柄也不影响读句柄
 package seglog
 
 import (
+	"bufio"
+	"encoding/binary"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"sort"
@@ -63,6 +78,20 @@ type Log struct {
 	// 读不回来。非 Linux 平台、以及 fallocate 返回 ENOTSUP 的文件系统上
 	// 恒为 false，落盘全程走完整 fsync，行为与本特性落地之前一致。
 	prealloc bool
+	// 读索引（卡 SQ4.10）：runs/terms/segBytes 由 noteEntry（Open 扫描与
+	// Append 共用）、maybeRotate、TruncateTo 维护，全部受 mu 保护。
+	//
+	// runs 按 first 升序、区间互不重叠：一个 run = 同一段文件内一串 index
+	// 连续的有效条目。换届改写（新条目 index ≤ 当前尾）把 ≥ 该 index 的旧
+	// run 丢弃或裁短——与 Open 重放的「后写的赢」同一规则、同一函数。
+	runs []run
+	// terms 任期变化点（index 升序）：某 index 的任期 = 最后一个起点 ≤ 它
+	// 的变化点的任期。只对 runs 覆盖的 index 有意义（查询先核覆盖）。
+	terms []termPoint
+	// segBytes 已关闭段的逻辑字节数（读上界与按字节保留的计算输入）；
+	// 活动段的读上界是 activeSize。
+	segBytes map[uint64]int64
+	offs     []int64 // Append 的逐条帧偏移暂存（复用减分配）
 	// syncHook 测试专用注入钩子（生产恒为 nil）：Sync 释放 l.mu 之后、
 	// 发起落盘系统调用之前调用一次，让同包测试把 Sync 停在「已取句柄、
 	// 未落盘」这一点，确定性地制造与 Append/轮转/Close 的并发交错。
@@ -138,26 +167,32 @@ func mkdirAllSync(dir string) error {
 // 打开末段续写。
 //
 // 返回：
-//   - Log: 就绪的日志（尾部定位在最后一条好帧之后）
+//   - Log: 就绪的日志（尾部定位在最后一条好帧之后）；「后写的赢」重放
+//     后的条目经 ReadEntries/Term 按需读，FirstIndex/LastIndex 给出范围
 //   - hs: 恢复出的最新 HardState；从未写过时为 nil
-//   - ents: 「后写的赢」重放后的连续条目序列（升序）；可能为空
 //   - err: 非末段坏帧（真损坏，非 torn write）或 I/O 错误
+//
+// 内存：扫描逐帧解码后只留读索引（每段 / 每次改写 / 每约 1MiB 一项），
+// 不留条目本体——内存不随日志保留量线性增长（卡 SQ4.10 S3）。
 //
 // 注意：末段的 torn tail（掉电正常形态）在此被物理截断到好帧边界后
 // 继续——绝不静默保留坏字节，否则续写会接在坏帧后面永远读不回。
-func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry, error) {
+func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, error) {
 	if err := mkdirAllSync(dir); err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	seqs, err := scanSegSeqs(dir)
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
+	// idx 承载扫描期的读索引：与运行期同一个 noteEntry 维护（Open 重建的
+	// 索引与运行期逐字一致，见 noteEntry 注释）
+	idx := &Log{segBytes: make(map[uint64]int64)}
 	var (
 		hs        *raftpb.HardState
-		ents      []*raftpb.Entry
+		scanned   int // 扫描解码的 entry 帧数（含被改写的旧版本），仅用于日志
 		lastIndex uint64
 		segMax    = make(map[uint64]uint64)
 		tornInfo  string // 非空表示发生了 torn 截断，写入 Info 日志用
@@ -179,7 +214,7 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 		path := filepath.Join(dir, name)
 		data, err := os.ReadFile(path)
 		if err != nil {
-			return nil, nil, nil, fmt.Errorf("seglog: 读段 %s 失败: %w", name, err)
+			return nil, nil, fmt.Errorf("seglog: 读段 %s 失败: %w", name, err)
 		}
 
 		if !isLast {
@@ -203,7 +238,7 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 					// 非末段出现坏帧：真损坏（写入方 bug 或位腐），不是掉电的
 					// 正常形态——掉电只可能截断当时的活动段（即最后一段）。
 					// 拒绝启动比静默丢数据安全。
-					return nil, nil, nil, fmt.Errorf(
+					return nil, nil, fmt.Errorf(
 						"seglog: 段 %s 偏移 %d 帧损坏且非末段——真损坏，拒绝启动", name, off)
 				}
 				// 末段坏帧：两种成因，必须分开记。
@@ -217,7 +252,7 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 				discarded := len(data) - off
 				zeroTail := allZero(data[off:])
 				if err := os.Truncate(path, int64(off)); err != nil {
-					return nil, nil, nil, fmt.Errorf("seglog: 截断段 %s 到偏移 %d 失败: %w", name, off, err)
+					return nil, nil, fmt.Errorf("seglog: 截断段 %s 到偏移 %d 失败: %w", name, off, err)
 				}
 				if zeroTail {
 					lg.Debug("seglog: 预分配零尾，截断到逻辑末尾",
@@ -235,51 +270,44 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 				var e raftpb.Entry
 				if uerr := proto.Unmarshal(payload, &e); uerr != nil {
 					if !isLast {
-						return nil, nil, nil, fmt.Errorf(
+						return nil, nil, fmt.Errorf(
 							"seglog: 段 %s 偏移 %d entry 解码失败且非末段——真损坏，拒绝启动: %w", name, off, uerr)
 					}
 					// CRC 校验通过但内容解码失败：写入方 bug 或位腐，按 torn
 					// 处理（末段才容忍），截断丢弃。
 					discarded := len(data) - off
 					if err := os.Truncate(path, int64(off)); err != nil {
-						return nil, nil, nil, fmt.Errorf("seglog: 截断段 %s 到偏移 %d 失败: %w", name, off, err)
+						return nil, nil, fmt.Errorf("seglog: 截断段 %s 到偏移 %d 失败: %w", name, off, err)
 					}
 					lg.Warn("seglog: 末段 entry 解码失败，按 torn 截断到好帧边界",
 						"segment", name, "goodOffset", off, "discardedBytes", discarded)
 					tornInfo = name
 					break scan // 文件已物理截断到 off，不能再按 len(data) 继续扫描
 				}
-				idx := e.GetIndex()
-				// 后写的赢：新条目 index <= 当前已知 lastIndex，说明发生了
-				// 换届回退重写，之前收集的 [idx, lastIndex] 区间条目已失效，
-				// 截掉后再 append 新条目。条目升序写入、回退距离通常很短，
-				// 线性回退足够（无需二分）。
-				if idx <= lastIndex {
-					cut := len(ents)
-					for cut > 0 && ents[cut-1].GetIndex() >= idx {
-						cut--
-					}
-					ents = ents[:cut]
-				}
-				ents = append(ents, &e)
-				lastIndex = idx
+				ei := e.GetIndex()
+				// 后写的赢：新条目 index <= 当前已知尾，说明发生了换届回退
+				// 重写，[ei, 旧尾] 区间的旧条目已失效——noteEntry 裁掉它们的
+				// 读索引后再登记新条目（与 Append 同一函数）。
+				idx.noteEntry(seq, int64(off), ei, e.GetTerm())
+				scanned++
+				lastIndex = ei
 				// 段内最大 entry index：随着本段扫描推进单调覆盖写入，最终
 				// 落在「本段物理上最后一条 entry 帧」的 index。若本段内部
 				// 也发生过换届冲突重写（同段内先写 7..10 又写 7'），最终值
-				// 就是冲突后幸存的那条（7），天然与上面的 ents 截断结果一致，
+				// 就是冲突后幸存的那条（7），天然与 noteEntry 的读索引裁剪结果一致，
 				// 不会偏高。跨段冲突（重写发生在更晚的段）不会回头修正本段
 				// 已经落定的值——那种情况下这里会偏高，见 segMax 字段注释。
-				segMax[seq] = idx
+				segMax[seq] = ei
 			case recHardState:
 				var h raftpb.HardState
 				if uerr := proto.Unmarshal(payload, &h); uerr != nil {
 					if !isLast {
-						return nil, nil, nil, fmt.Errorf(
+						return nil, nil, fmt.Errorf(
 							"seglog: 段 %s 偏移 %d hardstate 解码失败且非末段——真损坏，拒绝启动: %w", name, off, uerr)
 					}
 					discarded := len(data) - off
 					if err := os.Truncate(path, int64(off)); err != nil {
-						return nil, nil, nil, fmt.Errorf("seglog: 截断段 %s 到偏移 %d 失败: %w", name, off, err)
+						return nil, nil, fmt.Errorf("seglog: 截断段 %s 到偏移 %d 失败: %w", name, off, err)
 					}
 					lg.Warn("seglog: 末段 hardstate 解码失败，按 torn 截断到好帧边界",
 						"segment", name, "goodOffset", off, "discardedBytes", discarded)
@@ -293,6 +321,8 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 		}
 		if isLast {
 			activeLogicalEnd = int64(off)
+		} else {
+			idx.segBytes[seq] = int64(off)
 		}
 	}
 
@@ -310,7 +340,7 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 	// 平台走同一条写路径——未预分配时 WriteAt(activeSize) 与顺序追加等价。
 	f, err := os.OpenFile(activePath, os.O_WRONLY|os.O_CREATE, 0o644)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("seglog: 打开活动段 %s 失败: %w", segName(activeSeq), err)
+		return nil, nil, fmt.Errorf("seglog: 打开活动段 %s 失败: %w", segName(activeSeq), err)
 	}
 	if createdFirstSeg {
 		// 首段的目录项必须在这里就落盘，不能等到有人 Append+fsync 文件内容。
@@ -322,7 +352,7 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 		// 而不是留给调用方补。
 		if err := syncDir(dir); err != nil {
 			f.Close()
-			return nil, nil, nil, err
+			return nil, nil, err
 		}
 	}
 	// 活动段自身不计入 segMax（segMax 只记「已关闭」段），delete 掉活动段号
@@ -338,6 +368,9 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 		lastIndex:  lastIndex,
 		lastHS:     hs,
 		segMax:     segMax,
+		runs:       idx.runs,
+		terms:      idx.terms,
+		segBytes:   idx.segBytes,
 	}
 
 	// 活动段补分配。必须在 l 构造完成、activeSize 已定之后——顺序写反
@@ -349,7 +382,7 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 	// 不改变文件大小」这个前提。
 	if err := l.preallocActive(); err != nil {
 		f.Close()
-		return nil, nil, nil, err
+		return nil, nil, err
 	}
 
 	commit := uint64(0)
@@ -357,11 +390,11 @@ func Open(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry
 		commit = hs.GetCommit()
 	}
 	lg.Info("seglog: 打开完成",
-		"segments", len(seqs), "entries", len(ents), "lastIndex", lastIndex,
+		"segments", len(seqs), "entries", scanned, "runs", len(l.runs), "firstIndex", l.firstIndexLocked(), "lastIndex", lastIndex,
 		"hsCommit", commit, "tornTruncated", tornInfo != "", "tornSegment", tornInfo,
 		"prealloc", l.prealloc)
 
-	return l, hs, ents, nil
+	return l, hs, nil
 }
 
 // scanSegSeqs 列出 dir 下全部 *.seg 文件的序号，按数值序升序返回。
@@ -432,6 +465,7 @@ func (l *Log) Append(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) erro
 	// 分配 + 一次拷贝；盘上帧格式与 appendFrame 逐字节相同（见
 	// appendFrameMarshal 注释与对照测试），Open 扫描回读不受影响。
 	l.buf = l.buf[:0]
+	l.offs = l.offs[:0]
 	var err error
 	if hs != nil {
 		if l.buf, err = appendFrameMarshal(l.buf, recHardState, hs); err != nil {
@@ -439,6 +473,8 @@ func (l *Log) Append(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) erro
 		}
 	}
 	for _, e := range ents {
+		// 帧在段内的起始偏移：写入成功后登记进读索引（检查点要用）
+		l.offs = append(l.offs, l.activeSize+int64(len(l.buf)))
 		if l.buf, err = appendFrameMarshal(l.buf, recEntry, e); err != nil {
 			return fmt.Errorf("seglog: 编码 entry(index=%d) 失败: %w", e.GetIndex(), err)
 		}
@@ -463,6 +499,11 @@ func (l *Log) Append(hs *raftpb.HardState, ents []*raftpb.Entry, sync bool) erro
 	}
 	if len(ents) > 0 {
 		l.lastIndex = ents[len(ents)-1].GetIndex()
+	}
+	// 读索引与文件内容同步推进（同样只在写成功之后）：noteEntry 与 Open
+	// 扫描是同一个函数，运行期索引与重启重建的索引一致
+	for i, e := range ents {
+		l.noteEntry(l.activeSeq, l.offs[i], e.GetIndex(), e.GetTerm())
 	}
 
 	if sync {
@@ -518,6 +559,8 @@ func (l *Log) maybeRotate() error {
 	if err := l.active.Close(); err != nil {
 		return fmt.Errorf("seglog: 轮转关闭旧段 %s 失败: %w", segName(oldSeq), err)
 	}
+	// 旧段的读上界从此固定为逻辑字节数（读路径用它限定 ReadAt 范围）
+	l.segBytes[oldSeq] = oldBytes
 	// 旧段已经物理关闭：先置空，避免 Close 成功但下面开新段失败时，
 	// l.active 仍指着一个已关闭的文件句柄——那样后续 Append/Sync 走到
 	// Write/Sync 会得到一个含糊的「文件已关闭」I/O 错误，不如让「已关闭，
@@ -747,12 +790,394 @@ func (l *Log) TruncateTo(upto uint64) error {
 			return fmt.Errorf("seglog: 回收段 %s 失败: %w", segName(seq), err)
 		}
 		delete(l.segMax, seq)
+		delete(l.segBytes, seq)
 		deleted = append(deleted, seq)
 	}
+	l.dropRunsOf(deleted)
 
 	if len(deleted) > 0 {
 		l.lg.Info("seglog: 段回收完成",
 			"dir", l.dir, "upto", upto, "deletedSegments", deleted, "freedBytes", freedBytes)
 	}
 	return nil
+}
+
+// ---- 读路径（卡 SQ4.10 冷区）----
+
+// ErrCompacted 表示请求的 index 不在磁盘日志里：所在段已被 TruncateTo
+// 回收、从未写入（越过日志尾或落在快照安装留下的空洞里）、或段文件在读
+// 期间被并发删除。调用方（cluster.groupStorage）把它与其它读错误一并映射
+// 为 raft.ErrCompacted（raft 对该 peer 改发快照）。
+var ErrCompacted = errors.New("seglog: 请求的条目不在磁盘日志中")
+
+// ckptInterval 检查点间隔：一个 run 内每写过约这么多字节记一个
+// (index, 偏移)，冷读从 ≤lo 的最近检查点顺读，单次读的无效解码量 ≤ 1MiB。
+// 内存账：每 GiB 保留日志约 1k 个检查点（plan B2）。
+const ckptInterval int64 = 1 << 20
+
+// ckpt 检查点：index 为 idx 的条目帧起始于段内偏移 off。
+type ckpt struct {
+	idx uint64
+	off int64
+}
+
+// run 同一段内一串 index 连续的有效条目 [first, last]。ckpts[0] 恒为
+// first 的帧偏移，其后按 ckptInterval 稀疏登记，idx 升序且都 ≤ last。
+type run struct {
+	seq   uint64
+	first uint64
+	last  uint64
+	ckpts []ckpt
+}
+
+// termPoint 任期变化点：自 idx 起任期为 term（直到下一个变化点）。
+type termPoint struct {
+	idx  uint64
+	term uint64
+}
+
+// noteEntry 登记一条刚写入（或刚扫描到）的 entry 帧，维护 runs 与 terms。
+// 调用方须持有 l.mu（Open 扫描期的临时实例无并发，不持锁）。
+//
+// 规则与 Open 重放的「后写的赢」逐字一致，是两处唯一的实现：
+//   - idx ≤ 当前尾：换届改写，先丢弃/裁短覆盖 [idx, 尾] 的旧 run 与
+//     ≥ idx 的任期变化点；
+//   - 同段、紧接尾部且非改写：延长当前 run，按 ckptInterval 补检查点；
+//   - 其余（段轮转、改写起点、快照安装后的空洞）：新起一个 run。
+func (l *Log) noteEntry(seq uint64, off int64, idx, term uint64) {
+	rewrite := false
+	if n := len(l.runs); n > 0 && idx <= l.runs[n-1].last {
+		l.trimFrom(idx)
+		rewrite = true
+	}
+	n := len(l.runs)
+	// 改写后必须新起 run，即使裁短后的旧 run 恰好在同段且「紧接」idx：
+	// 物理上旧 run 的末帧之后还躺着被作废的旧版本，run 内「帧物理连续」
+	// 的承重前提不再成立
+	if !rewrite && n > 0 && l.runs[n-1].seq == seq && l.runs[n-1].last+1 == idx {
+		r := &l.runs[n-1]
+		r.last = idx
+		if off-r.ckpts[len(r.ckpts)-1].off >= ckptInterval {
+			r.ckpts = append(r.ckpts, ckpt{idx: idx, off: off})
+		}
+	} else {
+		l.runs = append(l.runs, run{seq: seq, first: idx, last: idx, ckpts: []ckpt{{idx: idx, off: off}}})
+	}
+	if k := len(l.terms); k == 0 || l.terms[k-1].term != term {
+		l.terms = append(l.terms, termPoint{idx: idx, term: term})
+	}
+}
+
+// trimFrom 让 index ≥ idx 的旧条目失效：整段落在其上的 run 丢弃，跨越
+// 它的 run 裁到 idx-1；任期变化点同步丢弃 ≥ idx 的部分。调用方持锁。
+func (l *Log) trimFrom(idx uint64) {
+	for len(l.runs) > 0 {
+		r := &l.runs[len(l.runs)-1]
+		if r.first >= idx {
+			l.runs = l.runs[:len(l.runs)-1]
+			continue
+		}
+		if r.last >= idx {
+			r.last = idx - 1
+			k := len(r.ckpts)
+			for k > 1 && r.ckpts[k-1].idx > r.last {
+				k--
+			}
+			r.ckpts = r.ckpts[:k]
+		}
+		break // runs 按 first 升序且互不重叠：更早的 run 都 < idx
+	}
+	k := len(l.terms)
+	for k > 0 && l.terms[k-1].idx >= idx {
+		k--
+	}
+	l.terms = l.terms[:k]
+}
+
+// dropRunsOf 删除属于已回收段的 run，并修剪不再可达的任期变化点（保留
+// 剩余最小 index 之前的最后一个变化点——它决定该 index 的任期）。调用方持锁。
+func (l *Log) dropRunsOf(deleted []uint64) {
+	if len(deleted) == 0 {
+		return
+	}
+	gone := make(map[uint64]bool, len(deleted))
+	for _, s := range deleted {
+		gone[s] = true
+	}
+	kept := l.runs[:0]
+	for _, r := range l.runs {
+		if !gone[r.seq] {
+			kept = append(kept, r)
+		}
+	}
+	l.runs = kept
+	if len(l.runs) == 0 {
+		return // 任期表留给后续追加接续（变化点只在任期变化时追加）
+	}
+	lo := l.runs[0].first
+	cut := 0
+	for cut+1 < len(l.terms) && l.terms[cut+1].idx <= lo {
+		cut++
+	}
+	l.terms = append(l.terms[:0], l.terms[cut:]...)
+}
+
+// firstIndexLocked 读索引覆盖的最小 index；无条目时为 0。调用方持锁。
+func (l *Log) firstIndexLocked() uint64 {
+	if len(l.runs) == 0 {
+		return 0
+	}
+	return l.runs[0].first
+}
+
+// FirstIndex 返回磁盘日志中仍可读的最小 index；无条目时 ok=false。
+//
+// 注意：按段回收的粒度下，它通常 ≤ 快照锚点（同段内锚点之前的条目仍在
+// 盘上）；raft 视角的日志起点由调用方按锚点另行裁定。
+func (l *Log) FirstIndex() (uint64, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.runs) == 0 {
+		return 0, false
+	}
+	return l.runs[0].first, true
+}
+
+// LastIndex 返回磁盘日志中最大的有效 index；无条目时 ok=false。
+func (l *Log) LastIndex() (uint64, bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if len(l.runs) == 0 {
+		return 0, false
+	}
+	return l.runs[len(l.runs)-1].last, true
+}
+
+// HardState 返回最新已写的 HardState（从未写过为 nil）。返回的是共享
+// 指针，调用方只读。
+func (l *Log) HardState() *raftpb.HardState {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.lastHS
+}
+
+// findRun 返回覆盖 idx 的 run 下标；不覆盖时 -1。调用方持锁。
+func (l *Log) findRun(idx uint64) int {
+	i := sort.Search(len(l.runs), func(i int) bool { return l.runs[i].last >= idx })
+	if i == len(l.runs) || l.runs[i].first > idx {
+		return -1
+	}
+	return i
+}
+
+// Term 返回 index 为 idx 的条目任期。
+//
+// 返回：idx 不被读索引覆盖时 ErrCompacted（已回收 / 未写入 / 空洞）。
+// 纯内存查询（任期变化点表），不碰磁盘。
+func (l *Log) Term(idx uint64) (uint64, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.findRun(idx) < 0 {
+		return 0, fmt.Errorf("%w: term(%d) 不在读索引覆盖内", ErrCompacted, idx)
+	}
+	k := sort.Search(len(l.terms), func(i int) bool { return l.terms[i].idx > idx })
+	if k == 0 {
+		// 有 run 覆盖却没有 ≤idx 的变化点：索引维护缺陷，按读不到处理
+		return 0, fmt.Errorf("%w: term(%d) 缺任期变化点（读索引不一致）", ErrCompacted, idx)
+	}
+	return l.terms[k-1].term, nil
+}
+
+// readPiece 一次冷读里落在同一 run 的那一段：从检查点 (ckIdx, ckOff) 顺读，
+// 收 [from, to] 的条目；limit 是该段在取快照那一刻的已写字节数。
+type readPiece struct {
+	seq   uint64
+	from  uint64
+	to    uint64
+	ckIdx uint64
+	ckOff int64
+	limit int64
+}
+
+// ReadEntries 读回 [lo, hi) 区间的条目（升序、index 连续、起于 lo）。
+//
+// 参数：
+//   - lo, hi: 半开区间，lo < hi
+//   - maxSize: 返回条目 proto 字节数之和的上限（raft MaxSizePerMsg 语义，
+//     与 raft 的 limitSize 同口径）；无论多小都至少返回一条
+//
+// 返回：
+//   - 条目：可能短于 hi-lo——遇字节上限，或遇读索引的覆盖空洞即止
+//   - err: lo 不被覆盖时 ErrCompacted；段文件已被并发回收时 ErrCompacted；
+//     帧损坏、index 不连续等 I/O / 一致性错误原样带上下文返回
+//
+// 并发：锁内只做 O(log n) 的索引定位与快照，打开文件与读全在锁外，用
+// 独立只读句柄；与 Append/Sync/TruncateTo 并发安全。读到半途段被删除：
+// 已打开的句柄在 POSIX 下照常可读（unlink 不影响已打开 fd），未打开的
+// 返回 ErrCompacted，不会读到半删文件的内容。
+func (l *Log) ReadEntries(lo, hi, maxSize uint64) ([]*raftpb.Entry, error) {
+	if lo >= hi {
+		return nil, nil
+	}
+	l.mu.Lock()
+	i := l.findRun(lo)
+	if i < 0 {
+		l.mu.Unlock()
+		return nil, fmt.Errorf("%w: [%d,%d) 起点不在读索引覆盖内", ErrCompacted, lo, hi)
+	}
+	var pieces []readPiece
+	for next := lo; i < len(l.runs) && next < hi; i++ {
+		r := l.runs[i]
+		if r.first > next {
+			break // 覆盖空洞：只返回空洞之前的部分
+		}
+		to := min(r.last, hi-1)
+		k := sort.Search(len(r.ckpts), func(j int) bool { return r.ckpts[j].idx > next }) - 1
+		limit := l.segBytes[r.seq]
+		if r.seq == l.activeSeq {
+			limit = l.activeSize
+		}
+		pieces = append(pieces, readPiece{seq: r.seq, from: next, to: to,
+			ckIdx: r.ckpts[k].idx, ckOff: r.ckpts[k].off, limit: limit})
+		next = to + 1
+	}
+	dir := l.dir
+	l.mu.Unlock()
+
+	var (
+		out   []*raftpb.Entry
+		total uint64
+	)
+	for _, p := range pieces {
+		done, err := readPieceInto(dir, p, maxSize, &out, &total)
+		if err != nil {
+			if len(out) > 0 && errors.Is(err, ErrCompacted) {
+				return out, nil // 前缀已读到：先返回前缀，下一轮再碰缺口
+			}
+			return nil, err
+		}
+		if done {
+			break
+		}
+	}
+	return out, nil
+}
+
+// readPieceInto 顺读一个 readPiece，把 [from, to] 的条目追加进 *out。
+// 返回 done=true 表示字节上限已到、调用方不应再读后续 piece。
+func readPieceInto(dir string, p readPiece, maxSize uint64, out *[]*raftpb.Entry, total *uint64) (bool, error) {
+	name := segName(p.seq)
+	f, err := os.Open(filepath.Join(dir, name))
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, fmt.Errorf("%w: 段 %s 已回收", ErrCompacted, name)
+		}
+		return false, fmt.Errorf("seglog: 冷读打开段 %s 失败: %w", name, err)
+	}
+	defer f.Close()
+	if p.ckOff > p.limit {
+		return false, fmt.Errorf("seglog: 冷读段 %s 检查点偏移 %d 越过已写长度 %d", name, p.ckOff, p.limit)
+	}
+	br := bufio.NewReaderSize(io.NewSectionReader(f, p.ckOff, p.limit-p.ckOff), 256<<10)
+	var (
+		frame  []byte
+		expect = p.ckIdx
+		off    = p.ckOff
+	)
+	for expect <= p.to {
+		frame = frame[:0]
+		var hdr [frameHeaderLen]byte
+		if _, err := io.ReadFull(br, hdr[:]); err != nil {
+			return false, fmt.Errorf("seglog: 冷读段 %s 偏移 %d 读帧头失败（期望 index %d）: %w", name, off, expect, err)
+		}
+		ln := binary.BigEndian.Uint32(hdr[0:4])
+		if ln == 0 || ln > maxFrameLen {
+			return false, fmt.Errorf("seglog: 冷读段 %s 偏移 %d 帧长 %d 非法", name, off, ln)
+		}
+		frame = append(frame, hdr[:]...)
+		frame = append(frame, make([]byte, ln)...)
+		if _, err := io.ReadFull(br, frame[frameHeaderLen:]); err != nil {
+			return false, fmt.Errorf("seglog: 冷读段 %s 偏移 %d 读帧体失败: %w", name, off, err)
+		}
+		typ, payload, n, ferr := readFrame(frame)
+		if ferr != nil {
+			return false, fmt.Errorf("seglog: 冷读段 %s 偏移 %d 帧校验失败: %w", name, off, ferr)
+		}
+		off += int64(n)
+		if typ != recEntry {
+			continue // HardState 帧：读路径不关心
+		}
+		e := &raftpb.Entry{}
+		if err := proto.Unmarshal(payload, e); err != nil {
+			return false, fmt.Errorf("seglog: 冷读段 %s 偏移 %d entry 解码失败: %w", name, off-int64(n), err)
+		}
+		if e.GetIndex() != expect {
+			// run 内条目物理连续是索引的承重前提，不符即索引与文件不一致
+			return false, fmt.Errorf("seglog: 冷读段 %s 偏移 %d 得到 index %d，期望 %d（读索引与文件不一致）",
+				name, off-int64(n), e.GetIndex(), expect)
+		}
+		expect++
+		if e.GetIndex() < p.from {
+			continue // 检查点到 from 之间的条目
+		}
+		sz := uint64(proto.Size(e))
+		if len(*out) > 0 && *total+sz > maxSize {
+			return true, nil
+		}
+		*out = append(*out, e)
+		*total += sz
+	}
+	return false, nil
+}
+
+// SegInfo 一个段的只读视图（按字节保留的计算输入）。
+type SegInfo struct {
+	Seq      uint64
+	Bytes    int64  // 逻辑字节数（活动段 = 已写长度）
+	MaxIndex uint64 // TruncateTo 的回收判据值（活动段无此值，恒 0）
+	Active   bool
+}
+
+// Segments 返回全部段的只读视图，按段号升序（活动段在末尾）。
+func (l *Log) Segments() []SegInfo {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]SegInfo, 0, len(l.segMax)+1)
+	for seq, max := range l.segMax {
+		out = append(out, SegInfo{Seq: seq, Bytes: l.segBytes[seq], MaxIndex: max})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	return append(out, SegInfo{Seq: l.activeSeq, Bytes: l.activeSize, Active: true})
+}
+
+// RetainBytesCap 返回「保证截断后剩余段总字节 ≥ budget」所允许的最大
+// 截断点 upto（TruncateTo(upto) 只删 MaxIndex ≤ upto 的已关闭段）。
+//
+// 算法：从最新段往回累加字节，直到累计 ≥ budget；这些段都必须保留，
+// upto 须小于它们中最小的 MaxIndex。段粒度、只多不少（plan B3）：
+//   - 活动段一段已够 budget：返回 math.MaxUint64（字节不构成约束）；
+//   - 全部段加起来都不够 budget：返回 0（一条都不许截——截断点同时是
+//     raft 视角的日志起点，不能只看「删不删段」）；
+//   - 需要保留的段里有纯 HardState 段（MaxIndex=0）：返回 0（保守方向）。
+func RetainBytesCap(segs []SegInfo, budget int64) uint64 {
+	var acc int64
+	upto := uint64(math.MaxUint64)
+	for i := len(segs) - 1; i >= 0; i-- {
+		if acc >= budget {
+			return upto
+		}
+		s := segs[i]
+		acc += s.Bytes
+		if s.Active {
+			continue
+		}
+		if s.MaxIndex == 0 {
+			return 0
+		}
+		upto = min(upto, s.MaxIndex-1)
+	}
+	if acc >= budget {
+		return upto
+	}
+	return 0
 }

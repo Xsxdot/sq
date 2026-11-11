@@ -13,6 +13,7 @@ import (
 	"io"
 	"net"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -148,6 +149,218 @@ func TestTransportDropPeerDrainsQueue(t *testing.T) {
 	if n := tr.drops[2].Load(); n != 0 {
 		t.Fatalf("DropPeer 后丢弃计数 = %d; want 0", n)
 	}
+}
+
+// TestTransportDiscardsBacklogWhilePeerUnreachable 对端不可达期间不积压：
+// 拨号失败即清空该 peer 队列，对端恢复后只收到恢复之后发出的消息。
+//
+// 承重原因（SQ4.10 排查）：停机期间 leader 每 tick 发的心跳与每次提交
+// 广播的空 MsgApp 在队列里攒成数百条；对端重启后逐条回 MsgHeartbeatResp，
+// 而 raft 在 StateProbe 下每收一条心跳响应就解除暂停、从同一 Next 重发一条
+// 满 MaxSizePerMsg 的 MsgApp——重发条数与停机时长成正比，落后条目经
+// 冷读层每次新分配，leader 内存随之放大。积压的陈旧消息对 raft 毫无用处
+// （raft 自身按 tick 重发心跳、按 Progress 重发日志），丢弃是合法行为。
+func TestTransportDiscardsBacklogWhilePeerUnreachable(t *testing.T) {
+	// 先占端口再关：拿到一个「当前无人监听、稍后可重新监听」的地址。
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.Addr().String()
+	probe.Close()
+
+	ln1, _ := net.Listen("tcp", "127.0.0.1:0")
+	tr := newTransport(1, ln1, map[uint64]string{2: addr},
+		func(uint32, *raftpb.Message) {}, nil, testSlog(t))
+	from, to := uint64(1), uint64(2)
+	typ := raftpb.MsgHeartbeat
+	const stale = 1000
+	for i := uint64(0); i < stale; i++ {
+		idx := i
+		tr.Send(0, []*raftpb.Message{{Type: &typ, From: &from, To: &to, Index: &idx}})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr.Start(ctx)
+	// 至少跨过一轮「拨号失败 → 退避」，积压应在此期间被清空。
+	time.Sleep(2 * redialBackoff)
+
+	ln2, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Skipf("端口 %s 被占用，无法重建对端：%v", addr, err)
+	}
+	got := make(chan uint64, stale+1)
+	peer := newTransport(2, ln2, nil,
+		func(_ uint32, m *raftpb.Message) { got <- m.GetIndex() }, nil, testSlog(t))
+	peer.Start(ctx)
+	const marker = uint64(1 << 40)
+	mk := marker
+	tr.Send(0, []*raftpb.Message{{Type: &typ, From: &from, To: &to, Index: &mk}})
+
+	staleSeen := 0
+	for {
+		select {
+		case idx := <-got:
+			if idx == marker {
+				if staleSeen != 0 {
+					t.Fatalf("对端恢复后先收到 %d 条不可达期间的积压消息; want 0（积压应在拨号失败时清空）", staleSeen)
+				}
+				return
+			}
+			staleSeen++
+		case <-time.After(5 * time.Second):
+			t.Fatalf("5s 未收到恢复后发出的消息（已收积压 %d 条）", staleSeen)
+		}
+	}
+}
+
+// awaitOnlyFresh 每 100ms 发一条新鲜 marker（Index ≥ markerBase），直到
+// 首条 marker 到达；期间统计先于它到达的非 marker 消息（均为故障期间
+// 入队的陈旧消息），有任何一条即失败。marker 反复发：恢复后的首次重连
+// 时刻不可预知，单发的 marker 自己也可能在队列里老化被丢。
+func awaitOnlyFresh(t *testing.T, tr *transport, got <-chan uint64, wait time.Duration) {
+	t.Helper()
+	const markerBase = uint64(1 << 40)
+	from, to := uint64(1), uint64(2)
+	hb := raftpb.MsgHeartbeat
+	stale := 0
+	deadline := time.After(wait)
+	tick := time.NewTicker(100 * time.Millisecond)
+	defer tick.Stop()
+	for i := markerBase; ; {
+		select {
+		case <-tick.C:
+			idx := i
+			i++
+			tr.Send(0, []*raftpb.Message{{Type: &hb, From: &from, To: &to, Index: &idx}})
+		case idx := <-got:
+			if idx >= markerBase {
+				if stale != 0 {
+					t.Fatalf("对端恢复后先收到 %d 条故障期间入队的陈旧消息; want 0（超过选举超时的积压应在出队时丢弃）", stale)
+				}
+				return
+			}
+			stale++
+		case <-deadline:
+			t.Fatalf("%s 内未收到恢复后发出的消息（已收陈旧消息 %d 条）", wait, stale)
+		}
+	}
+}
+
+// TestTransportDropsStaleBacklogAfterDialHang 故障形态一：对端主机掉电/
+// 黑洞，拨号既不成功也不立即失败（无超时时挂约 127s）。拨号挂起期间入队
+// 的消息到恢复时已超过选举超时，必须在出队时丢弃，而不是恢复后整批送达
+// （否则重启 follower 逐条回心跳响应，leader 在探测态逐条整段重发）。
+func TestTransportDropsStaleBacklogAfterDialHang(t *testing.T) {
+	ln2, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make(chan uint64, 2048)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	peer := newTransport(2, ln2, nil,
+		func(_ uint32, m *raftpb.Message) { got <- m.GetIndex() }, nil, testSlog(t))
+	peer.Start(ctx)
+
+	ln1, _ := net.Listen("tcp", "127.0.0.1:0")
+	tr := newTransport(1, ln1, map[uint64]string{2: ln2.Addr().String()},
+		func(uint32, *raftpb.Message) {}, nil, testSlog(t))
+	release := make(chan struct{})
+	var hung atomic.Bool
+	hung.Store(true)
+	tr.dial = func(dctx context.Context, addr string) (net.Conn, error) {
+		if hung.Load() {
+			select { // 模拟黑洞：挂到「恢复」或拨号超时
+			case <-release:
+			case <-dctx.Done():
+				return nil, dctx.Err()
+			}
+		}
+		return (&net.Dialer{}).DialContext(dctx, "tcp", addr)
+	}
+	from, to := uint64(1), uint64(2)
+	typ := raftpb.MsgHeartbeat
+	for i := uint64(0); i < 1000; i++ {
+		idx := i
+		tr.Send(0, []*raftpb.Message{{Type: &typ, From: &from, To: &to, Index: &idx}})
+	}
+	tr.Start(ctx)
+	time.Sleep(staleMsgAge + 500*time.Millisecond) // 积压老化越过选举超时
+	hung.Store(false)
+	close(release)
+	awaitOnlyFresh(t, tr, got, 10*time.Second)
+}
+
+// TestTransportDropsStaleBacklogAfterHalfOpenConn 故障形态二：旧连接半开
+// （对端进程冻结/掉电但未发 RST），对端不读、写阻塞（无写期限时挂到
+// tcp_retries2，约 15 分钟）。写期限到期须关连接重拨；阻塞期间入队的
+// 消息到恢复时已超过选举超时，必须在出队时丢弃。
+func TestTransportDropsStaleBacklogAfterHalfOpenConn(t *testing.T) {
+	frozenLn, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := frozenLn.Addr().String()
+	frozen := make(chan net.Conn, 4)
+	go func() { // 冻结的对端：接受连接但从不读
+		for {
+			c, err := frozenLn.Accept()
+			if err != nil {
+				return
+			}
+			frozen <- c
+		}
+	}()
+	defer func() {
+		for {
+			select {
+			case c := <-frozen:
+				c.Close()
+			default:
+				return
+			}
+		}
+	}()
+
+	ln1, _ := net.Listen("tcp", "127.0.0.1:0")
+	tr := newTransport(1, ln1, map[uint64]string{2: addr},
+		func(uint32, *raftpb.Message) {}, nil, testSlog(t))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr.Start(ctx)
+	from, to := uint64(1), uint64(2)
+	app := raftpb.MsgApp
+	// 64 条 × 1MiB：远超两端套接字缓冲，写必然阻塞在冻结连接上
+	big := make([]byte, 1<<20)
+	for i := uint64(0); i < 64; i++ {
+		idx := i
+		tr.Send(0, []*raftpb.Message{{Type: &app, From: &from, To: &to, Index: &idx,
+			Entries: []*raftpb.Entry{{Data: big}}}})
+	}
+	select {
+	case <-frozen: // 连接已建立，冻结连接保持打开（不发 RST，即半开）
+	case <-time.After(5 * time.Second):
+		t.Fatal("5s 未建立到冻结对端的连接")
+	}
+	// 冻结期间继续入队一批小消息，随后对端「恢复」：同地址换成正常读的
+	// 传输体（旧冻结连接仍不关，模拟半开）。
+	hb := raftpb.MsgHeartbeat
+	for i := uint64(100); i < 1100; i++ {
+		idx := i
+		tr.Send(0, []*raftpb.Message{{Type: &hb, From: &from, To: &to, Index: &idx}})
+	}
+	time.Sleep(staleMsgAge + 500*time.Millisecond)
+	frozenLn.Close()
+	ln2, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Skipf("端口 %s 被占用，无法重建对端：%v", addr, err)
+	}
+	got := make(chan uint64, 4096)
+	peer := newTransport(2, ln2, nil,
+		func(_ uint32, m *raftpb.Message) { got <- m.GetIndex() }, nil, testSlog(t))
+	peer.Start(ctx)
+	awaitOnlyFresh(t, tr, got, writeTimeout+dialTimeout+redialBackoff+5*time.Second)
 }
 
 // TestTransportUnregistersClosedConns 终审 R4：入站连接在 readLoop 退出

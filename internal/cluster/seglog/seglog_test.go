@@ -5,7 +5,10 @@ package seglog
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
@@ -22,6 +25,23 @@ func ent(index, term uint64, data string) *raftpb.Entry {
 	return &raftpb.Entry{Index: &index, Term: &term, Data: []byte(data)}
 }
 
+// openAll 是 Open + 经读路径读回全部条目：卡 SQ4.10 之前 Open 直接返回
+// 全量条目，既有用例的断言按这个四返回值形态写成——经读路径读回同一份
+// 内容，断言原样保留，同时顺带覆盖读路径与 Open 重建索引的一致性。
+func openAll(dir string, lg *slog.Logger) (*Log, *raftpb.HardState, []*raftpb.Entry, error) {
+	l, h, err := Open(dir, lg)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	first, ok := l.FirstIndex()
+	if !ok {
+		return l, h, nil, nil
+	}
+	last, _ := l.LastIndex()
+	ents, err := l.ReadEntries(first, last+1, math.MaxUint64)
+	return l, h, ents, err
+}
+
 // hs 构造一条测试 HardState。
 func hs(term, vote, commit uint64) *raftpb.HardState {
 	return &raftpb.HardState{Term: &term, Vote: &vote, Commit: &commit}
@@ -29,7 +49,7 @@ func hs(term, vote, commit uint64) *raftpb.HardState {
 
 func TestAppendReopenRoundTrip(t *testing.T) {
 	dir := t.TempDir()
-	l, gotHS, gotEnts, err := Open(dir, slog.Default())
+	l, gotHS, gotEnts, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -45,7 +65,7 @@ func TestAppendReopenRoundTrip(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, gotHS, gotEnts, err = Open(dir, slog.Default())
+	_, gotHS, gotEnts, err = openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -61,7 +81,7 @@ func TestAppendReopenRoundTrip(t *testing.T) {
 
 func TestReopenReplaysConflictOverwrite(t *testing.T) {
 	dir := t.TempDir()
-	l, _, _, err := Open(dir, slog.Default())
+	l, _, _, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -75,7 +95,7 @@ func TestReopenReplaysConflictOverwrite(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, _, gotEnts, err := Open(dir, slog.Default())
+	_, _, gotEnts, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -88,7 +108,7 @@ func TestReopenReplaysConflictOverwrite(t *testing.T) {
 
 func TestReopenTruncatesTornTail(t *testing.T) {
 	dir := t.TempDir()
-	l, _, _, err := Open(dir, slog.Default())
+	l, _, _, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -112,7 +132,7 @@ func TestReopenTruncatesTornTail(t *testing.T) {
 	if err := os.Truncate(seg, written-3); err != nil {
 		t.Fatal(err)
 	}
-	l2, _, gotEnts, err := Open(dir, slog.Default())
+	l2, _, gotEnts, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatalf("torn tail 应截断续跑，得到错误 %v", err)
 	}
@@ -126,7 +146,7 @@ func TestReopenTruncatesTornTail(t *testing.T) {
 	if err := l2.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, _, gotEnts, err = Open(dir, slog.Default())
+	_, _, gotEnts, err = openAll(dir, slog.Default())
 	if err != nil || len(gotEnts) != 2 || string(gotEnts[1].Data) != "rewritten" {
 		t.Fatalf("torn 截断后续写再恢复失败: %v, %+v", err, gotEnts)
 	}
@@ -143,7 +163,7 @@ func TestOpenRejectsCorruptNonLastSegment(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "00000002.seg"), seg2, 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, _, err := Open(dir, slog.Default()); err == nil {
+	if _, _, _, err := openAll(dir, slog.Default()); err == nil {
 		t.Fatal("非末段坏帧应拒绝打开（真损坏），得到 nil")
 	}
 }
@@ -168,7 +188,7 @@ func TestRotationCarriesHardStateAndRecovers(t *testing.T) {
 	SegMaxBytes = 40
 	defer func() { SegMaxBytes = old }()
 	dir := t.TempDir()
-	l, _, _, err := Open(dir, slog.Default())
+	l, _, _, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -191,7 +211,7 @@ func TestRotationCarriesHardStateAndRecovers(t *testing.T) {
 	if err := os.Remove(segs[0]); err != nil {
 		t.Fatal(err)
 	}
-	_, gotHS, _, err := Open(dir, slog.Default())
+	_, gotHS, _, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +229,7 @@ func TestTruncateToDeletesOnlyClosedCoveredSegments(t *testing.T) {
 	SegMaxBytes = 40
 	defer func() { SegMaxBytes = old }()
 	dir := t.TempDir()
-	l, _, _, err := Open(dir, slog.Default())
+	l, _, _, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -230,7 +250,7 @@ func TestTruncateToDeletesOnlyClosedCoveredSegments(t *testing.T) {
 	if err := l.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, _, gotEnts, err := Open(dir, slog.Default())
+	_, _, gotEnts, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -257,7 +277,7 @@ func TestTruncateToReclaimsHSOnlySegmentAfterReopen(t *testing.T) {
 	SegMaxBytes = 10
 	defer func() { SegMaxBytes = old }()
 	dir := t.TempDir()
-	l, _, _, err := Open(dir, slog.Default())
+	l, _, _, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -280,7 +300,7 @@ func TestTruncateToReclaimsHSOnlySegmentAfterReopen(t *testing.T) {
 	// 关键步骤：不复用内存里的 l，而是重新 Open——模拟进程重启，验证
 	// segMax 是靠 Open 的扫描重建出来的，不是靠内存里没丢过的状态侥幸
 	// 蒙对。
-	l2, _, _, err := Open(dir, slog.Default())
+	l2, _, _, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -305,7 +325,7 @@ func TestTruncateToReclaimsHSOnlySegmentAfterReopen(t *testing.T) {
 // 立即轮转」的东西。
 func TestReopenActiveSizeIsLogicalEnd(t *testing.T) {
 	dir := t.TempDir()
-	l, _, _, err := Open(dir, slog.Default())
+	l, _, _, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +340,7 @@ func TestReopenActiveSizeIsLogicalEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	l2, _, ents, err := Open(dir, slog.Default())
+	l2, _, ents, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -339,7 +359,7 @@ func TestReopenActiveSizeIsLogicalEnd(t *testing.T) {
 	if err := l2.Close(); err != nil {
 		t.Fatal(err)
 	}
-	_, _, ents, err = Open(dir, slog.Default())
+	_, _, ents, err = openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -364,7 +384,7 @@ func TestPreallocatedActiveSegmentKeepsLogicalActiveSize(t *testing.T) {
 	defer func() { SegMaxBytes = old }()
 
 	dir := t.TempDir()
-	l, _, _, err := Open(dir, slog.Default())
+	l, _, _, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,7 +396,7 @@ func TestPreallocatedActiveSegmentKeepsLogicalActiveSize(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	l2, _, ents, err := Open(dir, slog.Default())
+	l2, _, ents, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -415,7 +435,7 @@ func TestRotationTruncatesClosedSegmentToLogicalSize(t *testing.T) {
 	defer func() { SegMaxBytes = old }()
 
 	dir := t.TempDir()
-	l, _, _, err := Open(dir, slog.Default())
+	l, _, _, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -439,7 +459,7 @@ func TestRotationTruncatesClosedSegmentToLogicalSize(t *testing.T) {
 
 	// 已关闭段（除末段外）的物理大小必须等于其逻辑内容——用「重开成功」
 	// 断言，因为零尾会让非末段扫描判定为真损坏
-	_, _, ents, err := Open(dir, slog.Default())
+	_, _, ents, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatalf("轮转后重开失败（已关闭段疑似带零尾）: %v", err)
 	}
@@ -490,7 +510,7 @@ func TestZeroTailLogsDebugNotWarn(t *testing.T) {
 	defer func() { SegMaxBytes = old }()
 
 	dir := t.TempDir()
-	l, _, _, err := Open(dir, slog.Default())
+	l, _, _, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -516,7 +536,7 @@ func TestZeroTailLogsDebugNotWarn(t *testing.T) {
 	}
 
 	h := &recordHandler{}
-	l2, _, ents, err := Open(dir, slog.New(h))
+	l2, _, ents, err := openAll(dir, slog.New(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -539,7 +559,7 @@ func TestZeroTailLogsDebugNotWarn(t *testing.T) {
 // 必须保留 Warn——本用例守住「不要为了消噪把真告警一起消掉」。
 func TestGenuineTornTailStillLogsWarn(t *testing.T) {
 	dir := t.TempDir()
-	l, _, _, err := Open(dir, slog.Default())
+	l, _, _, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -564,7 +584,7 @@ func TestGenuineTornTailStillLogsWarn(t *testing.T) {
 	}
 
 	h := &recordHandler{}
-	l2, _, ents, err := Open(dir, slog.New(h))
+	l2, _, ents, err := openAll(dir, slog.New(h))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -574,5 +594,354 @@ func TestGenuineTornTailStillLogsWarn(t *testing.T) {
 	}
 	if !h.hasMsgAtLevel(slog.LevelWarn, "torn tail") {
 		t.Fatal("真 torn tail 未记 Warn——告警被消噪消掉了")
+	}
+}
+
+// ---- 读路径（卡 SQ4.10 冷区，plan §4.2 第 1–4 条）----
+
+// withSegMax 把 SegMaxBytes 临时调成 n（测试结束恢复）。
+func withSegMax(t *testing.T, n int64) {
+	t.Helper()
+	old := SegMaxBytes
+	SegMaxBytes = n
+	t.Cleanup(func() { SegMaxBytes = old })
+}
+
+// payload 第 i 条条目的确定性载荷（size 字节，内容随 i 变化）。
+func payload(i uint64, size int) string {
+	b := make([]byte, size)
+	for k := range b {
+		b[k] = byte('a' + (int(i)+k)%26)
+	}
+	return string(b)
+}
+
+// assertRead 读 [lo,hi) 并断言：起于 lo、连续、逐条等于 want[index]、
+// 字节上限语义（至少一条；多于一条时总量 ≤ max）。
+func assertRead(t *testing.T, l *Log, lo, hi, max uint64, want map[uint64]*raftpb.Entry) {
+	t.Helper()
+	got, err := l.ReadEntries(lo, hi, max)
+	if err != nil {
+		t.Fatalf("ReadEntries(%d,%d,%d): %v", lo, hi, max, err)
+	}
+	if len(got) == 0 {
+		t.Fatalf("ReadEntries(%d,%d,%d) 返回 0 条（至少应一条）", lo, hi, max)
+	}
+	var total uint64
+	for k, e := range got {
+		if e.GetIndex() != lo+uint64(k) {
+			t.Fatalf("第 %d 条 index=%d; want %d", k, e.GetIndex(), lo+uint64(k))
+		}
+		if !proto.Equal(e, want[e.GetIndex()]) {
+			t.Fatalf("index %d 读回 term=%d data=%.16q; want term=%d data=%.16q", e.GetIndex(),
+				e.GetTerm(), e.GetData(), want[e.GetIndex()].GetTerm(), want[e.GetIndex()].GetData())
+		}
+		total += uint64(proto.Size(e))
+	}
+	if len(got) > 1 && total > max {
+		t.Fatalf("ReadEntries(%d,%d,%d) 总量 %d 超上限", lo, hi, max, total)
+	}
+	if uint64(len(got)) < hi-lo {
+		// 短返回只允许因字节上限：再加下一条必超
+		next := want[lo+uint64(len(got))]
+		if total+uint64(proto.Size(next)) <= max {
+			t.Fatalf("ReadEntries(%d,%d,%d) 短返回 %d 条但未触及上限（%d+%d ≤ %d）",
+				lo, hi, max, len(got), total, proto.Size(next), max)
+		}
+	}
+}
+
+// TestReadEntriesEqualsAppended 第 1 条：多段（含仅 HardState 轮次、跨检查点
+// 的大 run）追加后，任意 [lo,hi) 与字节上限组合读回逐条等于追加值；关闭
+// 重开后（Open 重建索引）同样成立。
+func TestReadEntriesEqualsAppended(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		segMax int64
+		n      uint64
+		size   int
+	}{
+		{"小段多轮转", 512, 300, 40},
+		{"大 run 跨检查点", 64 << 20, 60, 100 << 10}, // 6MiB 单段 ⇒ 多个 1MiB 检查点
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			withSegMax(t, tc.segMax)
+			dir := t.TempDir()
+			l, _, err := Open(dir, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := map[uint64]*raftpb.Entry{}
+			for i := uint64(1); i <= tc.n; {
+				// 轮次形态轮换：仅 HS / HS+条目 / 只条目，批大小 1..4
+				switch i % 3 {
+				case 0:
+					if err := l.Append(hs(1, 1, i-1), nil, false); err != nil {
+						t.Fatal(err)
+					}
+				}
+				var batch []*raftpb.Entry
+				for k := uint64(0); k < 1+i%4 && i <= tc.n; k++ {
+					e := ent(i, 1+i/50, payload(i, tc.size))
+					want[i] = e
+					batch = append(batch, e)
+					i++
+				}
+				var h *raftpb.HardState
+				if i%2 == 0 {
+					h = hs(1, 1, i-1)
+				}
+				if err := l.Append(h, batch, false); err != nil {
+					t.Fatal(err)
+				}
+			}
+			check := func(l *Log) {
+				t.Helper()
+				if f, ok := l.FirstIndex(); !ok || f != 1 {
+					t.Fatalf("FirstIndex = %d,%v; want 1", f, ok)
+				}
+				if la, ok := l.LastIndex(); !ok || la != tc.n {
+					t.Fatalf("LastIndex = %d,%v; want %d", la, ok, tc.n)
+				}
+				entSize := uint64(proto.Size(want[1]))
+				for _, max := range []uint64{0, 1, entSize, 3*entSize + 1, math.MaxUint64} {
+					for lo := uint64(1); lo <= tc.n; lo += 7 {
+						for _, span := range []uint64{1, 2, 13, tc.n} {
+							hi := min(lo+span, tc.n+1)
+							assertRead(t, l, lo, hi, max, want)
+						}
+					}
+				}
+				for i := uint64(1); i <= tc.n; i++ {
+					if tm, err := l.Term(i); err != nil || tm != want[i].GetTerm() {
+						t.Fatalf("Term(%d) = %d,%v; want %d", i, tm, err, want[i].GetTerm())
+					}
+				}
+			}
+			check(l)
+			if err := l.Close(); err != nil {
+				t.Fatal(err)
+			}
+			l2, _, err := Open(dir, slog.Default())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer l2.Close()
+			check(l2)
+		})
+	}
+}
+
+// TestReadAfterRewriteAcrossSegments 第 2 条：追加 1..100，在跨段位置以新
+// 任期改写 60..80 再追加 81..120，读 50..90 得到新版本；任期在 59/60 两侧
+// 正确；关闭重开（Open 重建的索引）后同样断言。
+func TestReadAfterRewriteAcrossSegments(t *testing.T) {
+	withSegMax(t, 600)
+	dir := t.TempDir()
+	l, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[uint64]*raftpb.Entry{}
+	for i := uint64(1); i <= 100; i++ {
+		e := ent(i, 1, payload(i, 30))
+		want[i] = e
+		if err := l.Append(nil, []*raftpb.Entry{e}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	segsBefore := len(l.Segments())
+	var batch []*raftpb.Entry
+	for i := uint64(60); i <= 80; i++ {
+		e := ent(i, 2, "v2-"+payload(i, 20))
+		want[i] = e
+		batch = append(batch, e)
+	}
+	if err := l.Append(hs(2, 2, 59), batch, false); err != nil {
+		t.Fatal(err)
+	}
+	for i := uint64(81); i <= 120; i++ {
+		e := ent(i, 2, "v2-"+payload(i, 20))
+		want[i] = e
+		if err := l.Append(nil, []*raftpb.Entry{e}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if segsBefore < 3 {
+		t.Fatalf("前置：1..100 只占 %d 段，改写点不跨段", segsBefore)
+	}
+	check := func(l *Log) {
+		t.Helper()
+		assertRead(t, l, 50, 91, math.MaxUint64, want)
+		assertRead(t, l, 1, 121, math.MaxUint64, want)
+		for i, w := range map[uint64]uint64{59: 1, 60: 2, 80: 2, 81: 2, 120: 2, 1: 1} {
+			if tm, err := l.Term(i); err != nil || tm != w {
+				t.Fatalf("Term(%d) = %d,%v; want %d", i, tm, err, w)
+			}
+		}
+		if _, err := l.Term(121); !errors.Is(err, ErrCompacted) {
+			t.Fatalf("Term(121) 越尾应 ErrCompacted，得到 %v", err)
+		}
+	}
+	check(l)
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	l2, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l2.Close()
+	check(l2)
+}
+
+// TestReadAfterTruncateIsCompacted 第 3 条：截断后越界读报 ErrCompacted、
+// 不返回已删段内容；TruncateTo 与并发读无数据竞争（-race）、无读到半删
+// 文件的错误（读要么 ErrCompacted、要么逐条正确）。
+func TestReadAfterTruncateIsCompacted(t *testing.T) {
+	withSegMax(t, 400)
+	dir := t.TempDir()
+	l, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer l.Close()
+	const n = 600
+	want := map[uint64]*raftpb.Entry{}
+	for i := uint64(1); i <= n; i++ {
+		e := ent(i, 1, payload(i, 30))
+		want[i] = e
+		if err := l.Append(nil, []*raftpb.Entry{e}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	stop := make(chan struct{})
+	var wg sync.WaitGroup
+	var reads, compacted int64
+	var mu sync.Mutex
+	errs := make(chan error, 8)
+	for r := 0; r < 4; r++ {
+		wg.Add(1)
+		go func(r int) {
+			defer wg.Done()
+			lo := uint64(1 + r)
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+				}
+				got, err := l.ReadEntries(lo, lo+50, math.MaxUint64)
+				mu.Lock()
+				reads++
+				if errors.Is(err, ErrCompacted) {
+					compacted++
+				}
+				mu.Unlock()
+				if err != nil && !errors.Is(err, ErrCompacted) {
+					errs <- fmt.Errorf("并发读 [%d,%d) 非 compacted 错误: %w", lo, lo+50, err)
+					return
+				}
+				for k, e := range got {
+					if e.GetIndex() != lo+uint64(k) || !proto.Equal(e, want[e.GetIndex()]) {
+						errs <- fmt.Errorf("并发读 [%d,%d) 第 %d 条内容错误（index %d）", lo, lo+50, k, e.GetIndex())
+						return
+					}
+				}
+				lo += 37
+				if lo > n-50 {
+					lo = uint64(1 + r)
+				}
+			}
+		}(r)
+	}
+	for upto := uint64(50); upto <= 500; upto += 50 {
+		if err := l.TruncateTo(upto); err != nil {
+			t.Fatal(err)
+		}
+	}
+	close(stop)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
+	}
+	t.Logf("并发读 %d 次，其中 ErrCompacted %d 次", reads, compacted)
+
+	first, ok := l.FirstIndex()
+	if !ok || first <= 1 || first > 501 {
+		t.Fatalf("截断到 500 后 FirstIndex = %d,%v; want (1,501]", first, ok)
+	}
+	if _, err := l.ReadEntries(first-1, first+5, math.MaxUint64); !errors.Is(err, ErrCompacted) {
+		t.Fatalf("读已回收的 %d 应 ErrCompacted，得到 %v", first-1, err)
+	}
+	if _, err := l.Term(first - 1); !errors.Is(err, ErrCompacted) {
+		t.Fatalf("Term(%d) 已回收应 ErrCompacted，得到 %v", first-1, err)
+	}
+	if _, err := l.ReadEntries(1, 10, math.MaxUint64); !errors.Is(err, ErrCompacted) {
+		t.Fatalf("读 [1,10) 应 ErrCompacted，得到 %v", err)
+	}
+	assertRead(t, l, first, n+1, math.MaxUint64, want)
+}
+
+// TestReadStopsAtTornTail 第 4 条：torn tail 重开后读路径止于最后一条好帧。
+func TestReadStopsAtTornTail(t *testing.T) {
+	dir := t.TempDir()
+	l, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := map[uint64]*raftpb.Entry{}
+	for i := uint64(1); i <= 5; i++ {
+		e := ent(i, 1, payload(i, 50))
+		want[i] = e
+		if err := l.Append(nil, []*raftpb.Entry{e}, false); err != nil {
+			t.Fatal(err)
+		}
+	}
+	written := l.activeSize
+	if err := l.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Truncate(filepath.Join(dir, "00000001.seg"), written-3); err != nil {
+		t.Fatal(err)
+	}
+	l2, _, err := Open(dir, slog.Default())
+	if err != nil {
+		t.Fatalf("torn tail 应截断续跑，得到 %v", err)
+	}
+	defer l2.Close()
+	if last, ok := l2.LastIndex(); !ok || last != 4 {
+		t.Fatalf("torn 后 LastIndex = %d,%v; want 4", last, ok)
+	}
+	assertRead(t, l2, 1, 5, math.MaxUint64, want)
+	got, err := l2.ReadEntries(3, 10, math.MaxUint64)
+	if err != nil || len(got) != 2 || got[1].GetIndex() != 4 {
+		t.Fatalf("读 [3,10) 应止于好帧 4，得到 %d 条 err=%v", len(got), err)
+	}
+	if _, err := l2.ReadEntries(5, 6, math.MaxUint64); !errors.Is(err, ErrCompacted) {
+		t.Fatalf("读 torn 掉的 5 应 ErrCompacted，得到 %v", err)
+	}
+}
+
+// TestRetainBytesCap 按字节保留的截断上界：从新到旧累加到 ≥ budget 的段
+// 都必须保留（upto < 它们最小的 MaxIndex）；总量不够 budget 则一条不截。
+func TestRetainBytesCap(t *testing.T) {
+	segs := []SegInfo{
+		{Seq: 1, Bytes: 100, MaxIndex: 10},
+		{Seq: 2, Bytes: 100, MaxIndex: 20},
+		{Seq: 3, Bytes: 100, MaxIndex: 30},
+		{Seq: 4, Bytes: 50, Active: true},
+	}
+	for _, c := range []struct {
+		budget int64
+		want   uint64
+	}{
+		{0, math.MaxUint64}, {50, math.MaxUint64}, {51, 29}, {150, 29}, {151, 19}, {251, 9}, {350, 9}, {351, 0}, {1 << 40, 0},
+	} {
+		if got := RetainBytesCap(segs, c.budget); got != c.want {
+			t.Errorf("RetainBytesCap(budget=%d) = %d; want %d", c.budget, got, c.want)
+		}
 	}
 }

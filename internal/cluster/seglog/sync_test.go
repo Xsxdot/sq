@@ -72,7 +72,7 @@ func waitErr(t *testing.T, errc <-chan error) error {
 // 注册的 release 一定先于这里的 Close，失败即快速报红而不是挂到超时。
 func openTestLog(t *testing.T, dir string) *Log {
 	t.Helper()
-	l, _, _, err := Open(dir, slog.Default())
+	l, _, _, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -192,7 +192,7 @@ func TestRotateConcurrentWithSyncNoLoss(t *testing.T) {
 	const total = 5000
 	dir := t.TempDir()
 	rec := &recordHandler{}
-	l, _, _, err := Open(dir, slog.New(rec))
+	l, _, _, err := openAll(dir, slog.New(rec))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func TestRotateConcurrentWithSyncNoLoss(t *testing.T) {
 	}
 	t.Logf("Sync 与轮转撞车 %d 次", collided)
 
-	_, gotHS, gotEnts, err := Open(dir, slog.Default())
+	_, gotHS, gotEnts, err := openAll(dir, slog.Default())
 	if err != nil {
 		t.Fatal(err)
 	}

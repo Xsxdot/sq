@@ -27,6 +27,7 @@ import (
 	"io"
 	"log"
 	"log/slog"
+	"math"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -127,7 +128,17 @@ type group struct {
 	// （Append/SetHardState/Compact），stg 是包在 mem 外的 raft.Storage
 	// 包装——raft 经它读日志，Snapshot() 由 groupStorage 现场生成
 	mem *raft.MemoryStorage
-	stg raft.Storage
+	stg *groupStorage
+	// 内存热区窗口（卡 SQ4.10 B6）：apply 推进后热区条数 > 2×hotEntries
+	// 或估算字节 > 2×hotMaxBytes 即压缩到窗口（compactHot）。装配方
+	// （buildGroup）按 min(RetainEntries, 64MiB) 覆盖；rs 为 nil（无冷区）
+	// 时从不压缩——压出热区的条目无处可读。
+	hotEntries  uint64
+	hotMaxBytes uint64
+	// hotBytes 热区估算字节：上次压缩时的留存量 + 其后追加量（append 侧
+	// 原子累加，apply 侧压缩时重算）。估算口径 = len(Data)+16（帧头/
+	// 元数据量级），只用于触发判定，不求精确。
+	hotBytes atomic.Uint64
 	// snaps 是快照视图注册表（Manager 全组共享；单组单测路径由 newGroup
 	// 自建）。本组用它做两件事：stg 的现场快照生成建视图，以及 MsgSnap
 	// 外发时登记定向台账（noteSnapSends → leader 侧失败感知的判活依据）。
@@ -157,7 +168,7 @@ type group struct {
 	// v3 的 raftpb.Message 是 protobuf-go v2 生成，内部嵌入互斥锁
 	// （protoimpl.MessageState）。消息全链路用指针传递，避免按值拷贝
 	// 触发 vet copylocks 检查，也省一次拷贝开销。
-	inbox   chan *raftpb.Message
+	inbox chan *raftpb.Message
 	// 本地存储阶段的两条通道（AsyncStorageWrites）：主循环按 m.To 分发，
 	// append/apply 两条协程各自消费。
 	//
@@ -183,8 +194,8 @@ type group struct {
 	// 下次不必再去数 /proc/diskstats 才知道合批有没有生效。
 	syncCount  atomic.Uint64
 	batchCount atomic.Uint64
-	applied atomic.Uint64 // 已 apply 的最高条目 index（重启重放幂等的基础）
-	lead    atomic.Uint64 // 当前 leader 节点 ID，SoftState 变化时更新
+	applied    atomic.Uint64 // 已 apply 的最高条目 index（重启重放幂等的基础）
+	lead       atomic.Uint64 // 当前 leader 节点 ID，SoftState 变化时更新
 	// lastTerm 是最近一次非空 HardState 的 term 缓存（currentTerm 的
 	// 数据源）：HardState 只在有变化的那一轮非空，直接读
 	// rd.HardState.GetTerm() 在空轮次恒为 0——详见 currentTerm 注释
@@ -363,9 +374,31 @@ func newGroup(g uint32, selfID uint64, storage *raft.MemoryStorage, snaps *snapR
 		reg = newSnapRegistry(gr.st, snapRegistryDefaultTTL, gr.lg)
 	}
 	gr.snaps = reg
-	gr.stg = newGroupStorage(g, storage, reg, &gr.applied, &gr.confState, gr.selfID, &gr.applyMu, gr.lg)
+	gr.stg = newGroupStorage(g, storage, reg, &gr.applied, &gr.confState, gr.selfID, &gr.applyMu, rs, gr.lg)
+	gr.hotEntries = defaultRetainEntries
+	gr.hotMaxBytes = defaultHotMaxBytes
 	return gr
 }
+
+const (
+	// raftTickInterval 组主循环的 raft tick 周期（心跳 = 1 tick）。
+	raftTickInterval = 100 * time.Millisecond
+	// raftElectionTick 选举超时的 tick 数：选举超时 ≈ 1s。传输层的
+	// 陈旧消息判据（staleMsgAge）由它推出，改动须同步评估。
+	raftElectionTick = 10
+)
+
+// maxInflightBytes 单组对单个 follower 未确认在途日志字节的上限，取
+// 8 个发送合批（transport maxBatchBytes = 1MiB）的量。
+//
+// 为什么要按字节限（卡 SQ4.10）：窗口外条目经冷读层读出时每次新分配，
+// 在传输队列里等写出期间全部常驻 leader 堆。只有条数上限（256 条 ×
+// MaxSizePerMsg 1MiB）时，落后 follower 一转入复制态，leader 就把整段
+// 积压（最多 256MiB/组/follower）一次读出压进队列——linux-01 停机 5 分钟
+// 实测 leader VmHWM 从基线约 140MiB 涨到 500MiB 以上。按字节限后单组单
+// follower 的在途量与落后量无关；吞吐上界 = 8MiB / 往返时延（含对端
+// 落盘），局域网毫秒级往返下远高于磁盘带宽，不构成瓶颈。
+const maxInflightBytes = 8 * maxBatchBytes
 
 // raftConfig 构造共享的 raft 配置：tick 参数、单消息/在途日志上限、
 // 丢弃日志器（raft 库自身日志噪音大，关键节点由我们的 slog 承担）。
@@ -392,12 +425,14 @@ func newGroup(g uint32, selfID uint64, storage *raft.MemoryStorage, snaps *snapR
 func raftConfig(id uint64, storage raft.Storage) *raft.Config {
 	return &raft.Config{
 		ID:              id,
-		ElectionTick:    10,
+		ElectionTick:    raftElectionTick,
 		HeartbeatTick:   1,
 		Storage:         storage,
 		MaxSizePerMsg:   1 << 20,
 		MaxInflightMsgs: 256,
-		Logger:          &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)},
+		// 见 maxInflightBytes：按字节限住落后 follower 追平时的在途量
+		MaxInflightBytes: maxInflightBytes,
+		Logger:           &raft.DefaultLogger{Logger: log.New(io.Discard, "", 0)},
 		// 内核契约：follower 收到提案直接丢弃并返回错误，绝不转发给 leader
 		DisableProposalForwarding: true,
 		// 见 raftConfig 注释：预选阶段挡掉掉队节点的 term bump（安装攒满
@@ -431,7 +466,7 @@ func raftConfig(id uint64, storage raft.Storage) *raft.Config {
 // 注意：tick 与心跳是高频路径，本循环内零日志（热循环规则）；
 // 关键节点日志全部落在 dispatchReady/阶段协程/propose 等低频路径上。
 func (gr *group) run(ctx context.Context) {
-	ticker := time.NewTicker(100 * time.Millisecond) // ElectionTick=10 → 选举超时约 1s
+	ticker := time.NewTicker(raftTickInterval) // raftElectionTick=10 → 选举超时约 1s
 	defer ticker.Stop()
 	// 两条本地存储阶段协程与主循环同生命周期：doneCh 必须在三者**全部**
 	// 退出之后才关闭，否则测试里 <-gr.done() 返回时仍有协程在碰 store/rs，
@@ -910,6 +945,9 @@ func (gr *group) applyOnce(ctx context.Context, m *raftpb.Message) {
 	}
 	appliedCC := gr.applyPhase(m.GetEntries())
 	gr.installMu.Unlock()
+	// applied 推进后按需压缩内存热区（B6：apply goroutine 内，不进 raft
+	// 主循环；压缩点 ≤ applied 即 I-cold）
+	gr.compactHot()
 	gr.deliverResponses(ctx, m.GetResponses(), "apply")
 	for _, cc := range appliedCC {
 		if cc.notify {
@@ -1232,6 +1270,10 @@ func (gr *group) installSnapshot(ctx context.Context, snap *raftpb.Snapshot) err
 	if cs := meta.GetConfState(); cs != nil {
 		gr.confState.Store(cs)
 	}
+	// 磁盘下界同步跳到快照之后（卡 SQ4.10）：安装前的旧条目对 raft 不再
+	// 可见，冷读不得返回它们
+	gr.stg.advanceBound(idx+1, tm)
+	gr.hotBytes.Store(0)
 	gr.applyMu.Unlock()
 	// applied 跳到快照位点：唤醒可写门等待者（同 applyOnce 末尾）
 	gr.gateKick()
@@ -1361,6 +1403,92 @@ func (gr *group) persistPhase(hs *raftpb.HardState, ents []*raftpb.Entry, sync b
 		gr.lastTerm.Store(hs.GetTerm())
 	}
 	_ = gr.mem.Append(ents)
+	if len(ents) > 0 {
+		var n uint64
+		for _, e := range ents {
+			n += hotEntryBytes(e)
+		}
+		gr.hotBytes.Add(n)
+	}
+}
+
+// defaultHotMaxBytes 内存热区的字节窗口（plan B6：内部常量，不对用户暴露）。
+const defaultHotMaxBytes uint64 = 64 << 20
+
+// hotEntryBytes 热区字节估算：载荷 + 16B（index/term/类型与切片头量级）。
+func hotEntryBytes(e *raftpb.Entry) uint64 { return uint64(len(e.GetData())) + 16 }
+
+// compactHot 在热区超过 2× 窗口（条数或估算字节）时把它压到窗口内
+// （B6，apply goroutine 调用；按 2× 触发使 MemoryStorage.Compact 的整段
+// 复制摊还 O(1)）。
+//
+// 压缩点 = max(applied − hotEntries, 字节窗口起点 − 1)（字节窗口从日志尾
+// 往前量），再夹取到 ≤ min(applied, mem.LastIndex)：
+//   - ≤ applied 是 I-cold（冷区只含已 apply 条目，见 groupStorage）；
+//   - ≤ LastIndex 是 F5（MemoryStorage.Compact 越尾直接 Panicf）。
+//
+// 压出热区的条目仍在盘上（groupStorage 经冷读取）；rs 为 nil 时不压缩。
+func (gr *group) compactHot() {
+	if gr.rs == nil || gr.hotEntries == 0 {
+		return
+	}
+	first, _ := gr.mem.FirstIndex()
+	last, _ := gr.mem.LastIndex()
+	if last < first {
+		return
+	}
+	countTrig := last+1-first > 2*gr.hotEntries
+	byteTrig := gr.hotBytes.Load() > 2*gr.hotMaxBytes
+	if !countTrig && !byteTrig {
+		return
+	}
+	applied := gr.applied.Load()
+	upto := uint64(0)
+	if applied > gr.hotEntries {
+		upto = applied - gr.hotEntries
+	}
+	if byteTrig {
+		// 字节窗口：从日志尾往前累加（未 apply 的尾部也占内存），超过
+		// hotMaxBytes 的那条及更早的压掉——这个点可能越过 applied，由下面
+		// 的夹取拉回（I-cold）
+		if ents, err := gr.mem.Entries(first, last+1, math.MaxUint64); err == nil {
+			var acc uint64
+			for k := len(ents) - 1; k >= 0; k-- {
+				acc += hotEntryBytes(ents[k])
+				if acc > gr.hotMaxBytes {
+					upto = max(upto, ents[k].GetIndex())
+					break
+				}
+			}
+		}
+	}
+	upto = min(upto, applied, last)
+	if upto < first {
+		// 压不动（热区主体是未 apply 的尾部）：字节估算清零重新累积，
+		// 避免每次 apply 都重复扫描；条数触发下一批 apply 推进后自然重判
+		if byteTrig {
+			gr.hotBytes.Store(0)
+		}
+		return
+	}
+	if err := gr.mem.Compact(upto); err != nil && !errors.Is(err, raft.ErrCompacted) {
+		gr.lg.Warn("热区压缩失败（条目仍在盘上，不影响正确性）", "upto", upto, "first", first,
+			"applied", applied, "last", last, "err", err)
+		return
+	}
+	// 重算留存估算（每次压缩约淘汰一个窗口，重算摊还 O(1)）
+	first, _ = gr.mem.FirstIndex()
+	last, _ = gr.mem.LastIndex()
+	var kept uint64
+	if last >= first {
+		if ents, err := gr.mem.Entries(first, last+1, math.MaxUint64); err == nil {
+			for _, e := range ents {
+				kept += hotEntryBytes(e)
+			}
+		}
+	}
+	gr.hotBytes.Store(kept)
+	gr.lg.Debug("热区压缩", "upto", upto, "first", first, "last", last, "applied", applied, "keptBytes", kept)
 }
 
 // applyPhase 把一批已提交条目应用到 FSM，返回本批登记的成员变更 waiter。

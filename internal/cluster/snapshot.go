@@ -20,6 +20,7 @@ package cluster
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -391,12 +392,39 @@ func (r *snapRegistry) GCOnce(now time.Time) int {
 	return len(ids)
 }
 
-// groupStorage 是包在 MemoryStorage 外的 raft.Storage 包装：除 Snapshot
-// 外的全部方法直通 mem，Snapshot 现场生成描述符。
+// groupStorage 是 raft 组的两级日志存储（raft.Storage 实现，卡 SQ4.10）：
+// 热区是 MemoryStorage（最近一段窗口，raft 主路径读写），冷区是本组
+// seglog 的盘上日志（经 raftStore.ColdEntries/ColdTerm 按需读）。
+// Snapshot 现场生成描述符（Task 4）。
 //
-// raft 库经它读日志（Term/Entries/LastIndex/FirstIndex 与 InitialState），
-// 需要给落后 follower 发 MsgSnap 时调用 Snapshot()——「快照是现场拍的」，
-// 而不是启动时预置的。
+// 视图：
+//
+//	[ 磁盘下界 bound.first … 热区起点 mem.first ) 冷区 —— 盘上读
+//	[ 热区起点 … LastIndex ]                       热区 —— mem 直通
+//
+// FirstIndex 返回磁盘下界（锚点+1 / 快照 index+1），而不是热区起点：
+// 落后 peer 的 Next 只要 ≥ 磁盘下界，leader 就经冷读发日志，不发快照。
+//
+// 承重事实（plan §3 第 1 步，出处 go.etcd.io/raft/v3 v3.7.0）：
+//   - F1 并发：raft 只在 node.run goroutine 调 Storage，但本仓另有截断循环
+//     （FirstIndex/Term）、Snapshot（applied 的 term）、promoteLearners
+//     （LastIndex）跨 goroutine 调用；热区压缩在 apply goroutine。故所有
+//     方法只依赖 MemoryStorage 自带锁、原子量与 seglog 内部锁，并在「mem
+//     刚被并发压缩」时回落冷区重读。
+//   - F2 错误约定：log.go term()/slice() 对 ErrCompacted 转发快照、对
+//     ErrUnavailable 与其它错误 panic。故冷区一切读错误都映射为
+//     ErrCompacted + Warn（plan B7）：一块坏扇区只让该 peer 改收快照，
+//     不让 leader 进程退出。
+//   - F3 log.go firstIndex() 每次都调 FirstIndex()：必须 O(1)（原子量）。
+//   - F4 新当选 leader 对 peer 的 Match 从 0 起：宽限期内的死 peer 会以 0
+//     钉住截断，这是「多留」的安全方向（见 Manager.truncateOnceWith）。
+//   - F5 MemoryStorage.Compact(i) 在 i > lastIndex 时 Panicf（storage.go）：
+//     热区压缩点夹取到 ≤ min(applied, mem.LastIndex)。
+//
+// 冷区不变式 I-cold：冷区只含 index ≤ applied 的条目——热区压缩点 ≤
+// applied（group.compactHot），重启的热区起点 ≤ applied+1（raftStore.Load）。
+// 已 apply ⇒ 已提交 ⇒ 永不被换届改写，所以盘上「后写的赢」读到的版本就是
+// 最终版本，冷读不可能与 leader 日志分叉（plan R1）。
 type groupStorage struct {
 	g         uint32
 	mem       *raft.MemoryStorage
@@ -406,13 +434,68 @@ type groupStorage struct {
 	applyMu   *sync.Mutex                       // 与组 apply 路径共享的锁（组持有并传入）
 	selfID    uint64                            // 本节点 id：写进描述符的 leader 字段
 	lg        *slog.Logger
+
+	// rs 冷区读入口（nil = 无冷区，单组单测路径：行为退化为纯 mem）。
+	rs *raftStore
+	// bound 磁盘下界：first = raft 视角的日志起点，prevTerm = first-1 的
+	// 任期（raft 对账 firstIndex-1 用）。只前进不后退（advanceBound）。
+	bound atomic.Pointer[coldBound]
+	// 冷读计数（截断循环每轮取走并按组打 Info，见 takeColdStats）
+	coldReads   atomic.Uint64
+	coldEntries atomic.Uint64
+	coldBytes   atomic.Uint64
+	coldErrs    atomic.Uint64
 }
 
-// newGroupStorage 构造快照包装。applied/confState/applyMu 均指向组内
+// coldBound 磁盘下界快照（原子整体替换，first 与 prevTerm 配对）。
+type coldBound struct {
+	first    uint64
+	prevTerm uint64
+}
+
+// coldStats 一轮冷读统计（takeColdStats 返回）。
+type coldStats struct {
+	reads, entries, bytes, errs uint64
+}
+
+// newGroupStorage 构造两级存储。applied/confState/applyMu 均指向组内
 // 实例：Snapshot 与组的 apply 路径在 applyMu 上互斥，读 applied 与建
-// ReadView 才能原子配对（见 Snapshot 的顺序不变量注释）。
-func newGroupStorage(g uint32, mem *raft.MemoryStorage, reg *snapRegistry, applied *atomic.Uint64, cs *atomic.Pointer[raftpb.ConfState], selfID uint64, applyMu *sync.Mutex, lg *slog.Logger) *groupStorage {
-	return &groupStorage{g: g, mem: mem, reg: reg, applied: applied, confState: cs, applyMu: applyMu, selfID: selfID, lg: lg}
+// ReadView 才能原子配对（见 Snapshot 的顺序不变量注释）。rs 为 nil 时
+// 无冷区。磁盘下界初值取 mem 的现状（first 与 first-1 的任期，即无冷区
+// 的纯 mem 视图）；buildGroup 播种冷区后经 setBound 改为盘上下界。
+func newGroupStorage(g uint32, mem *raft.MemoryStorage, reg *snapRegistry, applied *atomic.Uint64, cs *atomic.Pointer[raftpb.ConfState], selfID uint64, applyMu *sync.Mutex, rs *raftStore, lg *slog.Logger) *groupStorage {
+	s := &groupStorage{g: g, mem: mem, reg: reg, applied: applied, confState: cs, applyMu: applyMu, selfID: selfID, rs: rs, lg: lg}
+	first, _ := mem.FirstIndex()
+	prev, _ := mem.Term(first - 1)
+	s.bound.Store(&coldBound{first: first, prevTerm: prev})
+	return s
+}
+
+// setBound 装配期设定磁盘下界（buildGroup 播种冷区后、raft 节点创建前
+// 调用，无并发）。运行期只能经 advanceBound 前进。
+func (s *groupStorage) setBound(first, prevTerm uint64) {
+	s.bound.Store(&coldBound{first: first, prevTerm: prevTerm})
+}
+
+// advanceBound 把磁盘下界前进到 first（截断落锚点后、快照安装后调用）；
+// first 不大于现值时不动——下界只前进，晚到的旧值不得把它拉回。
+func (s *groupStorage) advanceBound(first, prevTerm uint64) {
+	nb := &coldBound{first: first, prevTerm: prevTerm}
+	for {
+		cur := s.bound.Load()
+		if cur.first >= first {
+			return
+		}
+		if s.bound.CompareAndSwap(cur, nb) {
+			return
+		}
+	}
+}
+
+// takeColdStats 取走自上次调用以来的冷读计数（截断循环按组打 Info 用）。
+func (s *groupStorage) takeColdStats() coldStats {
+	return coldStats{reads: s.coldReads.Swap(0), entries: s.coldEntries.Swap(0),
+		bytes: s.coldBytes.Swap(0), errs: s.coldErrs.Swap(0)}
 }
 
 // InitialState 直通 mem：重启时 raft 取成员表与 HardState 用。
@@ -420,24 +503,82 @@ func (s *groupStorage) InitialState() (*raftpb.HardState, *raftpb.ConfState, err
 	return s.mem.InitialState()
 }
 
-// Entries 直通 mem：raft 追齐时读日志段。
+// Entries 读 [lo, hi)：热区内直通 mem；lo 落在热区之前则从冷区读
+// [lo, min(hi, 热区起点))——短于请求是 raft 认可的形态（raftLog.slice 按
+// 「短于请求 = 已到上限」处理），下一轮 MsgApp 自然接上热区。
+//
+// 错误：lo < 磁盘下界 → ErrCompacted（raft 发快照）；冷读失败 → Warn +
+// ErrCompacted（F2/B7）。
 func (s *groupStorage) Entries(lo, hi, maxSize uint64) ([]*raftpb.Entry, error) {
-	return s.mem.Entries(lo, hi, maxSize)
+	memFirst, _ := s.mem.FirstIndex()
+	if lo >= memFirst {
+		ents, err := s.mem.Entries(lo, hi, maxSize)
+		if !errors.Is(err, raft.ErrCompacted) {
+			return ents, err
+		}
+		// 与热区压缩（apply goroutine）撞车：lo 刚被压出热区，回落冷区
+		memFirst, _ = s.mem.FirstIndex()
+	}
+	b := s.bound.Load()
+	if lo < b.first {
+		return nil, raft.ErrCompacted
+	}
+	coldHi := min(hi, memFirst)
+	if s.rs == nil || coldHi <= lo {
+		return nil, raft.ErrCompacted
+	}
+	ents, err := s.rs.ColdEntries(s.g, lo, coldHi, maxSize)
+	if err != nil || len(ents) == 0 {
+		s.coldErrs.Add(1)
+		s.lg.Warn("冷读失败，按已压缩处理（该 peer 改收快照）", "g", s.g, "lo", lo, "hi", coldHi,
+			"bound", b.first, "memFirst", memFirst, "got", len(ents), "err", err)
+		return nil, raft.ErrCompacted
+	}
+	var bytes uint64
+	for _, e := range ents {
+		bytes += uint64(len(e.GetData()))
+	}
+	s.coldReads.Add(1)
+	s.coldEntries.Add(uint64(len(ents)))
+	s.coldBytes.Add(bytes)
+	return ents, nil
 }
 
-// Term 直通 mem：任期比较用。
+// Term 查 index i 的任期：热区直通 mem；i 已被压出热区时，i == 磁盘下界
+// −1 取下界配对的任期，其余落冷区任期表。错误映射同 Entries。
 func (s *groupStorage) Term(i uint64) (uint64, error) {
-	return s.mem.Term(i)
+	t, err := s.mem.Term(i)
+	if !errors.Is(err, raft.ErrCompacted) {
+		return t, err // 命中热区，或越尾 ErrUnavailable 原样交回 raft
+	}
+	b := s.bound.Load()
+	switch {
+	case i+1 < b.first:
+		return 0, raft.ErrCompacted
+	case i+1 == b.first:
+		return b.prevTerm, nil
+	}
+	if s.rs == nil {
+		return 0, raft.ErrCompacted
+	}
+	t, err = s.rs.ColdTerm(s.g, i)
+	if err != nil {
+		s.coldErrs.Add(1)
+		s.lg.Warn("冷区任期查询失败，按已压缩处理", "g", s.g, "index", i, "bound", b.first, "err", err)
+		return 0, raft.ErrCompacted
+	}
+	return t, nil
 }
 
-// LastIndex 直通 mem：日志末位。
+// LastIndex 直通 mem：日志末位（热区恒含日志尾）。
 func (s *groupStorage) LastIndex() (uint64, error) {
 	return s.mem.LastIndex()
 }
 
-// FirstIndex 直通 mem：日志起点（截断后 = 截断点+1）。
+// FirstIndex 返回磁盘下界（原子读，O(1)，F3）：截断后 = 锚点+1，快照
+// 安装后 = 快照 index+1。
 func (s *groupStorage) FirstIndex() (uint64, error) {
-	return s.mem.FirstIndex()
+	return s.bound.Load().first, nil
 }
 
 // Snapshot 现场生成一份快照描述符。raft 在需要给落后 follower 发
@@ -455,7 +596,7 @@ func (s *groupStorage) Snapshot() (*raftpb.Snapshot, error) {
 	id := s.reg.Create(s.g, index)
 	s.applyMu.Unlock()
 
-	term, err := s.mem.Term(index)
+	term, err := s.Term(index)
 	if err != nil {
 		// index 已被截断到不可查 term：本轮放弃，raft 下轮重试
 		s.reg.Release(id)

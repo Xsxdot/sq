@@ -56,7 +56,7 @@ func TestGroupStorageSnapshotIsConsistentWithIndex(t *testing.T) {
 	// applyMu 是组 apply 路径与 Snapshot 共享的锁（Task 4 设计：由 group
 	// 持有并传入），这里用测试侧独立的锁验证 Snapshot 的取位点语义。
 	var mu sync.Mutex
-	gs := newGroupStorage(1, mem, reg, &applied, &cs, 7 /*selfID*/, &mu, testSlog(t))
+	gs := newGroupStorage(1, mem, reg, &applied, &cs, 7 /*selfID*/, &mu, nil, testSlog(t))
 	snap, err := gs.Snapshot()
 	if err != nil {
 		t.Fatalf("Snapshot: %v", err)
