@@ -955,9 +955,10 @@ func TestRaftConfigBoundsInflightBytesToLaggingFollower(t *testing.T) {
 	term := rn.Status().GetTerm()
 	drain() // 新任期空条目（index 2）的首个探测 MsgApp，follower 2 暂不回
 
-	// follower 2 停在探测态期间积压 32MiB（4000 条 × 8KiB）
+	// follower 2 停在探测态期间积压 80MiB（10000 条 × 8KiB）：远大于
+	// 设计上限，上限放宽到数十 MiB 的变异也会越界变红
 	body := make([]byte, 8<<10)
-	const n = 4000
+	const n = 10000
 	for i := 0; i < n; i++ {
 		if err := rn.Propose(body); err != nil {
 			t.Fatal(err)
@@ -982,8 +983,11 @@ func TestRaftConfigBoundsInflightBytesToLaggingFollower(t *testing.T) {
 		t.Fatalf("raftConfig 未设 MaxInflightBytes：转入复制态后一次发出 %d 字节（积压 %d 字节，全部在途）",
 			sent, uint64(n)*uint64(len(body)))
 	}
-	if bound := limit + cfg.MaxSizePerMsg; sent > bound { // raft 允许最后一条越过上限
-		t.Fatalf("未确认在途 %d 字节（积压 %d 字节）; want ≤ %d（MaxInflightBytes=%d）",
-			sent, uint64(n)*uint64(len(body)), bound, limit)
+	// 上界按设计值（8 × 1MiB 合批）钉死，不随 raftConfig 取值浮动：
+	// 放宽上限必须同时改这里并重新论证 leader 追平期内存。
+	const designLimit = 8 << 20
+	if bound := uint64(designLimit) + cfg.MaxSizePerMsg; sent > bound { // raft 允许最后一条越过上限
+		t.Fatalf("未确认在途 %d 字节（积压 %d 字节）; want ≤ %d（设计上限 %d + 一条 MaxSizePerMsg；当前 MaxInflightBytes=%d）",
+			sent, uint64(n)*uint64(len(body)), bound, designLimit, limit)
 	}
 }
