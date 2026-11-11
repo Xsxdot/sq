@@ -150,6 +150,69 @@ func TestTransportDropPeerDrainsQueue(t *testing.T) {
 	}
 }
 
+// TestTransportDiscardsBacklogWhilePeerUnreachable 对端不可达期间不积压：
+// 拨号失败即清空该 peer 队列，对端恢复后只收到恢复之后发出的消息。
+//
+// 承重原因（SQ4.10 排查）：停机期间 leader 每 tick 发的心跳与每次提交
+// 广播的空 MsgApp 在队列里攒成数百条；对端重启后逐条回 MsgHeartbeatResp，
+// 而 raft 在 StateProbe 下每收一条心跳响应就解除暂停、从同一 Next 重发一条
+// 满 MaxSizePerMsg 的 MsgApp——重发条数与停机时长成正比，落后条目经
+// 冷读层每次新分配，leader 内存随之放大。积压的陈旧消息对 raft 毫无用处
+// （raft 自身按 tick 重发心跳、按 Progress 重发日志），丢弃是合法行为。
+func TestTransportDiscardsBacklogWhilePeerUnreachable(t *testing.T) {
+	// 先占端口再关：拿到一个「当前无人监听、稍后可重新监听」的地址。
+	probe, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	addr := probe.Addr().String()
+	probe.Close()
+
+	ln1, _ := net.Listen("tcp", "127.0.0.1:0")
+	tr := newTransport(1, ln1, map[uint64]string{2: addr},
+		func(uint32, *raftpb.Message) {}, nil, testSlog(t))
+	from, to := uint64(1), uint64(2)
+	typ := raftpb.MsgHeartbeat
+	const stale = 1000
+	for i := uint64(0); i < stale; i++ {
+		idx := i
+		tr.Send(0, []*raftpb.Message{{Type: &typ, From: &from, To: &to, Index: &idx}})
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	tr.Start(ctx)
+	// 至少跨过一轮「拨号失败 → 退避」，积压应在此期间被清空。
+	time.Sleep(2 * redialBackoff)
+
+	ln2, err := net.Listen("tcp", addr)
+	if err != nil {
+		t.Skipf("端口 %s 被占用，无法重建对端：%v", addr, err)
+	}
+	got := make(chan uint64, stale+1)
+	peer := newTransport(2, ln2, nil,
+		func(_ uint32, m *raftpb.Message) { got <- m.GetIndex() }, nil, testSlog(t))
+	peer.Start(ctx)
+	const marker = uint64(1 << 40)
+	mk := marker
+	tr.Send(0, []*raftpb.Message{{Type: &typ, From: &from, To: &to, Index: &mk}})
+
+	staleSeen := 0
+	for {
+		select {
+		case idx := <-got:
+			if idx == marker {
+				if staleSeen != 0 {
+					t.Fatalf("对端恢复后先收到 %d 条不可达期间的积压消息; want 0（积压应在拨号失败时清空）", staleSeen)
+				}
+				return
+			}
+			staleSeen++
+		case <-time.After(5 * time.Second):
+			t.Fatalf("5s 未收到恢复后发出的消息（已收积压 %d 条）", staleSeen)
+		}
+	}
+}
+
 // TestTransportUnregistersClosedConns 终审 R4：入站连接在 readLoop 退出
 // （对端断开等）时必须从看门狗集合摘除——不摘除的话，抖动对端反复
 // 连接又断开会让 conns 无界增长直到 ctx 取消。

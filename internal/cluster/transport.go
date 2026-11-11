@@ -44,7 +44,8 @@ import (
 
 const (
 	// peerQueueCap 每 peer 发送队列容量。队列满即丢——容量只是积压
-	// 缓冲，不是送达承诺（raft 心跳重试兜底）。
+	// 缓冲，不是送达承诺（raft 心跳重试兜底）；对端不可达（拨号失败）
+	// 时整队清空，不跨停机期积压（见 sendLoop）。
 	peerQueueCap = 4096
 
 	// maxFrameLen 单帧上限 16MiB：坏帧可声明任意帧长，不设上限会把
@@ -289,14 +290,7 @@ func (t *transport) DropPeer(id uint64) {
 	if !ok {
 		return
 	}
-	for {
-		select {
-		case <-q:
-		default:
-			goto drained
-		}
-	}
-drained:
+	discardQueued(q)
 	if d, ok := t.drops[id]; ok {
 		d.Store(0)
 	}
@@ -349,10 +343,18 @@ func (t *transport) sendLoop(ctx context.Context, peerID uint64, addr string) {
 		if ctx.Err() != nil {
 			return
 		}
-		// 对端未起时队列积满会被 Send 丢弃，退避期间周期上报一次。
+		// 对端未起时积压在拨号失败处清空、计入丢弃，退避期间周期上报一次。
 		t.logDrops(peerID, drops, &lastDropLog)
 		conn, err := net.Dial("tcp", addr)
 		if err != nil {
+			// 对端不可达：清空积压并计入丢弃。积压的心跳/空 MsgApp 对
+			// raft 毫无价值（raft 按 tick 重发心跳、按 Progress 重发日志），
+			// 留着反而有害——对端重启后逐条回 MsgHeartbeatResp，raft 在
+			// StateProbe 下每收一条就从同一 Next 重发一条满 MaxSizePerMsg
+			// 的 MsgApp，重发量与停机时长成正比（SQ4.10 排查实测：停机
+			// 20s 积压约 500 条，leader 堆峰值 ×30）。清空后对端恢复时
+			// 最多只见一个退避周期内的消息，重发量与停机时长无关。
+			drops.Add(uint64(discardQueued(q)))
 			select {
 			case <-ctx.Done():
 				return
@@ -607,7 +609,21 @@ func appendFrame(buf []byte, group uint32, payload []byte) []byte {
 	return append(buf, payload...)
 }
 
-// logDrops 周期上报队列满丢弃计数：丢弃点是高频热路径，逐条 Debug 会
+// discardQueued 非阻塞排空队列，返回丢弃条数。与并发 Send 竞争安全：
+// 排空期间新入队的消息可能被一并丢弃或留下，两者对 raft 都合法。
+func discardQueued(q chan envelope) int {
+	n := 0
+	for {
+		select {
+		case <-q:
+			n++
+		default:
+			return n
+		}
+	}
+}
+
+// logDrops 周期上报丢弃计数（队列满 + 对端不可达清空）：丢弃点是高频热路径，逐条 Debug 会
 // 刷屏，必须带计数累积、最多每秒一条（instrumenting-code 热循环规则）。
 // 仅在发送 goroutine 内调用（lastDropLog 无锁）。
 func (t *transport) logDrops(peerID uint64, drops *atomic.Uint64, lastDropLog *time.Time) {
@@ -615,6 +631,6 @@ func (t *transport) logDrops(peerID uint64, drops *atomic.Uint64, lastDropLog *t
 	if c == 0 || time.Since(*lastDropLog) < time.Second {
 		return
 	}
-	t.lg.Debug("队列满丢弃消息", "self", t.self, "peer", peerID, "dropped", c)
+	t.lg.Debug("丢弃消息（队列满或对端不可达）", "self", t.self, "peer", peerID, "dropped", c)
 	*lastDropLog = time.Now()
 }
