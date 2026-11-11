@@ -7,6 +7,9 @@
 //   - 提供故障注入原语：SIGKILL（断电语义）、优雅停（写干净关机标记）、
 //     原地重启（复用同一份配置与数据目录）、SIGSTOP/SIGCONT（假死）
 //   - 记录每进程内存峰值（全局约束：性能类验证必记）
+//   - 新旧节点混跑（卡 SQ4.3）：SQ_E2E_BROKER_ALT=<旧二进制路径> +
+//     SQ_E2E_ALT_NODES=<逗号分隔的 1 起节点号>，命中的节点用旧二进制起进程
+//     （重启沿用）；两个变量任一未设则全部节点用 brokerBinary，行为不变
 //
 // 边界：
 //   - 不做网络层分区（iptables/pfctl 要 root、两平台两套写法、CI 不可
@@ -22,6 +25,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -100,7 +104,12 @@ func (pc *procCluster) spawn(t *testing.T, i int, endpoint string) *brokerHandle
 	if err != nil {
 		t.Fatalf("打开节点 %d 日志文件失败: %v", i+1, err)
 	}
-	cmd := exec.Command(brokerBinary, "-config", pc.cfgPaths[i])
+	bin := brokerBinary
+	if alt := altBrokerFor(t, i); alt != "" {
+		bin = alt
+		t.Logf("节点 %d 使用混跑旧二进制 %s", i+1, alt)
+	}
+	cmd := exec.Command(bin, "-config", pc.cfgPaths[i])
 	if len(pc.env[i]) > 0 {
 		cmd.Env = append(os.Environ(), pc.env[i]...)
 	}
@@ -116,6 +125,32 @@ func (pc *procCluster) spawn(t *testing.T, i int, endpoint string) *brokerHandle
 		endpoint: endpoint, cfgPath: pc.cfgPaths[i], logPath: logPath,
 		logFile: logFile, cmd: cmd, waitDone: waitDone,
 	}
+}
+
+// altBrokerFor 返回第 i 个节点（0-based）应使用的混跑旧二进制路径；未配置
+// 混跑或该节点不在 SQ_E2E_ALT_NODES 内时返回 ""。
+//
+// 配置错误（节点号非法、二进制不可用）直接 Fatal：混跑用例静默退化成
+// 全新二进制会让「混跑全绿」变成假证据。
+func altBrokerFor(t *testing.T, i int) string {
+	t.Helper()
+	alt, nodes := os.Getenv("SQ_E2E_BROKER_ALT"), os.Getenv("SQ_E2E_ALT_NODES")
+	if alt == "" || nodes == "" {
+		return ""
+	}
+	if _, err := os.Stat(alt); err != nil {
+		t.Fatalf("SQ_E2E_BROKER_ALT=%s 不可用: %v", alt, err)
+	}
+	for _, f := range strings.Split(nodes, ",") {
+		n, err := strconv.Atoi(strings.TrimSpace(f))
+		if err != nil || n < 1 {
+			t.Fatalf("SQ_E2E_ALT_NODES=%q 含非法节点号 %q（应为 1 起的整数）", nodes, f)
+		}
+		if n == i+1 {
+			return alt
+		}
+	}
+	return ""
 }
 
 // multi 返回 SDK 用的「;」分隔多地址（SDK resolver 按 ; 拆分）。

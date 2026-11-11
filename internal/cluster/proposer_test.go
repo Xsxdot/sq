@@ -498,3 +498,363 @@ func TestProposerExpectedEpochMismatchRejected(t *testing.T) {
 		t.Fatalf("apply 到的序号 %v，期望只有 [9]（失配条目不得进日志）", applied)
 	}
 }
+
+// ---- 合并提案（卡 SQ4.3，计划 §4.2）----
+
+// gateFirstNode 包装 raft.Node：第一次 Propose 先等 gate 关闭再透传（让
+// proposer 卡在第一条上，后续条目在队列里堆成一次取走的整批），其余透传。
+type gateFirstNode struct {
+	raft.Node
+	once sync.Once
+	gate chan struct{}
+}
+
+func (n *gateFirstNode) Propose(ctx context.Context, data []byte) error {
+	n.once.Do(func() { <-n.gate })
+	return n.Node.Propose(ctx, data)
+}
+
+// queueDrained 返回「proposer 已取走队列里全部条目」的探针。
+func queueDrained(gr *group) func() bool {
+	return func() bool { gr.pq.mu.Lock(); defer gr.pq.mu.Unlock(); return len(gr.pq.items) == 0 }
+}
+
+// batchCounters 读合并计数（批次数、批内条目数）。
+func batchCounters(gr *group) (uint64, uint64) {
+	return gr.pq.batches.Load(), gr.pq.batchEntries.Load()
+}
+
+// TestProposerBatchMergesAndKeepsOrder 不变式 1：64 个调用方在外部互斥锁下
+// 取递增序号并调异步入口（锁外 Wait）时，合并真的发生（批次计数 >0、平均
+// 批长 >1），且 apply 顺序仍与调用顺序严格一致。
+func TestProposerBatchMergesAndKeepsOrder(t *testing.T) {
+	prefix := []byte("bm/")
+	var mu sync.Mutex
+	var applied []uint64
+	onApplied := func(_ uint32, repr []byte) {
+		s := seqsIn(repr, prefix)
+		mu.Lock()
+		applied = append(applied, s...)
+		mu.Unlock()
+	}
+	gr, st, _ := propTestGroup(t, onApplied, nil)
+	const writers, per = 64, 200
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	var callMu sync.Mutex
+	var next uint64
+	var wg sync.WaitGroup
+	errCh := make(chan error, writers)
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < per; i++ {
+				callMu.Lock()
+				next++
+				p := gr.enqueueProposal(ctx, seqBatch(t, st, string(prefix), next), false)
+				callMu.Unlock()
+				if err := p.Wait(); err != nil {
+					errCh <- err
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		t.Fatalf("提案失败: %v", err)
+	}
+	batches, entries := batchCounters(gr)
+	t.Logf("批次 %d，批内条目 %d，平均批长 %.2f", batches, entries, float64(entries)/float64(max(batches, 1)))
+	if batches == 0 || entries <= batches {
+		t.Fatalf("合并未发生：批次 %d，批内条目 %d（期望批次 >0 且平均批长 >1）", batches, entries)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(applied) != writers*per {
+		t.Fatalf("apply 条数 %d，期望 %d", len(applied), writers*per)
+	}
+	for i := 1; i < len(applied); i++ {
+		if applied[i] <= applied[i-1] {
+			t.Fatalf("apply 顺序与调用顺序不一致：第 %d 条 seq=%d 在 seq=%d 之后", i, applied[i], applied[i-1])
+		}
+	}
+}
+
+// TestProposerBatchDroppedFailsFast 不变式 2（计划 A1/A2 承重）：leader 侧
+// 领导权转移挂起（leadTransferee 非空）时 raft 整批丢弃 MsgProp，而 rn.Step
+// 不回传丢弃错误——围栏必须让整批在毫秒级以 ErrNotLeader 失败（而不是拖到
+// 条目 ctx 的 30s），且这些载荷从未进任何节点的日志。
+//
+// 构造：三节点组，kill 一个 follower，再让 leader 把领导权转给这个已死节点
+// （转移挂起约一个选举超时）。为让 ≥8 条一次被 proposer 取走，先放一条
+// 「挡板」条目让 proposer 卡在注册 waiter 的 gr.mu 上，期间入队 8 条；转移
+// 生效后取消挡板 ctx 再放锁——挡板以 ctx 错误失败（不触发作废），8 条成段。
+func TestProposerBatchDroppedFailsFast(t *testing.T) {
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{LeaderBalancerInterval: time.Hour})
+	const g = uint32(1)
+	lead := tc.leaderOf(t, g)
+	var victim uint64
+	for id := range tc.mgrs {
+		if id != lead {
+			victim = id
+			break
+		}
+	}
+	tc.kill(t, victim)
+	gr := tc.mgrs[lead].groups[g]
+	waitFor(t, 5*time.Second, func() bool { es := gr.epoch.Load(); return es.isSelf && es.term == gr.leaderTerm() }, "leader 领导权快照未就绪")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	prefix := "bd/"
+	blockCtx, unblock := context.WithCancel(ctx)
+	gr.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			gr.mu.Unlock()
+		}
+	}()
+	blocker := gr.enqueueProposal(blockCtx, seqBatch(t, tc.stores[lead], prefix, 999), false)
+	waitFor(t, 5*time.Second, queueDrained(gr), "proposer 未取走挡板条目")
+	time.Sleep(50 * time.Millisecond) // proposer 走到 proposeOne 的 gr.mu.Lock
+	const n = 8
+	pend := make([]*ProposalPending, n)
+	for i := 0; i < n; i++ {
+		pend[i] = gr.enqueueProposal(ctx, seqBatch(t, tc.stores[lead], prefix, uint64(i)), false)
+	}
+	tc.mgrs[lead].TransferLeader(g, victim)
+	waitFor(t, 2*time.Second, func() bool { return gr.rn.Status().LeadTransferee == victim }, "领导权转移未挂起")
+	b0, e0 := batchCounters(gr)
+	unblock()
+	gr.mu.Unlock()
+	locked = false
+
+	if err := blocker.Wait(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("挡板条目 Wait=%v，期望 context.Canceled", err)
+	}
+	start := time.Now()
+	for i, p := range pend {
+		if err := p.Wait(); !errors.Is(err, ErrNotLeader) {
+			t.Fatalf("转移窗口内条目 %d Wait=%v，期望 ErrNotLeader", i, err)
+		}
+	}
+	if d := time.Since(start); d > 2*time.Second {
+		t.Fatalf("整批失败用了 %v，期望 2s 内（围栏缺失时会拖到条目 ctx 超时）", d)
+	}
+	if b1, e1 := batchCounters(gr); b1-b0 < 1 || e1-e0 < n {
+		t.Fatalf("未走批路径：批次增量 %d，批内条目增量 %d（期望 ≥1、≥%d）", b1-b0, e1-e0, n)
+	}
+	// 转移作罢后写一条哨兵：它 apply 之后，若丢弃的条目进过日志也必已 apply
+	tc.waitLeader(t, g, lead, 20*time.Second)
+	waitFor(t, 10*time.Second, func() bool { return gr.rn.Status().LeadTransferee == 0 }, "转移未作罢")
+	if err := tc.mgrs[lead].ProposeReservedAsync(ctx, g, seqBatch(t, tc.stores[lead], "bd-new/", 1)).Wait(); err != nil {
+		t.Fatalf("转移作罢后的哨兵提案失败: %v", err)
+	}
+	newKey := make([]byte, len("bd-new/")+8)
+	copy(newKey, "bd-new/")
+	binary.BigEndian.PutUint64(newKey[len("bd-new/"):], 1)
+	for _, id := range tc.aliveIDs() {
+		st := tc.stores[id]
+		waitFor(t, 10*time.Second, func() bool { _, ok, _ := st.Get(newKey); return ok }, fmt.Sprintf("节点 %d 未收到哨兵", id))
+		for i := 0; i < n; i++ {
+			key := make([]byte, len(prefix)+8)
+			copy(key, prefix)
+			binary.BigEndian.PutUint64(key[len(prefix):], uint64(i))
+			if _, ok, err := st.Get(key); err != nil || ok {
+				t.Fatalf("节点 %d 见到了被丢弃批次条目 %d（ok=%v err=%v）", id, i, ok, err)
+			}
+		}
+	}
+}
+
+// TestProposerBatchTermChangeNotProposed 不变式 3：沿用 SQ2 不变式 2 的构造
+// （任期 T 入队、出队前换届并在 T'>T 重新当选），条目数加到 32，保证旧任期
+// 条目成批落到合并路径的候选里。断言同 SQ2：全部 ErrNotLeader、任何节点
+// 都没见到载荷、新任期条目照常成功。
+func TestProposerBatchTermChangeNotProposed(t *testing.T) {
+	tc := newTestClusterOpts(t, AckQuorumMem, Options{LeaderBalancerInterval: time.Hour})
+	const g = uint32(1)
+	lead := tc.leaderOf(t, g)
+	var other uint64
+	for id := range tc.mgrs {
+		if id != lead {
+			other = id
+			break
+		}
+	}
+	gr := tc.mgrs[lead].groups[g]
+	waitFor(t, 5*time.Second, func() bool { es := gr.epoch.Load(); return es.isSelf && es.term == gr.leaderTerm() }, "leader 领导权快照未就绪")
+	termT := gr.leaderTerm()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	const n = 32
+	prefix := "bt/"
+	gr.pq.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			gr.pq.mu.Unlock()
+		}
+	}()
+	pend := make([]*ProposalPending, n)
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			pend[i] = gr.enqueueProposal(ctx, seqBatch(t, tc.stores[lead], prefix, uint64(i)), false)
+		}(i)
+	}
+	time.Sleep(200 * time.Millisecond) // 入队方读完快照（绑定 T）、阻塞在 pq.mu 上
+	tc.mgrs[lead].TransferLeader(g, other)
+	tc.waitLeader(t, g, other, 20*time.Second)
+	tc.mgrs[other].TransferLeader(g, lead)
+	tc.waitLeader(t, g, lead, 20*time.Second)
+	waitFor(t, 5*time.Second, func() bool { es := gr.epoch.Load(); return es.isSelf && es.term > termT }, "本节点未在新任期重新当选")
+	gr.pq.mu.Unlock()
+	locked = false
+	wg.Wait()
+	for i, p := range pend {
+		if err := p.Wait(); !errors.Is(err, ErrNotLeader) {
+			t.Fatalf("旧任期条目 %d Wait=%v，期望 ErrNotLeader", i, err)
+		}
+	}
+	if err := tc.mgrs[lead].ProposeReservedAsync(ctx, g, seqBatch(t, tc.stores[lead], "bt-new/", 1)).Wait(); err != nil {
+		t.Fatalf("新任期提案失败: %v", err)
+	}
+	newKey := make([]byte, len("bt-new/")+8)
+	copy(newKey, "bt-new/")
+	binary.BigEndian.PutUint64(newKey[len("bt-new/"):], 1)
+	for id, st := range tc.stores {
+		waitFor(t, 10*time.Second, func() bool { _, ok, _ := st.Get(newKey); return ok }, fmt.Sprintf("节点 %d 未收到新任期条目", id))
+		for i := 0; i < n; i++ {
+			key := make([]byte, len(prefix)+8)
+			copy(key, prefix)
+			binary.BigEndian.PutUint64(key[len(prefix):], uint64(i))
+			if _, ok, err := st.Get(key); err != nil || ok {
+				t.Fatalf("节点 %d 见到了旧任期条目 %d 的载荷（ok=%v err=%v）——旧任期批次进了新任期日志", id, i, ok, err)
+			}
+		}
+	}
+}
+
+// gatedBatchGroup 单节点组 + gateFirstNode：返回组、store、gate 与 apply 序列
+// 读取函数。调用方先入队一条挡板（卡在第一次 Propose 上），再入队待测条目，
+// 关闭 gate 后 proposer 一次取走全部待测条目。
+func gatedBatchGroup(t *testing.T, prefix []byte) (*group, *store.Store, chan struct{}, func() []uint64) {
+	t.Helper()
+	var mu sync.Mutex
+	var applied []uint64
+	onApplied := func(_ uint32, repr []byte) {
+		s := seqsIn(repr, prefix)
+		mu.Lock()
+		applied = append(applied, s...)
+		mu.Unlock()
+	}
+	gate := make(chan struct{})
+	gr, st, _ := propTestGroup(t, onApplied, func(n raft.Node) raft.Node { return &gateFirstNode{Node: n, gate: gate} })
+	return gr, st, gate, func() []uint64 {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]uint64(nil), applied...)
+	}
+}
+
+// TestProposerBatchCanceledEntrySplitsSegment 不变式 4：段内一条 ctx 先取消
+// → 只失败它自己，并在此处断段：入队 a、b（已取消）、c、d，a 单独走单条
+// 路径，c、d 成一批（批次 +1、批内条目 +2）；apply 顺序 a<c<d。若实现「跳过
+// 失败条目而不断段」，a、c、d 会成一批（批内条目 +3）。
+func TestProposerBatchCanceledEntrySplitsSegment(t *testing.T) {
+	prefix := []byte("bc/")
+	gr, st, gate, applied := gatedBatchGroup(t, prefix)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	dead, kill := context.WithCancel(context.Background())
+	kill()
+	blocker := gr.enqueueProposal(ctx, seqBatch(t, st, string(prefix), 100), false)
+	waitFor(t, 5*time.Second, queueDrained(gr), "proposer 未取走挡板条目")
+	a := gr.enqueueProposal(ctx, seqBatch(t, st, string(prefix), 1), false)
+	b := gr.enqueueProposal(dead, seqBatch(t, st, string(prefix), 2), false)
+	c := gr.enqueueProposal(ctx, seqBatch(t, st, string(prefix), 3), false)
+	d := gr.enqueueProposal(ctx, seqBatch(t, st, string(prefix), 4), false)
+	b0, e0 := batchCounters(gr)
+	close(gate)
+	if err := blocker.Wait(); err != nil {
+		t.Fatalf("挡板条目失败: %v", err)
+	}
+	if err := b.Wait(); !errors.Is(err, context.Canceled) {
+		t.Fatalf("已取消条目 Wait=%v，期望 context.Canceled", err)
+	}
+	for name, p := range map[string]*ProposalPending{"a": a, "c": c, "d": d} {
+		if err := p.Wait(); err != nil {
+			t.Fatalf("条目 %s 被株连: %v", name, err)
+		}
+	}
+	if b1, e1 := batchCounters(gr); b1-b0 != 1 || e1-e0 != 2 {
+		t.Fatalf("批次增量 %d、批内条目增量 %d，期望 1、2（a 单条，c+d 一批；失败条目处必须断段）", b1-b0, e1-e0)
+	}
+	got := applied()
+	want := []uint64{100, 1, 3, 4}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("apply 顺序 %v，期望 %v", got, want)
+	}
+}
+
+// TestProposerBatchByteLimitSplits 不变式 5：一次取走的条目载荷合计超
+// batchProposalMaxBytes 时按字节上限断段：6 条各 ~300KiB → 至少 2 批，
+// 全部成功、apply 顺序不变。
+func TestProposerBatchByteLimitSplits(t *testing.T) {
+	prefix := []byte("bb/")
+	gr, st, gate, applied := gatedBatchGroup(t, prefix)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	big := func(seq uint64) []byte {
+		b := st.NewBatch()
+		key := make([]byte, len(prefix)+8)
+		copy(key, prefix)
+		binary.BigEndian.PutUint64(key[len(prefix):], seq)
+		if err := b.Set(key, bytes.Repeat([]byte("x"), 300<<10)); err != nil {
+			t.Fatal(err)
+		}
+		data := make([]byte, ProposalHeaderLen+len(b.Repr()))
+		copy(data[ProposalHeaderLen:], b.Repr())
+		_ = b.Close()
+		return data
+	}
+	blocker := gr.enqueueProposal(ctx, seqBatch(t, st, string(prefix), 100), false)
+	waitFor(t, 5*time.Second, queueDrained(gr), "proposer 未取走挡板条目")
+	const n = 6
+	pend := make([]*ProposalPending, n)
+	total := 0
+	for i := 0; i < n; i++ {
+		data := big(uint64(i + 1))
+		total += len(data)
+		pend[i] = gr.enqueueProposal(ctx, data, false)
+	}
+	if total <= batchProposalMaxBytes {
+		t.Fatalf("构造错误：载荷合计 %d 未超上限 %d", total, batchProposalMaxBytes)
+	}
+	b0, _ := batchCounters(gr)
+	close(gate)
+	if err := blocker.Wait(); err != nil {
+		t.Fatalf("挡板条目失败: %v", err)
+	}
+	for i, p := range pend {
+		if err := p.Wait(); err != nil {
+			t.Fatalf("条目 %d 失败: %v", i, err)
+		}
+	}
+	if b1, _ := batchCounters(gr); b1-b0 < 2 {
+		t.Fatalf("批次增量 %d，期望 ≥2（载荷合计 %d 超上限 %d 必须断段）", b1-b0, total, batchProposalMaxBytes)
+	}
+	got := applied()
+	want := []uint64{100, 1, 2, 3, 4, 5, 6}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("apply 顺序 %v，期望 %v", got, want)
+	}
+}
