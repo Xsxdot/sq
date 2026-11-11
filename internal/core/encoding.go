@@ -84,14 +84,15 @@ func SetEncoding(enc string) error {
 //   - m: 待编码消息；Body 可为空
 //
 // 返回：
-//   - 编码字节；格式由装配期档位决定（SetEncoding），默认 json 与历史
+//   - 编码字节；格式由装配期档位决定（SetEncoding）；未调用 SetEncoding
+//     时为 json（配置层缺省 binary，main 总会显式设置），json 档与历史
 //     版本逐字节相同
 //   - error: 序列化失败（对正常消息不可达），信息带消息 ID
 //
 // 注意：
-//   - 无论产出哪一档，本版本的 DecodeMessage 都能解开；反之，旧版本
-//     进程解不开 binary 档的产物——这正是 README「升级注意」里两步纪律
-//     的由来。
+//   - 无论产出哪一档，本版本的 DecodeMessage 都能解开；反之，v0.1.0
+//     之前的进程解不开 binary 档的产物——这正是它们不能与本版本混跑的
+//     由来（docs/deployment.md 升级注意）。
 func EncodeMessage(m *Message) ([]byte, error) {
 	if binaryEncoding.Load() {
 		return encodeMessageV1(m)

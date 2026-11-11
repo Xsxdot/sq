@@ -46,16 +46,16 @@ type Config struct {
 	AdvertisePort int    `yaml:"advertise_port"` // 默认 8081
 	DataDir       string `yaml:"data_dir"`       // Pebble 数据目录
 	Fsync         string `yaml:"fsync"`          // sync|async
-	// MessageEncoding 消息落盘/跨节点转发的编码档位：json|binary，缺省 json。
+	// MessageEncoding 消息落盘/跨节点转发的编码档位：json|binary，缺省 binary（SQ4.7）。
 	//
 	// json = 历史格式（整条 JSON，Body 走 base64，+33% 体积）；
 	// binary = v1 混合格式（Body 原始字节直落）。取值与 core.EncodingJSON/
 	// core.EncodingBinary 一一对应（此处用字面量与 fsync/ack 同风格，
 	// 保持 config 包不依赖 core）。
 	//
-	// ⚠️ 开启 binary 必须在**全集群升级完成之后**：解码永远双格式，但旧版本
-	// 进程不认识 v1，混版期提前开启会让旧节点解不开转发来的消息。两步纪律
-	// 见 README「升级注意」。
+	// 解码永远双格式，二进制解码随 v0.1.0 发布，故 v0.1.0 起混跑与滚动升级
+	// 都安全、已有 JSON 数据零迁移；v0.1.0 之前的版本解不开 binary，不能与
+	// 本版本混跑（见 docs/deployment.md 升级注意）。显式写 json 的部署行为不变。
 	MessageEncoding    string `yaml:"message_encoding"`
 	AutoCreateTopic    bool   `yaml:"auto_create_topic"`    // QueryRoute/Send 未知 topic 时自动建
 	DefaultQueueNums   uint32 `yaml:"default_queue_nums"`   // 自动建 topic 的队列数
@@ -180,7 +180,7 @@ func Load(path string) (*Config, error) {
 	cfg := &Config{
 		GRPCListen: ":8081", AdvertiseHost: "127.0.0.1", AdvertisePort: 8081,
 		DataDir: "./data", Fsync: "sync",
-		MessageEncoding: "json",
+		MessageEncoding: "binary",
 		AutoCreateTopic: true, DefaultQueueNums: 16, // 16：队列数决定消费并行度（每队列一路消费）；写吞吐自队列内 group commit 后与队列数基本无关
 
 		DefaultMaxAttempts: 16, LogLevel: "info",

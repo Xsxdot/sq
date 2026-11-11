@@ -232,7 +232,7 @@ func writeBrokerConfig(t *testing.T, mutate ...func(*config.Config)) (cfgPath, e
 		// 与 DefaultMaxAttempts/RetentionCheckInterval 同款陷阱：本结构体
 		// 不走 config.Load 的默认值，零值会序列化成 message_encoding: ""
 		// 并被 Load 的白名单拒绝，broker 直接起不来。取值同 Load 的缺省。
-		MessageEncoding:    "json",
+		MessageEncoding:    "binary",
 		AutoCreateTopic:    true,
 		DefaultQueueNums:   4,
 		DefaultMaxAttempts: 16,
