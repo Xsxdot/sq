@@ -5,7 +5,8 @@
 //
 // 职责：
 //   - delay/half 深度改由 store 内存计数后，leader 与 follower（apply 路径）
-//     的 /metrics 都等于期望值
+//     的 /metrics 都等于期望值：延时暂存的写入与到期搬运（删除）、经 follower
+//     转发的事务半消息写入
 //   - kill -9 meta 组 leader 再重启：重启节点（Open 重建基数 / Rejoin 重开
 //     store / 快照安装重数）与切主后的其余节点读数仍正确
 //
@@ -18,6 +19,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -104,9 +106,27 @@ func waitDepthsOnAll(t *testing.T, pc *procCluster, wantDelay, wantHalf float64,
 	t.Fatalf("[%s] %v 内未达标（期望 delay=%v half=%v）：%s", phase, within, wantDelay, wantHalf, last)
 }
 
+// adminSendDelay 经 meta leader 的控制台发送端点写一条延时消息（延时暂存
+// 只在 meta leader 受理）。
+//
+// 为什么不用 SDK：集群档下 SDK 的 Send/Recall 按 topic 路由挑端点，只有
+// meta leader 恰好也领导该 topic 某个队列组、且 SDK 轮到它时才会成功
+// （rpc.SendMessage 的 leadsAnyQueueGroup 探针 + delay 写入要求 meta
+// leader），实测 5 次里 3 次发不出——那是既有的集群路由限制，与本用例要
+// 验的计数无关，故走确定性的控制台入口。
+func adminSendDelay(t *testing.T, adminBase, topic, body string, delay time.Duration) {
+	t.Helper()
+	adminJSON(t, "POST", adminBase+"/admin/messages/send", "",
+		map[string]any{"topic": topic, "body": body, "delay_ms": delay.Milliseconds()}, http.StatusCreated, nil)
+}
+
 func TestClusterMetricsDepthOnAllNodes(t *testing.T) {
-	// 回查间隔拉长：孤儿半消息在用例期间不被回查（不受 checker 影响）
-	pc := startProcCluster(t, 3, func(c *config.Config) { c.TxnCheckInterval = "10m" })
+	// 回查间隔拉长：孤儿半消息在用例期间不被回查（不受 checker 影响）；
+	// 关客户端鉴权，沿用单机用例的 producer 辅助（空凭据）
+	pc := startProcCluster(t, 3, func(c *config.Config) {
+		c.TxnCheckInterval = "10m"
+		c.Credentials = nil
+	})
 	const (
 		topicDelay = "e2e-m49-delay"
 		topicTxn   = "e2e-m49-txn"
@@ -115,22 +135,17 @@ func TestClusterMetricsDepthOnAllNodes(t *testing.T) {
 	ensureTopic(t, pc.endpoints(), topicDelay)
 	ensureTopic(t, pc.endpoints(), topicTxn)
 
-	// 撤回必须落在 meta leader 上（delay.Scheduler.Recall 的判据 1）
 	ml := metaLeaderIndex(t, pc)
 	t.Logf("meta 组 leader = 节点 %d", ml+1)
-	p := newRecallProducer(t, pc.endpointOf(ml), topicDelay)
-	var handles []string
+	// K 条延时：K−R 条 10 分钟（留在暂存区），R 条 2 秒（到期被调度器搬走，
+	// 即暂存键的删除经复制到达各节点）
+	mlAdmin := "http://" + pc.cfgs[ml].AdminListen
 	for i := 0; i < K; i++ {
-		h, _ := sendDelayed(t, p, topicDelay, fmt.Sprintf("d-%d", i), 10*time.Minute)
-		if h == "" {
-			t.Fatal("延时消息未带回 recall 句柄")
+		d := 10 * time.Minute
+		if i < R {
+			d = 2 * time.Second
 		}
-		handles = append(handles, h)
-	}
-	for _, h := range handles[:R] {
-		if _, err := p.Recall(context.Background(), topicDelay, h); err != nil {
-			t.Fatalf("Recall: %v", err)
-		}
+		adminSendDelay(t, mlAdmin, topicDelay, fmt.Sprintf("d-%d", i), d)
 	}
 	// 事务半消息：经 follower 发（half 写入走 ApplyOrForward 转发到 leader）
 	fol := (ml + 1) % 3
@@ -143,11 +158,35 @@ func TestClusterMetricsDepthOnAllNodes(t *testing.T) {
 			t.Fatalf("SendWithTransaction: %v", err)
 		}
 	}
-	t.Logf("已发 K=%d 条延时（撤回 R=%d）、T=%d 条孤儿事务", K, R, T)
+	t.Logf("已发 K=%d 条延时（其中 R=%d 条 2s 后到期搬走）、T=%d 条孤儿事务", K, R, T)
 	waitDepthsOnAll(t, pc, K-R, T, 15*time.Second, "写入后")
 
 	pc.kill(t, ml)
 	pc.restart(t, ml)
 	waitDepthsOnAll(t, pc, K-R, T, 30*time.Second, "kill -9 meta leader 并重启后")
-	t.Logf("新 meta 组 leader = 节点 %d", metaLeaderIndex(t, pc)+1)
+	// 重启节点的计数来自重开 store 时的基数重建（同一日志文件跨重启追加）
+	raw, err := os.ReadFile(pc.handles[ml].logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rebuilt []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		if strings.Contains(line, "前缀计数基数已建立") || strings.Contains(line, "区间删除触及计数前缀") ||
+			strings.Contains(line, "重入编排: 第 5 步") {
+			rebuilt = append(rebuilt, line)
+		}
+	}
+	for _, l := range rebuilt {
+		t.Logf("节点 %d 日志: %s", ml+1, l)
+	}
+	if n := strings.Count(string(raw), "前缀计数基数已建立"); n < 2 {
+		t.Fatalf("重启节点应至少两次建立计数基数（首启 + 重启），得 %d", n)
+	}
+	// 切主后新 leader 继续受理延时写入：含重启节点在内三节点同步增长
+	nl := metaLeaderIndex(t, pc)
+	t.Logf("新 meta 组 leader = 节点 %d", nl+1)
+	for i := 0; i < 2; i++ {
+		adminSendDelay(t, "http://"+pc.cfgs[nl].AdminListen, topicDelay, fmt.Sprintf("d2-%d", i), 10*time.Minute)
+	}
+	waitDepthsOnAll(t, pc, K-R+2, T, 15*time.Second, "切主后新 leader 再写 2 条")
 }
