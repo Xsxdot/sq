@@ -5,6 +5,7 @@
 package store
 
 import (
+	"bytes"
 	"fmt"
 	"log/slog"
 	"math/rand"
@@ -65,14 +66,20 @@ func keyUniverse() [][]byte {
 
 // randomBatch 组装一个随机批次：新/旧键 Set、Delete（含不存在的键）、同批
 // 先删后写同一键、与计数族相交/不相交的 DeleteRange。
-func randomBatch(t *testing.T, s *Store, r *rand.Rand, ks [][]byte) *Batch {
+// ranges=false 时不产生 DeleteRange（并发用例用：区间删除会触发重数，把
+// 前面任何增量错误抹平，测试就失去了牙）。
+func randomBatch(t *testing.T, s *Store, r *rand.Rand, ks [][]byte, ranges bool) *Batch {
 	t.Helper()
 	b := s.NewBatch()
 	n := 1 + r.Intn(6)
 	for i := 0; i < n; i++ {
 		k := ks[r.Intn(len(ks))]
 		var err error
-		switch x := r.Intn(20); {
+		x := r.Intn(20)
+		if !ranges && x >= 17 {
+			x = r.Intn(17)
+		}
+		switch {
 		case x < 8:
 			err = b.Set(k, []byte("v"))
 		case x < 15:
@@ -131,7 +138,7 @@ func TestPrefixCountMatchesScanRandom(t *testing.T) {
 			for seed := int64(1); seed <= 5; seed++ {
 				r := rand.New(rand.NewSource(seed))
 				for i := 0; i < 400; i++ {
-					commitRotating(t, s, randomBatch(t, s, r, ks), i)
+					commitRotating(t, s, randomBatch(t, s, r, ks, true), i)
 					assertCountsMatch(t, s, fmt.Sprintf("seed=%d i=%d", seed, i))
 				}
 			}
@@ -140,9 +147,16 @@ func TestPrefixCountMatchesScanRandom(t *testing.T) {
 }
 
 // C2：8 个 goroutine 并发对重叠键集合提交，其中两个专门重复删同一批键
-// （模拟 End 与回查并发双删）；-race 下跑，结束后计数 = 全扫。
+// （模拟 End 与回查并发双删）；-race 下跑，结束后计数 = 全扫。批次不含
+// DeleteRange（否则重数会抹平增量错误），sync 档与 nosync 档各跑一遍。
 func TestPrefixCountConcurrent(t *testing.T) {
-	s := openCounted(t, t.TempDir(), false)
+	for _, syncMode := range []bool{false, true} {
+		t.Run(fmt.Sprintf("sync=%v", syncMode), func(t *testing.T) { prefixCountConcurrent(t, syncMode) })
+	}
+}
+
+func prefixCountConcurrent(t *testing.T, syncMode bool) {
+	s := openCounted(t, t.TempDir(), syncMode)
 	defer s.Close()
 	ks := keyUniverse()
 	var wg sync.WaitGroup
@@ -163,7 +177,7 @@ func TestPrefixCountConcurrent(t *testing.T) {
 						}
 					}
 				} else {
-					b = randomBatch(t, s, r, ks)
+					b = randomBatch(t, s, r, ks, false)
 				}
 				var err error
 				if i%2 == 0 {
@@ -324,4 +338,61 @@ func BenchmarkOpenCountedPrefixes(b *testing.B) {
 		s.Close()
 		b.StartTimer()
 	}
+}
+
+// errFamily 测试注入的读错误。
+var errInjected = fmt.Errorf("注入的读错误")
+
+// m-2：计数读失败不得升级为写失败或进程崩溃——该族标记不可信、提交照常
+// 生效，PrefixCount 返回 ok=false（调用方回落全扫）；之后一次成功的全量重数
+// （区间删除触发，或不可信期间的重建尝试）恢复可信。
+func TestPrefixCountReadErrorDegradesNotFails(t *testing.T) {
+	s := openCounted(t, t.TempDir(), false)
+	defer s.Close()
+	s.pc.retryEvery = 0 // 不可信期间每次触及的提交都尝试重建
+	put := func(keys ...string) error {
+		b := s.NewBatch()
+		for _, k := range keys {
+			b.Set([]byte(k), []byte("v"))
+		}
+		return s.Apply(b)
+	}
+	if err := put("delay/a", "half/a"); err != nil {
+		t.Fatal(err)
+	}
+	// 1) 存在性查询失败：写入成功，delay/ 不可信，half/ 不受影响
+	s.pc.setReadFault(func(k []byte) error {
+		if bytes.HasPrefix(k, []byte("delay/")) {
+			return errInjected
+		}
+		return nil
+	})
+	if err := put("delay/b", "half/b"); err != nil {
+		t.Fatalf("计数读失败不应让写入失败: %v", err)
+	}
+	if v, ok, _ := s.Get([]byte("delay/b")); !ok || string(v) != "v" {
+		t.Fatal("写入应已生效")
+	}
+	if _, ok := s.PrefixCount("delay/"); ok {
+		t.Fatal("读失败后 delay/ 应 ok=false（不可信）")
+	}
+	if n, ok := s.PrefixCount("half/"); !ok || n != 2 {
+		t.Fatalf("half/ 不受影响，应 ok=true n=2，得 n=%d ok=%v", n, ok)
+	}
+	// 2) 重数失败（区间删除触发）：提交照常，族保持不可信，不 panic
+	s.pc.setReadFault(func([]byte) error { return errInjected })
+	b := s.NewBatch()
+	b.DeleteRange([]byte("half/"), PrefixUpperBound([]byte("half/")))
+	if err := s.Apply(b); err != nil {
+		t.Fatalf("重数失败不应让写入失败: %v", err)
+	}
+	if _, ok := s.PrefixCount("half/"); ok {
+		t.Fatal("重数失败后 half/ 应 ok=false")
+	}
+	// 3) 读恢复后，下一次触及的提交即重建，恢复可信且等于全扫
+	s.pc.setReadFault(nil)
+	if err := put("delay/c"); err != nil {
+		t.Fatal(err)
+	}
+	assertCountsMatch(t, s, "恢复后")
 }

@@ -28,6 +28,12 @@
 //   - 不持锁等 fsync：sync 提交在计数路径上改用 ApplyNoSyncWait（返回即已
 //     发布可见），放锁后再由调用方 SyncWait——语义与 Commit(Sync) 相同。
 //   - 基数：Open 时尚无任何写入方，扫一次即精确。
+//   - 读失败降级（审查 m-2）：计数路径上的存在性查询或重数失败，不升级为
+//     写失败或进程崩溃——计数只是指标的派生物，绝不能让业务写入（集群档即
+//     FSM apply）因它停摆。该族标记不可信、提交照常，PrefixCount 返回
+//     ok=false（调用方回落全扫）；之后任一次成功的全量重数恢复可信：区间
+//     删除触发的重数，或不可信期间触及登记族的提交在锁内的重建尝试（间隔
+//     retryEvery，避免读故障期间每次提交都全扫）。
 //   - 读侧：PrefixCount 读原子值不取锁；提交与加减之间的瞬间读到旧值，等同
 //     「在提交之前读」，对指标无害。
 package store
@@ -49,6 +55,10 @@ type countFamily struct {
 	lower  []byte
 	upper  []byte // PrefixUpperBound(lower)；nil = 无上界（全 0xFF 前缀）
 	n      atomic.Int64
+	// trusted=false：计数读失败后不可信，PrefixCount 返回 ok=false，直到一次
+	// 成功的全量重数。failedAt 为最近一次失败时刻（计数锁内读写）。
+	trusted  atomic.Bool
+	failedAt time.Time
 }
 
 // prefixCounter 登记族集合与计数锁。Store.pc 为 nil = 未登记任何前缀，
@@ -58,13 +68,27 @@ type prefixCounter struct {
 	mu   sync.Mutex
 	// lockTaken 计数锁取用次数（仅测试观测「不触及的批次不取锁」）。
 	lockTaken atomic.Uint64
+	// retryEvery 不可信期间两次重建尝试的最小间隔（计数锁内全扫，读故障
+	// 期间不宜每次提交都做）。
+	retryEvery time.Duration
+	// readFault 测试注入的计数读错误（生产恒 nil；计数锁内读写）。
+	readFault func(key []byte) error
+}
+
+// defaultRecountRetry 不可信族的重建尝试间隔缺省值。
+const defaultRecountRetry = 30 * time.Second
+
+func (pc *prefixCounter) setReadFault(f func(key []byte) error) {
+	pc.mu.Lock()
+	pc.readFault = f
+	pc.mu.Unlock()
 }
 
 func newPrefixCounter(prefixes []string) (*prefixCounter, error) {
 	if len(prefixes) == 0 {
 		return nil, nil
 	}
-	pc := &prefixCounter{}
+	pc := &prefixCounter{retryEvery: defaultRecountRetry}
 	seen := map[string]bool{}
 	for _, p := range prefixes {
 		if p == "" {
@@ -88,6 +112,7 @@ func (pc *prefixCounter) rebase(s *Store) error {
 			return err
 		}
 		f.n.Store(n)
+		f.trusted.Store(true)
 	}
 	return nil
 }
@@ -115,18 +140,68 @@ func (s *Store) scanCount(f *countFamily) (int64, error) {
 // PrefixCount 返回登记前缀 prefix 当前的键数（不变式：等于对本库该前缀的
 // 全扫结果）。不取锁、零扫描。
 //
-// 返回：ok=false 表示 prefix 未在 Open 时登记（Options.CountPrefixes），
-// 调用方应自行扫描。
+// 返回：ok=false 表示 prefix 未在 Open 时登记（Options.CountPrefixes），或
+// 计数因读失败暂不可信（见文件头「读失败降级」），调用方应自行扫描。
 func (s *Store) PrefixCount(prefix string) (n int64, ok bool) {
 	if s.pc == nil {
 		return 0, false
 	}
 	for _, f := range s.pc.fams {
 		if f.prefix == prefix {
+			if !f.trusted.Load() {
+				return 0, false
+			}
 			return f.n.Load(), true
 		}
 	}
 	return 0, false
+}
+
+// countExists 计数锁内的存在性查询（测试可注入读错误）。
+func (s *Store) countExists(key []byte) (bool, error) {
+	if f := s.pc.readFault; f != nil {
+		if err := f(key); err != nil {
+			return false, err
+		}
+	}
+	_, ok, err := s.Get(key)
+	return ok, err
+}
+
+// recountLocked 计数锁内对一个族全量重数：成功即写入并恢复可信，失败即
+// 标记不可信（ERROR 日志带原因）。批次须已发布可见。
+func (s *Store) recountLocked(f *countFamily, why string) {
+	start := time.Now()
+	var n int64
+	var err error
+	if rf := s.pc.readFault; rf != nil {
+		err = rf(f.lower)
+	}
+	if err == nil {
+		n, err = s.scanCount(f)
+	}
+	if err != nil {
+		s.markUntrustedLocked(f, why+"重数失败", err)
+		return
+	}
+	was := f.trusted.Load()
+	f.n.Store(n)
+	f.trusted.Store(true)
+	if !was {
+		s.logger.Info("计数前缀重建成功，恢复可信", "prefix", f.prefix, "why", why, "count", n,
+			"took", time.Since(start).String())
+		return
+	}
+	s.logger.Info("计数前缀已重数", "prefix", f.prefix, "why", why, "count", n,
+		"took", time.Since(start).String())
+}
+
+// markUntrustedLocked 标记族不可信（计数锁内）：读数改由调用方全扫，提交不受影响。
+func (s *Store) markUntrustedLocked(f *countFamily, why string, err error) {
+	f.trusted.Store(false)
+	f.failedAt = time.Now()
+	s.logger.Error("计数前缀读失败，计数标记为不可信（指标回落全扫，写入不受影响）",
+		"prefix", f.prefix, "why", why, "err", err, "retry_every", s.pc.retryEvery.String())
 }
 
 // has 键 k 是否属于本族。
@@ -204,7 +279,7 @@ func (s *Store) commitCounted(b *pebble.Batch, sync bool) (bool, error) {
 	pc.mu.Lock()
 	defer pc.mu.Unlock()
 	pc.lockTaken.Add(1)
-	deltas, recount, err := s.batchDeltas(b.Repr())
+	deltas, recount, broken, err := s.batchDeltas(b.Repr())
 	if err != nil {
 		return false, err
 	}
@@ -216,24 +291,20 @@ func (s *Store) commitCounted(b *pebble.Batch, sync bool) (bool, error) {
 	if err != nil {
 		return false, err
 	}
+	// 批次已发布可见、仍持锁：此刻的重数得到的就是本批之后的精确值
 	for i, f := range pc.fams {
-		if !recount[i] {
+		switch {
+		case recount[i]:
+			s.recountLocked(f, "区间删除")
+		case broken[i] != nil:
+			s.markUntrustedLocked(f, "存在性查询", broken[i])
+		case !f.trusted.Load():
+			if time.Since(f.failedAt) >= pc.retryEvery {
+				s.recountLocked(f, "不可信期间重建")
+			}
+		default:
 			f.n.Add(deltas[i])
-			continue
 		}
-		// 批次已发布可见、仍持锁：重数得到的就是本批之后的精确值
-		start := time.Now()
-		n, rerr := s.scanCount(f)
-		if rerr != nil {
-			// 批次已提交、计数却无法重建：之后读数不可信，不能当作提交失败
-			// 返回（调用方会重试一个已生效的批次）。按 Pebble 读失败即库已
-			// 不可用处理：记错误并 panic，与集群 apply 失败的停摆策略一致。
-			s.logger.Error("区间删除后重数前缀失败，计数不可信", "prefix", f.prefix, "err", rerr)
-			panic(fmt.Errorf("store 重数前缀 %q: %w", f.prefix, rerr))
-		}
-		f.n.Store(n)
-		s.logger.Info("区间删除触及计数前缀，已重数", "prefix", f.prefix, "count", n,
-			"took", time.Since(start).String())
 	}
 	return sync, nil
 }
@@ -241,20 +312,24 @@ func (s *Store) commitCounted(b *pebble.Batch, sync bool) (bool, error) {
 // batchDeltas 在计数锁内按批次顺序算每个登记族的增量：键提交前是否存在
 // 先看本批内更早的操作（overlay），再查已提交状态。Set 不存在的键 +1，
 // Delete 存在的键 −1，其余 0。与族相交的 DeleteRange（及保守处理的范围键）
-// 使该族改为提交后重数，增量作废。
-func (s *Store) batchDeltas(repr []byte) (deltas []int64, recount []bool, err error) {
+// 使该族改为提交后重数，增量作废。存在性查询失败的族记入 broken（该族
+// 本批增量作废、提交后标记不可信），不让查询错误变成提交错误；已不可信的
+// 族不再查询。err 只在批次字节损坏时返回。
+func (s *Store) batchDeltas(repr []byte) (deltas []int64, recount []bool, broken []error, err error) {
 	fams := s.pc.fams
 	deltas = make([]int64, len(fams))
 	recount = make([]bool, len(fams))
+	broken = make([]error, len(fams))
+	skip := func(i int) bool { return recount[i] || broken[i] != nil || !fams[i].trusted.Load() }
 	overlay := map[string]bool{} // 本批内已操作过的键 → 操作后是否存在
 	r := batchrepr.Read(repr)
 	for {
 		kind, ukey, value, ok, nerr := r.Next()
 		if nerr != nil {
-			return nil, nil, fmt.Errorf("store 计数解析批次: %w", nerr)
+			return nil, nil, nil, fmt.Errorf("store 计数解析批次: %w", nerr)
 		}
 		if !ok {
-			return deltas, recount, nil
+			return deltas, recount, broken, nil
 		}
 		switch kind {
 		case pebble.InternalKeyKindLogData:
@@ -289,7 +364,7 @@ func (s *Store) batchDeltas(repr []byte) (deltas []int64, recount []bool, err er
 		}
 		in := -1
 		for i, f := range fams {
-			if f.has(ukey) && !recount[i] {
+			if f.has(ukey) && !skip(i) {
 				in = i
 				break
 			}
@@ -299,14 +374,19 @@ func (s *Store) batchDeltas(repr []byte) (deltas []int64, recount []bool, err er
 		}
 		existed, seen := overlay[string(ukey)]
 		if !seen {
-			_, existed, err = s.Get(ukey)
-			if err != nil {
-				return nil, nil, err
+			var gerr error
+			if existed, gerr = s.countExists(ukey); gerr != nil {
+				for i, f := range fams {
+					if f.has(ukey) && !skip(i) {
+						broken[i] = fmt.Errorf("查键 %q: %w", ukey, gerr)
+					}
+				}
+				continue
 			}
 		}
 		overlay[string(ukey)] = setOp
 		for i, f := range fams {
-			if !f.has(ukey) || recount[i] {
+			if !f.has(ukey) || skip(i) {
 				continue
 			}
 			switch {

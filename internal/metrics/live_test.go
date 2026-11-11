@@ -33,14 +33,17 @@ import (
 
 // liveFixture 单机全装配；ckpt>0 时 deliver 走检查点模式。
 type liveFixture struct {
-	st  *store.Store
-	mt  *meta.Meta
-	pr  *produce.Producer
-	dl  *deliver.Deliverer
-	ds  *delay.Scheduler
-	tx  *txn.Manager
-	rep replication.Replicator
-	rt  replication.Router
+	st *store.Store
+	mt *meta.Meta
+	pr *produce.Producer
+	dl *deliver.Deliverer
+	ds *delay.Scheduler
+	tx *txn.Manager
+	// txShort 回查间隔 20ms 的事务管理器（同一 store）：它暂存的半消息很快
+	// 到期，Pass 回查改期 = 同批 Delete 旧 half 键 + Set 新 half 键
+	txShort *txn.Manager
+	rep     replication.Replicator
+	rt      replication.Router
 }
 
 func newLiveFixture(t *testing.T, dir string, ckpt time.Duration) *liveFixture {
@@ -67,8 +70,9 @@ func newLiveFixture(t *testing.T, dir string, ckpt time.Duration) *liveFixture {
 		t.Cleanup(func() { dl.Stop(context.Background()) })
 	}
 	return &liveFixture{st: st, mt: mt, pr: pr, dl: dl, rep: rep, rt: rt,
-		ds: delay.New(rep, rt, st, pr, slog.Default()),
-		tx: txn.New(rep, rt, st, pr, mt, time.Hour, 15, slog.Default())}
+		ds:      delay.New(rep, rt, st, pr, slog.Default()),
+		tx:      txn.New(rep, rt, st, pr, mt, time.Hour, 15, slog.Default()),
+		txShort: txn.New(rep, rt, st, pr, mt, 20*time.Millisecond, 15, slog.Default())}
 }
 
 // countingSource 包装 inflight 数据源，统计 ok=true / ok=false 次数（防空过）。
@@ -94,8 +98,13 @@ type delayHandle struct {
 	seq   uint64
 }
 
-// drive 用种子生成一串随机业务操作（全部经真实入口）。
-func (f *liveFixture) drive(t *testing.T, seed int64) {
+// recoverNoop 回查下发桩：不回调客户端（半消息维持未决，只做改期）。
+type recoverNoop struct{}
+
+func (recoverNoop) RecoverOrphan(*core.Message, string) bool { return false }
+
+// drive 用种子生成一串随机业务操作（全部经真实入口），返回回查改期条数。
+func (f *liveFixture) drive(t *testing.T, seed int64) int {
 	t.Helper()
 	ctx := context.Background()
 	r := rand.New(rand.NewSource(seed))
@@ -105,6 +114,7 @@ func (f *liveFixture) drive(t *testing.T, seed int64) {
 	recvGroup := map[*core.Message]string{}
 	var delays []delayHandle
 	var txIDs []string
+	rescheduled := 0
 	for i := 0; i < 150; i++ {
 		tp := topics[r.Intn(len(topics))]
 		switch x := r.Intn(100); {
@@ -168,12 +178,24 @@ func (f *liveFixture) drive(t *testing.T, seed int64) {
 			if _, err := f.ds.Pass(ctx); err != nil {
 				t.Fatal(err)
 			}
-		case x < 92:
-			_, id, err := f.tx.Stage(ctx, &core.Message{Topic: tp, Body: []byte("h"), Transactional: true})
+		case x < 89:
+			mgr := f.tx
+			if r.Intn(2) == 0 {
+				mgr = f.txShort
+			}
+			_, id, err := mgr.Stage(ctx, &core.Message{Topic: tp, Body: []byte("h"), Transactional: true})
 			if err != nil {
 				t.Fatal(err)
 			}
 			txIDs = append(txIDs, id)
+		case x < 92:
+			// 回查一轮：到期半消息改期（Delete 旧 half 键 + Set 新 half 键）
+			time.Sleep(30 * time.Millisecond)
+			n, err := f.txShort.Pass(ctx, recoverNoop{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			rescheduled += n
 		case len(txIDs) > 0:
 			j := r.Intn(len(txIDs))
 			id := txIDs[j]
@@ -188,6 +210,7 @@ func (f *liveFixture) drive(t *testing.T, seed int64) {
 	if _, err := f.ds.Pass(ctx); err != nil {
 		t.Fatal(err)
 	}
+	return rescheduled
 }
 
 func TestLiveMatchesFullScan(t *testing.T) {
@@ -198,10 +221,10 @@ func TestLiveMatchesFullScan(t *testing.T) {
 	}{{"逐次复制", 0}, {"检查点20ms", 20 * time.Millisecond}} {
 		t.Run(mode.name, func(t *testing.T) {
 			var hits, falls int64
-			var delayMax, halfMax int
+			var delayMax, halfMax, resched int
 			for seed := int64(1); seed <= seeds; seed++ {
 				f := newLiveFixture(t, t.TempDir(), mode.ckpt)
-				f.drive(t, seed)
+				resched += f.drive(t, seed)
 				if mode.ckpt > 0 {
 					time.Sleep(6 * mode.ckpt) // 静置 ≥5 个检查点间隔
 				}
@@ -240,9 +263,11 @@ func TestLiveMatchesFullScan(t *testing.T) {
 				delayMax = max(delayMax, want.DelayDepth)
 				halfMax = max(halfMax, want.HalfDepth)
 			}
-			t.Logf("seeds=%d ok=true 命中=%d 回落=%d delay 深度最大=%d half 最大=%d", seeds, hits, falls, delayMax, halfMax)
-			if hits == 0 || falls == 0 || delayMax == 0 || halfMax == 0 {
-				t.Fatalf("防空过：命中=%d 回落=%d delayMax=%d halfMax=%d 均须 >0", hits, falls, delayMax, halfMax)
+			t.Logf("seeds=%d ok=true 命中=%d 回落=%d delay 深度最大=%d half 最大=%d 回查改期=%d",
+				seeds, hits, falls, delayMax, halfMax, resched)
+			if hits == 0 || falls == 0 || delayMax == 0 || halfMax == 0 || resched == 0 {
+				t.Fatalf("防空过：命中=%d 回落=%d delayMax=%d halfMax=%d 回查改期=%d 均须 >0",
+					hits, falls, delayMax, halfMax, resched)
 			}
 		})
 	}
@@ -414,5 +439,51 @@ func TestMetricNamesAndLabelsUnchanged(t *testing.T) {
 			}
 		}
 		t.FailNow()
+	}
+}
+
+// m-1：采样器快照过期（超过 2 个采样间隔，如采样器卡死/退出）即视为无快照，
+// 抓取当场 CollectLive；未过期时读快照（不扫描）。
+func TestCollectorIgnoresStaleSnapshot(t *testing.T) {
+	f := newLiveFixture(t, t.TempDir(), 0)
+	ctx := context.Background()
+	if _, err := f.pr.Append(ctx, &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	sp := NewSampler(f.st, f.mt, f.dl, 0, slog.Default())
+	reg := NewRegistry(f.st, f.mt, nil, nil, nil, nil, f.dl, sp, slog.Default())
+	sp.tick()
+	// 快照之后才出现的 topic：新鲜快照下不可见
+	if _, err := f.pr.Append(ctx, &core.Message{Topic: "t2", Body: []byte("x")}); err != nil {
+		t.Fatal(err)
+	}
+	hasT2 := func() bool {
+		mfs, err := reg.Gather()
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, mf := range mfs {
+			if mf.GetName() != "sq_topic_messages_written_total" {
+				continue
+			}
+			for _, m := range mf.GetMetric() {
+				for _, l := range m.GetLabel() {
+					if l.GetName() == "topic" && l.GetValue() == "t2" {
+						return true
+					}
+				}
+			}
+		}
+		return false
+	}
+	if hasT2() {
+		t.Fatal("新鲜快照下抓取应读快照（不应看到快照之后的 t2）")
+	}
+	// 把快照时刻拨回 2 个间隔之前：视为无快照，当场算
+	snap := *sp.latest.Load()
+	snap.at = time.Now().Add(-2*sampleInterval - time.Second)
+	sp.latest.Store(&snap)
+	if !hasT2() {
+		t.Fatal("快照过期后抓取应当场 CollectLive（应看到 t2）")
 	}
 }

@@ -2,7 +2,8 @@
 //
 // 职责：
 //   - 每 5 秒调一次 CollectLive，把快照压入内存环（保留最近 1 小时），并把
-//     完整 *Stats 存为最近快照供 /metrics 抓取读取（LatestStats，SQ4.9）
+//     完整 *Stats 存为最近快照供 /metrics 抓取读取（freshStats，SQ4.9；超过
+//     2 个采样间隔即过期）
 //   - 每跨过一个整分钟，把该分钟的 12 个样本归约成一条 MinutePoint 落 Pebble
 //   - 按 metrics_retention_hours 定期 DeleteRange 掉过期的分钟点
 //   - 对外提供 Ring/History/Latest/TopicQPS/LastConsumeMs 五个派生查询
@@ -98,8 +99,9 @@ type Sampler struct {
 	retention time.Duration  // 0 = 不落库
 	logger    *slog.Logger
 
-	// latest 最近一次成功采样的完整快照（/metrics 抓取读它，不再触发扫描）。
-	latest atomic.Pointer[Stats]
+	// latest 最近一次成功采样的完整快照及采样时刻（/metrics 抓取读它，不再
+	// 触发扫描；过期判定见 freshStats）。
+	latest atomic.Pointer[statsSnapshot]
 
 	mu    sync.RWMutex
 	ring  []Sample // 环形缓冲，按 n 递增覆盖
@@ -180,9 +182,30 @@ func (s *Sampler) tick() {
 	}
 }
 
-// LatestStats 最近一次成功采样的完整快照；尚未采过样返回 nil。返回值只读
+// statsSnapshot 一次成功采样的快照与采样时刻。
+type statsSnapshot struct {
+	stats *Stats
+	at    time.Time
+}
+
+// snapshotMaxAge 快照最长可用时长：超过 2 个采样间隔说明采样器卡住或已
+// 退出（或连续采样失败），此时快照视为不存在，抓取改为当场计算。
+const snapshotMaxAge = 2 * sampleInterval
+
+// freshStats 未过期的最近快照；尚未采过样或已过期返回 nil。返回值只读
 // （与采样器共享，不得修改）。
-func (s *Sampler) LatestStats() *Stats { return s.latest.Load() }
+func (s *Sampler) freshStats() *Stats {
+	p := s.latest.Load()
+	if p == nil {
+		return nil
+	}
+	if age := time.Since(p.at); age > snapshotMaxAge {
+		// Debug：抓取间隔内可能反复命中，状态本身已由采样失败的 Error 日志记录
+		s.logger.Debug("采样快照已过期，抓取改为当场计算", "age", age.String())
+		return nil
+	}
+	return p.stats
+}
 
 // collect 调用 CollectLive 并整理成 Sample，同时更新最近快照。死信 topic 从
 // 业务写入量里剔除，单独汇总成 DLQ——把死信算进「写入量」会让一次故障看起来
@@ -192,7 +215,7 @@ func (s *Sampler) collect() (Sample, error) {
 	if err != nil {
 		return Sample{}, fmt.Errorf("采样 CollectLive: %w", err)
 	}
-	s.latest.Store(st)
+	s.latest.Store(&statsSnapshot{stats: st, at: time.Now()})
 	sm := Sample{
 		TsMs:         time.Now().UnixMilli(),
 		DelayDepth:   st.DelayDepth,

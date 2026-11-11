@@ -148,8 +148,17 @@ func (qs *queueState) clear() {
 	qs.loadedMirror.Store(false)
 }
 
-// init 置为「已装载、cursor=c、无 inflight、无脏」的空状态。
+// init 置为「已装载、cursor=c、无 inflight、无脏」的空状态并对外标为已装载
+// （= reset + markLoaded；用于不需扫盘的场景，如位点重置）。
 func (qs *queueState) init(epoch, c uint64) {
+	qs.reset(epoch, c)
+	qs.markLoaded()
+}
+
+// reset 置为「已装载、cursor=c、无 inflight、无脏」的空状态，但不动只读镜像
+// 的装载标志：从盘装载时要等扫盘完成才 markLoaded，InflightCount 不会读到
+// 扫了一半的部分值。
+func (qs *queueState) reset(epoch, c uint64) {
 	qs.clear()
 	qs.loaded = true
 	qs.epoch = epoch
@@ -158,8 +167,10 @@ func (qs *queueState) init(epoch, c uint64) {
 	qs.inflight = map[uint64]*inflightEntry{}
 	qs.dirty = map[uint64]struct{}{}
 	qs.needFull = false
-	qs.loadedMirror.Store(true)
 }
+
+// markLoaded 对外（InflightCount）标为已装载。epochMirror 已在 reset 里先置。
+func (qs *queueState) markLoaded() { qs.loadedMirror.Store(true) }
 
 // load 从 pebble 装载本队列的检查点：cursor（无键 → 0）+ inflight 前缀全扫
 // 解码。O(该队列 inflight)，调用方持 mu。失败时状态保持未装载。
@@ -173,9 +184,8 @@ func (qs *queueState) load(st *store.Store, epoch uint64) error {
 	if ok {
 		c = store.GetU64(v)
 	}
-	qs.init(epoch, c)
-	// 扫盘期间 nInflight 只是部分值：镜像在装载完成后才对外标为已装载
-	qs.loadedMirror.Store(false)
+	// 扫盘期间 nInflight 只是部分值：reset 不标已装载，扫完才 markLoaded
+	qs.reset(epoch, c)
 	pfx := store.InflightPrefix(qs.group, qs.topic, qs.q)
 	err = st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) {
 		_, _, _, off, perr := store.ParseInflightKey(k)
@@ -197,7 +207,7 @@ func (qs *queueState) load(st *store.Store, epoch uint64) error {
 	qs.dirty = map[uint64]struct{}{}
 	qs.cursorDirty = false
 	qs.needFull = true
-	qs.loadedMirror.Store(true)
+	qs.markLoaded()
 	return nil
 }
 

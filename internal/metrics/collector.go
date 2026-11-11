@@ -105,10 +105,11 @@ func NewCollector(st *store.Store, mt *meta.Meta, sys *sysinfo.Reporter, tx TxnS
 	return &Collector{st: st, mt: mt, src: src, sp: sp, sys: sys, tx: tx, conns: conns, fs: fs, logger: logger.With("mod", "metrics")}
 }
 
-// stats 抓取用的业务快照：采样器最近快照优先，没有才现算（低成本路径）。
+// stats 抓取用的业务快照：采样器未过期的最近快照优先；没有或已过期（超过
+// 2 个采样间隔）才现算（低成本路径），现算失败由调用方按原样上报错误。
 func (c *Collector) stats() (*Stats, error) {
 	if c.sp != nil {
-		if s := c.sp.LatestStats(); s != nil {
+		if s := c.sp.freshStats(); s != nil {
 			return s, nil
 		}
 	}
