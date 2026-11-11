@@ -372,6 +372,22 @@ func run() error {
 		rep = replication.NewStandalone(st)
 		rt = replication.StandaloneRouter{}
 		rv = rpc.StaticRouteView(cfg)
+		// 单机 async 档周期刷盘（SQ4.11）：没有它，WAL 只靠内核回写落盘，
+		// 掉电丢失窗口无上界；挂上后最多丢 store.AsyncWALSyncInterval。
+		// sync 档每次写已 fsync，集群档由 Manager.flusher 负责，都不挂。
+		// 停机顺序：本 defer 注册在 st.Close 的 defer 之后（LIFO 先执行），
+		// 先停刷盘循环并等它返回，再关 store。单机档 st 不会被替换，直接
+		// 绑定方法值安全。
+		if cfg.Fsync == "async" {
+			walCtx, walCancel := context.WithCancel(context.Background())
+			var walWG sync.WaitGroup
+			walWG.Add(1)
+			go func() {
+				defer walWG.Done()
+				store.RunWALSyncLoop(walCtx, store.AsyncWALSyncInterval, st.SyncWAL, logger)
+			}()
+			defer func() { walCancel(); walWG.Wait() }()
+		}
 	}
 
 	mt, err = meta.New(rep, rt, st, cfg.AutoCreateTopic, cfg.DefaultQueueNums, cfg.DefaultMaxAttempts, logger)

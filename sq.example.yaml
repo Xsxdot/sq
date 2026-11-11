@@ -11,7 +11,9 @@ advertise_port: 8081
 
 # Pebble 数据目录（相对进程工作目录）
 data_dir: "./data"
-# 写盘策略：sync | async
+# 写盘策略：sync | async（单机档）
+#   sync  = 每次写入落盘后才应答，掉电不丢已确认消息
+#   async = 后台每 200ms 刷一次盘，掉电最多丢 200ms 内已确认的消息
 fsync: sync
 # 消息编码：json | binary
 #   json   = 历史格式（整条 JSON，Body 走 base64，体积 +33%）
