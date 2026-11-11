@@ -61,6 +61,7 @@ package cluster
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -860,22 +861,41 @@ func (r *raftStore) TruncateLog(g uint32, upto uint64) error {
 	return nil
 }
 
-// SyncLogs 逐个已打开组日志刷盘——mem 档 200ms flusher 的日志侧入口。
+// SyncLogs 全部已打开组日志并行刷盘——mem 档 200ms flusher 的日志侧入口。
+//
+// 每组一个 goroutine（组数上限 64 数据组 + 1 meta 组，不设并发上限），
+// 等全部完成才返回：各组段文件独立，串行刷会让一拍耗时随组数线性增长。
+// 任一组失败不取消其余组（每组都尽力刷），全部错误带组号用 errors.Join
+// 汇总返回，flusher 的 Error 日志据此定位坏组。
 //
 // 顺序契约（spec §5）：调用方必须先 SyncLogs 再 store.SyncWAL，保证
 // 崩溃窗口只出现「日志超前 FSM」（重放即补齐，安全）的方向，反过来
-// 「FSM 超前日志」会让已应用的状态在重启后凭空消失，不可接受。
+// 「FSM 超前日志」会让已应用的状态在重启后凭空消失，不可接受。返回 nil
+// 即全部组的刷盘都已完成，契约不因并行而松动。
 func (r *raftStore) SyncLogs() error {
+	type groupLog struct {
+		g uint32
+		l *seglog.Log
+	}
 	r.logsMu.Lock()
-	logs := make([]*seglog.Log, 0, len(r.logs))
-	for _, l := range r.logs {
-		logs = append(logs, l)
+	logs := make([]groupLog, 0, len(r.logs))
+	for g, l := range r.logs {
+		logs = append(logs, groupLog{g: g, l: l})
 	}
 	r.logsMu.Unlock()
-	for _, l := range logs {
-		if err := l.Sync(); err != nil {
-			return fmt.Errorf("raftstore SyncLogs: %w", err)
-		}
+
+	errs := make([]error, len(logs))
+	var wg sync.WaitGroup
+	for i, gl := range logs {
+		wg.Go(func() {
+			if err := gl.l.Sync(); err != nil {
+				errs[i] = fmt.Errorf("组 %d: %w", gl.g, err)
+			}
+		})
+	}
+	wg.Wait()
+	if err := errors.Join(errs...); err != nil {
+		return fmt.Errorf("raftstore SyncLogs: %w", err)
 	}
 	return nil
 }
