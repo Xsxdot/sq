@@ -60,24 +60,16 @@ func (r clusterReplicator) Apply(ctx context.Context, g uint32, b *store.Batch) 
 	return r.m.Propose(ctx, g, repr)
 }
 
-// shimPending 是 clusterReplicator.ApplyAsync 的返回类型：与
-// replication.Pending 同语义（恰好一次 Wait）。
-type shimPending chan error
-
-// Wait 读一次结果 channel（恰好一次语义，与 replication.chanPending 同）。
-func (p shimPending) Wait() error { return <-p }
-
 // ApplyAsync 与 replication.Cluster.ApplyAsync 同语义（shim 契约见
-// clusterReplicator 注释）：拷贝 repr、Close 批次、goroutine 内 Propose，
-// Wait 阻塞到本节点 apply 完成。
-func (r clusterReplicator) ApplyAsync(ctx context.Context, g uint32, b *store.Batch) (shimPending, error) {
-	repr := append([]byte(nil), b.Repr()...)
+// clusterReplicator 注释）：拷贝 repr 进预留提案头的缓冲、Close 批次、
+// 入组保序提案队列（ProposeReservedAsync），Wait 阻塞到本节点 apply 完成。
+func (r clusterReplicator) ApplyAsync(ctx context.Context, g uint32, b *store.Batch) (*ProposalPending, error) {
+	data := make([]byte, ProposalHeaderLen+len(b.Repr()))
+	copy(data[ProposalHeaderLen:], b.Repr())
 	if err := b.Close(); err != nil {
 		return nil, fmt.Errorf("回收批次: %w", err)
 	}
-	ch := make(chan error, 1)
-	go func() { ch <- r.m.Propose(ctx, g, repr) }()
-	return shimPending(ch), nil
+	return r.m.ProposeReservedAsync(ctx, g, data), nil
 }
 
 // TestClusterReplicateAllGroups 三节点起全 4 组；经 Replicator 往 meta 组
