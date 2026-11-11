@@ -89,7 +89,10 @@ func TestExpandStandaloneToThreeNodes(t *testing.T) {
 	//    （扩容 e2e 抓到的根因）；FSM 存量原样接管。种子日志保留量压到
 	//    1（快照兜底的前提，见 ②b 注释）
 	fullPeers := map[uint64]string{1: addr(t, 1), 2: addr(t, 2), 3: addr(t, 3)}
-	seed := startClusterNode(t, seedDir, 1, fullPeers, withRetainEntries(1), withTruncateInterval(time.Second))
+	// SQ4.10：字节下界注入成不构成约束、死 peer 宽限期极小，保持「保留量
+	// 压到 1 即截断」的原前提（断言不变）
+	seed := startClusterNode(t, seedDir, 1, fullPeers, withRetainEntries(1), withTruncateInterval(time.Second),
+		withRetainBytes(1), withPeerGrace(time.Nanosecond))
 	nodes := []*cluster.Manager{seed}
 	waitForMsg(t, 30*time.Second, func() bool { return seed.IsLeader(0) }, "种子节点未当选")
 
@@ -166,7 +169,10 @@ func TestClusterTruncationKeepsLogBounded(t *testing.T) {
 	if testing.Short() {
 		t.Skip("长跑用例")
 	}
-	h := startThreeNodeE2E(t, withRetainEntries(500), withTruncateInterval(2*time.Second))
+	// SQ4.10：字节下界注入成不构成约束（5000 条远不足默认 1GiB），保持
+	// 「按条数保留 500 即截断」的原前提（断言不变）
+	h := startThreeNodeE2E(t, withRetainEntries(500), withTruncateInterval(2*time.Second),
+		withRetainBytes(1), withPeerGrace(time.Nanosecond))
 	defer h.stopAll()
 	sendClusterMessages(t, h, 5000)
 	// 观测面迁移：旧断言数 raft/0/ent/* 键，seglog 落地后该前缀在 Pebble
@@ -388,6 +394,16 @@ type clusterOpt func(*cluster.Options)
 // withRetainEntries 注入截断循环的日志保留量（Options.RetainEntries）。
 func withRetainEntries(n uint64) clusterOpt {
 	return func(o *cluster.Options) { o.RetainEntries = n }
+}
+
+// withRetainBytes 注入按字节保留量（Options.RetainBytes，按节点总量，卡 SQ4.10）。
+func withRetainBytes(n int64) clusterOpt {
+	return func(o *cluster.Options) { o.RetainBytes = n }
+}
+
+// withPeerGrace 注入死 peer 宽限期（Options.PeerGrace，卡 SQ4.10）。
+func withPeerGrace(d time.Duration) clusterOpt {
+	return func(o *cluster.Options) { o.PeerGrace = d }
 }
 
 // withTruncateInterval 注入周期截断的执行间隔（Options.TruncateInterval）。

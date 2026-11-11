@@ -1884,7 +1884,9 @@ func TestFetchSnapshotRejectsUnknownID(t *testing.T) {
 // 追平判据是 FSM 数据（S199 可读）而非日志位点——快照路径的最终
 // 验收就是客户端数据完整。
 func TestLaggingFollowerCatchesUpBySnapshot(t *testing.T) {
-	h := startThreeNodeCluster(t, withRetainEntries(8)) // 极小保留量逼出快照路径
+	// 极小保留量逼出快照路径；字节下界 / 死 peer 宽限期（SQ4.10）注入成
+	// 不构成约束，保持「死节点即放弃」的原场景
+	h := startThreeNodeCluster(t, withRetainEntries(8), withLogRetainForSnapshot)
 	defer h.stopAll()
 	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancel()
@@ -1956,7 +1958,7 @@ func TestLaggingFollowerCatchesUpBySnapshot(t *testing.T) {
 // A1+1..P1 原样保留，新 leader 探测锚在 P1 上撞车、只流式重放 P1+1..，
 // X 的 FSM 永久缺 1..A1（R1 键全部丢失）。
 func TestInstallingMarkerRestartClearsRaftLog(t *testing.T) {
-	h := startThreeNodeCluster(t, withRetainEntries(8))
+	h := startThreeNodeCluster(t, withRetainEntries(8), withLogRetainForSnapshot) // SQ4.10：同上
 	defer h.stopAll()
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
@@ -2110,19 +2112,19 @@ func TestInstallingMarkerRestartClearsRaftLog(t *testing.T) {
 // 下界的「逃生门」：最慢 follower 冻结在低位的 Match 不得再把整组日志
 // 钉死——隔断（死）节点的下界约束必须被打破，截断照常推进。
 //
-// 两条逃生机制的叠加：
-//   - 绝对上限 hardLagCap（10×retain=40）：applied≈102 时 applied-cap=
-//     62 > victimMatch，上限把 victim 的约束抬到 62，仅此已保证截断
-//     越过冻结 Match；
-//   - 存活探测（probePeerAlive）：隔断后探测必失败（控制帧被分区侧
-//     丢弃，拨号超时归 net.OpError），victim 被整体排除，upto 直取
-//     applied-retain=98。
+// 逃生机制（卡 SQ4.10 起）：绝对上限 hardLagCap 已删，改为存活探测 +
+// 死 peer 宽限期——隔断后探测必失败（控制帧被分区侧丢弃，拨号超时归
+// net.OpError），本用例注入极小宽限期，victim 判死即超期、被整体排除，
+// upto 直取 applied-retain=98。宽限期内钉住的新行为见
+// TestTruncatePeerGraceHoldsThenReleases。
 //
 // 修复前本测试断言「upto ≤ minMatch」——修复后那个断言对死节点不再
 // 成立（正是本批要解的问题）；活 follower 的性能纪律仍在（健康时
 // Match≈applied，不压低 upto、也不触发探测，见 truncateOnce 注释）。
 func TestTruncateOnceRespectsLeaderMinMatch(t *testing.T) {
-	h := startThreeNodeCluster(t, withRetainEntries(4)) // cap = 10×4 = 40
+	// SQ4.10：hardLagCap 已删，死节点的放弃改由宽限期超期承担——注入极小
+	// 宽限期 + 不构成约束的字节下界，断言原结论（宽限超期即放弃）
+	h := startThreeNodeCluster(t, withRetainEntries(4), withLogRetainForSnapshot)
 	defer h.stopAll()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -2177,7 +2179,7 @@ func TestTruncateOnceRespectsLeaderMinMatch(t *testing.T) {
 // 非投票成员，快照追齐是设计内路径（见 truncateOnce 注释的排除规则）。
 // 修复前 minMatch 会把 learner 的 Match=0 计入，upto 恒 0、永不截断。
 func TestTruncateOnceExcludesLearnerFromMinMatch(t *testing.T) {
-	h := startThreeNodeCluster(t, withRetainEntries(2))
+	h := startThreeNodeCluster(t, withRetainEntries(2), withLogRetainForSnapshot) // SQ4.10：字节下界不构成约束
 	defer h.stopAll()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
@@ -2215,7 +2217,7 @@ func TestTruncateOnceExcludesLearnerFromMinMatch(t *testing.T) {
 // TestTruncateOnceNoopWhenNothingToDrop 保留量之内不该动手
 // （周期循环每 30s 触发一次，空转不许写盘、不许刷日志）。
 func TestTruncateOnceNoopWhenNothingToDrop(t *testing.T) {
-	h := startSingleNodeManager(t, withRetainEntries(10000))
+	h := startSingleNodeManager(t, withRetainEntries(10000), withLogRetainForSnapshot) // SQ4.10：只留条数下界
 	if _, done := h.m.truncateOnce(0); done {
 		t.Fatal("条目数远小于保留量时不应截断")
 	}

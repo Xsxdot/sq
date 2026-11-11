@@ -152,6 +152,11 @@ txn_max_checks: 15
 #       raft_addr: "127.0.0.1:9083"
 #       advertise_host: "127.0.0.1"
 #       advertise_port: 8083
+#   # 日志保留（可选，均为缺省值）：按字节下界按节点总量计、均分到各组；
+#   # 停机节点在宽限期内回来经日志追平，不拉全量快照（见 docs/configuration.md）
+#   # log_retain_entries: 10000
+#   # log_retain_bytes: 1GiB
+#   # log_peer_grace: 10m
 #
 # 单节点集群（单机升级形态）：
 # cluster:

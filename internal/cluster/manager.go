@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net"
 	"os"
 	"sort"
@@ -46,6 +47,7 @@ import (
 	"go.etcd.io/raft/v3/raftpb"
 	"go.etcd.io/raft/v3/tracker"
 
+	"github.com/Xsxdot/sq/internal/cluster/seglog"
 	"github.com/Xsxdot/sq/internal/store"
 )
 
@@ -132,6 +134,24 @@ type Options struct {
 	// 的配置面接管）：落后 follower 的位点一旦落在截断点之下，日志追齐
 	// 不可能，只能靠 MsgSnap 快照追平。0 时按 defaultRetainEntries。
 	RetainEntries uint64
+
+	// RetainBytes 是按字节的日志保留下界（卡 SQ4.10，按节点总量，默认
+	// 1GiB；0 按 defaultRetainBytes）：每组保留 RetainBytes/(数据组数+1)
+	// 字节的段（段粒度，只多不少）。生产由 main 注入（cluster.log_retain_bytes）。
+	RetainBytes int64
+
+	// PeerGrace 是死 peer 宽限期（卡 SQ4.10，默认 10m；0 按
+	// defaultPeerGrace）：存活探测失败的 voter 自首次判死起这么久内仍以其
+	// Match 作截断下界，超期才放弃（之后回来只能拉快照）。生产由 main 注入
+	// （cluster.log_peer_grace）。
+	PeerGrace time.Duration
+
+	// DiskPressure 报告数据盘水位是否告急（卡 SQ4.10，nil = 恒不告急）：
+	// 截断循环每组评估前调用一次；告急时放弃全部 peer 下界（活的也放），
+	// 只保留按条数与按字节两条下界。生产由 main 装配为「用量 ≥
+	// disk_watermark_percent」（与 retention 拒写同一函数同一阈值）。
+	// 在截断 goroutine 内同步调用，须快速返回。
+	DiskPressure func() bool
 
 	// TruncateInterval 是周期截断循环的执行间隔（batch④，默认 30s；0
 	// 按 defaultTruncateInterval）：每周期对全部组评估一次日志截断——
@@ -245,6 +265,19 @@ type Manager struct {
 	// truncateOnce 用它算截断点）。
 	retainEntries uint64
 
+	// 截断下界（卡 SQ4.10）：retainBytesPerGroup = RetainBytes/(数据组数+1)；
+	// peerGrace 死 peer 宽限期；diskPressure 水位告急判据（nil 安全）。
+	retainBytesPerGroup int64
+	peerGrace           time.Duration
+	diskPressure        func() bool
+	// deadPeers 死 peer 首次判死表（节点级：死的是节点不是组）。由截断
+	// 路径读写；测试会在截断循环之外直接调 truncateOnce，故以 deadMu
+	// 保护（无竞争时开销可忽略）。pressureOn 记录上一次告急判定，只在
+	// 翻转时打日志。
+	deadMu     sync.Mutex
+	deadPeers  map[uint64]deadPeer
+	pressureOn bool
+
 	// 截断循环（batch④）：truncateInterval 来自 Options（0 按默认 30s）；
 	// runCtx 是 Start 设置的运行上下文——循环随集群停机一并退出；
 	// truncateLoopOnce 保证重复启动只起一个循环。truncateLoopDone 是
@@ -281,14 +314,21 @@ type Manager struct {
 // 截断循环保留的日志条目数。生产值由 Task 8 的配置面接管。
 const defaultRetainEntries uint64 = 10000
 
-// hardLagCapFactor 是截断下界「绝对上限」的系数（见 truncateOnce 注释）：
-// voter 落后超过 hardLagCapFactor × retainEntries 后不再约束截断，其
-// 条目被截掉、恢复后经 MsgSnap 快照追齐。10× 保留量是慷慨的心跳级
-// 追齐余量（正常跟随的 follower 落后量级是心跳往返的个位数条目，误伤
-// 不了活节点），并把最坏日志大小上界钉在 retainEntries + 10×retainEntries
-// （默认 10000 + 100000 = 11 万条）——磁盘占用有界，死节点不再能把
-// 整组日志钉死到爆盘。
-const hardLagCapFactor = 10
+// defaultRetainBytes 是 Options.RetainBytes 的默认值（0 即默认）：按节点
+// 总量 1GiB，均分到全部组（含 meta 组）。
+const defaultRetainBytes int64 = 1 << 30
+
+// defaultPeerGrace 是 Options.PeerGrace 的默认值（0 即默认）。
+const defaultPeerGrace = 10 * time.Minute
+
+// deadPeer 死 peer 判死记录：since 首次判死时刻，match 判死时的 Match。
+// Match 此后前进即证明它活着（死节点的 Match 冻结），记录作废。
+type deadPeer struct {
+	since time.Time
+	match uint64
+	// expired 已打过「宽限超期」Warn（只在翻转时打）
+	expired bool
+}
 
 // defaultTruncateInterval 是 Options.TruncateInterval 的默认值（0 即
 // 默认）：周期截断循环的执行间隔，30s 一轮 × 全组。
@@ -334,6 +374,12 @@ func NewManager(o Options) (*Manager, error) {
 	if o.TruncateInterval == 0 {
 		o.TruncateInterval = defaultTruncateInterval
 	}
+	if o.RetainBytes == 0 {
+		o.RetainBytes = defaultRetainBytes
+	}
+	if o.PeerGrace == 0 {
+		o.PeerGrace = defaultPeerGrace
+	}
 	if o.SnapshotChunkBytes == 0 {
 		o.SnapshotChunkBytes = defaultSnapshotChunkBytes
 	}
@@ -355,6 +401,10 @@ func NewManager(o Options) (*Manager, error) {
 		leaderBalancerInterval: o.LeaderBalancerInterval,
 		autoPromote:            o.AutoPromoteLearners,
 		retainEntries:          o.RetainEntries,
+		retainBytesPerGroup:    o.RetainBytes / int64(o.DataGroups+1),
+		peerGrace:              o.PeerGrace,
+		diskPressure:           o.DiskPressure,
+		deadPeers:              make(map[uint64]deadPeer),
 		truncateInterval:       o.TruncateInterval,
 		snapshotChunkBytes:     o.SnapshotChunkBytes,
 		noBootstrap:            o.NoBootstrap,
@@ -1178,30 +1228,28 @@ func (m *Manager) promoteLearners(g uint32) {
 
 // truncateOnce 对一组执行一次截断评估与执行。
 //
-// 截断点计算（leader 侧四重下界取最小，再减保留量）：
-//   - 本节点 applied：不能截掉还没 apply 的条目；
-//   - leader 额外取 min(Progress.Match)：不能截掉最慢 follower 还要的
-//     条目。这不是正确性开关（有快照兜底），而是性能纪律——截过头会
-//     把一次心跳级追齐放大成整组状态传输（Global Constraints）；
-//   - 绝对上限 hardLagCap（10 × RetainEntries）：单个 voter 落后超过
-//     该量后不再约束截断——死节点/长期失联节点的 Match 冻结在低处，
-//     若无上限，一台死机（quorum 仍存）就把整组日志钉死、磁盘随写入
-//     无界膨胀。被超出的条目会被截掉，节点恢复后经 MsgSnap 快照追齐
-//     （batch④ 快照路径正是为此而建）；这是 I2 修复的逃生门；
-//   - 减 RetainEntries：留一段余量给刚落后一点点的 follower。
+// 截断点 upto（锚点）= 以下下界里最小的那个（保留量取最大，卡 SQ4.10）：
+//   - 按条数：min(本节点 applied, peer 下界) − RetainEntries——不能截掉还
+//     没 apply 的条目，并给刚落后一点点的 follower 留余量；
+//   - peer 下界（只在 leader 上有）：learner 不参与（快照追齐是 learner 的
+//     设计内路径）；活 voter 取 Match；存活探测失败的 voter 自首次判死起
+//     PeerGrace 内仍取 Match（停机这么久之内回来经日志追平，不拉快照），
+//     超期放弃。新当选 leader 对死 peer 的 Match 从 0 起（F4）：宽限期内
+//     该组完全不截断——只多占盘、不丢数据的安全方向；
+//   - 磁盘水位告急（DiskPressure）：放弃全部 peer 下界（活的也放），只留
+//     按条数与按字节两条；
+//   - 按字节：保证 upto 之后的段总字节 ≥ RetainBytes/(组数+1)（段粒度，只
+//     多不少，见 seglog.RetainBytesCap）。
 //
-// 另有两条排除规则（同为性能纪律而非正确性开关）：
-//   - learner 不参与下界：非投票成员、快照追齐是设计内路径，不得钉死
-//     截断；
-//   - 真正会压低下界的 voter 先做存活探测（probePeerAlive）：死节点
-//     （控制通道拨号失败/超时）不以其冻结 Match 为下界，恢复后快照
-//     追齐。探测只在「该 peer 会压低当前 upto」时发起（上限已兜住的
-//     不探），健康集群零探测、每 tick 每组至多一次（500ms 上限）。
+// 截断不是正确性开关（快照兜底），是性能纪律：截过头会把一次日志追平放大
+// 成整组状态传输。探测只对「会压低当前下界」的 voter 发起，健康集群零
+// 探测、每轮每 peer 至多一次（probed 缓存）。死 peer 进入/超出宽限期、
+// 告急放弃下界只在状态翻转时各打一行 Warn。
 //
-// 执行顺序固定为「先落锚点（Sync）→ 再删盘上条目 → 最后压内存视图」：
-// 任一步崩溃都停在「锚点已落、条目还在」的安全态（多留日志无害，重启
-// 时锚点提供起始位点，见 buildGroup 注释）。空转（无事可做）不写盘也
-// 不打日志——周期循环 30s 一轮 × 全组，空转刷日志就是噪声。
+// 执行顺序固定为「先落锚点（Sync）→ 前进磁盘下界 → 再删盘上段 → 最后压
+// 内存视图」：任一步崩溃都停在「锚点已落、条目还在」的安全态（多留日志
+// 无害，重启时锚点提供起始位点，见 buildGroup 注释）。空转（无事可做）不
+// 写盘也不打日志——周期循环每轮 × 全组，空转刷日志就是噪声。
 //
 // 返回：实际截断到的位点与是否真的执行了截断（无事可做时 done=false）。
 func (m *Manager) truncateOnce(g uint32) (uint64, bool) {
@@ -1234,48 +1282,49 @@ func (m *Manager) truncateOnceWith(g uint32, probed map[uint64]bool) (uint64, bo
 	// 成员表与位点同临界区配对——与 Task 4 applyEntries/Snapshot 同一纪律：
 	// 锚点 index（源自 applied）与 confState 必须取同一 apply 时刻，否则
 	// 会产出「index=N 却携带 N+k 成员表」的截断锚点。锁内只读两个原子，
-	// 无等待；mem.Term/SaveSnapMeta 等留在锁外（与 groupStorage.Snapshot
+	// 无等待；stg.Term/SaveSnapMeta 等留在锁外（与 groupStorage.Snapshot
 	// 的「锁内取配对、锁外查 term」同构）。
 	gr.applyMu.Lock()
 	applied := gr.applied.Load()
 	cs := gr.confState.Load()
 	gr.applyMu.Unlock()
-	upto := applied
+	pressure := m.checkDiskPressure(g)
 	leader := false
+	var floors []peerFloor
 	if st, ok := m.Status(g); ok && st.RaftState == raft.StateLeader {
 		leader = true
-		// 逐 voter 收紧下界（见函数注释的四重下界与两条排除规则）：
-		// 自己与 learner 直接跳过；上限把 peer 抬到不再压低 upto 时
-		// 跳过（不探测）；余下真正构成下界的 peer 先探存活，死节点
-		// 排除（Warn 留痕——恢复后经快照追齐，见 batch④ 快照路径）。
-		hardCap := hardLagCapFactor * m.retainEntries
+		base := applied // 探测门槛：只探会压低当前下界的 voter
 		for id, pr := range st.Progress {
-			if id == m.nodeID || pr.IsLearner {
+			if id == m.nodeID {
 				continue
 			}
-			floor := pr.Match
-			if applied > hardCap && floor < applied-hardCap {
-				// 该 voter 落后已超绝对上限：其条目终将被截掉，只能靠
-				// 快照追齐——不再约束截断（I2 逃生门的主体）。
-				floor = applied - hardCap
+			f := peerFloor{id: id, match: pr.Match, learner: pr.IsLearner}
+			if !f.learner && !pressure && f.match < base {
+				start := time.Now()
+				if alive(id) {
+					m.clearDead(id)
+				} else {
+					f.dead = true
+					f.deadFor = m.markDead(g, id, f.match, start)
+				}
+				if !f.dead || f.deadFor < m.peerGrace {
+					base = f.match
+				}
 			}
-			if floor >= upto {
-				continue // 上限已把它抬到不构成下界，无需探测
-			}
-			if !alive(id) {
-				// 死节点（控制通道拨号失败/超时）：不以其冻结 Match 为
-				// 下界。恢复后落后到截断点之外，raft 判定日志追齐不可能，
-				// 自动走 MsgSnap 快照追齐（与 learner 追齐同一路径）。
-				m.lg.Warn("截断：peer 存活探测失败，不以其 Match 为下界", "g", g, "node", id, "match", pr.Match)
-				continue
-			}
-			upto = floor
+			floors = append(floors, f)
 		}
 	}
-	if upto <= m.retainEntries {
+	bytesCap := uint64(math.MaxUint64)
+	if l, err := m.rs.getLog(g); err == nil {
+		bytesCap = seglog.RetainBytesCap(l.Segments(), m.retainBytesPerGroup)
+	} else {
+		m.lg.Warn("截断放弃：段日志不可用，无法计算按字节下界", "g", g, "err", err)
 		return 0, false
 	}
-	upto -= m.retainEntries
+	upto := truncateUpto(applied, m.retainEntries, bytesCap, floors, m.peerGrace, pressure)
+	if upto == 0 {
+		return 0, false
+	}
 	first, err := gr.stg.FirstIndex()
 	if err != nil || upto < first {
 		return 0, false // 已经截到这儿了，空转
@@ -1302,8 +1351,102 @@ func (m *Manager) truncateOnceWith(g uint32, probed map[uint64]bool) (uint64, bo
 	if err := gr.mem.Compact(upto); err != nil && !errors.Is(err, raft.ErrCompacted) {
 		m.lg.Warn("内存日志视图压缩失败（盘上已截断，下次重启自愈）", "g", g, "upto", upto, "err", err)
 	}
-	m.lg.Info("日志截断执行", "g", g, "upto", upto, "deleted", upto-first+1, "leader", leader)
+	m.lg.Info("日志截断执行", "g", g, "upto", upto, "deleted", upto-first+1, "leader", leader,
+		"applied", applied, "bytesCap", bytesCap, "pressure", pressure)
 	return upto, true
+}
+
+// peerFloor 一个 peer 在本轮截断评估中的下界输入（truncateUpto 的参数）。
+type peerFloor struct {
+	id      uint64
+	match   uint64
+	learner bool
+	// dead 本轮存活探测失败（未被探测的 peer 恒 false）；deadFor 自首次
+	// 判死起已过时长（dead 时有效）
+	dead    bool
+	deadFor time.Duration
+}
+
+// truncateUpto 计算截断点（纯函数，下界规则见 truncateOnce 注释）。
+//
+// 参数：applied 本节点已 apply 位点；retainEntries 按条数保留量；bytesCap
+// 按字节下界允许的最大截断点（seglog.RetainBytesCap）；floors leader 上的
+// peer 下界输入（follower 传 nil）；grace 死 peer 宽限期；pressure 磁盘
+// 水位告急。
+//
+// 返回：截断点；0 = 不截断。
+func truncateUpto(applied, retainEntries, bytesCap uint64, floors []peerFloor, grace time.Duration, pressure bool) uint64 {
+	base := applied
+	if !pressure {
+		for _, f := range floors {
+			if f.learner || (f.dead && f.deadFor >= grace) {
+				continue
+			}
+			base = min(base, f.match)
+		}
+	}
+	if base <= retainEntries {
+		return 0
+	}
+	return min(base-retainEntries, bytesCap)
+}
+
+// checkDiskPressure 调注入的水位判据并在状态翻转时留痕（nil = 恒不告急）。
+func (m *Manager) checkDiskPressure(g uint32) bool {
+	if m.diskPressure == nil {
+		return false
+	}
+	on := m.diskPressure()
+	m.deadMu.Lock()
+	flipped := on != m.pressureOn
+	m.pressureOn = on
+	m.deadMu.Unlock()
+	if flipped && on {
+		m.lg.Warn("截断：磁盘水位告急，放弃全部 peer 下界（只保留按条数与按字节下界）", "g", g)
+	} else if flipped {
+		m.lg.Info("截断：磁盘水位恢复，恢复 peer 下界", "g", g)
+	}
+	return on
+}
+
+// markDead 登记 peer 本轮判死并返回自首次判死起的时长。now 取探测发起
+// 时刻（判死至少历时一次探测）。首次判死、宽限超期各在翻转时打一行 Warn；
+// 判死记录在 Match 前进（证明它活着）时作废重计。
+func (m *Manager) markDead(g uint32, id, match uint64, now time.Time) time.Duration {
+	m.deadMu.Lock()
+	d, ok := m.deadPeers[id]
+	if !ok || match > d.match {
+		d = deadPeer{since: now, match: match}
+	}
+	deadFor := time.Since(d.since)
+	enter := !ok || d.since.Equal(now)
+	expire := !d.expired && deadFor >= m.peerGrace
+	if expire {
+		d.expired = true
+	}
+	m.deadPeers[id] = d
+	m.deadMu.Unlock()
+	if enter {
+		m.lg.Warn("截断：peer 判死，宽限期内仍以其 Match 为下界", "g", g, "node", id, "match", match,
+			"grace", m.peerGrace.String())
+	}
+	if expire {
+		// 文案沿用旧版「存活探测失败」行（运维检索习惯与既有用例的证据面）
+		m.lg.Warn("截断：peer 存活探测失败，不以其 Match 为下界", "g", g, "node", id, "match", match,
+			"deadFor", deadFor.Round(time.Millisecond).String(), "grace", m.peerGrace.String())
+	}
+	return deadFor
+}
+
+// clearDead 探测到 peer 存活：作废其判死记录（复活后再死重新计宽限）。
+func (m *Manager) clearDead(id uint64) {
+	m.deadMu.Lock()
+	_, ok := m.deadPeers[id]
+	delete(m.deadPeers, id)
+	m.deadMu.Unlock()
+	if ok {
+		m.lg.Info("截断：peer 探测恢复存活，作废判死记录", "node", id)
+	}
 }
 
 // snapStallTicks 是 leader 判定「对端没在拉这份快照」所需的连续观察
@@ -1453,6 +1596,11 @@ func (m *Manager) truncateLoop(ctx context.Context, interval time.Duration) {
 			probed := make(map[uint64]bool, len(m.peers))
 			for g := uint32(0); g < m.Groups(); g++ {
 				m.truncateOnceWith(g, probed)
+				// 冷读留痕（卡 SQ4.10）：本轮窗口外条目经磁盘日志发出的量
+				if cs := m.groups[g].stg.takeColdStats(); cs.reads > 0 || cs.errs > 0 {
+					m.lg.Info("冷读：本轮窗口外条目经磁盘日志发出", "g", g, "reads", cs.reads,
+						"entries", cs.entries, "bytes", cs.bytes, "errors", cs.errs)
+				}
 				// 截断与快照失败感知同节拍：两者都以「谁落后到只能靠快照」
 				// 为中心，共用一次 Status 采样周期即可，无需另起循环。
 				m.reportStalledSnapshots(g, interval, now, stalls[g])

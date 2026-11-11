@@ -131,12 +131,30 @@ cluster:
 | `data_groups` | `3` | 数据组数量；首次持久化后不可变 |
 | `ack` | `quorum-mem` | `quorum-mem` 或 `quorum-fsync` |
 | `peers` | 无 | 成员列表，必须包含本节点 |
-| `log_retain_entries` | `10000` | 周期截断保留的日志条数 |
+| `log_retain_entries` | `10000` | 日志保留的按条数下界；同时是每组内存热区的条数（热区另有 64MiB 内部上限） |
+| `log_retain_bytes` | `1GiB` | 日志保留的按字节下界，**按节点总量**计（下限 64MiB，写法同 storage 段字节键） |
+| `log_peer_grace` | `10m` | 死 peer 宽限期：探活失败的节点在此期间仍作截断下界（须 > 0） |
 | `truncate_interval` | `30s` | 日志截断评估间隔 |
 | `snapshot_chunk_bytes` | `4MiB` | 快照单块大小，必须小于 16MiB |
 | `snapshot_view_ttl` | `5m` | 快照视图闲置回收时间 |
 | `read_barrier` | `false` | 是否为消费读路径启用线性一致读屏障 |
 | `read_barrier_timeout` | `3s` | 单轮 read-index 时间预算 |
+
+### 日志保留与落后节点追平
+
+每轮截断（`truncate_interval`）在每个组上取以下下界中**最小**的那个作截断点，即保留量取最大：
+
+- **按条数**：`min(本节点 applied, peer 下界) − log_retain_entries`。
+- **按字节**：截断后剩余的日志段总字节 ≥ `log_retain_bytes / (data_groups + 1)`（`+1` 是 meta 组）。按段（64MiB）回收，只会多留，不会少留。默认 1GiB、3 个数据组时，每组保留 256MiB。
+- **peer 下界**（只在 leader 上生效）：learner 不参与。活着的 peer 取它的复制位点。探活失败的 peer 从首次判死起 `log_peer_grace` 内仍取它的位点，超期后放弃。
+
+磁盘用量达到 `disk_watermark_percent` 时，截断会放弃全部 peer 下界（活着的 peer 也一样），只保留按条数和按字节两条下界。这里用的阈值和判据与拒写相同；`disk_watermark_percent: 0` 时不会判定为磁盘告急。
+
+一个节点停机后在宽限期内回来，leader 会从磁盘日志读出它缺的条目，经日志追平，不触发全量快照。只有超过宽限期、磁盘告急，或者它落后于截断点时，才会改走快照。
+
+截断点之前的日志只留在磁盘上，内存里每组只保留最近 `min(log_retain_entries 条, 64MiB)` 的热区，所以内存占用不随保留量增长。
+
+**磁盘占用估算**：每组约为「按字节下界 + 宽限期内的写入量」。宽限期内，停机节点会钉住它所在各组的截断点。新当选的 leader 对停机节点的复制位点从 0 记起，这时该组在宽限期内完全不截断。估算时请按「宽限期 × 峰值写入速率」预留磁盘，也可以靠磁盘水位兜底。
 
 `peers` 的 `id`、`raft_addr`、`advertise_host`、`advertise_port` 必须为同一成员的对应信息。
 

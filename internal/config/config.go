@@ -235,7 +235,14 @@ const (
 	defaultClusterTruncateInterval   = 30 * time.Second
 	defaultClusterSnapshotChunkBytes = 4 << 20
 	defaultClusterSnapshotViewTTL    = 5 * time.Minute
+	// 卡 SQ4.10：日志按字节保留量（按节点总量，均分到各组）与死 peer 宽限期
+	defaultClusterLogRetainBytes = "1GiB"
+	defaultClusterLogPeerGrace   = 10 * time.Minute
 )
+
+// minClusterLogRetainBytes log_retain_bytes 的下限（64MiB = 一个日志段，
+// 低于一段的保留量在段粒度回收下没有意义）。
+const minClusterLogRetainBytes int64 = 64 << 20
 
 // ClusterConfig 集群模式配置段；nil = 单机模式。段一旦出现即集群模式，
 // 全部字段按集群语义严格校验（见 Load 末尾校验链）。
@@ -249,6 +256,17 @@ type ClusterConfig struct {
 	// 10000）：落后 follower 位点落在截断点之下就只能靠快照追平。
 	// 0 = 未填，按默认。
 	LogRetainEntries uint64 `yaml:"log_retain_entries"`
+	// LogRetainBytes 按字节的日志保留下界（log_retain_bytes，默认 1GiB，
+	// 下限 64MiB，写法同 storage 段字节键）。口径是**按节点总量**：每组
+	// 保留 log_retain_bytes / (data_groups + 1)（+1 是 meta 组），段粒度
+	// 向上取整（只多不少）。空串 = 未填，按默认。omitempty：不写出空键，
+	// 旧二进制读新生成的配置不因未知键拒启。
+	LogRetainBytes string `yaml:"log_retain_bytes,omitempty"`
+	// LogPeerGrace 死 peer 宽限期（log_peer_grace，默认 10m，须 > 0）：
+	// 存活探测失败的 peer 自首次判死起这么久内仍作截断下界（停机这么久
+	// 之内回来经日志追平，不拉快照）；超期或磁盘水位告急才放弃它。nil =
+	// 未填（指针以区分「未填」与非法的显式 0s）。
+	LogPeerGrace *time.Duration `yaml:"log_peer_grace,omitempty"`
 	// TruncateInterval 周期截断循环的执行间隔（truncate_interval，默认
 	// 30s，Go duration 格式）：每周期对全部组评估一次日志截断。
 	// 0 = 未填，按默认。
@@ -455,6 +473,21 @@ func Load(path string) (*Config, error) {
 		if cc.TruncateInterval == 0 {
 			cc.TruncateInterval = defaultClusterTruncateInterval
 		}
+		if cc.LogRetainBytes == "" {
+			cc.LogRetainBytes = defaultClusterLogRetainBytes
+		}
+		if n, err := parseByteSize(cc.LogRetainBytes); err != nil {
+			return nil, fmt.Errorf("配置 cluster.log_retain_bytes 非法（得到 %q）: %w", cc.LogRetainBytes, err)
+		} else if n < minClusterLogRetainBytes {
+			return nil, fmt.Errorf("配置 cluster.log_retain_bytes 须 ≥ %s（一个日志段），得到 %q",
+				formatIEC(minClusterLogRetainBytes), cc.LogRetainBytes)
+		}
+		if cc.LogPeerGrace == nil {
+			d := defaultClusterLogPeerGrace
+			cc.LogPeerGrace = &d
+		} else if *cc.LogPeerGrace <= 0 {
+			return nil, fmt.Errorf("配置 cluster.log_peer_grace 须为正 duration（如 10m），得到 %s", *cc.LogPeerGrace)
+		}
 		// 负间隔是笔误（time.NewTicker 对非正周期直接 panic，跑起来才炸
 		// 比启动时挡住更难排查），启动即挡。
 		if cc.TruncateInterval < 0 {
@@ -636,6 +669,28 @@ func (c *Config) StorageMemTableBytes() uint64 {
 // （min(4, CPU 核数)）。
 func (c *Config) StorageCompactionConcurrency() int {
 	return c.Storage.CompactionConcurrency
+}
+
+// ClusterLogRetainBytes 返回 cluster.log_retain_bytes 的字节数（按节点
+// 总量）；单机档或未经 Load 校验的值返回 0（= cluster 包缺省）。
+func (c *Config) ClusterLogRetainBytes() int64 {
+	if c.Cluster == nil {
+		return 0
+	}
+	n, err := parseByteSize(c.Cluster.LogRetainBytes)
+	if c.Cluster.LogRetainBytes == "" || err != nil {
+		return 0
+	}
+	return n
+}
+
+// ClusterLogPeerGrace 返回 cluster.log_peer_grace；单机档或未填返回 0
+// （= cluster 包缺省）。
+func (c *Config) ClusterLogPeerGrace() time.Duration {
+	if c.Cluster == nil || c.Cluster.LogPeerGrace == nil {
+		return 0
+	}
+	return *c.Cluster.LogPeerGrace
 }
 
 // ClusterEnabled 是否集群模式：Cluster 段存在即集群，nil 即单机。

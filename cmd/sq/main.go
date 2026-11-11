@@ -284,6 +284,9 @@ func run() error {
 			LeaderBalancerInterval: leaderBalanceInterval,
 			AutoPromoteLearners:    true, // 重入自愈的最后一环：追平后自动升 voter
 			RetainEntries:          cc.LogRetainEntries,
+			RetainBytes:            cfg.ClusterLogRetainBytes(),
+			PeerGrace:              cfg.ClusterLogPeerGrace(),
+			DiskPressure:           diskPressureFn(cfg.DataDir, cfg.DiskWatermarkPercent, logger),
 			TruncateInterval:       cc.TruncateInterval,
 			SnapshotChunkBytes:     cc.SnapshotChunkBytes,
 			SnapshotViewTTL:        cc.SnapshotViewTTL,
@@ -807,5 +810,24 @@ func storeOptions(cfg *config.Config) store.Options {
 		CacheSize:             cfg.StorageCacheBytes(),
 		MemTableSize:          cfg.StorageMemTableBytes(),
 		CompactionConcurrency: cfg.StorageCompactionConcurrency(),
+	}
+}
+
+// diskPressureFn 装配 cluster.Options.DiskPressure（卡 SQ4.10 B4）：与
+// retention 拒写同一个探测函数（sysinfo.DiskUsage）、同一个阈值
+// （disk_watermark_percent），控制台 / 指标 / 截断三方口径一致。水位为
+// 0（关闭）时返回 nil（恒不告急）。探测失败按不告急处理并 Warn——截断多留
+// 日志是安全方向。
+func diskPressureFn(dataDir string, watermarkPct int, lg *slog.Logger) func() bool {
+	if watermarkPct <= 0 {
+		return nil
+	}
+	return func() bool {
+		d, err := sysinfo.DiskUsage(dataDir)
+		if err != nil {
+			lg.Warn("截断：磁盘水位探测失败，按未告急处理", "dir", dataDir, "err", err)
+			return false
+		}
+		return d.UsedPercent >= float64(watermarkPct)
 	}
 }

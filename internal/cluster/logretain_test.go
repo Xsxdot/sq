@@ -19,6 +19,7 @@ import (
 	"go.etcd.io/raft/v3"
 	"go.etcd.io/raft/v3/raftpb"
 
+	"github.com/Xsxdot/sq/internal/cluster/seglog"
 	"github.com/Xsxdot/sq/internal/store"
 )
 
@@ -236,4 +237,170 @@ func TestSnapshotInstallAdvancesBound(t *testing.T) {
 
 // withLogRetainForSnapshot 依赖「小保留量即截断/死节点即放弃」的快照
 // 用例注入（plan §5）：字节下界 1（不构成约束）、死 peer 宽限期极小。
-func withLogRetainForSnapshot(o *Options) {}
+func withLogRetainForSnapshot(o *Options) {
+	o.RetainBytes = 1
+	o.PeerGrace = time.Nanosecond
+}
+
+// withPeerGrace 注入死 peer 宽限期（Options.PeerGrace）。
+func withPeerGrace(d time.Duration) func(*Options) { return func(o *Options) { o.PeerGrace = d } }
+
+// withRetainBytes 注入按字节保留量（Options.RetainBytes，按节点总量）。
+func withRetainBytes(n int64) func(*Options) { return func(o *Options) { o.RetainBytes = n } }
+
+// withDiskPressure 注入磁盘水位告急判据。
+func withDiskPressure(f func() bool) func(*Options) { return func(o *Options) { o.DiskPressure = f } }
+
+// partitionAndWrite 等 victim 追平选举位点后隔断它，leader 再写 n 条；
+// 返回 victim 在 leader 侧冻结的 Match 与写后 leader 的 applied。
+func partitionAndWrite(t *testing.T, h *snapHarness, leader, victim *Manager, n int) (frozen, applied uint64) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	waitFor(t, 30*time.Second, func() bool {
+		st, _ := leader.Status(0)
+		return st.Progress[victim.nodeID].Match >= 2
+	}, "victim 未追平选举位点")
+	h.partitionOff(victim)
+	st0, _ := leader.Status(0)
+	frozen = st0.Progress[victim.nodeID].Match
+	for i := 0; i < n; i++ {
+		b := leader.Store().NewBatch()
+		if err := b.Set(store.TopicMetaKey(fmt.Sprintf("G%03d", i)), []byte("v")); err != nil {
+			t.Fatal(err)
+		}
+		if err := leader.Propose(ctx, 0, b.Repr()); err != nil {
+			t.Fatal(err)
+		}
+		b.Close()
+	}
+	return frozen, leader.AppliedIndex(0)
+}
+
+// TestTruncatePeerGraceHoldsThenReleases 第 9 条（S2 前半）：隔断一个
+// follower 后写 100 条，宽限期（3s）内截断不越过它的冻结 Match；宽限期
+// 过后照常截断、越过冻结 Match，并留下宽限超期 Warn。
+func TestTruncatePeerGraceHoldsThenReleases(t *testing.T) {
+	h := startThreeNodeCluster(t, withRetainEntries(4), withRetainBytes(1), withPeerGrace(3*time.Second))
+	defer h.stopAll()
+	leader := h.leaderOf(t, 0)
+	victim := h.nonLeaderOf(t, 0)
+	frozen, applied := partitionAndWrite(t, h, leader, victim, 100)
+	defer h.healPartition(victim)
+
+	if upto, done := leader.truncateOnce(0); done && upto > frozen {
+		t.Fatalf("宽限期内截断到 %d，越过死 peer 冻结 Match %d", upto, frozen)
+	}
+	if h.countLog(leader, "宽限期内仍以其 Match 为下界") < 1 {
+		t.Fatal("死 peer 进入宽限期的 Warn 缺失")
+	}
+	time.Sleep(3 * time.Second)
+	upto, done := leader.truncateOnce(0)
+	if !done || upto <= frozen {
+		t.Fatalf("宽限期过后截断 done=%v upto=%d，未越过冻结 Match %d", done, upto, frozen)
+	}
+	if upto > applied-4 {
+		t.Fatalf("截断到 %d 越过 applied-retain %d", upto, applied-4)
+	}
+	if h.countLog(leader, "存活探测失败，不以其 Match 为下界") < 1 {
+		t.Fatal("宽限超期的 Warn 缺失")
+	}
+}
+
+// TestTruncateDiskPressureDropsPeerFloors 第 10 条（S2 后半）：宽限期 10m
+// 但磁盘告急，第一次截断即越过宽限期内死 peer 的冻结 Match，Warn 留痕；
+// upto 仍不越过 applied − RetainEntries。
+func TestTruncateDiskPressureDropsPeerFloors(t *testing.T) {
+	h := startThreeNodeCluster(t, withRetainEntries(4), withRetainBytes(1), withPeerGrace(10*time.Minute),
+		withDiskPressure(func() bool { return true }))
+	defer h.stopAll()
+	leader := h.leaderOf(t, 0)
+	victim := h.nonLeaderOf(t, 0)
+	frozen, applied := partitionAndWrite(t, h, leader, victim, 100)
+	defer h.healPartition(victim)
+
+	upto, done := leader.truncateOnce(0)
+	if !done || upto <= frozen {
+		t.Fatalf("磁盘告急下截断 done=%v upto=%d，未越过冻结 Match %d", done, upto, frozen)
+	}
+	if upto > applied-4 {
+		t.Fatalf("截断到 %d 越过 applied-retain %d（告急只放 peer 下界，不放条数下界）", upto, applied-4)
+	}
+	if h.countLog(leader, "磁盘水位告急") < 1 {
+		t.Fatal("磁盘告急放弃下界的 Warn 缺失")
+	}
+}
+
+// TestTruncateUptoRules 第 10 条（下界纯函数）：活 peer / 宽限期内死 peer /
+// 超期死 peer / learner / 磁盘告急 / 按字节上界各自的作用。
+func TestTruncateUptoRules(t *testing.T) {
+	const grace = time.Minute
+	live := peerFloor{id: 2, match: 50}
+	deadIn := peerFloor{id: 3, match: 40, dead: true, deadFor: grace - 1}
+	deadOut := peerFloor{id: 3, match: 40, dead: true, deadFor: grace}
+	learner := peerFloor{id: 4, match: 0, learner: true}
+	for _, c := range []struct {
+		name     string
+		floors   []peerFloor
+		bytesCap uint64
+		pressure bool
+		want     uint64
+	}{
+		{"follower 无 peer 下界", nil, math.MaxUint64, false, 90},
+		{"活 peer 构成下界", []peerFloor{live}, math.MaxUint64, false, 40},
+		{"宽限期内死 peer 构成下界", []peerFloor{live, deadIn}, math.MaxUint64, false, 30},
+		{"超期死 peer 不构成下界", []peerFloor{live, deadOut}, math.MaxUint64, false, 40},
+		{"learner 不构成下界", []peerFloor{learner}, math.MaxUint64, false, 90},
+		{"告急：活 peer 也不构成下界", []peerFloor{live, deadIn}, math.MaxUint64, true, 90},
+		{"告急仍守按字节下界", []peerFloor{live}, 70, true, 70},
+		{"按字节下界取小", []peerFloor{live}, 35, false, 35},
+		{"下界 ≤ 保留量不截断", []peerFloor{{id: 2, match: 10}}, math.MaxUint64, false, 0},
+		{"字节不足一条不截", nil, 0, false, 0},
+	} {
+		if got := truncateUpto(100, 10, c.bytesCap, c.floors, grace, c.pressure); got != c.want {
+			t.Errorf("%s: truncateUpto = %d; want %d", c.name, got, c.want)
+		}
+	}
+}
+
+// TestTruncateKeepsRetainBytes 第 11 条：小段写满若干段，RetainBytes 设为
+// 约 3 段（按节点总量，即每组 3 段）⇒ 截断后剩余段字节 ≥ 每组下界，且
+// 截断确实发生（被删段全部 ≤ upto，由 TruncateTo 的回收判据保证）。
+func TestTruncateKeepsRetainBytes(t *testing.T) {
+	old := seglog.SegMaxBytes
+	seglog.SegMaxBytes = 4 << 10
+	t.Cleanup(func() { seglog.SegMaxBytes = old })
+	perGroup := 3 * seglog.SegMaxBytes
+	_, m := startSoloManager(t, t.TempDir(), AckQuorumMem, withRetainEntries(10),
+		withRetainBytes(perGroup*int64(1+3))) // 3 数据组 + meta 组
+	waitSoloLeader(t, m)
+	proposeN(t, m, 1, 600)
+	l, err := m.rs.getLog(1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before := len(l.Segments())
+	upto, done := m.truncateOnce(1)
+	if !done {
+		t.Fatalf("应截断（%d 段 ≫ 3 段下界）", before)
+	}
+	var kept int64
+	segs := l.Segments()
+	for _, s := range segs {
+		kept += s.Bytes
+		if !s.Active && s.MaxIndex <= upto {
+			t.Fatalf("段 %d（MaxIndex %d ≤ upto %d）应已回收", s.Seq, s.MaxIndex, upto)
+		}
+	}
+	if kept < perGroup {
+		t.Fatalf("截断后剩余 %d 字节 < 每组下界 %d", kept, perGroup)
+	}
+	if len(segs) >= before {
+		t.Fatalf("截断前 %d 段、后 %d 段：未回收任何段", before, len(segs))
+	}
+	// 没有字节下界时会截到 applied-10，远比现在多：证明字节下界真的生效
+	if applied := m.groups[1].applied.Load(); upto >= applied-10 {
+		t.Fatalf("upto=%d 未被字节下界压低（applied-retain=%d）", upto, applied-10)
+	}
+	t.Logf("截断前 %d 段 → 后 %d 段，upto=%d，剩余 %d 字节（每组下界 %d）", before, len(segs), upto, kept, perGroup)
+}

@@ -832,3 +832,50 @@ func TestConsumeCheckpointInterval(t *testing.T) {
 		}
 	}
 }
+
+// TestClusterLogRetainConfig 卡 SQ4.10 的两个新键：缺省（1GiB / 10m）、
+// 覆盖值透传、非法值 Load 报错且错误含键名。
+func TestClusterLogRetainConfig(t *testing.T) {
+	cfg, err := loadClusterConfigErr(t, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.ClusterLogRetainBytes(); got != 1<<30 {
+		t.Fatalf("log_retain_bytes 默认 = %d; want 1GiB", got)
+	}
+	if got := cfg.ClusterLogPeerGrace(); got != 10*time.Minute {
+		t.Fatalf("log_peer_grace 默认 = %v; want 10m", got)
+	}
+
+	cfg, err = loadClusterConfigErr(t, "  log_retain_bytes: 4GiB\n  log_peer_grace: 90s\n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.ClusterLogRetainBytes(); got != 4<<30 {
+		t.Fatalf("log_retain_bytes 覆盖 = %d; want 4GiB", got)
+	}
+	if got := cfg.ClusterLogPeerGrace(); got != 90*time.Second {
+		t.Fatalf("log_peer_grace 覆盖 = %v; want 90s", got)
+	}
+	if cfg, err := loadClusterConfigErr(t, "  log_retain_bytes: 64MiB\n"); err != nil || cfg.ClusterLogRetainBytes() != 64<<20 {
+		t.Fatalf("下限 64MiB 本身应合法，得到 err=%v", err)
+	}
+
+	for _, c := range []struct{ frag, key string }{
+		{"  log_retain_bytes: -1GiB\n", "log_retain_bytes"},
+		{"  log_retain_bytes: 1GB\n", "log_retain_bytes"},
+		{"  log_retain_bytes: 0.5GiB\n", "log_retain_bytes"},
+		{"  log_retain_bytes: 32MiB\n", "log_retain_bytes"},
+		{"  log_peer_grace: -1s\n", "log_peer_grace"},
+		{"  log_peer_grace: 0s\n", "log_peer_grace"},
+	} {
+		_, err := loadClusterConfigErr(t, c.frag)
+		if err == nil {
+			t.Errorf("%q 应拒绝启动", strings.TrimSpace(c.frag))
+			continue
+		}
+		if !strings.Contains(err.Error(), c.key) {
+			t.Errorf("%q 的错误信息未含键名 %s: %v", strings.TrimSpace(c.frag), c.key, err)
+		}
+	}
+}
