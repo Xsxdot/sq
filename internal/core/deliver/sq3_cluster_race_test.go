@@ -66,7 +66,7 @@ type nopWriter struct{}
 
 func (nopWriter) Write(p []byte) (int, error) { return len(p), nil }
 
-func newSQ3Standalone(t *testing.T) *sq3Stack {
+func newSQ3Standalone(t *testing.T, opts ...Option) *sq3Stack {
 	t.Helper()
 	lg := sq3Logger()
 	st, err := store.Open(t.TempDir(), false, lg)
@@ -81,11 +81,11 @@ func newSQ3Standalone(t *testing.T) *sq3Stack {
 		t.Fatalf("meta: %v", err)
 	}
 	pr := produce.New(rep, rt, st, mt, lg)
-	return &sq3Stack{pr: pr, dl: New(rep, rt, st, mt, pr, lg)}
+	return &sq3Stack{pr: pr, dl: sq3Deliverer(t, New(rep, rt, st, mt, pr, lg, opts...))}
 }
 
 // newSQ3Cluster 单 voter 集群档：装配序与钩子同 cmd/sq/main.go 集群分支。
-func newSQ3Cluster(t *testing.T) *sq3Stack {
+func newSQ3Cluster(t *testing.T, opts ...Option) *sq3Stack {
 	t.Helper()
 	lg := sq3Logger()
 	st, err := store.Open(t.TempDir(), false, lg)
@@ -164,7 +164,47 @@ func newSQ3Cluster(t *testing.T) *sq3Stack {
 	mtPtr.Store(mt)
 	pr := produce.New(cl, cl, st, mt, lg)
 	prPtr.Store(pr)
-	return &sq3Stack{pr: pr, dl: New(cl, cl, st, mt, pr, lg)}
+	return &sq3Stack{pr: pr, dl: sq3Deliverer(t, New(cl, cl, st, mt, pr, lg, opts...))}
+}
+
+// sq3Deliverer 起检查点循环（逐次模式为空操作），Cleanup 里 Stop（注册晚于
+// 集群/store 的 Cleanup，LIFO 先执行：收尾检查点在 StopClean、store 关闭之前）。
+func sq3Deliverer(t *testing.T, d *Deliverer) *Deliverer {
+	d.Start(context.Background())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := d.Stop(ctx); err != nil {
+			t.Logf("Deliverer.Stop: %v", err)
+		}
+	})
+	return d
+}
+
+// sq3Modes 卡 SQ4.1：两种持久化模式，只改装配，判据一字不改。
+var sq3Modes = []struct {
+	name string
+	opts []Option
+}{
+	{"checkpoint", []Option{WithCheckpointInterval(time.Second)}},
+	{"perop", nil},
+}
+
+// sq3Each 对 {standalone, cluster} × {checkpoint, perop} 四种组合各跑一次。
+func sq3Each(t *testing.T, run func(t *testing.T, s *sq3Stack)) {
+	for _, arch := range []string{"standalone", "cluster"} {
+		for _, m := range sq3Modes {
+			t.Run(arch+"/"+m.name, func(t *testing.T) {
+				var s *sq3Stack
+				if arch == "cluster" {
+					s = newSQ3Cluster(t, m.opts...)
+				} else {
+					s = newSQ3Standalone(t, m.opts...)
+				}
+				run(t, s)
+			})
+		}
+	}
 }
 
 type sq3Delivery struct {
@@ -176,17 +216,7 @@ type sq3Delivery struct {
 
 // TestSQ3ConcurrentReceiveDuplicateDelivery 用例 A：普通消息并发取件重复投递。
 func TestSQ3ConcurrentReceiveDuplicateDelivery(t *testing.T) {
-	for _, mode := range []string{"standalone", "cluster"} {
-		t.Run(mode, func(t *testing.T) {
-			var s *sq3Stack
-			if mode == "cluster" {
-				s = newSQ3Cluster(t)
-			} else {
-				s = newSQ3Standalone(t)
-			}
-			sq3RunCaseA(t, s)
-		})
-	}
+	sq3Each(t, sq3RunCaseA)
 }
 
 func sq3RunCaseA(t *testing.T, s *sq3Stack) {
@@ -338,17 +368,7 @@ func head(s []uint64, n int) []uint64 {
 
 // TestSQ3ConcurrentReceiveOrderedLock 用例 B：顺序锁在并发取件下失效。
 func TestSQ3ConcurrentReceiveOrderedLock(t *testing.T) {
-	for _, mode := range []string{"standalone", "cluster"} {
-		t.Run(mode, func(t *testing.T) {
-			var s *sq3Stack
-			if mode == "cluster" {
-				s = newSQ3Cluster(t)
-			} else {
-				s = newSQ3Standalone(t)
-			}
-			sq3RunCaseB(t, s)
-		})
-	}
+	sq3Each(t, sq3RunCaseB)
 }
 
 func sq3RunCaseB(t *testing.T, s *sq3Stack) {

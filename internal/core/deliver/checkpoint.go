@@ -10,13 +10,22 @@
 //     （计划修订 R1）：在途期间到达的变更只改内存并挂到「下一次提案」，在途
 //     提案成功后才构造下一个差量——下一差量的基线恒为已落盘状态；在途提案
 //     失败即丢弃内存态、从盘重装
+//   - 检查点（checkpointRound）：检查点模式下变更只改内存、登记脏队列；后台
+//     循环每个间隔对脏队列做一轮整体替换落盘（修订 R1：DeleteRange inflight
+//     前缀 + Set 全部 inflight + Set cursor，同批）——任一检查点批次单独落地
+//     都自洽，前序批次丢弃或失败无害
+//   - 停机（Start/Stop）：Stop 先关门（新调用 ErrNotLeader）再停循环，最后对
+//     全部脏队列做收尾检查点——正常停机不产生重复投递
+//   - 计划内转移（PrepareTransfer，P1/P3）：置组围栏（到达的调用阻塞等待），
+//     对该组全部已装载队列做检查点（逐次模式下等在途提案了结），之后才允许
+//     转移领导权——计划内切换不产生重复投递
 //   - 管理批次（ApplyAdminBatch）：删消费组等旁路批次经此串行化，先失效再提交
 //
 // 边界：
 //   - 一切消费状态提案经 ApplyAsyncAt 绑定内存态装载时的 epoch：内存态只在
-//     该 epoch 内权威，绝不让它的差量进入其他任期的日志（主会话裁决）
+//     该 epoch 内权威，绝不让它的批次进入其他任期的日志（主会话裁决）
 //   - 不判定领导权本身（Router.WaitWritable 是唯一来源）；不碰 cluster 内部
-//   - 检查点模式（周期落盘、停机/转移前全量检查点）属本卡段 B，不在本文件当前版本
+//     ——转移前回调由 cluster 的摊布循环经组装点（main）调用 PrepareTransfer
 package deliver
 
 import (
@@ -40,6 +49,9 @@ const consumeProposeTimeout = 10 * time.Second
 // errStateDropped 内存态被丢弃时，挂在「下一次提案」上的变更以它失败。
 // 包装 ErrNotLeader：rpc 层映射为可重试错误，客户端重试即走重装后的状态。
 var errStateDropped = fmt.Errorf("%w: 队列消费状态已失效", replication.ErrNotLeader)
+
+// errStopped Stop 之后的消费调用（停机收尾检查点之后不得再有内存变更）。
+var errStopped = fmt.Errorf("%w: 消费引擎已停止", replication.ErrNotLeader)
 
 // queue 返回 (group,topic,queueID) 的队列状态，不存在则创建（未装载）。
 // 只在 d.mu 内读写 map 本身；返回值的 mu 由调用方在 d.mu 之外取。
@@ -67,13 +79,33 @@ func (d *Deliverer) queue(group, topic string, q uint32) *queueState {
 // 锁之前调用。
 func (d *Deliverer) acquire(ctx context.Context, group, topic string, q uint32) (*queueState, uint32, error) {
 	g := d.rt.GroupForQueue(topic, q)
-	e, err := d.rt.WaitWritable(ctx, g)
-	if err != nil {
-		d.logger.Debug("消费请求未过可写门", "group", group, "topic", topic, "queue", q, "g", g, "err", err)
-		return nil, g, err
-	}
 	qs := d.queue(group, topic, q)
-	qs.mu.Lock()
+	var e uint64
+	for {
+		if d.closed.Load() {
+			return nil, g, errStopped
+		}
+		if err := d.waitFence(ctx, g); err != nil {
+			return nil, g, err
+		}
+		var err error
+		e, err = d.rt.WaitWritable(ctx, g)
+		if err != nil {
+			d.logger.Debug("消费请求未过可写门", "group", group, "topic", topic, "queue", q, "g", g, "err", err)
+			return nil, g, err
+		}
+		qs.mu.Lock()
+		// 锁内复查：停机收尾检查点 / 转移前检查点按队列取锁构造批次，取锁
+		// 晚于它们的调用必须看到关门或围栏，否则改动会落在最后一次检查点之后
+		if d.closed.Load() {
+			qs.mu.Unlock()
+			return nil, g, errStopped
+		}
+		if !d.fenced(g) {
+			break
+		}
+		qs.mu.Unlock()
+	}
 	if qs.loaded && qs.epoch > e {
 		cur := qs.epoch
 		qs.mu.Unlock()
@@ -107,6 +139,7 @@ func (d *Deliverer) acquire(ctx context.Context, group, topic string, q uint32) 
 func (d *Deliverer) dropLocked(qs *queueState, cause error) {
 	qs.gen++
 	qs.inFlight = false
+	qs.cur = nil
 	if f := qs.next; f != nil {
 		qs.next = nil
 		f.err = fmt.Errorf("%w（%v）", errStateDropped, cause)
@@ -126,6 +159,16 @@ func (d *Deliverer) commitLocked(qs *queueState) *flush {
 	if !qs.hasDirty() {
 		return nil
 	}
+	if d.interval > 0 {
+		// 检查点模式：只登记脏队列，变更随下一轮检查点落盘
+		if !qs.ckDirty {
+			qs.ckDirty = true
+			d.ckMu.Lock()
+			d.ckDirty[qs] = struct{}{}
+			d.ckMu.Unlock()
+		}
+		return nil
+	}
 	if qs.next == nil {
 		qs.next = &flush{done: make(chan struct{})}
 	}
@@ -143,6 +186,7 @@ func (d *Deliverer) proposeLocked(qs *queueState) {
 	qs.next = nil
 	f.gen = qs.gen
 	qs.inFlight = true
+	qs.cur = f
 	b := d.st.NewBatch()
 	qs.buildDelta(b)
 	g := d.rt.GroupForQueue(qs.topic, qs.q)
@@ -164,6 +208,7 @@ func (d *Deliverer) finishFlush(qs *queueState, f *flush, err error) {
 	qs.mu.Lock()
 	if qs.gen == f.gen {
 		qs.inFlight = false
+		qs.cur = nil
 		if err != nil {
 			d.logger.Warn("消费状态提案失败，丢弃队列内存态（下次访问从盘重装）",
 				"group", qs.group, "topic", qs.topic, "queue", qs.q, "epoch", qs.epoch, "err", err)
@@ -259,4 +304,326 @@ func (d *Deliverer) InflightCount(group, topic string, q uint32) (n int, ok bool
 		return 0, false
 	}
 	return int(qs.nInflight.Load()), true
+}
+
+// fenceTTL 计划内转移围栏的有效期（P3，计划授权 [2s,5s]）：转移通常百毫秒内
+// 完成；中止时到期自动恢复服务。var 供测试注入小值。
+var fenceTTL = 3 * time.Second
+
+// stopCheckpointRounds 停机收尾最多做几轮检查点（失败的队列会重新登记，
+// 上限防止 leader 已失时空转到 ctx 截止）。
+const stopCheckpointRounds = 3
+
+// Start 启动检查点后台循环（检查点模式；逐次复制模式为空操作）。ctx 结束或
+// Stop 时循环退出。只可调用一次。
+func (d *Deliverer) Start(ctx context.Context) {
+	if d.interval <= 0 {
+		d.logger.Info("消费状态持久化：逐次复制模式（每次变更落盘后才应答）")
+		return
+	}
+	lctx, cancel := context.WithCancel(ctx)
+	d.loopCancel = cancel
+	d.loopDone = make(chan struct{})
+	d.logger.Info("消费状态持久化：检查点模式", "interval", d.interval.String())
+	go func() {
+		defer close(d.loopDone)
+		t := time.NewTicker(d.interval)
+		defer t.Stop()
+		for {
+			select {
+			case <-lctx.Done():
+				return
+			case <-t.C:
+			}
+			// 轮次 ctx 不取循环 ctx：Stop 取消循环时，正在进行的一轮照常收尾
+			// （提案已入队，半途放弃只会让收尾检查点多做一遍）
+			rctx, rcancel := context.WithTimeout(context.Background(), d.roundBudget())
+			d.checkpointRound(rctx, nil, false)
+			rcancel()
+		}
+	}()
+}
+
+// roundBudget 一轮后台检查点等可写门的预算：一个间隔，至少 1s。
+func (d *Deliverer) roundBudget() time.Duration {
+	if d.interval < time.Second {
+		return time.Second
+	}
+	return d.interval
+}
+
+// Stop 停止消费引擎（正常停机）：关门（此后新调用一律 ErrNotLeader）→ 停
+// 检查点循环 → 对全部脏队列做收尾检查点并等待落盘。ctx 为收尾上限（计划
+// 授权 [5s,20s]，由调用方给）。逐次复制模式只关门。重复调用为空操作。
+//
+// 调用时机（main）：gRPC 排空之后、Manager.StopClean 与 store.Close 之前。
+// 返回收尾检查点未全部落盘时的错误（后果：未落盘的进度在重启后表现为重复投递）。
+func (d *Deliverer) Stop(ctx context.Context) error {
+	if !d.closed.CompareAndSwap(false, true) {
+		return nil
+	}
+	if d.interval <= 0 {
+		d.logger.Info("消费引擎已停止（逐次复制模式，无收尾检查点）")
+		return nil
+	}
+	if d.loopCancel != nil {
+		d.loopCancel()
+		<-d.loopDone
+	}
+	start := time.Now()
+	var last error
+	total := 0
+	for i := 0; i < stopCheckpointRounds; i++ {
+		n, err := d.checkpointRound(ctx, nil, true)
+		total += n
+		last = err
+		if err == nil || ctx.Err() != nil {
+			break
+		}
+	}
+	if last != nil {
+		d.logger.Error("停机收尾检查点未全部落盘（重启后这部分进度表现为重复投递）",
+			"queues", total, "took", time.Since(start).String(), "err", last)
+		return last
+	}
+	d.logger.Info("消费引擎已停止，收尾检查点完成", "queues", total, "took", time.Since(start).String())
+	return nil
+}
+
+// ckPending 一轮检查点里一个已入队的队列批次。
+type ckPending struct {
+	qs  *queueState
+	gen uint64
+	p   replication.Pending
+}
+
+// checkpointRound 做一轮检查点：对候选队列逐组过可写门，逐队列「取锁 → 校
+// 已装载且 epoch == 门 epoch → 有变更即构造全量批次 → ApplyAsyncAt 绑 epoch」
+// → 放锁；全部入队后统一等落盘。
+//
+// 参数：
+//   - only：非 nil 时只处理该组（计划内转移）
+//   - all：true 时候选 = 本节点全部已装载队列（停机/转移前：不依赖脏集登记
+//     的时序，取锁本身与在改的调用串行）；false 时候选 = 脏队列集合
+//
+// 门未开或 epoch 已变的组：内存态直接丢弃不写（领导权已失，未落盘的变更属
+// 故障后果，表现为重复投递）。批次失败：队列保留内存态并重新登记为脏，下一轮
+// 重写（全量替换不依赖盘上基线，重试安全）。
+//
+// 返回：写出的队列数与首个失败原因。轮与轮串行（roundMu）。
+func (d *Deliverer) checkpointRound(ctx context.Context, only *uint32, all bool) (int, error) {
+	d.roundMu.Lock()
+	defer d.roundMu.Unlock()
+	var cands []*queueState
+	if all {
+		d.mu.Lock()
+		for _, qs := range d.qmu {
+			cands = append(cands, qs)
+		}
+		d.mu.Unlock()
+	} else {
+		d.ckMu.Lock()
+		for qs := range d.ckDirty {
+			cands = append(cands, qs)
+		}
+		d.ckDirty = map[*queueState]struct{}{}
+		d.ckMu.Unlock()
+	}
+	byG := map[uint32][]*queueState{}
+	for _, qs := range cands {
+		g := d.rt.GroupForQueue(qs.topic, qs.q)
+		if only != nil && g != *only {
+			if !all {
+				d.redirty(qs) // 非本组的脏队列放回集合
+			}
+			continue
+		}
+		byG[g] = append(byG[g], qs)
+	}
+	var pend []ckPending
+	var firstErr error
+	for g, qss := range byG {
+		e, werr := d.rt.WaitWritable(ctx, g)
+		for _, qs := range qss {
+			qs.mu.Lock()
+			qs.ckDirty = false
+			if !qs.loaded || !qs.hasDirty() {
+				qs.mu.Unlock()
+				continue
+			}
+			if werr != nil || qs.epoch != e {
+				cause := werr
+				if cause == nil {
+					cause = fmt.Errorf("epoch %d→%d", qs.epoch, e)
+				}
+				d.logger.Warn("检查点时本节点已不可写或已换届，丢弃未落盘的队列内存态",
+					"group", qs.group, "topic", qs.topic, "queue", qs.q, "g", g,
+					"epoch", qs.epoch, "err", cause)
+				d.dropLocked(qs, cause)
+				qs.mu.Unlock()
+				continue
+			}
+			b := d.st.NewBatch()
+			qs.buildFull(b)
+			pctx, cancel := context.WithTimeout(context.Background(), consumeProposeTimeout)
+			p, err := d.rep.ApplyAsyncAt(pctx, g, b, qs.epoch)
+			if err != nil {
+				p = errPending{err}
+			}
+			pend = append(pend, ckPending{qs: qs, gen: qs.gen, p: cancelPending{p, cancel}})
+			qs.mu.Unlock()
+		}
+	}
+	for _, cp := range pend {
+		if err := cp.p.Wait(); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			d.logger.Warn("队列检查点提交失败，保留内存态待下一轮重写",
+				"group", cp.qs.group, "topic", cp.qs.topic, "queue", cp.qs.q, "err", err)
+			cp.qs.mu.Lock()
+			if cp.qs.gen == cp.gen && cp.qs.loaded {
+				cp.qs.cursorDirty = true // 强制下一轮重写（buildFull 已清脏集）
+				if !cp.qs.ckDirty {
+					cp.qs.ckDirty = true
+					d.redirty(cp.qs)
+				}
+			}
+			cp.qs.mu.Unlock()
+		}
+	}
+	if len(pend) > 0 {
+		d.logger.Debug("检查点轮次完成", "queues", len(pend), "groups", len(byG), "err", firstErr)
+	}
+	return len(pend), firstErr
+}
+
+// redirty 把队列放回脏队列集合（ckMu 是叶子锁，可在持队列锁时调用）。
+func (d *Deliverer) redirty(qs *queueState) {
+	d.ckMu.Lock()
+	d.ckDirty[qs] = struct{}{}
+	d.ckMu.Unlock()
+}
+
+// errPending 入队即失败的提案。
+type errPending struct{ err error }
+
+func (p errPending) Wait() error { return p.err }
+
+// cancelPending Wait 后释放提案 ctx。
+type cancelPending struct {
+	p      replication.Pending
+	cancel context.CancelFunc
+}
+
+func (p cancelPending) Wait() error {
+	defer p.cancel()
+	return p.p.Wait()
+}
+
+// PrepareTransfer 计划内转移 g 组领导权之前调用（P1，经组装点接到
+// cluster.Options.BeforeLeaderTransfer）：置围栏（此后到达该组的消费调用阻塞
+// 等待，P3）→ 检查点模式对该组全部已装载队列做检查点、逐次模式等该组在途
+// 提案了结 → 返回 nil 后调用方即可转移。失败即撤围栏并返回错误（调用方本
+// 周期不转移）。
+//
+// 围栏在 fenceTTL 后自动失效：转移成功则领导权已失，围栏内等待者拿到
+// ErrNotLeader；转移中止则到期恢复服务（记 Warn）。
+func (d *Deliverer) PrepareTransfer(ctx context.Context, g uint32) error {
+	start := time.Now()
+	d.fenceMu.Lock()
+	d.fences[g] = start.Add(fenceTTL)
+	d.fenceMu.Unlock()
+	d.logger.Info("计划内转移领导权：组围栏已置，开始转移前检查点", "g", g, "ttl", fenceTTL.String())
+	var err error
+	n := 0
+	if d.interval > 0 {
+		n, err = d.checkpointRound(ctx, &g, true)
+	} else {
+		n, err = d.awaitInflight(ctx, g)
+	}
+	if err != nil {
+		d.fenceMu.Lock()
+		delete(d.fences, g)
+		d.fenceMu.Unlock()
+		d.logger.Warn("转移前检查点失败，撤围栏（本周期不转移）", "g", g, "err", err)
+		return fmt.Errorf("转移前检查点 (g=%d): %w", g, err)
+	}
+	d.logger.Info("转移前检查点完成，可转移领导权", "g", g, "queues", n,
+		"took", time.Since(start).String())
+	return nil
+}
+
+// awaitInflight 逐次复制模式下等 g 组全部队列的在途提案了结（围栏已置，
+// 不会再有新变更）。返回等过的队列数；ctx 结束返回其错误。
+func (d *Deliverer) awaitInflight(ctx context.Context, g uint32) (int, error) {
+	d.mu.Lock()
+	var qss []*queueState
+	for _, qs := range d.qmu {
+		if d.rt.GroupForQueue(qs.topic, qs.q) == g {
+			qss = append(qss, qs)
+		}
+	}
+	d.mu.Unlock()
+	n := 0
+	for _, qs := range qss {
+		for {
+			qs.mu.Lock()
+			f := qs.cur
+			qs.mu.Unlock()
+			if f == nil {
+				break
+			}
+			n++
+			select {
+			case <-f.done:
+			case <-ctx.Done():
+				return n, ctx.Err()
+			}
+		}
+	}
+	return n, nil
+}
+
+// fenced 组 g 当前是否处于转移围栏内。围栏到期时顺手清除并记一次 Warn
+// （转移被中止，服务恢复）。
+func (d *Deliverer) fenced(g uint32) bool {
+	d.fenceMu.Lock()
+	defer d.fenceMu.Unlock()
+	until, ok := d.fences[g]
+	if !ok {
+		return false
+	}
+	if time.Now().Before(until) {
+		return true
+	}
+	delete(d.fences, g)
+	if d.rt.IsLeader(g) {
+		d.logger.Warn("转移围栏到期而领导权仍在本节点（转移未发生或已中止），恢复消费服务", "g", g)
+	}
+	return false
+}
+
+// waitFence 围栏内的调用阻塞等待（P3）：直到围栏解除/到期、领导权已失
+// （返回 ErrNotLeader，rpc 映射可重试）或 ctx 结束。无围栏时一次 map 读。
+func (d *Deliverer) waitFence(ctx context.Context, g uint32) error {
+	if !d.fenced(g) {
+		return nil
+	}
+	start := time.Now()
+	t := time.NewTicker(5 * time.Millisecond)
+	defer t.Stop()
+	for d.fenced(g) {
+		if !d.rt.IsLeader(g) {
+			d.logger.Debug("围栏等待期间领导权已转走", "g", g, "waited", time.Since(start).String())
+			return fmt.Errorf("%w: 组 %d 领导权已转移", replication.ErrNotLeader, g)
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-t.C:
+		}
+	}
+	d.logger.Debug("围栏解除，继续消费调用", "g", g, "waited", time.Since(start).String())
+	return nil
 }

@@ -40,6 +40,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Xsxdot/sq/internal/core"
@@ -94,8 +95,11 @@ func RetryBackoff(attempts int32) time.Duration {
 // 下一个持锁者从 pebble 读到旧状态」的窗口（SQ3 的根因）。新增任何读写
 // inflight/cursor 的方法都必须经 acquire 取同一把锁，否则上面这句不再成立。
 //
-// 持久化（当前固定逐次复制模式，checkpoint.go）：每次变更以「cursor + 变更的
-// inflight 同批」提案，落盘后才交件/应答；同队列至多一个提案在途。
+// 持久化两种模式（checkpoint.go），区别只在「谁、何时」把内存态写成批次：
+//   - 逐次复制（WithCheckpointInterval(0) 或不传选项）：每次变更以「cursor +
+//     变更的 inflight 同批」差量提案，落盘后才交件/应答；同队列至多一个提案在途
+//   - 检查点（间隔 > 0，Start 起后台循环）：变更只改内存即返回；每个间隔把
+//     脏队列整体替换落盘一次（DeleteRange inflight 前缀 + 全部 inflight + cursor）
 type Deliverer struct {
 	rep    replication.Replicator
 	rt     replication.Router
@@ -115,6 +119,26 @@ type Deliverer struct {
 	skipMu  sync.Mutex
 	skipped map[FilterSkipKey]uint64
 
+	// interval 检查点间隔；0 = 逐次复制模式。构造后只读。
+	interval time.Duration
+
+	// ckMu 保护 ckDirty（检查点模式的脏队列集合，叶子锁：可在持队列锁时取）。
+	ckMu    sync.Mutex
+	ckDirty map[*queueState]struct{}
+	// roundMu 串行化检查点轮次（后台循环、停机收尾、计划内转移前检查点）。
+	roundMu sync.Mutex
+	// closed Stop 之后为真：新的消费调用一律 ErrNotLeader（停机收尾检查点
+	// 之后不得再有内存变更）。
+	closed atomic.Bool
+	// loopCancel/loopDone 检查点后台循环的停止与退出信号（Start 置）。
+	loopCancel context.CancelFunc
+	loopDone   chan struct{}
+
+	// fenceMu 保护 fences：组 → 围栏截止时刻（计划内转移领导权期间消费调用
+	// 阻塞等待，P3）。
+	fenceMu sync.Mutex
+	fences  map[uint32]time.Time
+
 	// afterAppendHook 测试专用注入钩子（生产恒为 nil）：在 moveToDLQ 第一段
 	// （死信消息写入）成功后、第二段（删源 inflight）前调用，用于模拟两段
 	// 之间进程崩溃。生产代码绝不允许设置。
@@ -126,12 +150,35 @@ type Deliverer struct {
 // fwd 从 rt 断言取得——集群档的 rt 即 *replication.Cluster（同时实现
 // Forwarder），单机档的 StandaloneRouter 不实现 Forwarder，断言得 nil；
 // 单机 IsLeader 恒真，转发分支不可达，nil 不会解引用（与 txn/delay 同款）。
+//
+// opts 可选（变参尾置，既有调用点不改）：不传即逐次复制模式；main 永远显式
+// 传 WithCheckpointInterval(配置值)。检查点模式须调用 Start 起后台循环、
+// 停机时调用 Stop 做收尾检查点。
 func New(rep replication.Replicator, rt replication.Router, st *store.Store,
-	mt *meta.Meta, pr *produce.Producer, logger *slog.Logger) *Deliverer {
+	mt *meta.Meta, pr *produce.Producer, logger *slog.Logger, opts ...Option) *Deliverer {
 	fwd, _ := rt.(replication.Forwarder)
-	return &Deliverer{rep: rep, rt: rt, fwd: fwd, st: st, mt: mt, pr: pr,
+	d := &Deliverer{rep: rep, rt: rt, fwd: fwd, st: st, mt: mt, pr: pr,
 		logger: logger.With("mod", "deliver"), qmu: map[string]*queueState{},
-		skipped: map[FilterSkipKey]uint64{}}
+		skipped: map[FilterSkipKey]uint64{}, ckDirty: map[*queueState]struct{}{},
+		fences: map[uint32]time.Time{}}
+	for _, o := range opts {
+		o(d)
+	}
+	return d
+}
+
+// Option Deliverer 构造选项。
+type Option func(*Deliverer)
+
+// WithCheckpointInterval 设消费状态检查点间隔：0（或负值）= 逐次复制模式，
+// > 0 = 检查点模式（配置键 consume_checkpoint_interval，卡 SQ4.1）。
+func WithCheckpointInterval(iv time.Duration) Option {
+	return func(d *Deliverer) {
+		if iv < 0 {
+			iv = 0
+		}
+		d.interval = iv
+	}
 }
 
 // FilterSkipKey 跳过计数的维度：topic + 消费组 + 跳过原因。

@@ -105,6 +105,12 @@ type queueState struct {
 	// next=在途期间到达的变更等待的下一次提案（在途结束后才构造，修订 R1）。
 	inFlight bool
 	next     *flush
+	// cur 当前在途的逐次复制提案（计划内转移前等它了结用）；无在途为 nil。
+	cur *flush
+
+	// ckDirty 检查点模式：本队列已登记进 Deliverer 的脏队列集合（避免每次
+	// 变更都去碰那张共享 map）。只在 mu 内读写。
+	ckDirty bool
 
 	// idxVisits 到期索引被检视的元素累计数（U3 用它核对「未到期 inflight
 	// 再多，一次取件对索引的访问也是常数级」）。只在 mu 内写。
