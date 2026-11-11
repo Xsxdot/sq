@@ -18,11 +18,13 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"runtime"
 	"sync/atomic"
 	"time"
 
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/cockroachdb/pebble/v2/batchrepr"
+	"github.com/cockroachdb/pebble/v2/bloom"
 )
 
 // onApplyObserve 是 Apply 耗时观测钩子。用 atomic.Pointer 而非裸函数变量：
@@ -80,21 +82,109 @@ type Store struct {
 	logger *slog.Logger
 }
 
-// Open 打开（或创建）dir 下的 Pebble 库。syncWrites 决定 Apply 是否逐次 fsync。
+// Pebble 调优参数的缺省值（SQ4.5）。这是全仓唯一真值：config 未填写的键
+// 传 0 下来，由 Options.resolve 解析成这些常量；走 Open 的测试与基准也
+// 自动用上它们，基准量到的就是生产缺省。
+//
+// 取值依据见 docs/superpowers/plans/sq4.5-plan.md 与卡上基准数字；内存
+// 占用估算见 docs/configuration.md「存储引擎（storage）」节。
+const (
+	// DefaultCacheSize block cache 缺省容量。注意 memtable 的内存从这块
+	// 缓存里预留（pebble db.go 的 Cache.Reserve），不是另外再加的。
+	DefaultCacheSize int64 = 256 << 20
+	// DefaultMemTableSize 单个 memtable 的稳态缺省大小。取 32MiB 而非
+	// 64MiB：最多约 3 个 memtable 从缓存预留，64MiB 会占去 256MiB 缓存的
+	// 3/4；基准上 32MiB 的 ack 点查不慢于 64MiB、写吞吐在 64MiB 的 95% 以内。
+	DefaultMemTableSize uint64 = 32 << 20
+	// DefaultMaxCompactionConcurrency 压实并发上限缺省值的封顶：
+	// 0 = min(DefaultMaxCompactionConcurrency, CPU 核数)。
+	DefaultMaxCompactionConcurrency = 4
+)
+
+// bloomBitsPerKey 布隆过滤器每键位数。10 位 ≈ 1% 误判率，是 LevelDB/
+// RocksDB/Pebble 的通用取值。
+const bloomBitsPerKey = 10
+
+// L0 阈值（L0CompactionThreshold/L0StopWritesThreshold）刻意不设、保持
+// Pebble 缺省 4/12：基准里 (8,24) 与 (6,18) 都没带来 ≥5% 的写吞吐提升
+// （SQ4.5 卡上有数字），抬高阈值只会放大读放大。
+
+// Options 是 Pebble 的可调参数。零值字段 = 用本包缺省常量，故零值
+// Options 即缺省配置（Open 就是这么调的）。
+type Options struct {
+	// CacheSize block cache 字节数；0 = DefaultCacheSize。
+	CacheSize int64
+	// MemTableSize 单个 memtable 稳态字节数；0 = DefaultMemTableSize。
+	MemTableSize uint64
+	// CompactionConcurrency 压实并发上限；0 = min(4, CPU 核数)。常态
+	// 只跑 1 路，L0 积压/压实欠账过高时 Pebble 才升到这个上限。
+	CompactionConcurrency int
+}
+
+// resolve 把零值字段替换为缺省值，返回实际生效的参数。
+func (o Options) resolve() Options {
+	if o.CacheSize <= 0 {
+		o.CacheSize = DefaultCacheSize
+	}
+	if o.MemTableSize == 0 {
+		o.MemTableSize = DefaultMemTableSize
+	}
+	if o.CompactionConcurrency <= 0 {
+		o.CompactionConcurrency = min(DefaultMaxCompactionConcurrency, runtime.NumCPU())
+	}
+	return o
+}
+
+// pebbleOptions 组装传给 pebble.Open 的选项（o 须已 resolve）。
+//
+// 只设运行期参数，不设 FormatMajorVersion（不做盘上格式棘轮）：缓存、
+// memtable、L0 阈值、压实并发都不改变盘上语义；布隆过滤器只是 SST 里
+// 多一个按名字查找的元块，旧二进制读新 SST 时忽略未注册的过滤器，回滚安全。
+func (o Options) pebbleOptions(l *slog.Logger) *pebble.Options {
+	cc := o.CompactionConcurrency
+	po := &pebble.Options{
+		// 不设 Logger 时 Pebble 退回 DefaultLogger 直写 stderr，绕过项目
+		// 日志通道——那正是 B12 里 FAIL 行被噪声挤掉的成因。
+		Logger:       newPebbleLogger(l),
+		CacheSize:    o.CacheSize,
+		MemTableSize: o.MemTableSize,
+		// 区间 (1, cc)：常态单路压实，不在 2 核小机上与写路径抢 CPU；
+		// L0 读放大或压实欠账升高时 Pebble 自动扩到 cc 路。
+		CompactionConcurrencyRange: func() (int, int) { return 1, cc },
+	}
+	// 只设 L0，EnsureDefaults 的 EnsureL1PlusDefaults 会把它逐层继承到
+	// L1–L6。作用范围：db.Get 不开 UseL6Filters，过滤器省的是 L0–L5 的
+	// 无效探查，L6（多数数据所在）的索引/数据块读取靠缓存容量解决。
+	po.Levels[0].FilterPolicy = bloom.FilterPolicy(bloomBitsPerKey)
+	return po
+}
+
+// Open 打开（或创建）dir 下的 Pebble 库，参数全用缺省值。syncWrites 决定
+// Apply 是否逐次 fsync。等价于 OpenWithOptions(dir, syncWrites, logger, Options{})。
 func Open(dir string, syncWrites bool, logger *slog.Logger) (*Store, error) {
+	return OpenWithOptions(dir, syncWrites, logger, Options{})
+}
+
+// OpenWithOptions 按调优参数打开（或创建）dir 下的 Pebble 库。opts 的零值
+// 字段用本包缺省值；生效值记在「store 已打开」日志里，是排查内存与性能
+// 问题时确认参数的唯一现场证据。
+func OpenWithOptions(dir string, syncWrites bool, logger *slog.Logger, opts Options) (*Store, error) {
 	// mod 一次性绑在 logger 上（与 meta/produce/deliver/rpc 各包的做法一致），
-	// 之后各调用点不再逐条重复这对键值。
-	//
-	// 必须在 pebble.Open 之前求值：Options.Logger 要拿它构造适配器。不设
-	// Options.Logger 时 Pebble 会退回 DefaultLogger 直写 stderr，绕过项目的
-	// 日志通道——那正是 B12 里 FAIL 行被噪声挤掉的成因。
+	// 之后各调用点不再逐条重复这对键值。必须在 pebble.Open 之前求值：
+	// Options.Logger 要拿它构造适配器。
 	l := logger.With("mod", "store")
 
-	db, err := pebble.Open(dir, &pebble.Options{Logger: newPebbleLogger(l)})
+	eff := opts.resolve()
+	db, err := pebble.Open(dir, eff.pebbleOptions(l))
 	if err != nil {
+		l.Error("打开 Pebble 失败", "dir", dir, "cache_size", eff.CacheSize,
+			"memtable_size", eff.MemTableSize, "err", err)
 		return nil, fmt.Errorf("打开 Pebble(%s): %w", dir, err)
 	}
-	l.Info("store 已打开", "dir", dir, "sync", syncWrites)
+	l.Info("store 已打开", "dir", dir, "sync", syncWrites,
+		"cache_size", eff.CacheSize, "memtable_size", eff.MemTableSize,
+		"compaction_concurrency", eff.CompactionConcurrency,
+		"bloom_bits_per_key", bloomBitsPerKey)
 	return &Store{db: db, dir: dir, sync: syncWrites, logger: l}, nil
 }
 

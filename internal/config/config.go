@@ -16,6 +16,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -103,6 +104,116 @@ type Config struct {
 	TxnMaxChecks int `yaml:"txn_max_checks"`
 	// Cluster 集群模式配置段。nil = 单机模式；段一旦出现即集群模式。
 	Cluster *ClusterConfig `yaml:"cluster"`
+	// Storage 存储引擎（Pebble）调优段（SQ4.5）。各键留空/缺省 = 用 store 包
+	// 的缺省值——缺省值的唯一真值在 store 包（store.DefaultCacheSize 等），
+	// 本包不重复写数字，只解析与校验用户显式填写的值。
+	Storage StorageConfig `yaml:"storage"`
+}
+
+// StorageConfig 存储引擎调优段。大小类键写「非负整数 + 可选 IEC 单位」
+// （B/KiB/MiB/GiB，区分大小写；不带单位 = 字节），拒绝 KB/MB/GB 以免
+// 1000/1024 歧义。取值经 Config.StorageCacheBytes 等方法读出。
+type StorageConfig struct {
+	// CacheSize Pebble block cache 容量（cache_size），范围 [8MiB, 64GiB]。
+	// memtable 的内存从这块缓存里预留，见 docs/configuration.md 内存估算。
+	CacheSize string `yaml:"cache_size"`
+	// MemTableSize 单个 memtable 的稳态大小（memtable_size），范围 [1MiB, 1GiB]。
+	MemTableSize string `yaml:"memtable_size"`
+	// CompactionConcurrency 压实并发上限（compaction_concurrency），范围
+	// [0, 64]；0 = min(4, CPU 核数)。常态单路压实，积压时才升到上限。
+	CompactionConcurrency int `yaml:"compaction_concurrency"`
+}
+
+// storage 段各键的校验范围（闭区间）。上限防笔误（多写一个 0）；memtable
+// 上限远低于 Pebble 的硬上限（< 4GiB），超过 1GiB 的 memtable 刷盘停顿过长。
+const (
+	minStorageCacheSize    int64 = 8 << 20
+	maxStorageCacheSize    int64 = 64 << 30
+	minStorageMemTableSize int64 = 1 << 20
+	maxStorageMemTableSize int64 = 1 << 30
+	maxStorageCompaction         = 64
+)
+
+// parseByteSize 解析「非负整数 + 可选 IEC 单位」写法的字节数。
+//
+// 只认 B/KiB/MiB/GiB（区分大小写），不带单位按字节。KB/MB/GB 单独报错并
+// 提示改写：同时接受 SI 与 IEC 时 256MB 究竟是 256×10⁶ 还是 256×2²⁰，
+// 用户和代码都会猜错，配置层干脆不给这个歧义。拒绝小数、负号、空白。
+func parseByteSize(s string) (int64, error) {
+	// 先挡 SI 写法（KB/MB/GB，大小写不敏感）并给出改写提示；放在 IEC 剥后缀
+	// 之前，否则 256MB 会被当成「B」单位剥掉后报成笼统的格式错误。
+	up := strings.ToUpper(s)
+	for _, si := range []string{"KB", "MB", "GB"} {
+		if strings.HasSuffix(up, si) {
+			return 0, fmt.Errorf("不接受单位 %s（有 1000/1024 歧义），请改用 KiB/MiB/GiB", si)
+		}
+	}
+	units := []struct {
+		suffix string
+		shift  uint
+	}{{"GiB", 30}, {"MiB", 20}, {"KiB", 10}, {"B", 0}}
+	num, shift := s, uint(0)
+	for _, u := range units {
+		if strings.HasSuffix(s, u.suffix) {
+			num, shift = strings.TrimSuffix(s, u.suffix), u.shift
+			break
+		}
+	}
+	if num == "" {
+		return 0, fmt.Errorf("缺少数字")
+	}
+	for _, c := range num {
+		if c < '0' || c > '9' {
+			return 0, fmt.Errorf("须为非负整数加可选单位 B/KiB/MiB/GiB（如 256MiB）")
+		}
+	}
+	n, err := strconv.ParseInt(num, 10, 64)
+	if err != nil || n > (1<<63-1)>>shift {
+		return 0, fmt.Errorf("数值溢出")
+	}
+	return n << shift, nil
+}
+
+// validateStorage 校验 storage 段中用户显式填写的键（空串 = 未填，跳过）。
+// 错误信息带完整键名与原始值，运维能直接定位到 yaml 的那一行。
+func validateStorage(sc *StorageConfig) error {
+	sizes := []struct {
+		key      string
+		val      string
+		min, max int64
+	}{
+		{"storage.cache_size", sc.CacheSize, minStorageCacheSize, maxStorageCacheSize},
+		{"storage.memtable_size", sc.MemTableSize, minStorageMemTableSize, maxStorageMemTableSize},
+	}
+	for _, x := range sizes {
+		if x.val == "" {
+			continue
+		}
+		n, err := parseByteSize(x.val)
+		if err != nil {
+			return fmt.Errorf("配置 %s 非法（得到 %q）: %w", x.key, x.val, err)
+		}
+		if n < x.min || n > x.max {
+			return fmt.Errorf("配置 %s 须在 [%s, %s]，得到 %q", x.key, formatIEC(x.min), formatIEC(x.max), x.val)
+		}
+	}
+	if sc.CompactionConcurrency < 0 || sc.CompactionConcurrency > maxStorageCompaction {
+		return fmt.Errorf("配置 storage.compaction_concurrency 须在 [0,%d]（0 = min(4, CPU 核数)），得到 %d",
+			maxStorageCompaction, sc.CompactionConcurrency)
+	}
+	return nil
+}
+
+// formatIEC 把校验边界格式化成配置写法（仅用于错误信息）。
+func formatIEC(n int64) string {
+	switch {
+	case n%(1<<30) == 0:
+		return fmt.Sprintf("%dGiB", n>>30)
+	case n%(1<<20) == 0:
+		return fmt.Sprintf("%dMiB", n>>20)
+	default:
+		return fmt.Sprintf("%d", n)
+	}
 }
 
 // MaxClusterSnapshotChunkBytes 是快照分块的上界（16MiB，传输层帧上限）：
@@ -305,6 +416,11 @@ func Load(path string) (*Config, error) {
 	if cfg.TxnMaxChecks < 1 || cfg.TxnMaxChecks > 1000 {
 		return nil, fmt.Errorf("配置 txn_max_checks 须在 [1,1000]，得到 %d", cfg.TxnMaxChecks)
 	}
+	// storage 段：大小写法与范围笔误启动即挡——静默回落缺省会让运维以为
+	// 调优已生效，内存或性能偏差事后很难追到这一行配置。
+	if err := validateStorage(&cfg.Storage); err != nil {
+		return nil, err
+	}
 	// —— 集群段（cluster）校验 ——
 	// 段缺省 = 单机模式（Cluster 保持 nil，ClusterEnabled()==false）；段一旦出现，
 	// 每个字段都按集群语义严格校验——半配的集群段比没有更危险，启动时挡住。
@@ -454,6 +570,33 @@ func (c *Config) RetentionInterval() time.Duration {
 func (c *Config) TxnInterval() time.Duration {
 	d, _ := time.ParseDuration(c.TxnCheckInterval)
 	return d
+}
+
+// StorageCacheBytes 返回 storage.cache_size 的字节数；未填返回 0（= 用
+// store 包缺省值）。Load 已校验合法，解析失败（仅字面量构造的 Config 会
+// 出现）同样按未填处理，回落缺省而不是把非法值带进存储引擎。
+func (c *Config) StorageCacheBytes() int64 {
+	n, err := parseByteSize(c.Storage.CacheSize)
+	if c.Storage.CacheSize == "" || err != nil {
+		return 0
+	}
+	return n
+}
+
+// StorageMemTableBytes 返回 storage.memtable_size 的字节数；未填返回 0
+// （= 用 store 包缺省值），解析失败处理同 StorageCacheBytes。
+func (c *Config) StorageMemTableBytes() uint64 {
+	n, err := parseByteSize(c.Storage.MemTableSize)
+	if c.Storage.MemTableSize == "" || err != nil {
+		return 0
+	}
+	return uint64(n)
+}
+
+// StorageCompactionConcurrency 返回压实并发上限；0 = 用 store 包缺省
+// （min(4, CPU 核数)）。
+func (c *Config) StorageCompactionConcurrency() int {
+	return c.Storage.CompactionConcurrency
 }
 
 // ClusterEnabled 是否集群模式：Cluster 段存在即集群，nil 即单机。
