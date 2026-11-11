@@ -7,6 +7,7 @@ import (
 	"bytes"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -96,16 +97,6 @@ func TestMessageDeliverAtMsRoundTripAndCompat(t *testing.T) {
 	}
 }
 
-func TestMessageIDShape(t *testing.T) {
-	id := NewMessageID()
-	if len(id) != 32 {
-		t.Fatalf("msgId 长度: %d", len(id))
-	}
-	if id == NewMessageID() {
-		t.Fatal("msgId 重复")
-	}
-}
-
 func TestInflightRoundTrip(t *testing.T) {
 	s := &InflightState{ExpireAtMs: 123456, Attempts: 3}
 	got, err := DecodeInflight(EncodeInflight(s))
@@ -166,4 +157,72 @@ func TestInflightStateRenewFieldsRoundTrip(t *testing.T) {
 	if *got != *want {
 		t.Fatalf("往返后 = %+v，期望 %+v", got, want)
 	}
+}
+
+// NewMessageID 的不变式（SQ4.6）：格式（32 位大写十六进制）、唯一性、
+// 并发安全、单次分配。ID 只要求全局唯一、不要求不可预测。
+func TestNewMessageIDFormat(t *testing.T) {
+	for i := 0; i < 1000; i++ {
+		id := NewMessageID()
+		if len(id) != 32 {
+			t.Fatalf("长度 = %d，期望 32：%q", len(id), id)
+		}
+		for _, c := range id {
+			if !(c >= '0' && c <= '9' || c >= 'A' && c <= 'F') {
+				t.Fatalf("非法字符 %q：%q", c, id)
+			}
+		}
+	}
+}
+
+func TestNewMessageIDUnique(t *testing.T) {
+	const n = 1_000_000
+	seen := make(map[string]struct{}, n)
+	for i := 0; i < n; i++ {
+		id := NewMessageID()
+		if _, dup := seen[id]; dup {
+			t.Fatalf("第 %d 个 ID 重复：%s", i, id)
+		}
+		seen[id] = struct{}{}
+	}
+}
+
+func TestNewMessageIDConcurrent(t *testing.T) {
+	const workers, per = 8, 10_000
+	out := make(chan string, workers*per)
+	var wg sync.WaitGroup
+	for w := 0; w < workers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < per; i++ {
+				out <- NewMessageID()
+			}
+		}()
+	}
+	wg.Wait()
+	close(out)
+	seen := make(map[string]struct{}, workers*per)
+	for id := range out {
+		if _, dup := seen[id]; dup {
+			t.Fatalf("并发生成出现重复 ID：%s", id)
+		}
+		seen[id] = struct{}{}
+	}
+}
+
+// 写路径每条消息都要生成 ID：只允许一次分配（结果字符串本身）。
+func TestNewMessageIDAllocs(t *testing.T) {
+	if a := testing.AllocsPerRun(1000, func() { _ = NewMessageID() }); a != 1 {
+		t.Fatalf("每次分配 %v 次，期望 1", a)
+	}
+}
+
+func BenchmarkNewMessageID(b *testing.B) {
+	b.ReportAllocs()
+	b.RunParallel(func(pb *testing.PB) {
+		for pb.Next() {
+			_ = NewMessageID()
+		}
+	})
 }

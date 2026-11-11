@@ -11,11 +11,9 @@
 package core
 
 import (
-	"crypto/rand"
-	"encoding/hex"
 	"encoding/json"
 	"fmt"
-	"strings"
+	"math/rand/v2"
 )
 
 // BodyEncoding 消息体的编码/压缩方式。
@@ -93,11 +91,25 @@ type Message struct {
 	DeliveryAttempt int32 `json:"-"`
 }
 
-// NewMessageID 生成 32 位大写十六进制消息 ID（16 随机字节）。
+// upperHex 大写十六进制字母表：直接按它编码，省掉 hex 编码后再 ToUpper 的二次分配。
+const upperHex = "0123456789ABCDEF"
+
+// NewMessageID 生成 32 位大写十六进制消息 ID（128 位随机），每次只分配结果字符串。
+//
+// 随机源用 math/rand/v2 的全局函数（运行时 ChaCha8 源，由操作系统熵播种、
+// 每个 M 独立无锁）而非 crypto/rand：ID 只要求全局唯一、不要求抗预测（不作
+// 凭据用——receipt handle 另有 HMAC 签名），而 crypto/rand 在 macOS 上走
+// 带全局锁的 arc4random，剖析中占写入路径约三分之一 CPU（SQ4.6）。
 func NewMessageID() string {
-	b := make([]byte, 16)
-	rand.Read(b) // crypto/rand 在受支持平台不会失败
-	return strings.ToUpper(hex.EncodeToString(b))
+	var buf [32]byte
+	for half := 0; half < 2; half++ {
+		v := rand.Uint64()
+		for i := 0; i < 16; i++ {
+			buf[half*16+i] = upperHex[v>>60]
+			v <<= 4
+		}
+	}
+	return string(buf[:])
 }
 
 // InflightState 已投未确认消息的持久状态（inflight key 的 value）。
