@@ -18,11 +18,23 @@
 //     转移超时作罢后本节点仍是同任期 leader），若整个任期作废，本组在
 //     下次换届前所有写都会失败——活性故障。同任期内「N 未进日志、N+1
 //     成功」本身是安全的（计划 §4.2 失败语义论证）。
+//     注意：作废只覆盖丢弃时已在队列的同任期条目，**不提供跨调用方的
+//     同任期失败前缀性**（丢弃之后新入队的同任期条目可以成功）；需要
+//     前缀性的调用方须自行保证（见 SQ4.1 计划修订 R1）。
+//   - 合并提案（卡 SQ4.3）：proposer 每次唤醒取走全部已排队条目，把其中
+//     连续的、绑同一任期、逐条通过核对的条目切成段，段长 ≥2 时用一条
+//     MsgProp（rn.Step）一次交给 raft，段长 1 照走 SQ2 的 proposeOne
+//     （rn.Propose）。不为攒批而等待：队列只有 1 条时立即单条提案。段内
+//     顺序 = 队列顺序 = 日志顺序；每条 entry 仍各自带提案头、各有一个
+//     waiter，条目格式不变。rn.Step 对 MsgProp 不回传丢弃错误，所以每批
+//     紧随一次 rn.Status() 作「围栏」判断是否进了日志（承重假设 H3–H6）；
+//     围栏判不确定 → 整批 ErrNotLeader 并作废该任期在途条目（同 SQ2 丢弃）。
 //   - 任期读取入口 leaderTerm()：Ready 循环观察到的当前任期（SQ1 复用）。
 //   - ProposalPending：一条提案的等待句柄（Wait 恰好调用一次）。
 //
 // 边界：
-//   - 不合并提案（一条入队 = 一个 raft 条目），不改提案头布局；
+//   - 合并只发生在 proposer 内部（一条入队 = 一个 raft 条目），不改提案头
+//     布局、不改条目格式、不改 apply 侧；
 //   - proposer 不等 apply：只把「已进日志 / 失败」交给等待方，等 apply
 //     在调用方的 Wait 里（否则 proposer 串行等 quorum，吞吐退化为 1/RTT）；
 //   - 热路径零日志：只有队列深度越过 proposalQueueWarnDepth 时记一条 Warn。
@@ -48,9 +60,41 @@
 //	不再抬任期）抬任期，所以当选任期的 HardState 要么在候选那轮、要么在
 //	当选这轮 Ready 里。proposer_test 断言「当选后 leaderTerm()==Status().Term」。
 //
+//	H3「rn.Step(MsgProp) 返回 nil = node.run 已取走该消息，且其 r.Step 在
+//	node.run 本轮 select 内同步执行完才进入下一轮」：Node.Step（node.go:475-487）
+//	→ step → stepWithWaitOption(wait=false)（node.go:504-506、514-540）；
+//	n.propc 无缓冲（node.go:314），`case ch <- pm: if !wait { return nil }`
+//	即 node.run 已在 `case pm := <-propc`（node.go:386-393）接收；该分支内
+//	同步 r.Step(m) 后才回到 select。wait=false 时 pm.result 为 nil，丢弃
+//	错误（ErrProposalDropped）被吞——这正是要加围栏的原因。
+//
+//	H4「H3 之后发起的 rn.Status() 观察到的状态晚于本批处理」：Status 经
+//	n.status 通道请求（node.go:575-583），由 node.run 在**后续**轮次的
+//	`case c := <-n.status`（node.go:447-448）同步 getStatus(r)；本批的
+//	r.Step 在本轮已完成（H3），故围栏看到的一定是本批之后的状态。
+//
+//	H5「一条 MsgProp 在 leader 侧要么整批 append、要么整批丢弃」：stepLeader
+//	MsgProp（raft.go:1294-1352）的丢弃条件只有三条且都对整条消息生效——
+//	本节点不在成员表（Progress[r.id]==nil）、leadTransferee 非空（:1304）、
+//	appendEntry 超未提交上限（raft.go:812 起对全批一次
+//	increaseUncommittedSize）；本仓 raftConfig 未设 MaxUncommittedEntriesSize，
+//	raft.go:313-314 置 noLimit，第三条不可达。非 leader（stepFollower
+//	raft.go:1718、stepCandidate :1673）一律丢弃。围栏判据由此得出：
+//	「RaftState=Leader ∧ Term=本批任期 ∧ LeadTransferee=0 ∧ Progress 含本
+//	节点」→ 已进日志；否则不确定（判为失败，计划 A2）。
+//
+//	H6「MsgProp 永不出本节点」：raftConfig DisableProposalForwarding=true，
+//	stepFollower 丢弃而不转发（raft.go:1722-1724）。线上只有 MsgApp，一条
+//	MsgApp 带多条 entry 本来就是常态（MaxSizePerMsg 打包），合并提案不改变
+//	任何线上格式，新旧节点混跑互通。
+//
 // 残余窗口（计划 R1，已知不闭合）：任期核对与 rn.Propose 之间、以及 Ready
 // 循环观察滞后于 node 内部状态之间存在间隙；彻底关闭需 apply 时按条目
-// term 校验（改日志格式，计划 D5，不在本卡）。
+// term 校验（改日志格式，计划 D5，不在本卡）。批路径同样存在、不放大：
+// 围栏只会把「不确定」判为失败。围栏自身的两个窗口（SQ4.3 计划 R2/R3）：
+// Step 与 Status 之间恰好一次 tick 中止了转移 → 误判「已进日志」，这些
+// 条目等到 ctx 超时按 classifyTimeout 归类；Step 之后转移才开始 → 误判
+// 「不确定」而条目实际提交，客户端重试产生重复（既有至少一次语义）。
 package cluster
 
 import (
@@ -62,6 +106,7 @@ import (
 	"sync/atomic"
 
 	"go.etcd.io/raft/v3"
+	"go.etcd.io/raft/v3/raftpb"
 )
 
 // proposalQueueWarnDepth 队列深度越过它时记一条 Warn（只在越过的那一刻
@@ -103,7 +148,19 @@ type proposalQueue struct {
 	warned bool   // 已为本次越过阈值记过 Warn
 	// signal 容量 1：入队后非阻塞投递一次唤醒，proposer 醒来一次取走全部
 	signal chan struct{}
+
+	// 合并提案计数（只有 proposer 写；同包测试与退出日志读）：batches =
+	// 走批路径（一条 MsgProp ≥2 条 entry）的段数，batchEntries = 这些段内
+	// 的条目总数。二者之比即平均批长；单条路径不计入。
+	batches      atomic.Uint64
+	batchEntries atomic.Uint64
 }
+
+// batchProposalMaxBytes 一条合并 MsgProp 的载荷总字节上限，与 raftConfig
+// 的 MaxSizePerMsg（1MiB）同值：合并段不超过 raft 单条 MsgApp 的打包上限，
+// 避免一个超大批把复制拆成多轮的同时还占着 proposer。单条超限的条目自成
+// 一段走单条路径（与 SQ2 行为相同）。
+const batchProposalMaxBytes = 1 << 20
 
 // ProposalPending 一条已入队提案的等待句柄。
 //
@@ -267,6 +324,7 @@ func (gr *group) runProposer(ctx context.Context) {
 	q := gr.pq
 	var void voidMark // 作废标记（某条绑定条目被 raft 丢弃后置位）
 	var batch []*ProposalPending
+	var seg []*ProposalPending // 合并段缓冲（proposeTaken 复用）
 	for {
 		select {
 		case <-ctx.Done():
@@ -281,30 +339,199 @@ func (gr *group) runProposer(ctx context.Context) {
 			if len(rest) > 0 {
 				gr.lg.Info("提案队列随组退出，未处理条目以停止错误失败", "count", len(rest))
 			}
+			// 合并统计（每组生命周期一条）：平均批长 = batch_entries / batches
+			gr.lg.Info("提案 proposer 退出", "batches", q.batches.Load(), "batch_entries", q.batchEntries.Load())
 			return
 		case <-q.signal:
 		}
-		// 一次取走全部就绪条目再逐条提案（为后续合并卡留口子）；复用
-		// 上一批的底层数组，稳态零分配
+		// 一次取走全部就绪条目，切段后合并提案；复用上一批的底层数组，
+		// 稳态零分配
 		q.mu.Lock()
 		batch, q.items = q.items, batch[:0]
 		if len(q.items) < proposalQueueWarnDepth {
 			q.warned = false
 		}
 		q.mu.Unlock()
-		for i, p := range batch {
-			if ctx.Err() != nil {
-				gr.resolveProposal(p, gr.stoppedErr())
-			} else {
-				gr.proposeOne(ctx, p, &void)
-			}
-			batch[i] = nil // 释放引用：data 可能很大
+		seg = gr.proposeTaken(ctx, batch, seg, &void)
+		clear(batch) // 释放引用：data 可能很大
+	}
+}
+
+// proposeTaken 按合并规则处理 proposer 一次取走的条目（proposer 线程）。
+//
+// 切段规则（SQ4.3 计划 §2）：只有「绑任期、同一任期、逐条通过 SQ2 第 1、2
+// 步核对」的**连续**条目进同一段；遇到未绑任期条目、任期不同、单条超
+// batchProposalMaxBytes、或累计字节将超上限即断段；核对失败的条目就地失败
+// 并断段（之后的条目另起一段）。所以交给 raft 的每条 MsgProp 内条目在
+// 队列里连续，段内顺序即日志顺序。
+//
+// 为什么「先断段、再核对下一条」：断段即提交前一段，提交可能置作废标记
+// （丢弃/围栏不确定），下一条必须在那之后核对才看得到。段非空时核对通过
+// 的条目随段一起提交、失败的条目就地失败——二者都与段的命运一致（作废
+// 标记只在段提交时变化；任期变化会让整段在 Step/围栏处失败）。
+//
+// 参数 seg 是可复用的段缓冲（proposer 私有），返回复用后的缓冲。
+func (gr *group) proposeTaken(lifeCtx context.Context, taken, seg []*ProposalPending, void *voidMark) []*ProposalPending {
+	seg = seg[:0]
+	segBytes := 0
+	var segEs *epochState
+	flush := func() {
+		switch len(seg) {
+		case 0:
+		case 1:
+			gr.proposeOne(lifeCtx, seg[0], void)
+		default:
+			gr.proposeBatch(lifeCtx, seg, segEs, void)
 		}
+		clear(seg)
+		seg, segBytes, segEs = seg[:0], 0, nil
+	}
+	for _, p := range taken {
+		switch {
+		case lifeCtx.Err() != nil:
+			flush()
+			gr.resolveProposal(p, gr.stoppedErr())
+			continue
+		case !p.bound, len(p.data) > batchProposalMaxBytes:
+			// 未绑任期（同步入口在 leader 未知时入队）或单条超限：自成一段
+			flush()
+			gr.proposeOne(lifeCtx, p, void)
+			continue
+		case len(seg) > 0 && (p.term != seg[0].term || segBytes+len(p.data) > batchProposalMaxBytes):
+			flush()
+		}
+		es, err := gr.checkBound(p, void)
+		if err != nil {
+			flush()
+			gr.resolveProposal(p, err)
+			continue
+		}
+		if len(seg) == 0 {
+			segEs = es
+		}
+		seg = append(seg, p)
+		segBytes += len(p.data)
+	}
+	flush()
+	return seg
+}
+
+// checkBound 对一条绑任期条目做 SQ2 第 1、2 步核对（proposer 线程）：
+// 条目 ctx 已取消 → 返回 ctx 错误（只失败它自己）；本节点已非 leader /
+// 任期已变 / 落在作废范围 → ErrNotLeader。通过时返回当前领导权快照。
+func (gr *group) checkBound(p *ProposalPending, void *voidMark) (*epochState, error) {
+	if err := p.ctx.Err(); err != nil {
+		return nil, err
+	}
+	es := gr.epoch.Load()
+	if !es.isSelf || es.term != p.term || void.covers(p) {
+		return nil, gr.notLeaderErr()
+	}
+	return es, nil
+}
+
+// proposeBatch 把一段（≥2 条、同任期、已逐条通过核对）用一条 MsgProp 交给
+// raft（proposer 线程）：逐条回填提案头并注册 waiter → rn.Step → 围栏
+// rn.Status → 逐条交结果。
+//
+// 参数 es 是段首核对时的领导权快照（段内条目同任期，同一任期内本节点的
+// 领导权快照唯一）；Step 的 ctx 用本任期 ctx：有 leader 时 Step 只阻塞到
+// node.run 接收，ctx 只在 raft 内部已无 leader（propc 为 nil）时起作用，
+// 此时本任期 ctx 会被 Ready 循环取消。条目各自的 ctx 不并入（核对时已查；
+// 之后才取消的条目可能仍进日志，与 proposeOne 的同类窗口语义相同，由
+// Wait 的交接 CAS 收尾）。
+//
+// 结果对整段生效（计划 §2 结果归类表）：Step 失败且组已停止 → 停止错误；
+// Step 失败且本任期 ctx 已取消 → ErrNotLeader + 作废该任期；Step 成功且
+// 围栏判已进日志 → 全段「已进日志」；围栏判不确定 → ErrNotLeader + 作废。
+func (gr *group) proposeBatch(lifeCtx context.Context, seg []*ProposalPending, es *epochState, void *voidMark) {
+	term := seg[0].term
+	ents := make([]*raftpb.Entry, len(seg))
+	ids := make([]uint64, len(seg))
+	chs := make([]chan struct{}, len(seg))
+	// 回填提案头（[8B 提案者 nodeID][8B waiter id]）并一次加锁注册全部 waiter
+	gr.mu.Lock()
+	for i, p := range seg {
+		ids[i] = gr.nextID.Add(1)
+		chs[i] = make(chan struct{})
+		gr.propWaiters[ids[i]] = chs[i]
+		binary.BigEndian.PutUint64(p.data[:8], gr.selfID)
+		binary.BigEndian.PutUint64(p.data[8:16], ids[i])
+		ents[i] = &raftpb.Entry{Data: p.data}
+	}
+	gr.mu.Unlock()
+	gr.pq.batches.Add(1)
+	gr.pq.batchEntries.Add(uint64(len(seg)))
+
+	// 先查一次（同 proposeOne）：ctx 已结束时 stepWithWaitOption 的 select
+	// 可能仍随机选中投递
+	err := es.ctx.Err()
+	if err == nil {
+		err = gr.rn.Step(es.ctx, &raftpb.Message{Type: raftpb.MsgProp.Enum(), Entries: ents})
+	}
+	landed := false
+	if err == nil {
+		// 围栏（H3/H4/H5）：Step 返回 nil 只说明 node.run 收下了本批；
+		// 之后的 Status 晚于本批处理，据它判断本批是否进了日志
+		st := gr.rn.Status()
+		_, member := st.Progress[gr.selfID]
+		landed = st.RaftState == raft.StateLeader && st.GetTerm() == term &&
+			st.LeadTransferee == raft.None && member
+		if !landed {
+			// Debug：转移窗口内每个新批都会走到这里（与 enqueueProposal 的
+			// 高频拒绝同级），Info 会刷屏
+			gr.lg.Debug("合并提案围栏判不确定，整批以 ErrNotLeader 失败并作废该任期在途条目",
+				"count", len(seg), "term", term, "raft_state", st.RaftState.String(),
+				"raft_term", st.GetTerm(), "lead_transferee", st.LeadTransferee)
+		}
+	}
+	for _, p := range seg {
+		p.data = nil // 所有权已移交 raft（appendEntry 已克隆）或提案失败，句柄不再持有
+	}
+	if landed {
+		for i, p := range seg {
+			p.id, p.waitCh = ids[i], chs[i]
+			if !gr.resolveProposal(p, nil) {
+				// Wait 已因条目 ctx 结束放弃：没人会等这个 waiter 了，移除防泄漏
+				gr.removeWaiter(gr.propWaiters, ids[i])
+			}
+		}
+		return
+	}
+	gr.mu.Lock()
+	for _, id := range ids {
+		delete(gr.propWaiters, id)
+	}
+	gr.mu.Unlock()
+	var fail error
+	switch {
+	case err == nil:
+		// 围栏判不确定（计划 A2）：与 raft 丢弃同语义
+		void.mark(gr.pq, term)
+		fail = gr.notLeaderErr()
+	case lifeCtx.Err() != nil || errors.Is(err, raft.ErrStopped):
+		fail = gr.stoppedErr()
+	case es.ctx.Err() != nil:
+		void.mark(gr.pq, term)
+		fail = gr.notLeaderErr()
+	default:
+		// wait=false 的 Step 只会返回 ctx 错误或 ErrStopped，此分支理论
+		// 不可达；按失去领导权保守处理（未确认进日志即不报成功）
+		gr.lg.Warn("合并提案 Step 返回意外错误，整批以 ErrNotLeader 失败", "count", len(seg), "term", term, "err", err)
+		void.mark(gr.pq, term)
+		fail = gr.notLeaderErr()
+	}
+	for _, p := range seg {
+		gr.resolveProposal(p, fail)
 	}
 }
 
 // voidMark 作废标记：任期 term 内入队序号 ≤ upTo 的绑定条目一律失败。
 // proposer 私有（只有 proposer goroutine 读写）。
+//
+// 作废只覆盖「丢弃那一刻已在队列」的同任期条目，不提供跨调用方的同任期
+// 失败前缀性（之后新入队的同任期条目照常提案、可以成功）；需要前缀性的
+// 调用方须自行保证（见 SQ4.1 计划修订 R1）。
 type voidMark struct {
 	term uint64
 	upTo uint64
