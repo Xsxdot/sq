@@ -239,6 +239,9 @@ func HalfIdxKey(txID string) []byte { return []byte(halfIdxPrefix + txID) }
 // 注意：key 是用户任意字符串（可含 '/'，与 topic/group 名不同），
 // 解析必须从尾部定长回推（见 ParseKeyIdxKey），不能按 '/' 分割。
 // storeMs 用消息 StoreAtMs：同一 key 多条消息按写入时间排序，retention 清理同用此值。
+//
+// 约束：索引键必须与对应 msg/ 键同批写、同批删（retention 不再全扫 keyidx，
+// 不同批写入会产生只能靠启动补扫清理的孤儿）。
 func KeyIdxKey(topic, key string, storeMs int64, queueID uint32, offset uint64) []byte {
 	k := make([]byte, 0, len(keyIdxPrefix)+len(topic)+1+len(key)+1+20)
 	k = append(k, keyIdxPrefix...)
