@@ -460,14 +460,16 @@ func run() error {
 	var reg *prometheus.Registry
 	var sp *metrics.Sampler
 	if cfg.AdminListen != "" {
-		reg = metrics.NewRegistry(st, mt, sys, tx, srv, dl, logger)
+		// 时序采样器先于 registry 构造：/metrics 的业务指标读采样器最近快照
+		// （SQ4.9，最多滞后 5s），dl 同时是 inflight 内存视图与过滤跳过计数。
+		// 停机顺序与 retention/delay 同理：本 defer 注册在 st.Close 的 defer
+		// 之后（LIFO 先执行），保证不会在 store 关闭后落库。
+		sp = metrics.NewSampler(st, mt, dl,
+			time.Duration(cfg.MetricsRetentionHours)*time.Hour, logger)
+		reg = metrics.NewRegistry(st, mt, sys, tx, srv, dl, dl, sp, logger)
 
-		// 时序采样器。停机顺序与 retention/delay 同理：本 defer 注册在
-		// st.Close 的 defer 之后（LIFO 先执行），保证不会在 store 关闭后落库。
 		serCtx, serCancel := context.WithCancel(context.Background())
 		var serWG sync.WaitGroup
-		sp = metrics.NewSampler(st, mt,
-			time.Duration(cfg.MetricsRetentionHours)*time.Hour, logger)
 		serWG.Add(1)
 		go func() { defer serWG.Done(); sp.Run(serCtx) }()
 		defer func() { serCancel(); serWG.Wait() }()
@@ -807,5 +809,8 @@ func storeOptions(cfg *config.Config) store.Options {
 		CacheSize:             cfg.StorageCacheBytes(),
 		MemTableSize:          cfg.StorageMemTableBytes(),
 		CompactionConcurrency: cfg.StorageCompactionConcurrency(),
+		// delay/、half/ 深度由 store 内存计数（SQ4.9）：指标采样零扫描读取。
+		// Rejoin 重开 store 也经本函数的结果（cluster.Options.StoreOptions）。
+		CountPrefixes: metrics.CountedPrefixes(),
 	}
 }
