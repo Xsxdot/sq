@@ -1,9 +1,10 @@
-// Package produce 实现消息写入路径：队列选择、offset 分配、落盘、长轮询唤醒。
+// Package produce 实现消息写入路径：队列选择、offset 分配、落盘、可见性通知。
 //
 // 职责：
 //   - Append：一次语义写 = 消息体 + alloc 计数器，同一 Batch 原子提交
 //   - offset 分配采用持久化计数器（alloc/ key），重启 O(1) 恢复且绝不回退
-//   - 长轮询唤醒：按 topic 的 close-broadcast 信号
+//   - 可见性通知：消息持久化成功后，锁外逐个调用 OnVisible 注册的监听者，
+//     报出 (topic, 队列)；按队列唤醒长轮询是监听者（deliver）的事（卡 SQ4.2）
 //   - AppendDelay：延时消息写 delay/ 暂存区，seq 计数器同批原子提交
 //
 // 边界：
@@ -22,6 +23,7 @@ import (
 	"log/slog"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Xsxdot/sq/internal/core"
@@ -55,13 +57,16 @@ type Producer struct {
 	mt     *meta.Meta
 	logger *slog.Logger
 
-	// mu 只护共享 map（qstates/rr/wakers）——临界区内不再有任何 I/O。
+	// mu 只护共享 map（qstates/rr）与监听者注册的写端——临界区内不再有任何 I/O。
 	// 旧实现的单一全局锁跨越 store.Apply（fsync 在内），使所有队列的写入
 	// 全局串行、group commit 失效，见 git 历史中原锁注释的完整推导。
 	mu      sync.Mutex
 	qstates map[string]*queueState
 	rr      map[string]uint32
-	wakers  map[string]chan struct{}
+
+	// visible 可见性监听者列表（写时拷贝：OnVisible 持 mu 换整份切片，写入
+	// 热路径只做一次原子读，不取 mu）。
+	visible atomic.Pointer[[]func(topic string, q uint32)]
 
 	// delayMu 护延时暂存区的 seq 分配与落盘（单一全局计数器，天然串行；
 	// 独立成锁是为了不与普通写入互相阻塞）。
@@ -84,7 +89,7 @@ func New(rep replication.Replicator, rt replication.Router, st *store.Store,
 	mt *meta.Meta, logger *slog.Logger) *Producer {
 	return &Producer{
 		st: st, rep: rep, rt: rt, mt: mt, logger: logger.With("mod", "produce"),
-		qstates: map[string]*queueState{}, rr: map[string]uint32{}, wakers: map[string]chan struct{}{},
+		qstates: map[string]*queueState{}, rr: map[string]uint32{},
 	}
 }
 
@@ -96,7 +101,7 @@ func qkey(topic string, q uint32) string {
 }
 
 // Append 写入一条普通消息（spec §5 流程 1）：队列选择、offset 分配、消息与
-// alloc 计数器 + Keys 索引同一 Batch 原子提交，fsync 完成后唤醒长轮询。
+// alloc 计数器 + Keys 索引同一 Batch 原子提交，持久化完成后通知可见性监听者。
 // 本方法是本 Producer 唯一的普通消息追加入口（AppendDelay 为延时专用入口）。
 //
 // 注意：消息追加只保证本消息语义域内原子；跨语义域的关联写（DLQ 转入、延时
@@ -233,11 +238,9 @@ func (p *Producer) Append(ctx context.Context, m *core.Message) (*core.Message, 
 		return nil, fmt.Errorf("等待消息 %s 持久化 (topic=%s q=%d off=%d): %w", m.ID, m.Topic, m.QueueID, m.Offset, err)
 	}
 
-	// 段 3（p.mu）：唤醒长轮询。必须在持久化成功之后——被唤醒的订阅者读 store
-	// 必能看到这条消息。
-	p.mu.Lock()
-	p.wakeLocked(m.Topic)
-	p.mu.Unlock()
+	// 段 3：通知可见性监听者。必须在持久化成功之后——被唤醒的订阅者读 store
+	// 必能看到这条消息（集群档 Wait 返回 = 已在本节点 apply）。
+	p.notifyVisible(m.Topic, m.QueueID)
 	p.logger.Debug("消息已写入", "topic", m.Topic, "queue", m.QueueID, "offset", m.Offset, "msg_id", m.ID, "keys", len(m.Keys))
 	return m, nil
 }
@@ -474,9 +477,7 @@ func (p *Producer) AppendBatch(ctx context.Context, msgs []*core.Message) ([]*co
 		return nil, fmt.Errorf("等待批量写入持久化 (topic=%s q=%d off=%d n=%d): %w", topic, qid, off, len(msgs), err)
 	}
 
-	p.mu.Lock()
-	p.wakeLocked(topic)
-	p.mu.Unlock()
+	p.notifyVisible(topic, qid)
 	p.logger.Debug("批量消息已写入", "topic", topic, "queue", qid, "first_offset", off, "count", len(msgs))
 	return msgs, nil
 }
@@ -514,24 +515,34 @@ func staleEpochErr(what string, got, cur uint64) error {
 	return fmt.Errorf("%w: %s 计数器缓存已属任期 %d，调用方 epoch %d 已过期", replication.ErrNotLeader, what, cur, got)
 }
 
-// Subscribe 返回 topic 的唤醒信号：下一次 Append 该 topic 时该 chan 被 close。
-// 消费方等待后必须重新 Subscribe（close 是一次性广播）。
-func (p *Producer) Subscribe(topic string) <-chan struct{} {
+// OnVisible 注册可见性监听者：此后每次 Append / AppendBatch 持久化成功，以
+// 消息实际落入的 (topic, 队列) 调用 fn（批量写入整批一次）。可注册多个，
+// fn 为 nil 时忽略。
+//
+// 注意：fn 在写入方的 goroutine 上、不持本 Producer 任何锁时同步调用，必须
+// 快速返回且不得回调本 Producer 的写入口；调用方（如 moveToDLQ）可能持有
+// 自己的锁调用 Append，fn 只应取叶子锁。
+func (p *Producer) OnVisible(fn func(topic string, q uint32)) {
+	if fn == nil {
+		return
+	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	ch, ok := p.wakers[topic]
-	if !ok {
-		ch = make(chan struct{})
-		p.wakers[topic] = ch
+	var next []func(string, uint32)
+	if cur := p.visible.Load(); cur != nil {
+		next = append(next, *cur...)
 	}
-	return ch
+	next = append(next, fn)
+	p.visible.Store(&next)
 }
 
-// wakeLocked close 当前信号并撤下（下一 Subscribe 换新 chan）。调用方必须已持有 p.mu
-// （由 Append 在同一临界区内调用），本方法不再重复加锁。
-func (p *Producer) wakeLocked(topic string) {
-	if ch, ok := p.wakers[topic]; ok {
-		close(ch)
-		delete(p.wakers, topic)
+// notifyVisible 逐个调用可见性监听者（调用方不持任何 Producer 锁）。
+func (p *Producer) notifyVisible(topic string, q uint32) {
+	fns := p.visible.Load()
+	if fns == nil {
+		return
+	}
+	for _, fn := range *fns {
+		fn(topic, q)
 	}
 }

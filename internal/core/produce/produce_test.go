@@ -4,7 +4,7 @@
 //   - 验证轮询队列选择下 offset 单调递增、且轮询覆盖全部队列
 //   - 验证 offset 计数器崩溃/重启后不回退、不复用（alloc/ 持久化的核心保证）
 //   - 验证 MessageGroup 落队规则（同 group 固定同一队列）
-//   - 验证 Subscribe/Append 的长轮询唤醒信号
+//   - 验证 Append/AppendBatch 持久化后向可见性监听者报出实际落入的 (topic, 队列)
 //
 // 边界：
 //   - 仅测试 produce.Producer 及其导出方法的行为
@@ -13,6 +13,7 @@ package produce
 
 import (
 	"context"
+	"fmt"
 	"hash/fnv"
 	"log/slog"
 	"sync"
@@ -107,17 +108,58 @@ func TestMessageGroupPinsQueue(t *testing.T) {
 	}
 }
 
-func TestSubscribeWakesOnAppend(t *testing.T) {
+// TestOnVisibleReportsLandedQueue（卡 SQ4.2 改写自 TestSubscribeWakesOnAppend，
+// 原用例测的按 topic 唤醒机制已删除）：Append、AppendBatch、MessageGroup 选队
+// 各触发一次可见性监听，参数恰为消息实际落入的 (topic, 队列)；多个监听者都被调用。
+func TestOnVisibleReportsLandedQueue(t *testing.T) {
 	p, st := newTestProducer(t, t.TempDir())
 	defer st.Close()
-	ch := p.Subscribe("t3")
-	if _, err := p.Append(context.Background(), &core.Message{Topic: "t3", Body: []byte("x")}); err != nil {
-		t.Fatalf("Append: %v", err)
+	ctx := context.Background()
+	if _, err := p.mt.CreateTopic(ctx, "t3", 8); err != nil {
+		t.Fatalf("CreateTopic: %v", err)
 	}
-	select {
-	case <-ch: // 期望已被 close
-	default:
-		t.Fatal("Append 未唤醒订阅者")
+	type tq struct {
+		topic string
+		q     uint32
+	}
+	var mu sync.Mutex
+	var got, got2 []tq
+	p.OnVisible(func(topic string, q uint32) {
+		mu.Lock()
+		got = append(got, tq{topic, q})
+		mu.Unlock()
+	})
+	p.OnVisible(nil) // nil 安全
+	p.OnVisible(func(topic string, q uint32) {
+		mu.Lock()
+		got2 = append(got2, tq{topic, q})
+		mu.Unlock()
+	})
+	var want []tq
+	for i := 0; i < 3; i++ { // 轮询选队：每条落不同队列
+		m, err := p.Append(ctx, &core.Message{Topic: "t3", Body: []byte("x")})
+		if err != nil {
+			t.Fatalf("Append: %v", err)
+		}
+		want = append(want, tq{"t3", m.QueueID})
+	}
+	m, err := p.Append(ctx, &core.Message{Topic: "t3", Body: []byte("x"), MessageGroup: "user-7"})
+	if err != nil {
+		t.Fatalf("Append(MessageGroup): %v", err)
+	}
+	want = append(want, tq{"t3", m.QueueID})
+	ms, err := p.AppendBatch(ctx, []*core.Message{{Topic: "t3", Body: []byte("a")}, {Topic: "t3", Body: []byte("b")}})
+	if err != nil {
+		t.Fatalf("AppendBatch: %v", err)
+	}
+	want = append(want, tq{"t3", ms[0].QueueID}) // 整批一次
+	mu.Lock()
+	defer mu.Unlock()
+	if fmt.Sprint(got) != fmt.Sprint(want) || fmt.Sprint(got2) != fmt.Sprint(want) {
+		t.Fatalf("监听收到 %v / %v，期望 %v", got, got2, want)
+	}
+	if want[0].q == want[1].q {
+		t.Fatalf("前置不成立：轮询选队未换队列 %v", want)
 	}
 }
 

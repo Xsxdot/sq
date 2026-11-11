@@ -74,6 +74,13 @@ func newTestEnv(t *testing.T, autoCreate bool, opts ...grpc.ServerOption) testEn
 // （路由指向 leader、follower 快速失败、ErrNotLeader 映射）注入两者。
 func newTestEnvWith(t *testing.T, autoCreate bool, rv RouteView, rep replication.Replicator, opts ...grpc.ServerOption) testEnv {
 	t.Helper()
+	return newTestEnvDeliver(t, autoCreate, rv, rep, nil, opts...)
+}
+
+// newTestEnvDeliver 在 newTestEnvWith 之上再指定 deliver 构造选项（如检查点
+// 模式）。检查点模式时起后台循环，Cleanup 里先 Stop 再关 store。
+func newTestEnvDeliver(t *testing.T, autoCreate bool, rv RouteView, rep replication.Replicator, dopts []deliver.Option, opts ...grpc.ServerOption) testEnv {
+	t.Helper()
 	st, err := store.Open(t.TempDir(), true, slog.Default())
 	if err != nil {
 		t.Fatalf("store.Open: %v", err)
@@ -88,7 +95,15 @@ func newTestEnvWith(t *testing.T, autoCreate bool, rv RouteView, rep replication
 		t.Fatalf("meta.New: %v", err)
 	}
 	pr := produce.New(rep, rt, st, mt, slog.Default())
-	dl := deliver.New(rep, rt, st, mt, pr, slog.Default())
+	dl := deliver.New(rep, rt, st, mt, pr, slog.Default(), dopts...)
+	dl.Start(context.Background())
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if err := dl.Stop(ctx); err != nil {
+			t.Logf("Deliverer.Stop: %v", err)
+		}
+	})
 	ds := delay.New(rep, rt, st, pr, slog.Default())
 	cfg, err := config.Load("")
 	if err != nil {

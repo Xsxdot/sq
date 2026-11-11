@@ -159,3 +159,111 @@
 - `rg -n "deliver\.New\(|New\(rep, rt, st, mt, pr" --type go` → `main.go:400` 加 9 处测试装配（retention / txn / delay / soak / adminops / rpc / admin×2 / metrics），P1 推荐方案下这些一处都不用改
 - SQ4.1 计划 第 2 节「锁序」：`d.mu` → 围栏 / 毒化等待 → 队列锁 → produce 内部锁（DLQ Append），「不同时持两把」；「对外只读面」：给 SQ4.2 不导出任何东西，到期索引在 `queueState` 里；第 3 节步骤 0、11：`TestClusterConsumeThroughput`
 - e2e 用例名：`test/e2e/sdk_fifo_test.go:71,115`、`sdk_push_test.go:288,470`、`sdk_delay_test.go:47`、`sdk_txn_test.go:117`；`Makefile:44` `e2e`
+
+### 实现期证据（cards/sq4.2，2026-11-12，本机 macOS；produce 基准在 linux-01）
+
+步骤 0 基线（旧实现 8957215，S1 同法，断言只打印）：
+
+```
+[SQ42-S1] TestSQ42OrderedAckThroughput/standalone/checkpoint: 500 条用时 50.607s，吞吐 9.9 条/秒
+[SQ42-S1] TestSQ42OrderedAckThroughput/standalone/perop: 500 条用时 50.68s，吞吐 9.9 条/秒
+[SQ42-S1] TestSQ42OrderedAckThroughput/cluster/checkpoint: 500 条用时 50.488s，吞吐 9.9 条/秒
+[SQ42-S1] TestSQ42OrderedAckThroughput/cluster/perop: 500 条用时 50.861s，吞吐 9.8 条/秒
+```
+
+S1（判据已按主会话 2026-11-12 裁定改为「tick 起因占投出轮 ≤ 1%」+ 检查点吞吐 ≥ 200）。非 race，`-count=3`：
+
+```
+[SQ42-S1] standalone/checkpoint: 500 条用时 6ms，吞吐 82315.3 条/秒；投出轮 500：被唤醒 498、首轮 2、tick 0（tick 占 0.0%）
+[SQ42-S1] standalone/perop: 500 条用时 29ms，吞吐 17147.8 条/秒；投出轮 500：被唤醒 499、首轮 1、tick 0（tick 占 0.0%）
+[SQ42-S1] cluster/checkpoint: 500 条用时 4ms，吞吐 114518.0 条/秒；投出轮 500：被唤醒 499、首轮 1、tick 0（tick 占 0.0%）
+[SQ42-S1] cluster/perop: 500 条用时 78ms，吞吐 6437.9 条/秒；投出轮 500：被唤醒 499、首轮 1、tick 0（tick 占 0.0%）
+[SQ42-S1] standalone/checkpoint: 500 条用时 4ms，吞吐 121089.8 条/秒；投出轮 500：被唤醒 499、首轮 1、tick 0（tick 占 0.0%）
+[SQ42-S1] standalone/perop: 500 条用时 19ms，吞吐 26530.1 条/秒；投出轮 500：被唤醒 499、首轮 1、tick 0（tick 占 0.0%）
+[SQ42-S1] cluster/checkpoint: 500 条用时 4ms，吞吐 121110.6 条/秒；投出轮 500：被唤醒 499、首轮 1、tick 0（tick 占 0.0%）
+[SQ42-S1] cluster/perop: 500 条用时 37ms，吞吐 13693.8 条/秒；投出轮 500：被唤醒 499、首轮 1、tick 0（tick 占 0.0%）
+[SQ42-S1] standalone/checkpoint: 500 条用时 5ms，吞吐 103712.0 条/秒；投出轮 500：被唤醒 499、首轮 1、tick 0（tick 占 0.0%）
+[SQ42-S1] standalone/perop: 500 条用时 16ms，吞吐 31633.8 条/秒；投出轮 500：被唤醒 499、首轮 1、tick 0（tick 占 0.0%）
+[SQ42-S1] cluster/checkpoint: 500 条用时 7ms，吞吐 70110.7 条/秒；投出轮 500：被唤醒 499、首轮 1、tick 0（tick 占 0.0%）
+[SQ42-S1] cluster/perop: 500 条用时 40ms，吞吐 12611.2 条/秒；投出轮 500：被唤醒 498、首轮 2、tick 0（tick 占 0.0%）
+ok  	github.com/Xsxdot/sq/internal/core/deliver	12.249s
+```
+
+S1，`-race -count=3`：
+
+```
+[SQ42-S1] standalone/checkpoint: 500 条用时 54ms，吞吐 9224.6 条/秒；投出轮 500：被唤醒 499、首轮 1、tick 0（tick 占 0.0%）
+[SQ42-S1] standalone/perop: 500 条用时 92ms，吞吐 5409.9 条/秒；投出轮 500：被唤醒 431、首轮 69、tick 0（tick 占 0.0%）
+[SQ42-S1] cluster/checkpoint: 500 条用时 52ms，吞吐 9571.2 条/秒；投出轮 500：被唤醒 497、首轮 3、tick 0（tick 占 0.0%）
+[SQ42-S1] cluster/perop: 500 条用时 195ms，吞吐 2559.3 条/秒；投出轮 500：被唤醒 429、首轮 71、tick 0（tick 占 0.0%）
+[SQ42-S1] standalone/checkpoint: 500 条用时 50ms，吞吐 10026.1 条/秒；投出轮 500：被唤醒 498、首轮 2、tick 0（tick 占 0.0%）
+[SQ42-S1] standalone/perop: 500 条用时 88ms，吞吐 5712.2 条/秒；投出轮 500：被唤醒 444、首轮 56、tick 0（tick 占 0.0%）
+[SQ42-S1] cluster/checkpoint: 500 条用时 52ms，吞吐 9562.1 条/秒；投出轮 500：被唤醒 499、首轮 1、tick 0（tick 占 0.0%）
+[SQ42-S1] cluster/perop: 500 条用时 192ms，吞吐 2604.8 条/秒；投出轮 500：被唤醒 423、首轮 77、tick 0（tick 占 0.0%）
+[SQ42-S1] standalone/checkpoint: 500 条用时 51ms，吞吐 9888.5 条/秒；投出轮 500：被唤醒 499、首轮 1、tick 0（tick 占 0.0%）
+[SQ42-S1] standalone/perop: 500 条用时 88ms，吞吐 5681.9 条/秒；投出轮 500：被唤醒 440、首轮 60、tick 0（tick 占 0.0%）
+[SQ42-S1] cluster/checkpoint: 500 条用时 53ms，吞吐 9474.1 条/秒；投出轮 500：被唤醒 497、首轮 3、tick 0（tick 占 0.0%）
+[SQ42-S1] cluster/perop: 500 条用时 197ms，吞吐 2535.6 条/秒；投出轮 500：被唤醒 417、首轮 83、tick 0（tick 占 0.0%）
+ok  	github.com/Xsxdot/sq/internal/core/deliver	14.273s
+```
+
+S2 轮次计数（`-count=3`，三次相同）：
+
+```
+[SQ42-S2] 队列 1–15 被唤醒轮数全为 0；队列 0：g=1 g2=1
+[SQ42-S2] ack 段：g 被唤醒 1→2，g2 被唤醒 1→1
+ok  	github.com/Xsxdot/sq/internal/core/deliver	12.434s
+```
+
+真机首跑项（02:01:31 → 02:07:34）：
+
+```
+--- PASS: TestThreeNodeClusterE2E (125.61s)
+--- PASS: TestOfficialGoSDKDelayDelivery (14.10s)
+--- PASS: TestOfficialGoSDKFIFOOrderedDelivery (124.19s)
+--- PASS: TestOfficialGoSDKFIFOBlockedUntilAck (29.11s)
+--- PASS: TestOfficialGoSDKPushFIFOOrderLock (29.24s)
+--- PASS: TestOfficialGoSDKPushLongPollingWakeup (27.21s)
+--- PASS: TestOfficialGoSDKTransactionCommitAndRollback (9.13s)
+ok  	github.com/Xsxdot/sq/test/e2e	361.428s
+```
+
+`make e2e`（02:11:46 → 02:46:45）：
+
+```
+ok  	github.com/Xsxdot/sq/test/e2e	2097.414s
+exit=0
+```
+
+`SQ_BENCH=1 TestClusterConsumeThroughput`（同机，base = 8957215）：
+
+```
+# base
+cluster/quorum-mem/checkpoint-1s            26190 msg/s
+standalone/checkpoint-1s                    41325 msg/s
+cluster/quorum-mem/perop                    14970 msg/s
+standalone/perop                             1158 msg/s
+--- PASS: TestClusterConsumeThroughput (192.58s)
+# 本卡，第 1 次
+cluster/quorum-mem/checkpoint-1s            27065 msg/s
+standalone/checkpoint-1s                    35231 msg/s
+cluster/quorum-mem/perop                    13615 msg/s
+standalone/perop                             1232 msg/s
+--- PASS: TestClusterConsumeThroughput (186.63s)
+# 本卡，第 2 次
+cluster/quorum-mem/checkpoint-1s            27006 msg/s
+standalone/checkpoint-1s                    39667 msg/s
+cluster/quorum-mem/perop                    14305 msg/s
+standalone/perop                             1396 msg/s
+ok  	github.com/Xsxdot/sq/test/e2e	201.527s
+```
+
+rpc 协议面回归（检查点模式改不可见 / 转死信，SQ4.1 遗留缺陷），8957215 上：
+
+```
+8957215 Merge cards/sq4.1: 消费状态内存权威 + 检查点模式（SQ4.1）
+    checkpoint_mode_test.go:49: 检查点模式 ChangeInvisibleDuration 应 Code_OK，得 code:INVALID_RECEIPT_HANDLE  message:"receipt 已失效"（err=<nil>）
+    checkpoint_mode_test.go:59: 检查点模式 ForwardMessageToDeadLetterQueue 应 Code_OK，得 code:INVALID_RECEIPT_HANDLE  message:"句柄已失效（已确认或已重投）"（err=<nil>）
+--- FAIL: TestCheckpointModeChangeInvisibleAndForwardReturnOK (0.07s)
+FAIL	github.com/Xsxdot/sq/internal/rpc	0.583s
+```
