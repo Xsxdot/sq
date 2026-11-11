@@ -29,8 +29,8 @@ const (
 	backfillPause = 50 * time.Millisecond
 )
 
-// scanKeyIdx 本包内一切 keyidx 迭代的唯一入口：扫描并把键数计入 counter。
-// 稳态清理不应调用它（passIdxScanned 恒为 0 是 S2 的观测量）。
+// scanKeyIdx 补扫的 keyidx 分块扫描：扫描并把键数计入 counter（补扫进度日志用）。
+// 稳态清理（Pass）不读 keyidx，不得调用它。
 func (m *Manager) scanKeyIdx(counter interface{ Add(int64) int64 }, lower, upper []byte, limit int,
 	fn func(k []byte) (bool, error)) (int, error) {
 	n := 0

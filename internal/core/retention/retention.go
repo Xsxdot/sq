@@ -52,11 +52,21 @@ const maxPurgePerQueue = 10000
 // 消息 × 多个长 key 能轻易越过上限。预算只在消息边界截停（见 purgeQueue）。
 const maxIdxDeleteBytes = 512 << 10
 
+// storeAccess retention 对存储的全部访问面（读：Scan/Get；写：NewBatch 后经
+// rep.Apply 提交）。生产实现即 *store.Store 本身（New 注入）；之所以收成接口，
+// 是让测试能包装读路径、从外部观测「稳态清理是否读了 keyidx」，而不依赖
+// 实现自身记账——本包内不得另持 *store.Store 绕开它。
+type storeAccess interface {
+	Scan(lower, upper []byte, limit int, fn func(k, v []byte) (bool, error)) error
+	Get(key []byte) ([]byte, bool, error)
+	NewBatch() *store.Batch
+}
+
 // Manager 过期清理任务。单 goroutine 运行（Run），Pass 可单独调用（测试/未来 Admin 触发）。
 type Manager struct {
 	rep      replication.Replicator
 	rt       replication.Router
-	st       *store.Store
+	st       storeAccess // 生产即 *store.Store；见 storeAccess 注释
 	mt       *meta.Meta
 	interval time.Duration
 	logger   *slog.Logger
@@ -69,9 +79,6 @@ type Manager struct {
 	writeBlocked *atomic.Bool
 
 	// 观测统计（日志与测试读取；Pass 与补扫分属两个 goroutine，故用原子量）。
-	// 本包内一切 keyidx 迭代都经 scanKeyIdx 并计入对应计数器——
-	// passIdxScanned 是「稳态清理扫描 keyidx 键数」，按设计恒为 0。
-	passIdxScanned     atomic.Int64 // 最近一趟 Pass 扫描的 keyidx 键数
 	passIdxDeleted     atomic.Int64 // 最近一趟 Pass 同批删除的索引条数
 	backfillScanned    atomic.Int64 // 补扫累计扫描的 keyidx 键数
 	backfillDeleted    atomic.Int64 // 补扫累计删除的孤儿索引条数
@@ -124,7 +131,7 @@ func (m *Manager) Run(ctx context.Context) {
 			m.logger.Error("retention 清理失败", "err", err)
 		} else if n > 0 {
 			m.logger.Info("retention 清理完成", "purged_msgs", n,
-				"purged_idx", m.passIdxDeleted.Load(), "idx_scanned", m.passIdxScanned.Load())
+				"purged_idx", m.passIdxDeleted.Load())
 		} else if proc == 0 {
 			// 本趟 0 队列可处理：本节点未 lead 任何队列组，清理由各组
 			// leader 承担——摊布稳态下每节点只清自己的组，这是常态；
@@ -178,7 +185,6 @@ func (m *Manager) checkDisk() {
 //   - err: 错误信息
 func (m *Manager) Pass(ctx context.Context) (purged int, processable int, err error) {
 	idxDeleted := 0
-	m.passIdxScanned.Store(0) // 稳态路径不扫 keyidx；任何扫描都会经 scanKeyIdx 计入
 	defer func() { m.passIdxDeleted.Store(int64(idxDeleted)) }()
 	now := time.Now().UnixMilli()
 	for _, tc := range m.mt.Topics() {

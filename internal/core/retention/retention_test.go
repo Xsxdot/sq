@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -343,8 +344,43 @@ func TestPurgeSingleMessageOverBudget(t *testing.T) {
 	}
 }
 
-// TestSteadyPassScansNoKeyIndex S2：稳态清理不扫描 keyidx——2 万条未过期带 key
-// 消息 + 1 条过期带 key 消息，一趟 Pass 的 keyidx 扫描键数为 0，过期那条的索引已删。
+// keyIdxReadSpy 包装 *store.Store 的读路径，统计读到 keyidx 前缀的键数
+// （Scan 回调交出的键 + Get 的键）。与 retention 自身记账无关：retention 的
+// 一切存储读都经 Manager.st，注入本包装后任何 keyidx 读都会被计入。
+type keyIdxReadSpy struct {
+	*store.Store
+	reads atomic.Int64
+}
+
+// keyIdxRoot keyidx 键族根前缀（由公开拼键函数推出，避免硬编码）。
+var keyIdxRoot = strings.TrimSuffix(string(store.KeyIdxTopicPrefix("x")), "x/")
+
+func (s *keyIdxReadSpy) Scan(lower, upper []byte, limit int, fn func(k, v []byte) (bool, error)) error {
+	return s.Store.Scan(lower, upper, limit, func(k, v []byte) (bool, error) {
+		if strings.HasPrefix(string(k), keyIdxRoot) {
+			s.reads.Add(1)
+		}
+		return fn(k, v)
+	})
+}
+
+func (s *keyIdxReadSpy) Get(key []byte) ([]byte, bool, error) {
+	if strings.HasPrefix(string(key), keyIdxRoot) {
+		s.reads.Add(1)
+	}
+	return s.Store.Get(key)
+}
+
+// spyOn 给 Manager 注入读观测包装并返回它。
+func spyOn(m *Manager, st *store.Store) *keyIdxReadSpy {
+	spy := &keyIdxReadSpy{Store: st}
+	m.st = spy
+	return spy
+}
+
+// TestSteadyPassScansNoKeyIndex S2：稳态清理不读 keyidx——2 万条未过期带 key
+// 消息 + 1 条过期带 key 消息，一趟 Pass 经存储读到的 keyidx 键数为 0（外部包装
+// 观测），过期那条的索引已删。
 func TestSteadyPassScansNoKeyIndex(t *testing.T) {
 	st, mt, rep, rt := newFixtureRouted(t)
 	ctx := context.Background()
@@ -358,12 +394,13 @@ func TestSteadyPassScansNoKeyIndex(t *testing.T) {
 		return []string{fmt.Sprintf("k-%05d", i)}
 	})
 	m := New(rep, rt, st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default())
+	spy := spyOn(m, st)
 	n, _, err := m.Pass(ctx)
 	if err != nil || n != 1 {
 		t.Fatalf("Pass: purged=%d err=%v; want 1", n, err)
 	}
-	if got := m.passIdxScanned.Load(); got != 0 {
-		t.Fatalf("稳态 Pass 扫描 keyidx %d 个键; want 0", got)
+	if got := spy.reads.Load(); got != 0 {
+		t.Fatalf("稳态 Pass 读到 keyidx %d 个键; want 0", got)
 	}
 	if got := m.passIdxDeleted.Load(); got != 1 {
 		t.Fatalf("Pass 同批删除索引 %d 条; want 1", got)
@@ -406,6 +443,7 @@ func TestBackfillRemovesOrphans(t *testing.T) {
 	writeMsgAt(t, st, "t", 1, now, "live")    // (c) 未过期、消息在
 
 	m := New(rep, rt, st, mt, time.Minute, t.TempDir(), 0, nil, slog.Default())
+	spy := spyOn(m, st)
 	if err := m.backfillRound(ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -426,15 +464,15 @@ func TestBackfillRemovesOrphans(t *testing.T) {
 	if !m.backfillDone[0] {
 		t.Fatal("补扫完成后组 0 未记入已完成集合")
 	}
-	scanned := m.backfillScanned.Load()
-	if scanned == 0 {
-		t.Fatal("补扫扫描计数为 0")
+	reads := spy.reads.Load()
+	if reads == 0 {
+		t.Fatal("补扫未读到任何 keyidx 键")
 	}
 	if err := m.backfillRound(ctx); err != nil {
 		t.Fatal(err)
 	}
-	if got := m.backfillScanned.Load(); got != scanned {
-		t.Fatalf("已完成组再跑一轮仍扫描：%d → %d", scanned, got)
+	if got := spy.reads.Load(); got != reads {
+		t.Fatalf("已完成组再跑一轮仍读 keyidx：%d → %d", reads, got)
 	}
 }
 
@@ -447,13 +485,14 @@ func TestBackfillSkipsWhenNotLeader(t *testing.T) {
 	}
 	orphan := writeIdx(t, st, "t", "orphan", time.Now().Add(-4*24*time.Hour).UnixMilli(), 7)
 	m := New(rep, fixedLeaderRouter{leader: false}, st, mt, 10*time.Millisecond, t.TempDir(), 0, nil, slog.Default())
+	spy := spyOn(m, st)
 	done := make(chan struct{})
 	go func() { m.Run(ctx); close(done) }()
 	time.Sleep(100 * time.Millisecond) // 约 10 个周期
 	cancel()
 	<-done
-	if got := m.backfillScanned.Load(); got != 0 {
-		t.Fatalf("非 leader 补扫扫描 %d 个键; want 0", got)
+	if got := spy.reads.Load(); got != 0 {
+		t.Fatalf("非 leader 读到 keyidx %d 个键; want 0", got)
 	}
 	if _, ok, _ := st.Get(orphan); !ok {
 		t.Fatal("非 leader 删了孤儿索引")
@@ -477,10 +516,11 @@ func TestBackfillInterruptible(t *testing.T) {
 		t.Fatal(err)
 	}
 	m := New(rep, rt, st, mt, time.Hour, t.TempDir(), 0, nil, slog.Default())
+	spy := spyOn(m, st)
 	done := make(chan struct{})
 	go func() { m.Run(ctx); close(done) }()
 	deadline := time.Now().Add(5 * time.Second)
-	for m.backfillScanned.Load() == 0 {
+	for spy.reads.Load() == 0 {
 		if time.Now().After(deadline) {
 			t.Fatal("补扫未开始")
 		}
@@ -494,10 +534,10 @@ func TestBackfillInterruptible(t *testing.T) {
 		t.Fatal("补扫中取消后 Run 未在 2s 内返回")
 	}
 	if m.backfillDone[0] {
-		t.Fatalf("中断的补扫（已扫 %d 键）把组记为已完成", m.backfillScanned.Load())
+		t.Fatalf("中断的补扫（已读 %d 个 keyidx 键）把组记为已完成", spy.reads.Load())
 	}
 	if c := countPrefix(t, st, store.KeyIdxTopicPrefix("t")); c == 0 {
 		t.Fatal("中断后孤儿已全删——补扫未在块边界中断（用例未覆盖中断路径）")
 	}
-	t.Logf("取消到返回 %v，已扫 %d 键", time.Since(start), m.backfillScanned.Load())
+	t.Logf("取消到返回 %v，已读 %d 个 keyidx 键", time.Since(start), spy.reads.Load())
 }
