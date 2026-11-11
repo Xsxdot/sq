@@ -147,6 +147,8 @@ storage:
 
 **方案**：inflight 计数取自 SQ4.1 的内存态；delay / half 深度由所在组 leader 在内存维护计数（暂存、搬运、撤回、提交/回滚时增减，切主时从盘重数一次）；Prometheus 抓取改读采样器最近一次结果，不再触发扫描。
 
+> 修订（2026-11-11，主会话，plan 拍板时）：delay / half 深度改由 store 层按前缀精确计数、每个节点（含 follower）都维护——原写「所在组 leader 在内存维护」不可行：half 写入在非 leader 节点经 ApplyOrForward 转发后由 leader 侧直接 Apply 原始批次，leader 的 txn 代码看不到，会漏数；且 follower 上无计数会让指标消失或退回全扫。用户可见行为（指标名、数值、不再全扫）不变。
+
 **必交故事**
 - S1：指标数值与全扫结果一致（包级测试：同一数据集两种算法对比）。
 - S2：采样与抓取不再随 delay/half 积压量线性变慢（以扫描键数为观测量）。
