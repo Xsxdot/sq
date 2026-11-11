@@ -1,7 +1,9 @@
 // series.go: 运行指标的时序化——内存环给实时观察，Pebble 给历史回看。
 //
 // 职责：
-//   - 每 5 秒调一次 Collect，把快照压入内存环（保留最近 1 小时）
+//   - 每 5 秒调一次 CollectLive，把快照压入内存环（保留最近 1 小时），并把
+//     完整 *Stats 存为最近快照供 /metrics 抓取读取（freshStats，SQ4.9；超过
+//     2 个采样间隔即过期）
 //   - 每跨过一个整分钟，把该分钟的 12 个样本归约成一条 MinutePoint 落 Pebble
 //   - 按 metrics_retention_hours 定期 DeleteRange 掉过期的分钟点
 //   - 对外提供 Ring/History/Latest/TopicQPS/LastConsumeMs 五个派生查询
@@ -20,8 +22,9 @@
 //   - 只做单机进程内的时序；不做聚合、不做告警、不替代 Prometheus。
 //     /metrics 仍是对外的正式指标源，本包是控制台的自带存储。
 //   - 环在进程内存里，重启即丢；落库的分钟点跨重启保留。
-//   - 采样代价 = 一次 Collect（全扫 cursor/inflight/delay 前缀），5 秒一次；
-//     超大 inflight 积压场景下应调大 sampleInterval 或关掉落库。
+//   - 采样代价 = 一次 CollectLive：扫 cursor 前缀（组×topic×队列）、逐队列读
+//     alloc 与 inflight 内存计数、delay/half 读 store 内存计数——与延时/半消息
+//     积压量无关；follower 上 inflight 回落逐队列前缀扫，与在外条数成正比。
 package metrics
 
 import (
@@ -30,6 +33,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/Xsxdot/sq/internal/core/meta"
@@ -91,8 +95,13 @@ type Point struct {
 type Sampler struct {
 	st        *store.Store
 	mt        *meta.Meta
-	retention time.Duration // 0 = 不落库
+	src       InflightSource // nil = inflight 全部回落前缀扫描
+	retention time.Duration  // 0 = 不落库
 	logger    *slog.Logger
+
+	// latest 最近一次成功采样的完整快照及采样时刻（/metrics 抓取读它，不再
+	// 触发扫描；过期判定见 freshStats）。
+	latest atomic.Pointer[statsSnapshot]
 
 	mu    sync.RWMutex
 	ring  []Sample // 环形缓冲，按 n 递增覆盖
@@ -106,10 +115,11 @@ type Sampler struct {
 	lastConsume map[GroupTopic]int64
 }
 
-// NewSampler 构造采样器。retention<=0 表示只保留内存环、不落库。
-func NewSampler(st *store.Store, mt *meta.Meta, retention time.Duration, logger *slog.Logger) *Sampler {
+// NewSampler 构造采样器。src 为 inflight 内存视图（main 传 *deliver.Deliverer；
+// nil 时逐队列前缀扫描）；retention<=0 表示只保留内存环、不落库。
+func NewSampler(st *store.Store, mt *meta.Meta, src InflightSource, retention time.Duration, logger *slog.Logger) *Sampler {
 	return &Sampler{
-		st: st, mt: mt, retention: retention,
+		st: st, mt: mt, src: src, retention: retention,
 		logger:      logger.With("mod", "metrics.series"),
 		ring:        make([]Sample, ringSize),
 		lastConsume: map[GroupTopic]int64{},
@@ -172,13 +182,40 @@ func (s *Sampler) tick() {
 	}
 }
 
-// collect 调用 Collect 并整理成 Sample。死信 topic 从业务写入量里剔除，
-// 单独汇总成 DLQ——把死信算进「写入量」会让一次故障看起来像一次流量高峰。
-func (s *Sampler) collect() (Sample, error) {
-	st, err := Collect(s.st, s.mt)
-	if err != nil {
-		return Sample{}, fmt.Errorf("采样 Collect: %w", err)
+// statsSnapshot 一次成功采样的快照与采样时刻。
+type statsSnapshot struct {
+	stats *Stats
+	at    time.Time
+}
+
+// snapshotMaxAge 快照最长可用时长：超过 2 个采样间隔说明采样器卡住或已
+// 退出（或连续采样失败），此时快照视为不存在，抓取改为当场计算。
+const snapshotMaxAge = 2 * sampleInterval
+
+// freshStats 未过期的最近快照；尚未采过样或已过期返回 nil。返回值只读
+// （与采样器共享，不得修改）。
+func (s *Sampler) freshStats() *Stats {
+	p := s.latest.Load()
+	if p == nil {
+		return nil
 	}
+	if age := time.Since(p.at); age > snapshotMaxAge {
+		// Debug：抓取间隔内可能反复命中，状态本身已由采样失败的 Error 日志记录
+		s.logger.Debug("采样快照已过期，抓取改为当场计算", "age", age.String())
+		return nil
+	}
+	return p.stats
+}
+
+// collect 调用 CollectLive 并整理成 Sample，同时更新最近快照。死信 topic 从
+// 业务写入量里剔除，单独汇总成 DLQ——把死信算进「写入量」会让一次故障看起来
+// 像一次流量高峰。
+func (s *Sampler) collect() (Sample, error) {
+	st, err := CollectLive(s.st, s.mt, s.src)
+	if err != nil {
+		return Sample{}, fmt.Errorf("采样 CollectLive: %w", err)
+	}
+	s.latest.Store(&statsSnapshot{stats: st, at: time.Now()})
 	sm := Sample{
 		TsMs:         time.Now().UnixMilli(),
 		DelayDepth:   st.DelayDepth,

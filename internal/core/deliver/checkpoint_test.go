@@ -137,14 +137,23 @@ func (p heldPending) Wait() error {
 	return p.r.st.Apply(b)
 }
 
-// epochRouter 单机路由 + 可切换的可写门 epoch。
+// epochRouter 单机路由 + 可切换的可写门 epoch。down=true 模拟本节点已失
+// 领导权（只影响非阻塞的 WritableEpoch 查询）。
 type epochRouter struct {
 	replication.StandaloneRouter
 	epoch atomic.Uint64
+	down  atomic.Bool
 }
 
 func (r *epochRouter) WaitWritable(context.Context, uint32) (uint64, error) {
 	return r.epoch.Load(), nil
+}
+
+func (r *epochRouter) WritableEpoch(uint32) (uint64, bool) {
+	if r.down.Load() {
+		return 0, false
+	}
+	return r.epoch.Load(), true
 }
 
 type holdFixture struct {

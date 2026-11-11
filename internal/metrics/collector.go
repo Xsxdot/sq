@@ -1,7 +1,9 @@
-// collector.go: 把 Collect 的快照适配成 Prometheus Collector，并组装进程级 Registry。
+// collector.go: 把指标快照适配成 Prometheus Collector，并组装进程级 Registry。
 //
 // 职责：
-//   - 抓取时调用 Collect，翻译为带标签的 gauge/counter
+//   - 抓取时读采样器最近一次的快照（最多滞后一个采样间隔 5s，不触发扫描）；
+//     未装配采样器或尚未采过样时当场 CollectLive 一次；翻译为带标签的
+//     gauge/counter
 //   - 产出系统类指标（磁盘用量、数据目录占用、拒写开关），与控制台
 //     /admin/system 共用同一个 sysinfo.Reporter
 //   - 产出事务回查计数（TxnStats）与客户端连接数（ConnCounter），tx/conns
@@ -87,6 +89,8 @@ var (
 type Collector struct {
 	st     *store.Store
 	mt     *meta.Meta
+	src    InflightSource // 无快照时现算用；nil = inflight 回落前缀扫描
+	sp     *Sampler       // nil = 每次抓取现算
 	sys    *sysinfo.Reporter
 	tx     TxnStats
 	conns  ConnCounter
@@ -95,9 +99,21 @@ type Collector struct {
 }
 
 // NewCollector 构造状态 Collector。sys/tx/conns/fs 为 nil 时跳过各自负责的
-// 指标组（测试可只关心业务指标；main 装配时恒非 nil）。
-func NewCollector(st *store.Store, mt *meta.Meta, sys *sysinfo.Reporter, tx TxnStats, conns ConnCounter, fs FilterStats, logger *slog.Logger) *Collector {
-	return &Collector{st: st, mt: mt, sys: sys, tx: tx, conns: conns, fs: fs, logger: logger.With("mod", "metrics")}
+// 指标组（测试可只关心业务指标；main 装配时恒非 nil）。src/sp 可为 nil：
+// sp 非 nil 且已采过样时抓取读其快照，否则当场 CollectLive(st, mt, src)。
+func NewCollector(st *store.Store, mt *meta.Meta, sys *sysinfo.Reporter, tx TxnStats, conns ConnCounter, fs FilterStats, src InflightSource, sp *Sampler, logger *slog.Logger) *Collector {
+	return &Collector{st: st, mt: mt, src: src, sp: sp, sys: sys, tx: tx, conns: conns, fs: fs, logger: logger.With("mod", "metrics")}
+}
+
+// stats 抓取用的业务快照：采样器未过期的最近快照优先；没有或已过期（超过
+// 2 个采样间隔）才现算（低成本路径），现算失败由调用方按原样上报错误。
+func (c *Collector) stats() (*Stats, error) {
+	if c.sp != nil {
+		if s := c.sp.freshStats(); s != nil {
+			return s, nil
+		}
+	}
+	return CollectLive(c.st, c.mt, c.src)
 }
 
 // Describe 实现 prometheus.Collector。
@@ -119,7 +135,7 @@ func (c *Collector) Describe(ch chan<- *prometheus.Desc) {
 	ch <- descBlocked
 }
 
-// Collect 实现 prometheus.Collector：每次抓取现算。业务指标采集失败时上报
+// Collect 实现 prometheus.Collector：业务指标取 stats()（采样器快照或现算）。业务指标采集失败时上报
 // invalid metric（抓取端能看到错误）并记 Error 日志，不让一次 store 故障
 // panic 掉抓取协程；系统类指标不受此影响，恒会产出。
 func (c *Collector) Collect(ch chan<- prometheus.Metric) {
@@ -127,7 +143,7 @@ func (c *Collector) Collect(ch chan<- prometheus.Metric) {
 	// 写不下去时，恰恰是 sq_write_blocked 最需要被看见的时刻——放在末尾会让
 	// 告警侧看到 absent() 而不是 1。
 	c.collectSystem(ch)
-	s, err := Collect(c.st, c.mt)
+	s, err := c.stats()
 	if err != nil {
 		c.logger.Error("metrics 采集失败", "err", err)
 		ch <- prometheus.NewInvalidMetric(descTopics, err)
@@ -194,12 +210,13 @@ func (c *Collector) collectSystem(ch chan<- prometheus.Metric) {
 // 观测钩子，调用两次后一次会静默覆盖前一次的直方图。钩子本身并发安全
 // （见 store.SetApplyObserver），因此本函数相对后台 goroutine 的启动顺序
 // 不影响正确性——只影响装配完成前那一小段时间的样本会不会被记录。
-// tx/conns/fs 允许为 nil（测试与降级场景跳过事务/连接/过滤跳过指标）。
-func NewRegistry(st *store.Store, mt *meta.Meta, sys *sysinfo.Reporter, tx TxnStats, conns ConnCounter, fs FilterStats, logger *slog.Logger) *prometheus.Registry {
+// tx/conns/fs 允许为 nil（测试与降级场景跳过事务/连接/过滤跳过指标）；
+// src/sp 见 NewCollector（main 传 dl 与采样器，业务指标即采样器快照）。
+func NewRegistry(st *store.Store, mt *meta.Meta, sys *sysinfo.Reporter, tx TxnStats, conns ConnCounter, fs FilterStats, src InflightSource, sp *Sampler, logger *slog.Logger) *prometheus.Registry {
 	reg := prometheus.NewRegistry()
 	reg.MustRegister(collectors.NewGoCollector())
 	reg.MustRegister(collectors.NewProcessCollector(collectors.ProcessCollectorOpts{}))
-	reg.MustRegister(NewCollector(st, mt, sys, tx, conns, fs, logger))
+	reg.MustRegister(NewCollector(st, mt, sys, tx, conns, fs, src, sp, logger))
 	h := prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name: "sq_store_apply_duration_seconds",
 		Help: "store 批次提交耗时（含 fsync）",

@@ -14,6 +14,7 @@ import (
 	"net"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/Xsxdot/sq/internal/config"
 )
@@ -114,13 +115,22 @@ func TestAdminAPISmoke(t *testing.T) {
 	if ov.Topics < 1 || ov.TotalWritten < 1 {
 		t.Fatalf("总览计数不符: %+v", ov)
 	}
-	mresp, err := http.Get(base + "/metrics")
-	if err != nil {
-		t.Fatal(err)
-	}
-	mraw, _ := io.ReadAll(mresp.Body)
-	mresp.Body.Close()
-	if mresp.StatusCode != http.StatusOK || !bytes.Contains(mraw, []byte("sq_topic_messages_written_total")) {
-		t.Fatalf("/metrics 应含 sq_topic_messages_written_total: code=%d", mresp.StatusCode)
+	// /metrics 业务指标取采样器快照，最多滞后一个采样间隔（5s，SQ4.9）：
+	// 刚建的 topic 要等下一次采样才出现，轮询至 10s
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mresp, err := http.Get(base + "/metrics")
+		if err != nil {
+			t.Fatal(err)
+		}
+		mraw, _ := io.ReadAll(mresp.Body)
+		mresp.Body.Close()
+		if mresp.StatusCode == http.StatusOK && bytes.Contains(mraw, []byte("sq_topic_messages_written_total")) {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("/metrics 10s 内应含 sq_topic_messages_written_total: code=%d", mresp.StatusCode)
+		}
+		time.Sleep(250 * time.Millisecond)
 	}
 }

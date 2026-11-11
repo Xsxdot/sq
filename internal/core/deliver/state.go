@@ -124,9 +124,11 @@ type queueState struct {
 	// 再多，一次取件对索引的访问也是常数级」）。只在 mu 内写。
 	idxVisits uint64
 
-	// 只读镜像：不取锁的查询（InflightCount）读它们。
+	// 只读镜像：不取锁的查询（InflightCount）读它们。epochMirror 先于
+	// loadedMirror 置位，读侧先读 loadedMirror 再读 epochMirror。
 	nInflight    atomic.Int64
 	loadedMirror atomic.Bool
+	epochMirror  atomic.Uint64
 }
 
 func newQueueState(group, topic string, q uint32) *queueState {
@@ -146,17 +148,29 @@ func (qs *queueState) clear() {
 	qs.loadedMirror.Store(false)
 }
 
-// init 置为「已装载、cursor=c、无 inflight、无脏」的空状态。
+// init 置为「已装载、cursor=c、无 inflight、无脏」的空状态并对外标为已装载
+// （= reset + markLoaded；用于不需扫盘的场景，如位点重置）。
 func (qs *queueState) init(epoch, c uint64) {
+	qs.reset(epoch, c)
+	qs.markLoaded()
+}
+
+// reset 置为「已装载、cursor=c、无 inflight、无脏」的空状态，但不动只读镜像
+// 的装载标志：从盘装载时要等扫盘完成才 markLoaded，InflightCount 不会读到
+// 扫了一半的部分值。
+func (qs *queueState) reset(epoch, c uint64) {
 	qs.clear()
 	qs.loaded = true
 	qs.epoch = epoch
+	qs.epochMirror.Store(epoch)
 	qs.cursor = c
 	qs.inflight = map[uint64]*inflightEntry{}
 	qs.dirty = map[uint64]struct{}{}
 	qs.needFull = false
-	qs.loadedMirror.Store(true)
 }
+
+// markLoaded 对外（InflightCount）标为已装载。epochMirror 已在 reset 里先置。
+func (qs *queueState) markLoaded() { qs.loadedMirror.Store(true) }
 
 // load 从 pebble 装载本队列的检查点：cursor（无键 → 0）+ inflight 前缀全扫
 // 解码。O(该队列 inflight)，调用方持 mu。失败时状态保持未装载。
@@ -170,7 +184,8 @@ func (qs *queueState) load(st *store.Store, epoch uint64) error {
 	if ok {
 		c = store.GetU64(v)
 	}
-	qs.init(epoch, c)
+	// 扫盘期间 nInflight 只是部分值：reset 不标已装载，扫完才 markLoaded
+	qs.reset(epoch, c)
 	pfx := store.InflightPrefix(qs.group, qs.topic, qs.q)
 	err = st.Scan(pfx, store.PrefixUpperBound(pfx), 0, func(k, v []byte) (bool, error) {
 		_, _, _, off, perr := store.ParseInflightKey(k)
@@ -192,6 +207,7 @@ func (qs *queueState) load(st *store.Store, epoch uint64) error {
 	qs.dirty = map[uint64]struct{}{}
 	qs.cursorDirty = false
 	qs.needFull = true
+	qs.markLoaded()
 	return nil
 }
 

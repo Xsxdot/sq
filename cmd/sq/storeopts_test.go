@@ -9,9 +9,11 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/Xsxdot/sq/internal/config"
+	"github.com/Xsxdot/sq/internal/metrics"
 	"github.com/Xsxdot/sq/internal/store"
 )
 
@@ -25,8 +27,10 @@ func TestStoreOptionsFromConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load: %v", err)
 	}
-	want := store.Options{CacheSize: 128 << 20, MemTableSize: 16 << 20, CompactionConcurrency: 2}
-	if got := storeOptions(cfg); got != want {
+	// CountPrefixes 不来自配置：装配点恒登记指标用的计数前缀（SQ4.9）
+	want := store.Options{CacheSize: 128 << 20, MemTableSize: 16 << 20, CompactionConcurrency: 2,
+		CountPrefixes: metrics.CountedPrefixes()}
+	if got := storeOptions(cfg); !reflect.DeepEqual(got, want) {
 		t.Fatalf("覆盖值未穿过装配点: got %+v want %+v", got, want)
 	}
 
@@ -34,7 +38,7 @@ func TestStoreOptionsFromConfig(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Load(\"\"): %v", err)
 	}
-	if got := storeOptions(def); got != (store.Options{}) {
-		t.Fatalf("未配置时应为零值（= store 缺省），得到 %+v", got)
+	if got := storeOptions(def); !reflect.DeepEqual(got, store.Options{CountPrefixes: metrics.CountedPrefixes()}) {
+		t.Fatalf("未配置时调优字段应为零值（= store 缺省），得到 %+v", got)
 	}
 }

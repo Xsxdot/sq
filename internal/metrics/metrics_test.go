@@ -81,7 +81,7 @@ func TestRegistryExposesMetrics(t *testing.T) {
 	if _, err := pr.Append(context.Background(), &core.Message{Topic: "t1", Body: []byte("x")}); err != nil {
 		t.Fatal(err)
 	}
-	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()), nil, nil, nil, slog.Default())
+	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()), nil, nil, nil, nil, nil, slog.Default())
 	// Append 走过 store.Apply，直方图应已有样本；写入 counter 应为 1
 	got, err := testutil.GatherAndCount(reg, "sq_topic_messages_written_total", "sq_store_apply_duration_seconds")
 	if err != nil || got == 0 {
@@ -102,7 +102,7 @@ func TestRegistryExposesDiskAndWriteBlocked(t *testing.T) {
 	st, mt, _, _ := fixture(t)
 	blocked := &atomic.Bool{}
 	sys := sysinfo.New(t.TempDir(), 85, blocked, slog.Default())
-	reg := NewRegistry(st, mt, sys, nil, nil, nil, slog.Default())
+	reg := NewRegistry(st, mt, sys, nil, nil, nil, nil, nil, slog.Default())
 
 	names := gatherNames(t, reg)
 	for _, want := range []string{"sq_write_blocked", "sq_data_dir_bytes", "sq_disk_used_percent", "sq_disk_free_bytes"} {
@@ -172,7 +172,7 @@ func TestSystemMetricsSurviveStoreFailure(t *testing.T) {
 	blocked := &atomic.Bool{}
 	blocked.Store(true)
 	sys := sysinfo.New(t.TempDir(), 85, blocked, slog.Default())
-	reg := NewRegistry(st, mt, sys, nil, nil, nil, slog.Default())
+	reg := NewRegistry(st, mt, sys, nil, nil, nil, nil, nil, slog.Default())
 
 	// 关掉 store，让业务采集必然失败（Collect 里的 st.Get/Scan 会报 ErrClosed）
 	if err := st.Close(); err != nil {
@@ -232,7 +232,7 @@ func TestRegistryExportsTxnAndConnMetrics(t *testing.T) {
 		t.Fatal(err)
 	}
 	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()),
-		&fakeTxnStats{checks: 7, dropped: 1}, &fakeConns{n: 3}, nil, slog.Default())
+		&fakeTxnStats{checks: 7, dropped: 1}, &fakeConns{n: 3}, nil, nil, nil, slog.Default())
 	if err := testutil.GatherAndCompare(reg, strings.NewReader(`
 # HELP sq_half_messages 半消息暂存区待回查条数
 # TYPE sq_half_messages gauge
@@ -256,7 +256,7 @@ sq_connections 3
 func TestRegistryTolerantToNilTxnAndConns(t *testing.T) {
 	st, mt, _, _ := fixture(t)
 	reg := NewRegistry(st, mt, sysinfo.New(t.TempDir(), 0, &atomic.Bool{}, slog.Default()),
-		nil, nil, nil, slog.Default())
+		nil, nil, nil, nil, nil, slog.Default())
 	names := gatherNames(t, reg)
 	for _, absent := range []string{"sq_txn_checks_total", "sq_txn_dropped_total", "sq_connections"} {
 		if names[absent] {
@@ -285,7 +285,7 @@ func TestCollectorExposesFilterSkipped(t *testing.T) {
 		{Topic: "t", Group: "g", Reason: "tag_miss"}:    5,
 	}}
 	reg := prometheus.NewRegistry()
-	reg.MustRegister(NewCollector(st, mt, nil, nil, nil, fs, slog.Default()))
+	reg.MustRegister(NewCollector(st, mt, nil, nil, nil, fs, nil, nil, slog.Default()))
 
 	mfs, err := reg.Gather()
 	if err != nil {
