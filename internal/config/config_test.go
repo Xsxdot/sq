@@ -690,3 +690,105 @@ cluster:
 		t.Fatalf("snapshot_view_ttl 显式值 = %v; want 20m", cfg2.Cluster.SnapshotViewTTL)
 	}
 }
+
+// TestStorageConfig storage 段（SQ4.5）：缺省、覆盖、非法值启动即拒。
+//
+// 缺省返回 0 是契约：0 = 「未配置」，由 store 包解析成它的缺省常量——
+// 缺省值只有 store 一处真值，config 不能偷偷写一份数字。非法值逐条
+// 必须让 Load 失败且错误信息含键名，运维才能定位到 yaml 的那一行。
+func TestStorageConfig(t *testing.T) {
+	write := func(t *testing.T, body string) string {
+		t.Helper()
+		p := filepath.Join(t.TempDir(), "sq.yaml")
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatalf("WriteFile: %v", err)
+		}
+		return p
+	}
+
+	t.Run("无storage段返回0", func(t *testing.T) {
+		for _, path := range []string{"", write(t, "fsync: async\n")} {
+			cfg, err := Load(path)
+			if err != nil {
+				t.Fatalf("Load(%q): %v", path, err)
+			}
+			if cfg.StorageCacheBytes() != 0 || cfg.StorageMemTableBytes() != 0 || cfg.StorageCompactionConcurrency() != 0 {
+				t.Fatalf("未配置时应全为 0，得到 cache=%d memtable=%d cc=%d",
+					cfg.StorageCacheBytes(), cfg.StorageMemTableBytes(), cfg.StorageCompactionConcurrency())
+			}
+		}
+	})
+
+	t.Run("覆盖值", func(t *testing.T) {
+		cfg, err := Load(write(t, "storage:\n  cache_size: 512MiB\n  memtable_size: 1048576\n  compaction_concurrency: 2\n"))
+		if err != nil {
+			t.Fatalf("Load: %v", err)
+		}
+		if got := cfg.StorageCacheBytes(); got != 536870912 {
+			t.Fatalf("cache_size 512MiB 应为 536870912，得到 %d", got)
+		}
+		if got := cfg.StorageMemTableBytes(); got != 1048576 {
+			t.Fatalf("memtable_size 1048576 应为 1048576，得到 %d", got)
+		}
+		if got := cfg.StorageCompactionConcurrency(); got != 2 {
+			t.Fatalf("compaction_concurrency 应为 2，得到 %d", got)
+		}
+	})
+
+	t.Run("单位与边界值", func(t *testing.T) {
+		cases := []struct {
+			yml  string
+			want int64
+		}{
+			{"storage:\n  cache_size: 8MiB\n", 8 << 20},
+			{"storage:\n  cache_size: 64GiB\n", 64 << 30},
+			{"storage:\n  cache_size: 16384KiB\n", 16 << 20},
+			{"storage:\n  cache_size: 8388608B\n", 8 << 20},
+		}
+		for _, c := range cases {
+			cfg, err := Load(write(t, c.yml))
+			if err != nil {
+				t.Fatalf("%q 应合法: %v", c.yml, err)
+			}
+			if got := cfg.StorageCacheBytes(); got != c.want {
+				t.Fatalf("%q 应为 %d，得到 %d", c.yml, c.want, got)
+			}
+		}
+		cfg, err := Load(write(t, "storage:\n  memtable_size: 1GiB\n"))
+		if err != nil || cfg.StorageMemTableBytes() != 1<<30 {
+			t.Fatalf("memtable_size 1GiB（上界）应合法: cfg=%v err=%v", cfg, err)
+		}
+	})
+
+	t.Run("非法值启动即拒", func(t *testing.T) {
+		cases := []struct {
+			key, yml, wantMsg string
+		}{
+			{"storage.cache_size", "storage:\n  cache_size: -1MiB\n", ""},
+			{"storage.cache_size", "storage:\n  cache_size: 256MB\n", "KiB/MiB/GiB"},
+			{"storage.cache_size", "storage:\n  cache_size: 1.5GiB\n", ""},
+			{"storage.cache_size", "storage:\n  cache_size: abc\n", ""},
+			{"storage.cache_size", "storage:\n  cache_size: 0\n", ""},
+			{"storage.cache_size", "storage:\n  cache_size: 7MiB\n", ""},
+			{"storage.cache_size", "storage:\n  cache_size: 65GiB\n", ""},
+			{"storage.cache_size", "storage:\n  cache_size: 99999999999999999999GiB\n", ""},
+			{"storage.memtable_size", "storage:\n  memtable_size: 2GiB\n", ""},
+			{"storage.memtable_size", "storage:\n  memtable_size: 512KiB\n", ""},
+			{"storage.memtable_size", "storage:\n  memtable_size: 64mb\n", "KiB/MiB/GiB"},
+			{"storage.compaction_concurrency", "storage:\n  compaction_concurrency: -1\n", ""},
+			{"storage.compaction_concurrency", "storage:\n  compaction_concurrency: 65\n", ""},
+		}
+		for _, c := range cases {
+			_, err := Load(write(t, c.yml))
+			if err == nil {
+				t.Fatalf("%q 必须拒绝启动", c.yml)
+			}
+			if !strings.Contains(err.Error(), c.key) {
+				t.Fatalf("%q 的错误信息应含键名 %s: %v", c.yml, c.key, err)
+			}
+			if c.wantMsg != "" && !strings.Contains(err.Error(), c.wantMsg) {
+				t.Fatalf("%q 的错误信息应含提示 %q: %v", c.yml, c.wantMsg, err)
+			}
+		}
+	})
+}
